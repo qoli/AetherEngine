@@ -556,6 +556,46 @@ enum BlackCarrierAudioRenditionMuxer {
         )
     }
 
+    /// Validate the exact stream-copy/bridge route without retaining a writer or emitting carrier bytes.
+    ///
+    /// HLS segment admission uses this after opening the graph-bound first rendition segment. It exercises
+    /// the same codec-parameter copy, AudioBridge construction and fMP4 header probe as the real writer, so
+    /// public HLS admission cannot be based on a looser codec-name allowlist.
+    static func admissionDescriptor(
+        demuxer: Demuxer,
+        audioStreamIndex: Int32,
+        bridgeMode: AudioBridgeMode = .surroundCompat
+    ) throws -> BlackCarrierAudioRenditionDescriptor {
+        guard audioStreamIndex >= 0,
+              let sourceStream = demuxer.stream(
+                  at: audioStreamIndex
+              ),
+              sourceStream.pointee.codecpar.pointee.codec_type
+                == AVMEDIA_TYPE_AUDIO else {
+            throw BlackCarrierAudioRenditionMuxerError
+                .audioStreamMissing(index: audioStreamIndex)
+        }
+        let route = try prepareRoute(
+            sourceStream: sourceStream,
+            sourceStartPTS:
+                BlackCarrierSourceAxis.sourceStartPTS(
+                    demuxer: demuxer,
+                    streamIndex: audioStreamIndex
+                ),
+            bridgeMode: bridgeMode
+        )
+        defer { route.bridge?.close() }
+        return BlackCarrierAudioRenditionDescriptor(
+            pipeline: route.pipeline,
+            codecString: route.codecString,
+            channelsAttribute: route.channelsAttribute,
+            declaredCodecInitialPaddingSamples:
+                route.declaredCodecInitialPaddingSamples,
+            constantRateBridgeProfile:
+                route.constantRateBridgeProfile
+        )
+    }
+
     static func mux(
         demuxer: Demuxer,
         audioStreamIndex: Int32,

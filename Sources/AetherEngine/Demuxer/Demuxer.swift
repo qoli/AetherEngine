@@ -561,6 +561,11 @@ public final class Demuxer: @unchecked Sendable {
         return ctx.pointee.bit_rate
     }
 
+    var streamCount: Int {
+        guard let ctx = formatContext else { return 0 }
+        return Int(ctx.pointee.nb_streams)
+    }
+
     /// AVFormatContext.start_time in AV_TIME_BASE units. Non-zero on re-muxed
     /// MKV/TS; subtract from packet PTS for file-relative playback time.
     var formatStartTime: Int64 {

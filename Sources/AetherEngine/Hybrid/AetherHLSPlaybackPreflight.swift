@@ -155,6 +155,18 @@ struct HLSVODResourceGraph: Sendable, Equatable {
         let timeline = try BlackCarrierTimeline.mirroredHLSVOD(
             segmentDurations: segmentResources.map(\.duration)
         )
+        for rendition in audioRenditions {
+            let audioDuration = try summedDuration(
+                rendition.segments
+            )
+            guard audioDuration == timeline.duration.value else {
+                throw HLSPreflightError
+                    .unsupportedSeekableVODResourceGraph(
+                        reason:
+                            "alternate-audio rendition duration does not match selected video"
+                    )
+            }
+        }
         let identity = makeIdentity(
             requestedRootURL: requestedRootURL,
             effectiveRootURL: effectiveRootURL,
@@ -384,5 +396,30 @@ struct HLSVODResourceGraph: Sendable, Equatable {
                 url: url
             )
         }
+    }
+
+    private static func summedDuration(
+        _ segments: [HLSVODSegmentResource]
+    ) throws -> CMTimeValue {
+        guard !segments.isEmpty else {
+            throw HLSPreflightError
+                .unsupportedSeekableVODResourceGraph(
+                    reason:
+                        "alternate-audio rendition has no segments"
+                )
+        }
+        var total: CMTimeValue = 0
+        for segment in segments {
+            let addition = total.addingReportingOverflow(
+                segment.duration.value
+            )
+            guard !addition.overflow else {
+                throw HLSPreflightError.invalidPlaylist(
+                    "alternate-audio duration overflow"
+                )
+            }
+            total = addition.partialValue
+        }
+        return total
     }
 }

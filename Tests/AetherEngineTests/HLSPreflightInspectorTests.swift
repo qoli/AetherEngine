@@ -363,6 +363,84 @@ final class HLSPreflightInspectorTests: XCTestCase {
         }
     }
 
+    func testResourceGraphRejectsAlternateAudioDurationMismatch()
+        throws
+    {
+        let baseURL = URL(
+            string: "https://example.com/video/media.m3u8"
+        )!
+        let videoMedia = HLSMediaPlaylist(
+            targetDuration: 4,
+            mediaSequence: 0,
+            segments: [
+                HLSMediaSegment(
+                    uri: "video.ts",
+                    duration: 4,
+                    discontinuityBefore: false
+                ),
+            ],
+            hasEndList: true,
+            hasUnsupportedEncryption: false,
+            hasMap: false,
+            mapURI: nil,
+            contentProtection: .none
+        )
+        let audioMedia = HLSMediaPlaylist(
+            targetDuration: 3,
+            mediaSequence: 0,
+            segments: [
+                HLSMediaSegment(
+                    uri: "audio.aac",
+                    duration: 3,
+                    discontinuityBefore: false
+                ),
+            ],
+            hasEndList: true,
+            hasUnsupportedEncryption: false,
+            hasMap: false,
+            mapURI: nil,
+            contentProtection: .none
+        )
+        let audio = try HLSVODResourceGraph
+            .makeAudioRendition(
+                ordinal: 0,
+                metadata: HLSAudioRendition(
+                    groupID: "audio",
+                    uri: "audio.m3u8",
+                    name: "English",
+                    isDefault: true
+                ),
+                playlistURL: baseURL,
+                playlistData: Data(),
+                media: audioMedia
+            )
+
+        XCTAssertThrowsError(
+            try HLSVODResourceGraph.make(
+                requestedRootURL: baseURL,
+                effectiveRootURL: baseURL,
+                selectedMediaPlaylistURL: baseURL,
+                selectedVariant: nil,
+                separateAudioGroupID: "audio",
+                mediaPlaylistData: Data(),
+                media: videoMedia,
+                audioRenditions: [audio],
+                inspectedInitSegmentData: nil,
+                inspectedFirstMediaSegmentData:
+                    Data([0x47]),
+                httpHeaders: [:]
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? HLSPreflightError,
+                .unsupportedSeekableVODResourceGraph(
+                    reason:
+                        "alternate-audio rendition duration does not match selected video"
+                )
+            )
+        }
+    }
+
     func testSeekableVODResourceGraphRejectsNonFiniteOrAmbiguousPlaylists() throws {
         let baseURL = URL(
             string: "https://example.com/video/media.m3u8"
