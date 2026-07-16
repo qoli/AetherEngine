@@ -19,6 +19,7 @@ enum BlackCarrierMediaFanoutPumpError:
     case restartTimelineOffsetUnavailable(trackID: Int)
     case freshDemuxerFactoryMissing
     case freshDemuxerOpenFailed(reason: String)
+    case restartSourceContractMismatch
     case restartTrackContractMismatch
     case generationSuperseded(generation: UInt64)
     case closed
@@ -53,6 +54,8 @@ enum BlackCarrierMediaFanoutPumpError:
             return "Black carrier lazy restart requires a fresh-demux factory"
         case .freshDemuxerOpenFailed(let reason):
             return "Black carrier fresh demux generation could not open: \(reason)"
+        case .restartSourceContractMismatch:
+            return "Black carrier fresh demux generation changed the admitted source contract"
         case .restartTrackContractMismatch:
             return "Black carrier fresh demux generation changed the admitted track contract"
         case .generationSuperseded(let generation):
@@ -76,6 +79,20 @@ enum BlackCarrierMediaFanoutPumpError:
 enum BlackCarrierMediaFanoutRestartResult: Sendable, Equatable {
     case applied(generation: UInt64, segmentIndex: Int)
     case stale(currentGeneration: UInt64)
+}
+
+struct BlackCarrierDemuxContract: Sendable, Equatable {
+    let durationMicroseconds: Int64
+    let formatStartTime: Int64
+    let containerBitRate: Int64
+
+    init(demuxer: Demuxer) {
+        durationMicroseconds = Int64(
+            (demuxer.duration * 1_000_000).rounded()
+        )
+        formatStartTime = demuxer.formatStartTime
+        containerBitRate = demuxer.bitRate
+    }
 }
 
 /// Incremental single-demux packet fanout for carrier audio and the future real-video decoder.
@@ -109,9 +126,11 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
 
     let renditionMetadata: [BlackCarrierAudioRenditionMetadata]
     let renditionDescriptors: [BlackCarrierAudioRenditionDescriptor]
+    let sourceContract: BlackCarrierDemuxContract
 
     private var demuxer: Demuxer
     private let freshDemuxerFactory: FreshDemuxerFactory?
+    private var sourceFactory: BlackCarrierDemuxSourceFactory?
     private let timeline: BlackCarrierTimeline
     private let bridgeMode: AudioBridgeMode
     private var videoStreamIndex: Int32
@@ -144,7 +163,9 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         videoStreamIndex: Int32? = nil,
         videoPacketSink: VideoPacketSink? = nil,
         initialGeneration: UInt64 = 0,
-        freshDemuxerFactory: FreshDemuxerFactory? = nil
+        freshDemuxerFactory: FreshDemuxerFactory? = nil,
+        ownsInitialDemuxer: Bool = false,
+        sourceFactory: BlackCarrierDemuxSourceFactory? = nil
     ) throws {
         guard let firstSegmentIndex = timeline.segments.first?.index else {
             throw BlackCarrierMediaFanoutPumpError
@@ -214,18 +235,21 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
 
         self.demuxer = demuxer
         self.freshDemuxerFactory = freshDemuxerFactory
+        self.sourceFactory = sourceFactory
         self.timeline = timeline
         self.bridgeMode = bridgeMode
         self.videoStreamIndex = videoPacketSink == nil
             ? -1
             : resolvedVideoStreamIndex
         self.videoPacketSink = videoPacketSink
+        sourceContract = BlackCarrierDemuxContract(demuxer: demuxer)
         renditionMetadata = metadata
         renditions = prepared
         renditionDescriptors = prepared.map(\.writer.descriptor)
         generationStartSegmentIndex = firstSegmentIndex
         currentGeneration = initialGeneration
         interruptibleDemuxer = demuxer
+        ownsActiveDemuxer = ownsInitialDemuxer
         renditionsByStream = Dictionary(
             uniqueKeysWithValues: prepared.map {
                 ($0.writer.sourceStreamIndex, $0)
@@ -237,6 +261,66 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             keep.insert(self.videoStreamIndex)
         }
         demuxer.discardAllStreamsExcept(keep)
+    }
+
+    static func makeSeekableVOD(
+        source: MediaSource,
+        options: LoadOptions,
+        timeline: BlackCarrierTimeline,
+        bridgeMode: AudioBridgeMode = .surroundCompat,
+        videoPacketSink: VideoPacketSink? = nil,
+        initialGeneration: UInt64 = 0,
+        selectTitleID: Int? = nil
+    ) throws -> BlackCarrierMediaFanoutPump {
+        let sourceFactory = try BlackCarrierDemuxSourceFactory.adopting(
+            source: source,
+            options: options,
+            selectTitleID: selectTitleID
+        )
+        return try makeSeekableVOD(
+            sourceFactory: sourceFactory,
+            ownsSourceFactory: true,
+            timeline: timeline,
+            bridgeMode: bridgeMode,
+            videoPacketSink: videoPacketSink,
+            initialGeneration: initialGeneration
+        )
+    }
+
+    static func makeSeekableVOD(
+        sourceFactory: BlackCarrierDemuxSourceFactory,
+        ownsSourceFactory: Bool,
+        timeline: BlackCarrierTimeline,
+        bridgeMode: AudioBridgeMode = .surroundCompat,
+        videoPacketSink: VideoPacketSink? = nil,
+        initialGeneration: UInt64 = 0
+    ) throws -> BlackCarrierMediaFanoutPump {
+        do {
+            let demuxer = try sourceFactory.openDemuxer()
+            do {
+                return try BlackCarrierMediaFanoutPump(
+                    demuxer: demuxer,
+                    timeline: timeline,
+                    bridgeMode: bridgeMode,
+                    videoStreamIndex: demuxer.videoStreamIndex,
+                    videoPacketSink: videoPacketSink,
+                    initialGeneration: initialGeneration,
+                    freshDemuxerFactory: {
+                        try sourceFactory.openDemuxer()
+                    },
+                    ownsInitialDemuxer: true,
+                    sourceFactory: ownsSourceFactory ? sourceFactory : nil
+                )
+            } catch {
+                demuxer.close()
+                throw error
+            }
+        } catch {
+            if ownsSourceFactory {
+                sourceFactory.close()
+            }
+            throw error
+        }
     }
 
     deinit {
@@ -354,6 +438,11 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             guard freshDemuxer !== retiringDemuxer else {
                 throw BlackCarrierMediaFanoutPumpError
                     .restartTrackContractMismatch
+            }
+            guard BlackCarrierDemuxContract(demuxer: freshDemuxer)
+                    == sourceContract else {
+                throw BlackCarrierMediaFanoutPumpError
+                    .restartSourceContractMismatch
             }
 
             let freshTracks = freshDemuxer.audioTrackInfos()
@@ -647,7 +736,13 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                 )
             }
             isClosed = true
+            let demuxerToClose = ownsActiveDemuxer ? demuxer : nil
+            ownsActiveDemuxer = false
+            let sourceFactoryToClose = sourceFactory
+            sourceFactory = nil
             lock.unlock()
+            demuxerToClose?.close()
+            sourceFactoryToClose?.close()
             return stores
         } catch let error as BlackCarrierMediaFanoutPumpError {
             lock.unlock()
@@ -692,18 +787,22 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         activeDemuxer.markClosed()
 
         lock.lock()
-        guard !isClosed else {
-            lock.unlock()
-            return
+        let caches: [SegmentCache]
+        if isClosed {
+            caches = []
+        } else {
+            isClosed = true
+            caches = renditions.map(\.cache)
         }
-        isClosed = true
-        let caches = renditions.map(\.cache)
         let demuxerToClose = ownsActiveDemuxer ? demuxer : nil
         ownsActiveDemuxer = false
+        let sourceFactoryToClose = sourceFactory
+        sourceFactory = nil
         clearRequestedRestart()
         lock.unlock()
         caches.forEach { $0.close() }
         demuxerToClose?.close()
+        sourceFactoryToClose?.close()
     }
 
     private func finishWriters() throws {

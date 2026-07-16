@@ -131,6 +131,7 @@ public final class Demuxer: @unchecked Sendable {
     private let accessLock = NSLock()
 
     private var avioProvider: AVIOProvider?
+    private var ownedIOReader: IOReader?
     private var openProfile: DemuxerOpenProfile = .playback
 
     /// #112 round 11: whether `seekByteEstimate` has what it needs (a resolved byte size and a positive
@@ -326,6 +327,17 @@ public final class Demuxer: @unchecked Sendable {
         let bridge = CustomIOReaderBridge(reader: reader)
         let inputFormat: UnsafePointer<AVInputFormat>? = formatHint.flatMap { av_find_input_format($0) }
         try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
+    }
+
+    /// Transfer a custom reader's teardown ownership to this demuxer.
+    ///
+    /// `open(reader:)` keeps its historical borrowed-reader contract because the main engine
+    /// may retain a custom source across probe/reload. Disposable independent readers created
+    /// for carrier generations opt in after a successful open.
+    func adoptOwnedReader(_ reader: IOReader) {
+        accessLock.lock()
+        ownedIOReader = reader
+        accessLock.unlock()
     }
 
     /// A remote disc image (ISO 9660 / UDF / BDMV) by URL extension. Gates the HTTP disc-adapter
@@ -1186,10 +1198,13 @@ public final class Demuxer: @unchecked Sendable {
             avformat_close_input(&formatContext)
         }
         formatContext = nil
+        let readerToClose = ownedIOReader
+        ownedIOReader = nil
         accessLock.unlock()
 
         avioProvider?.close()
         avioProvider = nil
+        readerToClose?.close()
     }
 
     deinit {

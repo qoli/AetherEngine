@@ -59,6 +59,57 @@ struct BlackCarrierAudioBandwidthAdmission: Sendable, Equatable {
     let evidence: BlackCarrierAudioBandwidthEvidence
 }
 
+struct BlackCarrierAudioBandwidthMeasurement: Sendable, Equatable {
+    let sourceContract: BlackCarrierDemuxContract
+    let renditionMetadata: [BlackCarrierAudioRenditionMetadata]
+    let renditionDescriptors: [BlackCarrierAudioRenditionDescriptor]
+    let admissions: [BlackCarrierAudioBandwidthAdmission]
+}
+
+enum BlackCarrierAudioBandwidthPreflight {
+    static func measure(
+        sourceFactory: BlackCarrierDemuxSourceFactory,
+        timeline: BlackCarrierTimeline,
+        bridgeMode: AudioBridgeMode
+    ) throws -> BlackCarrierAudioBandwidthMeasurement {
+        EngineLog.emit(
+            "[BlackCarrierAudioBandwidthPreflight] full-asset measurement started",
+            category: .session
+        )
+        let pump = try BlackCarrierMediaFanoutPump.makeSeekableVOD(
+            sourceFactory: sourceFactory,
+            ownsSourceFactory: false,
+            timeline: timeline,
+            bridgeMode: bridgeMode
+        )
+        let stores = try pump.finishStores()
+        defer { stores.forEach { $0.close() } }
+        let admissions = stores.map {
+            BlackCarrierAudioBandwidthAdmission(
+                ordinal: $0.metadata.ordinal,
+                evidence: .measuredFullAsset(
+                    peakBandwidth: $0.peakBandwidth,
+                    averageBandwidth: $0.averageBandwidth
+                )
+            )
+        }
+        EngineLog.emit(
+            "[BlackCarrierAudioBandwidthPreflight] full-asset measurement completed "
+                + admissions.map {
+                    "audio[\($0.ordinal)] peak=\($0.evidence.peakBandwidth) "
+                        + "average=\($0.evidence.averageBandwidth)"
+                }.joined(separator: " "),
+            category: .session
+        )
+        return BlackCarrierAudioBandwidthMeasurement(
+            sourceContract: pump.sourceContract,
+            renditionMetadata: pump.renditionMetadata,
+            renditionDescriptors: pump.renditionDescriptors,
+            admissions: admissions
+        )
+    }
+}
+
 enum BlackCarrierLazyCompositeProviderError:
     Error,
     LocalizedError,
@@ -68,6 +119,7 @@ enum BlackCarrierLazyCompositeProviderError:
     case admissionCountMismatch(expected: Int, actual: Int)
     case admissionOrdinalMismatch(expected: Int, actual: Int)
     case invalidBandwidthEvidence(ordinal: Int)
+    case bandwidthMeasurementContractMismatch
     case startupResourceMissing(ordinal: Int)
     case pump(BlackCarrierMediaFanoutPumpError)
 
@@ -79,6 +131,8 @@ enum BlackCarrierLazyCompositeProviderError:
             return "Lazy carrier audio bandwidth ordinal \(actual) is invalid; expected \(expected)"
         case .invalidBandwidthEvidence(let ordinal):
             return "Lazy carrier audio rendition \(ordinal) has invalid peak-bandwidth evidence"
+        case .bandwidthMeasurementContractMismatch:
+            return "Lazy carrier playback tracks changed after bandwidth measurement"
         case .startupResourceMissing(let ordinal):
             return "Lazy carrier audio rendition \(ordinal) did not produce its startup init and segment"
         case .pump(let error):
@@ -170,6 +224,93 @@ final class BlackCarrierLazyCompositeProvider:
                     $0.evidence.averageBandwidth
                 }.max() ?? 0)
         )
+    }
+
+    convenience init(
+        videoProvider: BlackCarrierVideoProvider,
+        pump: BlackCarrierMediaFanoutPump,
+        bandwidthMeasurement: BlackCarrierAudioBandwidthMeasurement
+    ) throws {
+        guard bandwidthMeasurement.sourceContract
+                == pump.sourceContract,
+              bandwidthMeasurement.renditionMetadata
+                == pump.renditionMetadata,
+              bandwidthMeasurement.renditionDescriptors
+                == pump.renditionDescriptors else {
+            videoProvider.close()
+            pump.close()
+            throw BlackCarrierLazyCompositeProviderError
+                .bandwidthMeasurementContractMismatch
+        }
+        try self.init(
+            videoProvider: videoProvider,
+            pump: pump,
+            bandwidthAdmissions: bandwidthMeasurement.admissions
+        )
+    }
+
+    static func buildSeekableVOD(
+        videoProvider: BlackCarrierVideoProvider,
+        source: MediaSource,
+        options: LoadOptions,
+        timeline: BlackCarrierTimeline,
+        bridgeMode: AudioBridgeMode = .surroundCompat,
+        videoPacketSink: BlackCarrierMediaFanoutPump.VideoPacketSink? = nil,
+        initialGeneration: UInt64 = 0,
+        selectTitleID: Int? = nil
+    ) throws -> BlackCarrierLazyCompositeProvider {
+        let sourceFactory: BlackCarrierDemuxSourceFactory
+        do {
+            sourceFactory = try BlackCarrierDemuxSourceFactory.adopting(
+                source: source,
+                options: options,
+                selectTitleID: selectTitleID
+            )
+        } catch {
+            videoProvider.close()
+            throw error
+        }
+
+        let measurement: BlackCarrierAudioBandwidthMeasurement
+        do {
+            measurement = try BlackCarrierAudioBandwidthPreflight.measure(
+                sourceFactory: sourceFactory,
+                timeline: timeline,
+                bridgeMode: bridgeMode
+            )
+        } catch {
+            sourceFactory.close()
+            videoProvider.close()
+            throw error
+        }
+
+        let pump: BlackCarrierMediaFanoutPump
+        do {
+            pump = try BlackCarrierMediaFanoutPump.makeSeekableVOD(
+                sourceFactory: sourceFactory,
+                ownsSourceFactory: true,
+                timeline: timeline,
+                bridgeMode: bridgeMode,
+                videoPacketSink: videoPacketSink,
+                initialGeneration: initialGeneration
+            )
+        } catch {
+            sourceFactory.close()
+            videoProvider.close()
+            throw error
+        }
+
+        do {
+            return try BlackCarrierLazyCompositeProvider(
+                videoProvider: videoProvider,
+                pump: pump,
+                bandwidthMeasurement: measurement
+            )
+        } catch {
+            pump.close()
+            videoProvider.close()
+            throw error
+        }
     }
 
     deinit {
