@@ -180,6 +180,12 @@ protocol HybridPlaybackTerminalErrorSource:
 {
     var terminalHybridPlaybackError:
         HybridPlaybackSessionError? { get }
+    func setTerminalHybridPlaybackErrorHandler(
+        _ handler:
+            (@Sendable (
+                HybridPlaybackSessionError
+            ) -> Void)?
+    )
 }
 
 protocol HybridAudioAnalysisSource: Sendable {
@@ -433,6 +439,17 @@ final class HybridPlaybackSession {
         )
         avPlayer = transport.avPlayer
         relay.attach(self)
+        if let terminalErrorSource =
+                provider as?
+                any HybridPlaybackTerminalErrorSource {
+            terminalErrorSource
+                .setTerminalHybridPlaybackErrorHandler {
+                    [weak self] error in
+                    Task { @MainActor [weak self] in
+                        self?.terminate(with: error)
+                    }
+                }
+        }
     }
 
     static func makeSeekableVOD(

@@ -80,6 +80,10 @@ final class HLSVODCarrierProvider:
     private let failureLock = NSLock()
     private var _terminalError:
         HLSVODCarrierProviderError?
+    private var terminalHybridPlaybackErrorHandler:
+        (@Sendable (
+            HybridPlaybackSessionError
+        ) -> Void)?
 
     static func make(
         preflight: AetherHLSPlaybackPreflight,
@@ -275,6 +279,26 @@ final class HLSVODCarrierProvider:
         return Self.hybridPlaybackSessionError(
             from: terminalError
         )
+    }
+
+    func setTerminalHybridPlaybackErrorHandler(
+        _ handler:
+            (@Sendable (
+                HybridPlaybackSessionError
+            ) -> Void)?
+    ) {
+        failureLock.lock()
+        terminalHybridPlaybackErrorHandler =
+            handler
+        let existing = _terminalError.flatMap {
+            Self.hybridPlaybackSessionError(
+                from: $0
+            )
+        }
+        failureLock.unlock()
+        if let existing {
+            handler?(existing)
+        }
     }
 
     var hybridVideoFormat: VideoFormat? {
@@ -651,14 +675,27 @@ final class HLSVODCarrierProvider:
     ) {
         failureLock.lock()
         let isFirst: Bool
+        let handler:
+            (@Sendable (
+                HybridPlaybackSessionError
+            ) -> Void)?
         if _terminalError == nil {
             _terminalError = error
             isFirst = true
+            handler =
+                terminalHybridPlaybackErrorHandler
         } else {
             isFirst = false
+            handler = nil
         }
         failureLock.unlock()
         guard isFirst else { return }
+        if let typed =
+                Self.hybridPlaybackSessionError(
+                    from: error
+                ) {
+            handler?(typed)
+        }
         EngineLog.emit(
             "[HLSVODCarrierProvider] terminal error: "
                 + error.localizedDescription,

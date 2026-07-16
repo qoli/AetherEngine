@@ -64,6 +64,7 @@ struct HybridPlaybackSessionTests {
         HybridCarrierTransportProvider,
         HybridAudioAnalysisSource,
         HybridAudioAnalysisPlaybackPressureSink,
+        HybridPlaybackTerminalErrorSource,
         @unchecked Sendable
     {
         private let relay: HybridPlaybackFrameRelay
@@ -82,6 +83,12 @@ struct HybridPlaybackSessionTests {
         private var currentGeneration: UInt64 = 0
         private var forcedRestartResult:
             BlackCarrierMediaFanoutRestartResult?
+        private var terminalError:
+            HybridPlaybackSessionError?
+        private var terminalErrorHandler:
+            (@Sendable (
+                HybridPlaybackSessionError
+            ) -> Void)?
 
         init(
             relay: HybridPlaybackFrameRelay,
@@ -94,6 +101,13 @@ struct HybridPlaybackSessionTests {
         }
 
         var hybridVideoFormat: VideoFormat? { .sdr }
+        var terminalHybridPlaybackError:
+            HybridPlaybackSessionError?
+        {
+            lock.lock()
+            defer { lock.unlock() }
+            return terminalError
+        }
         var audioAnalysisTrackIDs: [Int] {
             analysisData == nil ? [] : [0]
         }
@@ -114,6 +128,21 @@ struct HybridPlaybackSessionTests {
             _ pressure: HybridAudioAnalysisPlaybackPressure
         ) async {
             recordAudioAnalysisPlaybackPressure(pressure)
+        }
+
+        func setTerminalHybridPlaybackErrorHandler(
+            _ handler:
+                (@Sendable (
+                    HybridPlaybackSessionError
+                ) -> Void)?
+        ) {
+            lock.lock()
+            terminalErrorHandler = handler
+            let existing = terminalError
+            lock.unlock()
+            if let existing {
+                handler?(existing)
+            }
         }
 
         private func recordAudioAnalysisPlaybackPressure(
@@ -191,6 +220,16 @@ struct HybridPlaybackSessionTests {
             lock.lock()
             forcedRestartResult = result
             lock.unlock()
+        }
+
+        func failTerminally(
+            _ error: HybridPlaybackSessionError
+        ) {
+            lock.lock()
+            terminalError = error
+            let handler = terminalErrorHandler
+            lock.unlock()
+            handler?(error)
         }
 
         func snapshot()
@@ -739,6 +778,35 @@ struct HybridPlaybackSessionTests {
                     .packetTimestampMissing.localizedDescription
             )
         ))
+        #expect(fixture.transport.didStop)
+        #expect(fixture.renderSurface.flushCount == 1)
+    }
+
+    @Test("Provider invalidation terminates a paused session without waiting for decode demand")
+    @MainActor
+    func providerInvalidationTerminatesPausedSession()
+        async throws
+    {
+        let fixture = try makeSession()
+        try await fixture.session.prepare(timeout: 1)
+        try fixture.session.pause()
+        let expected = HybridPlaybackSessionError
+            .hlsPreflightGenerationInvalidated(
+                .credentialRejected(
+                    statusCode: 403,
+                    resource: .audioSegment(
+                        renditionOrdinal: 0,
+                        index: 3
+                    )
+                )
+            )
+
+        fixture.provider.failTerminally(expected)
+        try await waitUntil {
+            fixture.session.state == .failed(expected)
+        }
+
+        #expect(fixture.session.state == .failed(expected))
         #expect(fixture.transport.didStop)
         #expect(fixture.renderSurface.flushCount == 1)
     }
