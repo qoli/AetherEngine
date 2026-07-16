@@ -72,6 +72,13 @@ struct BlackCarrierAudioRenditionSummary: Sendable, Equatable {
     let averageBandwidth: Int
 }
 
+struct BlackCarrierAudioRenditionDescriptor: Sendable, Equatable {
+    let pipeline: BlackCarrierAudioPipeline
+    let codecString: String
+    let channelsAttribute: String
+    let declaredCodecInitialPaddingSamples: Int64
+}
+
 enum BlackCarrierAudioRenditionMuxer {
     typealias SegmentSink = (
         _ timing: BlackCarrierSegmentTiming,
@@ -116,6 +123,8 @@ enum BlackCarrierAudioRenditionMuxer {
         private var totalMediaBytes = 0
         private var presentationTimelineOffset: Int64?
         private var isFinished = false
+        private var didPublishInit = false
+        private(set) var highestFinalizedSegmentIndex: Int
 
         fileprivate init(
             sourceStreamIndex: Int32,
@@ -136,6 +145,7 @@ enum BlackCarrierAudioRenditionMuxer {
             self.lastTiming = lastTiming
             self.onInit = onInit
             self.onSegment = onSegment
+            highestFinalizedSegmentIndex = firstTiming.index - 1
             route = try prepareRoute(
                 sourceStream: sourceStream,
                 sourceStartPTS: sourceStartPTS,
@@ -166,6 +176,16 @@ enum BlackCarrierAudioRenditionMuxer {
 
         deinit {
             route.bridge?.close()
+        }
+
+        var descriptor: BlackCarrierAudioRenditionDescriptor {
+            BlackCarrierAudioRenditionDescriptor(
+                pipeline: route.pipeline,
+                codecString: route.codecString,
+                channelsAttribute: route.channelsAttribute,
+                declaredCodecInitialPaddingSamples:
+                    route.declaredCodecInitialPaddingSamples
+            )
         }
 
         func consume(
@@ -224,10 +244,10 @@ enum BlackCarrierAudioRenditionMuxer {
             }
             try emitFinalized(muxer.finalize(), timing: lastTiming)
 
-            guard let initSegment = initCapture.data else {
+            publishInitIfAvailable()
+            guard didPublishInit else {
                 throw BlackCarrierAudioRenditionMuxerError.initSegmentMissing
             }
-            onInit(initSegment)
 
             let duration = CMTimeGetSeconds(timeline.duration)
             let presentationTrimSamples = samples(
@@ -260,6 +280,8 @@ enum BlackCarrierAudioRenditionMuxer {
                 )
             }
             try onSegment(timing, finalized.path, finalized.bytesWritten)
+            highestFinalizedSegmentIndex = timing.index
+            publishInitIfAvailable()
             let duration = CMTimeGetSeconds(timing.duration)
             peakBandwidth = max(
                 peakBandwidth,
@@ -354,6 +376,15 @@ enum BlackCarrierAudioRenditionMuxer {
                 )
             }
             wroteCurrentSegment = true
+            publishInitIfAvailable()
+        }
+
+        private func publishInitIfAvailable() {
+            guard !didPublishInit, let initSegment = initCapture.data else {
+                return
+            }
+            didPublishInit = true
+            onInit(initSegment)
         }
     }
 

@@ -287,6 +287,53 @@ struct BlackCarrierAudioRenditionMuxerTests {
         }
     }
 
+    @Test("Media fanout pump stops after the requested segment and resumes to EOF")
+    func incrementalMediaFanoutPump() throws {
+        let sourceData = try makeDualEAC3Container(seconds: 5.25)
+        let demuxer = Demuxer()
+        try demuxer.open(reader: DataIOReader(data: sourceData))
+        defer { demuxer.close() }
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(seconds: 5.25, preferredTimescale: 90_000)
+        )
+        let pump = try BlackCarrierMediaFanoutPump(
+            demuxer: demuxer,
+            timeline: timeline
+        )
+        defer { pump.close() }
+
+        #expect(pump.renditionMetadata.map(\.ordinal) == [0, 1])
+        #expect(pump.renditionDescriptors.allSatisfy {
+            $0.pipeline == .streamCopy(codecString: "ec-3")
+        })
+        #expect(!pump.finished)
+        #expect(pump.peekInitSegment(ordinal: 0) == nil)
+        #expect(throws: BlackCarrierMediaFanoutPumpError
+            .invalidRenditionOrdinal(ordinal: 9)) {
+            _ = try pump.initSegment(ordinal: 9)
+        }
+        #expect(pump.peekInitSegment(ordinal: 0) == nil)
+
+        let firstInit = try pump.initSegment(ordinal: 0)
+        #expect(firstInit != nil)
+        #expect(pump.peekInitSegment(ordinal: 1) != nil)
+        #expect(pump.peekMediaSegmentURL(ordinal: 0, index: 0) != nil)
+        #expect(pump.peekMediaSegmentURL(ordinal: 1, index: 0) != nil)
+        #expect(pump.peekMediaSegmentURL(ordinal: 0, index: 1) == nil)
+        #expect(pump.peekMediaSegmentURL(ordinal: 1, index: 1) == nil)
+        #expect(!pump.finished)
+
+        try pump.produce(throughSegment: 1)
+        #expect(pump.finished)
+        for ordinal in 0...1 {
+            #expect(pump.peekMediaSegmentURL(
+                ordinal: ordinal,
+                index: 1
+            ) != nil)
+            #expect(pump.summary(ordinal: ordinal)?.codecString == "ec-3")
+        }
+    }
+
     private struct EditListEntry: Equatable {
         let segmentDuration: UInt64
         let mediaTime: Int64
