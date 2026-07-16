@@ -86,6 +86,8 @@ extension AetherEngine {
     /// separate alternate-audio playlist in the selected group is bound too. Internal graph-bound
     /// fetch/demux/carrier composition exists, but the public hybrid session must continue to exclude HLS
     /// until startup bandwidth ownership and the remaining public/device gates are complete.
+    /// Gate 1 hosts that require a structured started/completed/failed lifecycle must execute this work
+    /// through `AetherPlaybackPreflightOperation.inspectHLS`.
     public nonisolated static func preflightHLSPlayback(
         url: URL,
         sourceIsSeekableVOD: Bool,
