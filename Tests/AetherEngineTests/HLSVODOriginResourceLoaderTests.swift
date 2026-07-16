@@ -57,6 +57,70 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         }
     }
 
+    private actor ScheduledFetchRecorder {
+        private let responses: [
+            URL: HLSVODOriginFetchResponse
+        ]
+        private let blockedURLs: Set<URL>
+        private var releasedURLs: Set<URL> = []
+        private var requests: [URL] = []
+
+        init(
+            responses: [
+                URL: HLSVODOriginFetchResponse
+            ],
+            blockedURLs: Set<URL>
+        ) {
+            self.responses = responses
+            self.blockedURLs = blockedURLs
+        }
+
+        func fetch(
+            _ request: URLRequest,
+            maximumBytes: Int
+        ) async throws -> HLSVODOriginFetchResponse {
+            guard let url = request.url else {
+                throw HLSVODOriginResourceError
+                    .transportFailure
+            }
+            requests.append(url)
+            while blockedURLs.contains(url),
+                  !releasedURLs.contains(url) {
+                try await Task.sleep(
+                    for: .milliseconds(5)
+                )
+            }
+            guard let response = responses[url] else {
+                throw HLSVODOriginResourceError
+                    .httpStatus(404)
+            }
+            return response
+        }
+
+        func waitForRequestCount(
+            _ expected: Int
+        ) async throws {
+            for _ in 0..<400 {
+                if requests.count >= expected {
+                    return
+                }
+                try await Task.sleep(
+                    for: .milliseconds(5)
+                )
+            }
+            throw HLSVODOriginResourceError
+                .transportFailure
+        }
+
+        func release(_ url: URL) {
+            releasedURLs.insert(url)
+        }
+
+        var requestedURLs: [URL] {
+            requests
+        }
+    }
+
     func testPreflightEvidenceSeedsVideoAndAudioFetchIsSingleFlight()
         async throws
     {
@@ -250,6 +314,587 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         try await loader.close()
     }
 
+    func testAnalysisSchedulerAllowsOnlyOneOriginFetch()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let audioSegments =
+            fixture.graph.audioRenditions[0]
+                .segments
+        let firstURL = audioSegments[0].url
+        let secondURL = audioSegments[1].url
+        let recorder = ScheduledFetchRecorder(
+            responses: [
+                firstURL:
+                    response(
+                        data:
+                            fixture.audioFirstSegmentData,
+                        url: firstURL
+                    ),
+                secondURL:
+                    response(
+                        data:
+                            fixture.audioFirstSegmentData,
+                        url: secondURL
+                    ),
+            ],
+            blockedURLs: [firstURL]
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [:],
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+        let first = Task {
+            try await loader.payload(
+                for: .audioSegment(
+                    renditionOrdinal: 0,
+                    index: 0
+                ),
+                purpose: .analysis
+            )
+        }
+        try await recorder.waitForRequestCount(1)
+        let second = Task {
+            try await loader.payload(
+                for: .audioSegment(
+                    renditionOrdinal: 0,
+                    index: 1
+                ),
+                purpose: .analysis
+            )
+        }
+        try await waitForAnalysisScheduler(
+            active: 1,
+            queued: 1,
+            loader: loader
+        )
+        let queued = await loader.snapshot
+        XCTAssertEqual(
+            queued.activeAnalysisFetchCount,
+            1
+        )
+        XCTAssertEqual(
+            queued.activePlaybackFetchCount,
+            0
+        )
+        let requestsWhileQueued =
+            await recorder.requestedURLs
+        XCTAssertEqual(
+            requestsWhileQueued,
+            [firstURL],
+            "a second analysis resource must stay queued while the first origin fetch is active"
+        )
+
+        await recorder.release(firstURL)
+        _ = try await first.value
+        try await recorder.waitForRequestCount(2)
+        _ = try await second.value
+        let completedRequests =
+            await recorder.requestedURLs
+        XCTAssertEqual(
+            completedRequests,
+            [
+                firstURL,
+                secondURL,
+            ]
+        )
+        let final = await loader.snapshot
+        XCTAssertEqual(
+            final.activeAnalysisRequestCount,
+            0
+        )
+        XCTAssertEqual(
+            final.queuedAnalysisRequestCount,
+            0
+        )
+        try await loader.close()
+    }
+
+    func testPlaybackBypassesQueuedAnalysisAndKeepsPriority()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let audioSegments =
+            fixture.graph.audioRenditions[0]
+                .segments
+        let firstAudioURL = audioSegments[0].url
+        let secondAudioURL = audioSegments[1].url
+        let secondVideoURL =
+            fixture.graph.segments[1].url
+        let recorder = ScheduledFetchRecorder(
+            responses: [
+                firstAudioURL:
+                    response(
+                        data:
+                            fixture.audioFirstSegmentData,
+                        url: firstAudioURL
+                    ),
+                secondAudioURL:
+                    response(
+                        data:
+                            fixture.audioFirstSegmentData,
+                        url: secondAudioURL
+                    ),
+                secondVideoURL:
+                    response(
+                        data:
+                            fixture.videoFirstSegmentData,
+                        url: secondVideoURL
+                    ),
+            ],
+            blockedURLs: [
+                firstAudioURL,
+                secondVideoURL,
+            ]
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [:],
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+        let firstAnalysis = Task {
+            try await loader.payload(
+                for: .audioSegment(
+                    renditionOrdinal: 0,
+                    index: 0
+                ),
+                purpose: .analysis
+            )
+        }
+        try await recorder.waitForRequestCount(1)
+        let secondAnalysis = Task {
+            try await loader.payload(
+                for: .audioSegment(
+                    renditionOrdinal: 0,
+                    index: 1
+                ),
+                purpose: .analysis
+            )
+        }
+        try await waitForAnalysisScheduler(
+            active: 1,
+            queued: 1,
+            loader: loader
+        )
+
+        let playback = Task {
+            try await loader.payload(
+                for: .videoSegment(index: 1),
+                purpose: .playback
+            )
+        }
+        try await recorder.waitForRequestCount(2)
+        let paused = await loader.snapshot
+        XCTAssertEqual(
+            paused.pausedAnalysisRequestCount,
+            1
+        )
+        XCTAssertEqual(
+            paused.analysisPreemptionCount,
+            1
+        )
+        XCTAssertEqual(
+            paused.inFlightPlaybackWaiterCount,
+            1
+        )
+        XCTAssertEqual(
+            paused.activeAnalysisFetchCount,
+            0
+        )
+        XCTAssertEqual(
+            paused.activePlaybackFetchCount,
+            1
+        )
+        let requestsBeforeRelease =
+            await recorder.requestedURLs
+        XCTAssertEqual(
+            requestsBeforeRelease,
+            [
+                firstAudioURL,
+                secondVideoURL,
+            ],
+            "playback must not wait behind an analysis permit queue"
+        )
+
+        await recorder.release(secondVideoURL)
+        _ = try await playback.value
+        try await recorder.waitForRequestCount(3)
+        let resumed = await loader.snapshot
+        XCTAssertEqual(
+            resumed.pausedAnalysisRequestCount,
+            0
+        )
+        XCTAssertEqual(
+            resumed.analysisPreemptionCount,
+            1
+        )
+        XCTAssertEqual(
+            resumed.activeAnalysisFetchCount,
+            1
+        )
+        XCTAssertEqual(
+            resumed.activePlaybackFetchCount,
+            0
+        )
+        let requestsAfterResume =
+            await recorder.requestedURLs
+        XCTAssertEqual(
+            requestsAfterResume,
+            [
+                firstAudioURL,
+                secondVideoURL,
+                firstAudioURL,
+            ],
+            "the exact paused analysis key must resume only after playback pressure clears"
+        )
+
+        await recorder.release(firstAudioURL)
+        _ = try await firstAnalysis.value
+        try await recorder.waitForRequestCount(4)
+        _ = try await secondAnalysis.value
+        let prioritizedRequests =
+            await recorder.requestedURLs
+        XCTAssertEqual(
+            prioritizedRequests,
+            [
+                firstAudioURL,
+                secondVideoURL,
+                firstAudioURL,
+                secondAudioURL,
+            ]
+        )
+        try await loader.close()
+    }
+
+    func testCancellingQueuedAnalysisDoesNotStartItsFetch()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let audioSegments =
+            fixture.graph.audioRenditions[0]
+                .segments
+        let firstURL = audioSegments[0].url
+        let secondURL = audioSegments[1].url
+        let recorder = ScheduledFetchRecorder(
+            responses: [
+                firstURL:
+                    response(
+                        data:
+                            fixture.audioFirstSegmentData,
+                        url: firstURL
+                    ),
+                secondURL:
+                    response(
+                        data:
+                            fixture.audioFirstSegmentData,
+                        url: secondURL
+                    ),
+            ],
+            blockedURLs: [firstURL]
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [:],
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+        let first = Task {
+            try await loader.payload(
+                for: .audioSegment(
+                    renditionOrdinal: 0,
+                    index: 0
+                ),
+                purpose: .analysis
+            )
+        }
+        try await recorder.waitForRequestCount(1)
+        let queued = Task {
+            try await loader.payload(
+                for: .audioSegment(
+                    renditionOrdinal: 0,
+                    index: 1
+                ),
+                purpose: .analysis
+            )
+        }
+        try await waitForAnalysisScheduler(
+            active: 1,
+            queued: 1,
+            loader: loader
+        )
+        queued.cancel()
+        do {
+            _ = try await queued.value
+            XCTFail(
+                "cancelled queued analysis unexpectedly fetched"
+            )
+        } catch is CancellationError {
+            // Expected.
+        }
+        try await waitForAnalysisScheduler(
+            active: 1,
+            queued: 0,
+            loader: loader
+        )
+        let requestsAfterCancellation =
+            await recorder.requestedURLs
+        XCTAssertEqual(
+            requestsAfterCancellation,
+            [firstURL]
+        )
+
+        await recorder.release(firstURL)
+        _ = try await first.value
+        try await loader.close()
+    }
+
+    func testCancellingPausedAnalysisDoesNotRestartItsFetch()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let firstAudioURL =
+            fixture.graph.audioRenditions[0]
+                .segments[0].url
+        let secondVideoURL =
+            fixture.graph.segments[1].url
+        let recorder = ScheduledFetchRecorder(
+            responses: [
+                firstAudioURL:
+                    response(
+                        data:
+                            fixture.audioFirstSegmentData,
+                        url: firstAudioURL
+                    ),
+                secondVideoURL:
+                    response(
+                        data:
+                            fixture.videoFirstSegmentData,
+                        url: secondVideoURL
+                    ),
+            ],
+            blockedURLs: [
+                firstAudioURL,
+                secondVideoURL,
+            ]
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [:],
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+        let analysis = Task {
+            try await loader.payload(
+                for: .audioSegment(
+                    renditionOrdinal: 0,
+                    index: 0
+                ),
+                purpose: .analysis
+            )
+        }
+        try await recorder.waitForRequestCount(1)
+        let playback = Task {
+            try await loader.payload(
+                for: .videoSegment(index: 1),
+                purpose: .playback
+            )
+        }
+        try await recorder.waitForRequestCount(2)
+        try await waitForAnalysisScheduler(
+            active: 1,
+            queued: 0,
+            paused: 1,
+            loader: loader
+        )
+
+        analysis.cancel()
+        do {
+            _ = try await analysis.value
+            XCTFail(
+                "cancelled paused analysis unexpectedly delivered data"
+            )
+        } catch is CancellationError {
+            // Expected.
+        }
+        try await waitForAnalysisScheduler(
+            active: 0,
+            queued: 0,
+            paused: 0,
+            loader: loader
+        )
+
+        await recorder.release(secondVideoURL)
+        _ = try await playback.value
+        try await Task.sleep(for: .milliseconds(25))
+        let requestedURLs =
+            await recorder.requestedURLs
+        XCTAssertEqual(
+            requestedURLs,
+            [
+                firstAudioURL,
+                secondVideoURL,
+            ],
+            "cancelling a paused analysis waiter must remove its exact key instead of restarting it"
+        )
+        try await loader.close()
+    }
+
+    func testCancellingSameKeyPlaybackRestoresAnalysisPreemption()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let firstAudioURL =
+            fixture.graph.audioRenditions[0]
+                .segments[0].url
+        let secondVideoURL =
+            fixture.graph.segments[1].url
+        let recorder = ScheduledFetchRecorder(
+            responses: [
+                firstAudioURL:
+                    response(
+                        data:
+                            fixture.audioFirstSegmentData,
+                        url: firstAudioURL
+                    ),
+                secondVideoURL:
+                    response(
+                        data:
+                            fixture.videoFirstSegmentData,
+                        url: secondVideoURL
+                    ),
+            ],
+            blockedURLs: [
+                firstAudioURL,
+                secondVideoURL,
+            ]
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [:],
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+        let analysis = Task {
+            try await loader.payload(
+                for: .audioSegment(
+                    renditionOrdinal: 0,
+                    index: 0
+                ),
+                purpose: .analysis
+            )
+        }
+        try await recorder.waitForRequestCount(1)
+        let sameKeyPlayback = Task {
+            try await loader.payload(
+                for: .audioSegment(
+                    renditionOrdinal: 0,
+                    index: 0
+                ),
+                purpose: .playback
+            )
+        }
+        try await waitForFetchCounts(
+            playback: 1,
+            analysis: 0,
+            loader: loader
+        )
+        let sameKeyRequests =
+            await recorder.requestedURLs
+        XCTAssertEqual(
+            sameKeyRequests,
+            [firstAudioURL],
+            "same-key playback must join the existing origin fetch"
+        )
+
+        sameKeyPlayback.cancel()
+        do {
+            _ = try await sameKeyPlayback.value
+            XCTFail(
+                "cancelled same-key playback unexpectedly delivered data"
+            )
+        } catch is CancellationError {
+            // Expected.
+        }
+        try await waitForFetchCounts(
+            playback: 0,
+            analysis: 1,
+            loader: loader
+        )
+
+        let differentKeyPlayback = Task {
+            try await loader.payload(
+                for: .videoSegment(index: 1),
+                purpose: .playback
+            )
+        }
+        try await recorder.waitForRequestCount(2)
+        try await waitForAnalysisScheduler(
+            active: 1,
+            queued: 0,
+            paused: 1,
+            loader: loader
+        )
+        let preempted = await loader.snapshot
+        XCTAssertEqual(
+            preempted.activeAnalysisFetchCount,
+            0
+        )
+        XCTAssertEqual(
+            preempted.activePlaybackFetchCount,
+            1
+        )
+        let requestsAfterPreemption =
+            await recorder.requestedURLs
+        XCTAssertEqual(
+            requestsAfterPreemption,
+            [
+                firstAudioURL,
+                secondVideoURL,
+            ],
+            "a later different-key playback fetch must preempt the analysis flight after the same-key playback waiter leaves"
+        )
+
+        await recorder.release(secondVideoURL)
+        _ = try await differentKeyPlayback.value
+        try await recorder.waitForRequestCount(3)
+        let requestsAfterResume =
+            await recorder.requestedURLs
+        XCTAssertEqual(
+            requestsAfterResume,
+            [
+                firstAudioURL,
+                secondVideoURL,
+                firstAudioURL,
+            ]
+        )
+        await recorder.release(firstAudioURL)
+        _ = try await analysis.value
+        try await loader.close()
+    }
+
     func testUnboundAndOversizedResourcesFailExplicitly()
         async throws
     {
@@ -312,6 +957,91 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
             await recorder.requestCount
         XCTAssertEqual(requestCountAfterOversized, 1)
         try await loader.close()
+    }
+
+    func testCloseFailsActiveAndQueuedAnalysisRequests()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let audioSegments =
+            fixture.graph.audioRenditions[0]
+                .segments
+        let firstURL = audioSegments[0].url
+        let secondURL = audioSegments[1].url
+        let recorder = ScheduledFetchRecorder(
+            responses: [
+                firstURL:
+                    response(
+                        data:
+                            fixture.audioFirstSegmentData,
+                        url: firstURL
+                    ),
+                secondURL:
+                    response(
+                        data:
+                            fixture.audioFirstSegmentData,
+                        url: secondURL
+                    ),
+            ],
+            blockedURLs: [firstURL]
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [:],
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+        let active = Task {
+            try await loader.payload(
+                for: .audioSegment(
+                    renditionOrdinal: 0,
+                    index: 0
+                ),
+                purpose: .analysis
+            )
+        }
+        try await recorder.waitForRequestCount(1)
+        let queued = Task {
+            try await loader.payload(
+                for: .audioSegment(
+                    renditionOrdinal: 0,
+                    index: 1
+                ),
+                purpose: .analysis
+            )
+        }
+        try await waitForAnalysisScheduler(
+            active: 1,
+            queued: 1,
+            loader: loader
+        )
+
+        try await loader.close()
+        for task in [active, queued] {
+            do {
+                _ = try await task.value
+                XCTFail(
+                    "closed scheduler unexpectedly delivered analysis data"
+                )
+            } catch let error
+                    as HLSVODOriginResourceError {
+                XCTAssertEqual(error, .closed)
+            }
+        }
+        let snapshot = await loader.snapshot
+        XCTAssertTrue(snapshot.isClosed)
+        XCTAssertEqual(
+            snapshot.activeAnalysisRequestCount,
+            0
+        )
+        XCTAssertEqual(
+            snapshot.queuedAnalysisRequestCount,
+            0
+        )
     }
 
     func testCloseFailsPendingWaiterAndRemovesSessionCache()
@@ -437,6 +1167,67 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
             try await Task.sleep(nanoseconds: 1_000_000)
         }
         XCTFail("timed out waiting for \(expected) loader waiters")
+    }
+
+    private func waitForAnalysisScheduler(
+        active: Int,
+        queued: Int,
+        paused: Int? = nil,
+        loader: HLSVODOriginResourceLoader
+    ) async throws {
+        for _ in 0..<400 {
+            let snapshot = await loader.snapshot
+            if snapshot.activeAnalysisRequestCount
+                    == active,
+               snapshot.queuedAnalysisRequestCount
+                    == queued,
+               paused == nil
+                    || snapshot.pausedAnalysisRequestCount
+                        == paused {
+                return
+            }
+            try await Task.sleep(
+                for: .milliseconds(5)
+            )
+        }
+        XCTFail(
+            "timed out waiting for analysis scheduler active=\(active) queued=\(queued) paused=\(String(describing: paused))"
+        )
+    }
+
+    private func waitForFetchCounts(
+        playback: Int,
+        analysis: Int,
+        loader: HLSVODOriginResourceLoader
+    ) async throws {
+        for _ in 0..<400 {
+            let snapshot = await loader.snapshot
+            if snapshot.activePlaybackFetchCount
+                    == playback,
+               snapshot.activeAnalysisFetchCount
+                    == analysis {
+                return
+            }
+            try await Task.sleep(
+                for: .milliseconds(5)
+            )
+        }
+        XCTFail(
+            "timed out waiting for fetch counts playback=\(playback) analysis=\(analysis)"
+        )
+    }
+
+    private func response(
+        data: Data,
+        url: URL
+    ) -> HLSVODOriginFetchResponse {
+        HLSVODOriginFetchResponse(
+            data: data,
+            effectiveURL: url,
+            statusCode: 200,
+            contentLength: Int64(data.count),
+            contentEncoding: nil
+        )
     }
 
     private func makeFixture() throws -> Fixture {

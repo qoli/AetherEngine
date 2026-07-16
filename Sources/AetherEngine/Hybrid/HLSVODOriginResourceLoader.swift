@@ -115,7 +115,32 @@ struct HLSVODOriginResourceLoaderSnapshot: Sendable, Equatable {
     let inFlightWaiterCount: Int
     let inFlightPlaybackWaiterCount: Int
     let inFlightAnalysisWaiterCount: Int
+    let activeAnalysisRequestCount: Int
+    let queuedAnalysisRequestCount: Int
+    let activePlaybackFetchCount: Int
+    let activeAnalysisFetchCount: Int
+    let pausedAnalysisRequestCount: Int
+    let analysisPreemptionCount: Int
     let isClosed: Bool
+}
+
+private final class HLSVODAnalysisPermitToken:
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var isCancelled = false
+
+    func cancel() {
+        lock.lock()
+        isCancelled = true
+        lock.unlock()
+    }
+
+    var cancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isCancelled
+    }
 }
 
 private struct HLSVODBoundOriginResource: Sendable {
@@ -194,6 +219,9 @@ extension HLSVODResourceGraph {
 /// cache directly, so playback cannot silently use bytes different from those that selected the route.
 /// Remaining resources use exact-key single-flight. Cancelling one waiter does not cancel a fetch still
 /// needed by another waiter; the origin task is cancelled when the final waiter leaves or the loader closes.
+/// One analysis request may own an origin fetch at a time. A playback request for a different key cancels
+/// only the analysis transport task, retains its exact graph-bound waiter, and resumes that same key after
+/// all playback fetch pressure settles. A playback waiter for the same key upgrades the shared fetch in place.
 ///
 /// Cache paths contain only a UUID session directory and structural resource keys. URLs, signed query
 /// parameters, Authorization and Cookie values remain in memory and are never written as metadata.
@@ -224,8 +252,18 @@ actor HLSVODOriginResourceLoader {
                 >
         }
 
+        let resource: HLSVODBoundOriginResource
         var waiters: [UUID: Waiter]
         var task: Task<Void, Never>?
+        var taskID: UUID?
+        var activePurpose: HLSVODOriginResourcePurpose
+        var isPausedForPlayback: Bool
+    }
+
+    private struct AnalysisPermitWaiter {
+        let token: HLSVODAnalysisPermitToken
+        let continuation:
+            CheckedContinuation<Void, Error>
     }
 
     private let graph: HLSVODResourceGraph
@@ -239,6 +277,11 @@ actor HLSVODOriginResourceLoader {
     private var flights: [HLSVODOriginResourceKey: Flight] = [:]
     private var cachedBytes: Int64 = 0
     private var accessCounter: UInt64 = 0
+    private var activeAnalysisPermitID: UUID?
+    private var analysisPermitOrder: [UUID] = []
+    private var analysisPermitWaiters:
+        [UUID: AnalysisPermitWaiter] = [:]
+    private var analysisPreemptionCount = 0
     private var isClosed = false
     private var closeError: HLSVODOriginResourceError?
 
@@ -312,18 +355,54 @@ actor HLSVODOriginResourceLoader {
     ) async throws -> HLSVODOriginResourcePayload {
         try Task.checkCancellation()
         let waiterID = UUID()
+        let analysisPermitID =
+            purpose == .analysis ? UUID() : nil
+        let analysisToken =
+            purpose == .analysis
+            ? HLSVODAnalysisPermitToken()
+            : nil
         return try await withTaskCancellationHandler {
-            try await registerWaiter(
-                waiterID,
-                for: key,
-                purpose: purpose
-            )
+            if let analysisPermitID,
+               let analysisToken {
+                try await acquireAnalysisPermit(
+                    analysisPermitID,
+                    token: analysisToken
+                )
+                try Task.checkCancellation()
+            }
+            do {
+                let payload = try await registerWaiter(
+                    waiterID,
+                    for: key,
+                    purpose: purpose
+                )
+                try Task.checkCancellation()
+                if let analysisPermitID {
+                    await releaseAnalysisPermit(
+                        analysisPermitID
+                    )
+                }
+                return payload
+            } catch {
+                if let analysisPermitID {
+                    await releaseAnalysisPermit(
+                        analysisPermitID
+                    )
+                }
+                throw error
+            }
         } onCancel: {
+            analysisToken?.cancel()
             Task {
                 await self.cancelWaiter(
                     waiterID,
                     for: key
                 )
+                if let analysisPermitID {
+                    await self.cancelAnalysisPermit(
+                        analysisPermitID
+                    )
+                }
             }
         }
     }
@@ -350,6 +429,26 @@ actor HLSVODOriginResourceLoader {
                             $0.purpose == .analysis
                         }.count
                 },
+            activeAnalysisRequestCount:
+                activeAnalysisPermitID == nil ? 0 : 1,
+            queuedAnalysisRequestCount:
+                analysisPermitWaiters.count,
+            activePlaybackFetchCount:
+                flights.values.filter {
+                    $0.activePurpose == .playback
+                        && $0.task != nil
+                }.count,
+            activeAnalysisFetchCount:
+                flights.values.filter {
+                    $0.activePurpose == .analysis
+                        && $0.task != nil
+                }.count,
+            pausedAnalysisRequestCount:
+                flights.values.filter {
+                    $0.isPausedForPlayback
+                }.count,
+            analysisPreemptionCount:
+                analysisPreemptionCount,
             isClosed: isClosed
         )
     }
@@ -370,6 +469,14 @@ actor HLSVODOriginResourceLoader {
             }
         }
         flights.removeAll()
+        activeAnalysisPermitID = nil
+        for waiter in analysisPermitWaiters.values {
+            waiter.continuation.resume(
+                throwing: error
+            )
+        }
+        analysisPermitWaiters.removeAll()
+        analysisPermitOrder.removeAll()
         cache.removeAll()
         cachedBytes = 0
         do {
@@ -399,74 +506,268 @@ actor HLSVODOriginResourceLoader {
 
         return try await withCheckedThrowingContinuation {
             continuation in
+            let waiter = Flight.Waiter(
+                purpose: purpose,
+                continuation: continuation
+            )
             if var flight = flights[key] {
-                flight.waiters[waiterID] =
-                    Flight.Waiter(
-                        purpose: purpose,
-                        continuation: continuation
-                    )
+                flight.waiters[waiterID] = waiter
+                if purpose == .playback,
+                   flight.activePurpose == .analysis {
+                    flight.activePurpose = .playback
+                    flight.isPausedForPlayback = false
+                }
                 flights[key] = flight
+                if purpose == .playback {
+                    pauseAnalysisFetches(
+                        except: key
+                    )
+                    startFlightIfNeeded(for: key)
+                }
                 return
             }
 
             flights[key] = Flight(
+                resource: resource,
                 waiters: [
-                    waiterID:
-                        Flight.Waiter(
-                            purpose: purpose,
-                            continuation: continuation
-                        ),
+                    waiterID: waiter,
                 ],
-                task: nil
+                task: nil,
+                taskID: nil,
+                activePurpose: purpose,
+                isPausedForPlayback:
+                    purpose == .analysis
+                    && hasPlaybackPressure
             )
-            let fetch = self.fetch
-            let headers = httpHeaders
-            let maximumBytes = maximumResourceBytes
-            let task = Task.detached(priority: .userInitiated) {
-                do {
-                    let response: HLSVODOriginFetchResponse
-                    if let seededData = resource.seededData {
-                        response = HLSVODOriginFetchResponse(
-                            data: seededData,
-                            effectiveURL: resource.url,
-                            statusCode: 200,
-                            contentLength: Int64(seededData.count),
-                            contentEncoding: nil
-                        )
-                    } else {
-                        var request = URLRequest(url: resource.url)
-                        for (field, value) in headers {
-                            request.setValue(
-                                value,
-                                forHTTPHeaderField: field
-                            )
-                        }
+            if purpose == .playback {
+                pauseAnalysisFetches(except: key)
+            }
+            startFlightIfNeeded(for: key)
+        }
+    }
+
+    private func startFlightIfNeeded(
+        for key: HLSVODOriginResourceKey
+    ) {
+        guard !isClosed,
+              var flight = flights[key],
+              flight.task == nil,
+              !flight.isPausedForPlayback else {
+            return
+        }
+        if flight.activePurpose == .analysis,
+           hasPlaybackPressure {
+            flight.isPausedForPlayback = true
+            flights[key] = flight
+            return
+        }
+
+        let taskID = UUID()
+        let resource = flight.resource
+        let fetch = self.fetch
+        let headers = httpHeaders
+        let maximumBytes = maximumResourceBytes
+        let priority: TaskPriority =
+            flight.activePurpose == .playback
+            ? .userInitiated
+            : .utility
+        let task = Task.detached(priority: priority) {
+            do {
+                let response: HLSVODOriginFetchResponse
+                if let seededData = resource.seededData {
+                    response = HLSVODOriginFetchResponse(
+                        data: seededData,
+                        effectiveURL: resource.url,
+                        statusCode: 200,
+                        contentLength: Int64(seededData.count),
+                        contentEncoding: nil
+                    )
+                } else {
+                    var request = URLRequest(url: resource.url)
+                    for (field, value) in headers {
                         request.setValue(
-                            "identity",
-                            forHTTPHeaderField: "Accept-Encoding"
-                        )
-                        response = try await fetch(
-                            request,
-                            maximumBytes
+                            value,
+                            forHTTPHeaderField: field
                         )
                     }
-                    await self.finish(
-                        resource,
-                        result: .success(response)
+                    request.setValue(
+                        "identity",
+                        forHTTPHeaderField: "Accept-Encoding"
                     )
-                } catch {
-                    await self.finish(
-                        resource,
-                        result: .failure(error)
+                    response = try await fetch(
+                        request,
+                        maximumBytes
                     )
                 }
+                await self.finish(
+                    resource,
+                    taskID: taskID,
+                    result: .success(response)
+                )
+            } catch {
+                await self.finish(
+                    resource,
+                    taskID: taskID,
+                    result: .failure(error)
+                )
             }
-            if var flight = flights[key] {
-                flight.task = task
-                flights[key] = flight
-            } else {
-                task.cancel()
+        }
+        flight.task = task
+        flight.taskID = taskID
+        flights[key] = flight
+    }
+
+    private func pauseAnalysisFetches(
+        except protectedKey: HLSVODOriginResourceKey
+    ) {
+        for key in Array(flights.keys)
+        where key != protectedKey {
+            pauseAnalysisFetch(for: key)
+        }
+    }
+
+    private func pauseAnalysisFetch(
+        for key: HLSVODOriginResourceKey
+    ) {
+        guard var flight = flights[key],
+              flight.activePurpose == .analysis,
+              let task = flight.task else {
+            return
+        }
+        task.cancel()
+        flight.task = nil
+        flight.taskID = nil
+        flight.isPausedForPlayback = true
+        flights[key] = flight
+        analysisPreemptionCount += 1
+        EngineLog.emit(
+            "[HLSVODOriginResourceLoader] analysis fetch paused for playback key=\(key.cacheFileName)",
+            category: .session
+        )
+    }
+
+    private func resumePausedAnalysisFetchIfPossible() {
+        guard !isClosed,
+              !hasPlaybackPressure else {
+            return
+        }
+        for key in Array(flights.keys) {
+            guard var flight = flights[key],
+                  flight.activePurpose == .analysis,
+                  flight.isPausedForPlayback,
+                  flight.task == nil else {
+                continue
             }
+            flight.isPausedForPlayback = false
+            flights[key] = flight
+            EngineLog.emit(
+                "[HLSVODOriginResourceLoader] analysis fetch resumed key=\(key.cacheFileName)",
+                category: .session
+            )
+            startFlightIfNeeded(for: key)
+            return
+        }
+    }
+
+    private func acquireAnalysisPermit(
+        _ permitID: UUID,
+        token: HLSVODAnalysisPermitToken
+    ) async throws {
+        guard !isClosed else {
+            throw HLSVODOriginResourceError.closed
+        }
+        guard !token.cancelled else {
+            throw CancellationError()
+        }
+        if activeAnalysisPermitID == nil,
+           !hasPlaybackPressure {
+            activeAnalysisPermitID = permitID
+            return
+        }
+        try await withCheckedThrowingContinuation {
+            (
+                continuation:
+                    CheckedContinuation<Void, Error>
+            ) in
+            if token.cancelled {
+                continuation.resume(
+                    throwing: CancellationError()
+                )
+                return
+            }
+            analysisPermitOrder.append(permitID)
+            analysisPermitWaiters[permitID] =
+                AnalysisPermitWaiter(
+                    token: token,
+                    continuation: continuation
+                )
+        }
+    }
+
+    private func releaseAnalysisPermit(
+        _ permitID: UUID
+    ) {
+        guard activeAnalysisPermitID == permitID else {
+            return
+        }
+        activeAnalysisPermitID = nil
+        resumeNextAnalysisPermitIfPossible()
+    }
+
+    private func cancelAnalysisPermit(
+        _ permitID: UUID
+    ) {
+        if activeAnalysisPermitID == permitID {
+            activeAnalysisPermitID = nil
+            resumeNextAnalysisPermitIfPossible()
+            return
+        }
+        guard let waiter =
+                analysisPermitWaiters.removeValue(
+                    forKey: permitID
+                ) else {
+            return
+        }
+        analysisPermitOrder.removeAll {
+            $0 == permitID
+        }
+        waiter.continuation.resume(
+            throwing: CancellationError()
+        )
+    }
+
+    private var hasPlaybackPressure: Bool {
+        flights.values.contains { flight in
+            flight.waiters.values.contains {
+                $0.purpose == .playback
+            }
+        }
+    }
+
+    private func resumeNextAnalysisPermitIfPossible() {
+        guard !isClosed,
+              activeAnalysisPermitID == nil,
+              !hasPlaybackPressure else {
+            return
+        }
+        while !analysisPermitOrder.isEmpty {
+            let nextID =
+                analysisPermitOrder.removeFirst()
+            guard let waiter =
+                    analysisPermitWaiters.removeValue(
+                        forKey: nextID
+                    ) else {
+                continue
+            }
+            guard !waiter.token.cancelled else {
+                waiter.continuation.resume(
+                    throwing: CancellationError()
+                )
+                continue
+            }
+            activeAnalysisPermitID = nextID
+            waiter.continuation.resume()
+            return
         }
     }
 
@@ -486,18 +787,36 @@ actor HLSVODOriginResourceLoader {
             flight.task?.cancel()
             flights.removeValue(forKey: key)
         } else {
+            flight.activePurpose =
+                flight.waiters.values.contains {
+                    $0.purpose == .playback
+                }
+                ? .playback
+                : .analysis
             flights[key] = flight
+            if flight.activePurpose == .analysis,
+               hasPlaybackPressure {
+                pauseAnalysisFetch(for: key)
+            }
         }
+        resumePausedAnalysisFetchIfPossible()
+        resumeNextAnalysisPermitIfPossible()
     }
 
     private func finish(
         _ resource: HLSVODBoundOriginResource,
+        taskID: UUID,
         result: Result<HLSVODOriginFetchResponse, Error>
     ) {
-        guard let flight = flights.removeValue(
-            forKey: resource.key
-        ) else {
+        guard let current = flights[resource.key],
+              current.taskID == taskID else {
             return
+        }
+        let flight = current
+        flights.removeValue(forKey: resource.key)
+        defer {
+            resumePausedAnalysisFetchIfPossible()
+            resumeNextAnalysisPermitIfPossible()
         }
         do {
             let response = try result.get()
