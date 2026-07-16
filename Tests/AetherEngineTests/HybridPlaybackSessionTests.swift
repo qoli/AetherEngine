@@ -63,6 +63,7 @@ struct HybridPlaybackSessionTests {
     private final class Provider:
         HybridCarrierTransportProvider,
         HybridAudioAnalysisSource,
+        HybridAudioAnalysisPlaybackPressureSink,
         @unchecked Sendable
     {
         private let relay: HybridPlaybackFrameRelay
@@ -76,6 +77,8 @@ struct HybridPlaybackSessionTests {
         private(set) var preparedSegments: [Int] = []
         private(set) var decodeDemands: [CMTime] = []
         private(set) var prepareMainThreadSamples: [Bool] = []
+        private(set) var analysisPlaybackPressures:
+            [HybridAudioAnalysisPlaybackPressure] = []
         private var currentGeneration: UInt64 = 0
         private var forcedRestartResult:
             BlackCarrierMediaFanoutRestartResult?
@@ -105,6 +108,20 @@ struct HybridPlaybackSessionTests {
                 DataIOReader(data: analysisData),
                 formatHint: "wav"
             )
+        }
+
+        func setAudioAnalysisPlaybackPressure(
+            _ pressure: HybridAudioAnalysisPlaybackPressure
+        ) async {
+            recordAudioAnalysisPlaybackPressure(pressure)
+        }
+
+        private func recordAudioAnalysisPlaybackPressure(
+            _ pressure: HybridAudioAnalysisPlaybackPressure
+        ) {
+            lock.lock()
+            analysisPlaybackPressures.append(pressure)
+            lock.unlock()
         }
 
         func prepareForTransportStart() throws {
@@ -183,6 +200,8 @@ struct HybridPlaybackSessionTests {
                 segments: [Int],
                 demands: [CMTime],
                 prepareMainThreads: [Bool],
+                analysisPlaybackPressures:
+                    [HybridAudioAnalysisPlaybackPressure],
                 closed: Bool
             )
         {
@@ -194,6 +213,7 @@ struct HybridPlaybackSessionTests {
                 preparedSegments,
                 decodeDemands,
                 prepareMainThreadSamples,
+                analysisPlaybackPressures,
                 didClose
             )
         }
@@ -383,6 +403,243 @@ struct HybridPlaybackSessionTests {
         #expect(abs(totalFrames - 24_000) <= 1_200)
         #expect(abs(resolvedFirstPosition - 12_000) <= 120)
         #expect(abs(resolvedFinalPosition - 36_000) <= 120)
+    }
+
+    @MainActor
+    @Test("AVPlayer pressure policy is explicit and does not pressure paused playback")
+    func audioAnalysisPlaybackPressurePolicy() {
+        let ready = HybridPlaybackSessionState.ready(
+            generation: 0
+        )
+        #expect(
+            HybridPlaybackSession
+                .resolveAudioAnalysisPlaybackPressure(
+                    state: .preparing(
+                        generation: 0,
+                        target: .zero
+                    ),
+                    timeControlStatus: .paused,
+                    rate: 0,
+                    playbackStalled: false,
+                    isPlaybackBufferEmpty: false,
+                    isPlaybackLikelyToKeepUp: true,
+                    forwardBufferSeconds: nil
+                )
+                == .carrierPreparingOrSeeking
+        )
+        #expect(
+            HybridPlaybackSession
+                .resolveAudioAnalysisPlaybackPressure(
+                    state: ready,
+                    timeControlStatus: .paused,
+                    rate: 0,
+                    playbackStalled: false,
+                    isPlaybackBufferEmpty: true,
+                    isPlaybackLikelyToKeepUp: false,
+                    forwardBufferSeconds: 0
+                )
+                == .none
+        )
+        #expect(
+            HybridPlaybackSession
+                .resolveAudioAnalysisPlaybackPressure(
+                    state: ready,
+                    timeControlStatus:
+                        .waitingToPlayAtSpecifiedRate,
+                    rate: 0,
+                    playbackStalled: false,
+                    isPlaybackBufferEmpty: false,
+                    isPlaybackLikelyToKeepUp: true,
+                    forwardBufferSeconds: 4
+                )
+                == .carrierWaitingToPlay
+        )
+        #expect(
+            HybridPlaybackSession
+                .resolveAudioAnalysisPlaybackPressure(
+                    state: ready,
+                    timeControlStatus: .playing,
+                    rate: 1,
+                    playbackStalled: true,
+                    isPlaybackBufferEmpty: false,
+                    isPlaybackLikelyToKeepUp: true,
+                    forwardBufferSeconds: 4
+                )
+                == .carrierPlaybackStalled
+        )
+        #expect(
+            HybridPlaybackSession
+                .resolveAudioAnalysisPlaybackPressure(
+                    state: ready,
+                    timeControlStatus: .playing,
+                    rate: 1,
+                    playbackStalled: false,
+                    isPlaybackBufferEmpty: true,
+                    isPlaybackLikelyToKeepUp: false,
+                    forwardBufferSeconds: 0
+                )
+                == .carrierBufferEmpty
+        )
+        #expect(
+            HybridPlaybackSession
+                .resolveAudioAnalysisPlaybackPressure(
+                    state: ready,
+                    timeControlStatus: .playing,
+                    rate: 1,
+                    playbackStalled: false,
+                    isPlaybackBufferEmpty: false,
+                    isPlaybackLikelyToKeepUp: true,
+                    forwardBufferSeconds: 1.999
+                )
+                == .carrierForwardBufferLow
+        )
+        #expect(
+            HybridPlaybackSession
+                .resolveAudioAnalysisPlaybackPressure(
+                    state: ready,
+                    timeControlStatus: .playing,
+                    rate: 1,
+                    playbackStalled: false,
+                    isPlaybackBufferEmpty: false,
+                    isPlaybackLikelyToKeepUp: false,
+                    forwardBufferSeconds: nil
+                )
+                == .carrierNotLikelyToKeepUp
+        )
+        #expect(
+            HybridPlaybackSession
+                .resolveAudioAnalysisPlaybackPressure(
+                    state: ready,
+                    timeControlStatus: .playing,
+                    rate: 1,
+                    playbackStalled: false,
+                    isPlaybackBufferEmpty: false,
+                    isPlaybackLikelyToKeepUp: true,
+                    forwardBufferSeconds:
+                        HybridPlaybackSession
+                            .analysisForwardBufferPressureThresholdSeconds
+                )
+                == .none
+        )
+    }
+
+    @Test("Forward-buffer coverage merges overlap and stops at the first gap")
+    func audioAnalysisForwardBufferCoverage() {
+        let second: CMTimeScale = 600
+        func range(
+            _ start: Double,
+            _ duration: Double
+        ) -> CMTimeRange {
+            CMTimeRange(
+                start: CMTime(
+                    seconds: start,
+                    preferredTimescale: second
+                ),
+                duration: CMTime(
+                    seconds: duration,
+                    preferredTimescale: second
+                )
+            )
+        }
+
+        #expect(
+            HybridPlaybackSession.forwardBufferSeconds(
+                currentTime: CMTime(
+                    seconds: 5,
+                    preferredTimescale: second
+                ),
+                loadedTimeRanges: []
+            ) == nil
+        )
+        #expect(
+            HybridPlaybackSession.forwardBufferSeconds(
+                currentTime: CMTime(
+                    seconds: 5,
+                    preferredTimescale: second
+                ),
+                loadedTimeRanges: [
+                    range(0, 6),
+                    range(5.5, 4.5),
+                ]
+            ) == 5
+        )
+        #expect(
+            HybridPlaybackSession.forwardBufferSeconds(
+                currentTime: CMTime(
+                    seconds: 5,
+                    preferredTimescale: second
+                ),
+                loadedTimeRanges: [
+                    range(0, 6),
+                    range(6.1, 3.9),
+                ]
+            ) == 1
+        )
+        #expect(
+            HybridPlaybackSession.forwardBufferSeconds(
+                currentTime: CMTime(
+                    seconds: 5,
+                    preferredTimescale: second
+                ),
+                loadedTimeRanges: [
+                    range(6, 4),
+                ]
+            ) == 0
+        )
+        #expect(
+            HybridPlaybackSession.forwardBufferSeconds(
+                currentTime: CMTime(
+                    seconds: 11,
+                    preferredTimescale: second
+                ),
+                loadedTimeRanges: [
+                    range(0, 10),
+                ]
+            ) == 0
+        )
+    }
+
+    @MainActor
+    @Test("Hybrid session forwards ordered pressure reasons to the provider")
+    func audioAnalysisPlaybackPressurePropagation() async throws {
+        let fixture = try makeSession()
+        defer { fixture.session.stop() }
+
+        fixture.session.applyAudioAnalysisPlaybackPressure(
+            .carrierPlaybackStalled,
+            forwardBufferSeconds: 0.25
+        )
+        try await waitUntil {
+            fixture.provider.snapshot()
+                .analysisPlaybackPressures.last
+                == .carrierPlaybackStalled
+        }
+        #expect(
+            fixture.session.audioAnalysisPlaybackPressure
+                == .carrierPlaybackStalled
+        )
+        #expect(
+            fixture.session.carrierForwardBufferSeconds
+                == 0.25
+        )
+
+        fixture.session.applyAudioAnalysisPlaybackPressure(
+            .none,
+            forwardBufferSeconds: 4
+        )
+        try await waitUntil {
+            fixture.provider.snapshot()
+                .analysisPlaybackPressures.last
+                == HybridAudioAnalysisPlaybackPressure.none
+        }
+        #expect(
+            fixture.provider.snapshot()
+                .analysisPlaybackPressures
+                == [
+                    .carrierPlaybackStalled,
+                    .none,
+                ]
+        )
     }
 
     @Test("Initial carrier and decoded frame must both become ready")

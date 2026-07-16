@@ -1328,6 +1328,45 @@ final class HLSVODMediaPumpTests: XCTestCase {
         }
     }
 
+    func testCarrierProviderForwardsAVPlayerPressureToTheOriginLoader()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let provider =
+            try await HLSVODCarrierProvider.make(
+                preflight: fixture.preflight,
+                bandwidthAdmissions:
+                    validBandwidthAdmissions(),
+                fetchOverride: { request, _ in
+                    try fixture.fetchStore.response(
+                        for: request
+                    )
+                }
+            )
+        addTeardownBlock {
+            provider.close()
+        }
+
+        await provider.setAudioAnalysisPlaybackPressure(
+            .carrierWaitingToPlay
+        )
+        var snapshot =
+            await provider.originLoaderSnapshot()
+        XCTAssertEqual(
+            snapshot.declaredPlaybackPressure,
+            .carrierWaitingToPlay
+        )
+
+        await provider.setAudioAnalysisPlaybackPressure(
+            .none
+        )
+        snapshot = await provider.originLoaderSnapshot()
+        XCTAssertEqual(
+            snapshot.declaredPlaybackPressure,
+            .none
+        )
+    }
+
     func testHLSAnalysisReusesThePlaybackOriginGraph()
         async throws
     {

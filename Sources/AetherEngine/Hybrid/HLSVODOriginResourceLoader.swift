@@ -121,6 +121,8 @@ struct HLSVODOriginResourceLoaderSnapshot: Sendable, Equatable {
     let activeAnalysisFetchCount: Int
     let pausedAnalysisRequestCount: Int
     let analysisPreemptionCount: Int
+    let declaredPlaybackPressure:
+        HybridAudioAnalysisPlaybackPressure
     let isClosed: Bool
 }
 
@@ -282,6 +284,8 @@ actor HLSVODOriginResourceLoader {
     private var analysisPermitWaiters:
         [UUID: AnalysisPermitWaiter] = [:]
     private var analysisPreemptionCount = 0
+    private var declaredPlaybackPressure:
+        HybridAudioAnalysisPlaybackPressure = .none
     private var isClosed = false
     private var closeError: HLSVODOriginResourceError?
 
@@ -449,7 +453,31 @@ actor HLSVODOriginResourceLoader {
                 }.count,
             analysisPreemptionCount:
                 analysisPreemptionCount,
+            declaredPlaybackPressure:
+                declaredPlaybackPressure,
             isClosed: isClosed
+        )
+    }
+
+    func setAudioAnalysisPlaybackPressure(
+        _ pressure: HybridAudioAnalysisPlaybackPressure
+    ) {
+        guard !isClosed,
+              pressure != declaredPlaybackPressure else {
+            return
+        }
+        declaredPlaybackPressure = pressure
+        if pressure == .none {
+            resumePausedAnalysisFetchIfPossible()
+            resumeNextAnalysisPermitIfPossible()
+        } else {
+            for key in Array(flights.keys) {
+                pauseAnalysisFetch(for: key)
+            }
+        }
+        EngineLog.emit(
+            "[HLSVODOriginResourceLoader] declared playback pressure=\(pressure.rawValue)",
+            category: .session
         )
     }
 
@@ -477,6 +505,7 @@ actor HLSVODOriginResourceLoader {
         }
         analysisPermitWaiters.removeAll()
         analysisPermitOrder.removeAll()
+        declaredPlaybackPressure = .none
         cache.removeAll()
         cachedBytes = 0
         do {
@@ -737,11 +766,12 @@ actor HLSVODOriginResourceLoader {
     }
 
     private var hasPlaybackPressure: Bool {
-        flights.values.contains { flight in
-            flight.waiters.values.contains {
-                $0.purpose == .playback
+        declaredPlaybackPressure != .none
+            || flights.values.contains { flight in
+                flight.waiters.values.contains {
+                    $0.purpose == .playback
+                }
             }
-        }
     }
 
     private func resumeNextAnalysisPermitIfPossible() {

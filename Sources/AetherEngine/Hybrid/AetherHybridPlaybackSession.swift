@@ -89,6 +89,11 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
     public let carrierTimeSeconds: Double?
     public let carrierRate: Float
     public let carrierTimeControlStatus: HybridCarrierTimeControlStatus
+    public let carrierForwardBufferSeconds: Double?
+    public let audioAnalysisPlaybackPressure:
+        HybridAudioAnalysisPlaybackPressure
+    public let audioAnalysisForwardBufferPressureThresholdSeconds:
+        Double
     public let audioAnalysisTrackIDs: [Int]
     public let activeAudioAnalysisRequestCount: Int
     public let renderer: AetherMetalPlayerView.Diagnostics
@@ -103,6 +108,11 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
         carrierTimeSeconds: Double?,
         carrierRate: Float,
         carrierTimeControlStatus: HybridCarrierTimeControlStatus,
+        carrierForwardBufferSeconds: Double?,
+        audioAnalysisPlaybackPressure:
+            HybridAudioAnalysisPlaybackPressure,
+        audioAnalysisForwardBufferPressureThresholdSeconds:
+            Double,
         audioAnalysisTrackIDs: [Int],
         activeAudioAnalysisRequestCount: Int,
         renderer: AetherMetalPlayerView.Diagnostics,
@@ -116,6 +126,12 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
         self.carrierTimeSeconds = carrierTimeSeconds
         self.carrierRate = carrierRate
         self.carrierTimeControlStatus = carrierTimeControlStatus
+        self.carrierForwardBufferSeconds =
+            carrierForwardBufferSeconds
+        self.audioAnalysisPlaybackPressure =
+            audioAnalysisPlaybackPressure
+        self.audioAnalysisForwardBufferPressureThresholdSeconds =
+            audioAnalysisForwardBufferPressureThresholdSeconds
         self.audioAnalysisTrackIDs = audioAnalysisTrackIDs
         self.activeAudioAnalysisRequestCount = activeAudioAnalysisRequestCount
         self.renderer = renderer
@@ -275,6 +291,13 @@ public final class AetherHybridPlaybackSession: ObservableObject {
             carrierTimeControlStatus: Self.timeControlStatus(
                 avPlayer.timeControlStatus
             ),
+            carrierForwardBufferSeconds:
+                core.carrierForwardBufferSeconds,
+            audioAnalysisPlaybackPressure:
+                core.audioAnalysisPlaybackPressure,
+            audioAnalysisForwardBufferPressureThresholdSeconds:
+                HybridPlaybackSession
+                    .analysisForwardBufferPressureThresholdSeconds,
             audioAnalysisTrackIDs: core.audioAnalysisTrackIDs,
             activeAudioAnalysisRequestCount:
                 core.activeAudioAnalysisRequestCount,

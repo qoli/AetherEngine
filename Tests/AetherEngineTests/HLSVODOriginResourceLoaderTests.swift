@@ -416,6 +416,227 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         try await loader.close()
     }
 
+    func testDeclaredPlaybackPressureQueuesAnalysisBeforeFetch()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let firstURL =
+            fixture.graph.audioRenditions[0]
+                .segments[0].url
+        let recorder = ScheduledFetchRecorder(
+            responses: [
+                firstURL:
+                    response(
+                        data:
+                            fixture.audioFirstSegmentData,
+                        url: firstURL
+                    ),
+            ],
+            blockedURLs: []
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [:],
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+        await loader.setAudioAnalysisPlaybackPressure(
+            .carrierWaitingToPlay
+        )
+        let analysis = Task {
+            try await loader.payload(
+                for: .audioSegment(
+                    renditionOrdinal: 0,
+                    index: 0
+                ),
+                purpose: .analysis
+            )
+        }
+        try await waitForAnalysisScheduler(
+            active: 0,
+            queued: 1,
+            loader: loader
+        )
+        let pressured = await loader.snapshot
+        XCTAssertEqual(
+            pressured.declaredPlaybackPressure,
+            .carrierWaitingToPlay
+        )
+        let requestsWhilePressured =
+            await recorder.requestedURLs
+        XCTAssertEqual(requestsWhilePressured, [])
+
+        await loader.setAudioAnalysisPlaybackPressure(.none)
+        try await recorder.waitForRequestCount(1)
+        let payload = try await analysis.value
+        XCTAssertEqual(
+            payload.data,
+            fixture.audioFirstSegmentData
+        )
+        let requestsAfterPressure =
+            await recorder.requestedURLs
+        XCTAssertEqual(requestsAfterPressure, [firstURL])
+        try await loader.close()
+    }
+
+    func testDeclaredPlaybackPressurePausesAndResumesExactAnalysisKey()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let firstURL =
+            fixture.graph.audioRenditions[0]
+                .segments[0].url
+        let recorder = ScheduledFetchRecorder(
+            responses: [
+                firstURL:
+                    response(
+                        data:
+                            fixture.audioFirstSegmentData,
+                        url: firstURL
+                    ),
+            ],
+            blockedURLs: [firstURL]
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [:],
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+        let analysis = Task {
+            try await loader.payload(
+                for: .audioSegment(
+                    renditionOrdinal: 0,
+                    index: 0
+                ),
+                purpose: .analysis
+            )
+        }
+        try await recorder.waitForRequestCount(1)
+
+        await loader.setAudioAnalysisPlaybackPressure(
+            .carrierForwardBufferLow
+        )
+        try await waitForAnalysisScheduler(
+            active: 1,
+            queued: 0,
+            paused: 1,
+            loader: loader
+        )
+        let paused = await loader.snapshot
+        XCTAssertEqual(
+            paused.declaredPlaybackPressure,
+            .carrierForwardBufferLow
+        )
+        XCTAssertEqual(paused.analysisPreemptionCount, 1)
+        XCTAssertEqual(paused.activeAnalysisFetchCount, 0)
+        let requestsWhilePaused =
+            await recorder.requestedURLs
+        XCTAssertEqual(requestsWhilePaused, [firstURL])
+
+        await loader.setAudioAnalysisPlaybackPressure(.none)
+        try await recorder.waitForRequestCount(2)
+        let resumedRequests =
+            await recorder.requestedURLs
+        XCTAssertEqual(
+            resumedRequests,
+            [firstURL, firstURL],
+            "clearing declared pressure must resume the same admitted key"
+        )
+        await recorder.release(firstURL)
+        let payload = try await analysis.value
+        XCTAssertEqual(
+            payload.data,
+            fixture.audioFirstSegmentData
+        )
+        let completed = await loader.snapshot
+        XCTAssertEqual(
+            completed.declaredPlaybackPressure,
+            .none
+        )
+        try await loader.close()
+    }
+
+    func testCancellingDeclaredPressureQueueNeverStartsAfterClear()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let firstURL =
+            fixture.graph.audioRenditions[0]
+                .segments[0].url
+        let recorder = ScheduledFetchRecorder(
+            responses: [
+                firstURL:
+                    response(
+                        data:
+                            fixture.audioFirstSegmentData,
+                        url: firstURL
+                    ),
+            ],
+            blockedURLs: []
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [:],
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+        await loader.setAudioAnalysisPlaybackPressure(
+            .carrierPlaybackStalled
+        )
+        let analysis = Task {
+            try await loader.payload(
+                for: .audioSegment(
+                    renditionOrdinal: 0,
+                    index: 0
+                ),
+                purpose: .analysis
+            )
+        }
+        try await waitForAnalysisScheduler(
+            active: 0,
+            queued: 1,
+            loader: loader
+        )
+
+        analysis.cancel()
+        do {
+            _ = try await analysis.value
+            XCTFail(
+                "cancelled pressure-queued analysis unexpectedly completed"
+            )
+        } catch is CancellationError {
+            // Expected.
+        }
+        try await waitForAnalysisScheduler(
+            active: 0,
+            queued: 0,
+            loader: loader
+        )
+        await loader.setAudioAnalysisPlaybackPressure(.none)
+        try await Task.sleep(for: .milliseconds(25))
+        let requestedURLs =
+            await recorder.requestedURLs
+        XCTAssertEqual(
+            requestedURLs,
+            [],
+            "clearing pressure must not revive a cancelled queued analysis request"
+        )
+        try await loader.close()
+    }
+
     func testPlaybackBypassesQueuedAnalysisAndKeepsPriority()
         async throws
     {

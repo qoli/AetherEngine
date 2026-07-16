@@ -677,6 +677,15 @@ actor HLSVODMediaPump {
         return analysisInput
     }
 
+    func setAudioAnalysisPlaybackPressure(
+        _ pressure: HybridAudioAnalysisPlaybackPressure
+    ) async {
+        guard !isClosed else { return }
+        await loader.setAudioAnalysisPlaybackPressure(
+            pressure
+        )
+    }
+
     func advanceVideoDecodeDemand(
         to time: CMTime
     ) throws {
@@ -724,6 +733,12 @@ actor HLSVODMediaPump {
                 workerSnapshot.audioPacketCounts,
             isClosed: isClosed
         )
+    }
+
+    func originLoaderSnapshot() async
+        -> HLSVODOriginResourceLoaderSnapshot
+    {
+        await loader.snapshot
     }
 
     func close() async throws {

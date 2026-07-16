@@ -58,6 +58,7 @@ enum HLSVODCarrierProviderError:
 final class HLSVODCarrierProvider:
     BlackCarrierTransportProvider,
     HybridAudioAnalysisSource,
+    HybridAudioAnalysisPlaybackPressureSink,
     @unchecked Sendable
 {
     private let videoProvider: BlackCarrierVideoProvider
@@ -280,6 +281,14 @@ final class HLSVODCarrierProvider:
         return analysisInput
     }
 
+    func setAudioAnalysisPlaybackPressure(
+        _ pressure: HybridAudioAnalysisPlaybackPressure
+    ) async {
+        await pump.setAudioAnalysisPlaybackPressure(
+            pressure
+        )
+    }
+
     func mediaPumpSnapshot() throws
         -> HLSVODMediaPumpSnapshot
     {
@@ -287,6 +296,12 @@ final class HLSVODCarrierProvider:
         return try BlockingAsyncBridge.wait {
             await self.pump.snapshot()
         }
+    }
+
+    func originLoaderSnapshot() async
+        -> HLSVODOriginResourceLoaderSnapshot
+    {
+        await pump.originLoaderSnapshot()
     }
 
     func prepareForTransportStart() throws {

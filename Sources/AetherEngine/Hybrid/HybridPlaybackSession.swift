@@ -136,6 +136,23 @@ public enum HybridPlaybackSeekResult: Sendable, Equatable {
     case superseded(currentGeneration: UInt64)
 }
 
+/// Engine-owned reason for pausing independent audio-analysis origin work.
+///
+/// This is a scheduling signal only. It never selects another URL, track, decoder or playback route.
+public enum HybridAudioAnalysisPlaybackPressure:
+    String,
+    Sendable,
+    Equatable
+{
+    case none
+    case carrierPreparingOrSeeking
+    case carrierWaitingToPlay
+    case carrierPlaybackStalled
+    case carrierBufferEmpty
+    case carrierForwardBufferLow
+    case carrierNotLikelyToKeepUp
+}
+
 protocol HybridCarrierTransportProvider:
     BlackCarrierTransportProvider,
     Sendable
@@ -156,6 +173,12 @@ extension BlackCarrierLazyCompositeProvider:
 protocol HybridAudioAnalysisSource: Sendable {
     var audioAnalysisTrackIDs: [Int] { get }
     func makeAudioAnalysisInput() throws -> AudioAnalysisInput
+}
+
+protocol HybridAudioAnalysisPlaybackPressureSink: Sendable {
+    func setAudioAnalysisPlaybackPressure(
+        _ pressure: HybridAudioAnalysisPlaybackPressure
+    ) async
 }
 
 extension BlackCarrierLazyCompositeProvider:
@@ -191,9 +214,14 @@ extension AetherMetalPlayerView: HybridPlaybackRenderSurface {}
 
 actor HybridPlaybackProviderCoordinator {
     private let provider: any HybridCarrierTransportProvider
+    private let analysisPlaybackPressureSink:
+        (any HybridAudioAnalysisPlaybackPressureSink)?
+    private var analysisPlaybackPressureSequence: UInt64 = 0
 
     init(provider: any HybridCarrierTransportProvider) {
         self.provider = provider
+        analysisPlaybackPressureSink =
+            provider as? any HybridAudioAnalysisPlaybackPressureSink
     }
 
     func prepareInitialGeneration() throws {
@@ -212,6 +240,18 @@ actor HybridPlaybackProviderCoordinator {
 
     func advanceDecodeDemand(to time: CMTime) throws {
         try provider.advanceVideoDecodeDemand(to: time)
+    }
+
+    func setAudioAnalysisPlaybackPressure(
+        _ pressure: HybridAudioAnalysisPlaybackPressure,
+        sequence: UInt64
+    ) async {
+        guard sequence >= analysisPlaybackPressureSequence else {
+            return
+        }
+        analysisPlaybackPressureSequence = sequence
+        await analysisPlaybackPressureSink?
+            .setAudioAnalysisPlaybackPressure(pressure)
     }
 }
 
@@ -277,12 +317,14 @@ final class HybridPlaybackSession {
         seconds: 0.25,
         preferredTimescale: 600
     )
+    static let analysisForwardBufferPressureThresholdSeconds = 2.0
     nonisolated private static let observedJumpThresholdSeconds = 0.5
 
     let avPlayer: AVPlayer
     private(set) var state: HybridPlaybackSessionState = .idle {
         didSet {
             stateDidChange?(state)
+            reevaluateAudioAnalysisPlaybackPressure()
         }
     }
 
@@ -302,6 +344,7 @@ final class HybridPlaybackSession {
     private var classifier: HybridSeekIntentClassifier
     private var readinessGate = HybridPresentationReadinessGate()
     private var periodicTimeObserver: Any?
+    private var playerObservations: [NSKeyValueObservation] = []
     private var notificationObservers: [NSObjectProtocol] = []
     private var lastObservedPlayerTime: CMTime?
     private var managedSeekGeneration: UInt64?
@@ -309,6 +352,11 @@ final class HybridPlaybackSession {
     private var managedTimeJumpSuppressionDeadline: TimeInterval?
     private var externalJumpTask: Task<Void, Never>?
     private var pendingResumeIntent: ResumeIntent?
+    private(set) var audioAnalysisPlaybackPressure:
+        HybridAudioAnalysisPlaybackPressure = .none
+    private(set) var carrierForwardBufferSeconds: Double?
+    private var playbackStallLatched = false
+    private var analysisPlaybackPressureSequence: UInt64 = 0
 
     private var latestDecodeDemand: CMTime?
     private var decodeDemandWorker: Task<Void, Never>?
@@ -488,6 +536,7 @@ final class HybridPlaybackSession {
             throw currentAvailabilityError()
         }
         avPlayer.play()
+        reevaluateAudioAnalysisPlaybackPressure()
     }
 
     func pause() throws {
@@ -509,6 +558,7 @@ final class HybridPlaybackSession {
         default:
             throw currentAvailabilityError()
         }
+        reevaluateAudioAnalysisPlaybackPressure()
     }
 
     func setRate(_ rate: Float) throws {
@@ -519,6 +569,7 @@ final class HybridPlaybackSession {
             throw currentAvailabilityError()
         }
         avPlayer.rate = rate
+        reevaluateAudioAnalysisPlaybackPressure()
     }
 
     func seek(
@@ -665,6 +716,7 @@ final class HybridPlaybackSession {
             return
         }
         lastObservedPlayerTime = time
+        reevaluateAudioAnalysisPlaybackPressure()
         renderSurface.advanceMasterClock(
             to: time,
             tolerance: Self.presentationTolerance
@@ -793,7 +845,6 @@ final class HybridPlaybackSession {
                     currentGeneration: classifier.generation
                 )
             }
-            state = .ready(generation: generation)
             managedSeekGeneration = nil
             decodeDemandSuspended = false
             pendingResumeIntent = nil
@@ -804,6 +855,7 @@ final class HybridPlaybackSession {
             }
             handleClockTick(landedTime)
             restoreResumeIntent(resumeIntent)
+            state = .ready(generation: generation)
             EngineLog.emit(
                 "[HybridPlaybackSession] seek ready generation=\(generation) "
                     + "target=\(target.seconds)",
@@ -843,7 +895,65 @@ final class HybridPlaybackSession {
                 }
             }
             notificationObservers.append(observer)
+
+            playerObservations.append(
+                item.observe(
+                    \.isPlaybackBufferEmpty,
+                    options: [.initial, .new]
+                ) { [weak self] _, _ in
+                    Task { @MainActor [weak self] in
+                        self?.reevaluateAudioAnalysisPlaybackPressure()
+                    }
+                }
+            )
+            playerObservations.append(
+                item.observe(
+                    \.isPlaybackLikelyToKeepUp,
+                    options: [.initial, .new]
+                ) { [weak self] _, _ in
+                    Task { @MainActor [weak self] in
+                        self?.reevaluateAudioAnalysisPlaybackPressure()
+                    }
+                }
+            )
+            playerObservations.append(
+                item.observe(
+                    \.loadedTimeRanges,
+                    options: [.initial, .new]
+                ) { [weak self] _, _ in
+                    Task { @MainActor [weak self] in
+                        self?.reevaluateAudioAnalysisPlaybackPressure()
+                    }
+                }
+            )
+            let stalledObserver =
+                NotificationCenter.default.addObserver(
+                    forName:
+                        AVPlayerItem.playbackStalledNotification,
+                    object: item,
+                    queue: .main
+                ) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        self.playbackStallLatched = true
+                        self.reevaluateAudioAnalysisPlaybackPressure(
+                            allowClearingStall: false
+                        )
+                    }
+                }
+            notificationObservers.append(stalledObserver)
         }
+        playerObservations.append(
+            avPlayer.observe(
+                \.timeControlStatus,
+                options: [.initial, .new]
+            ) { [weak self] _, _ in
+                Task { @MainActor [weak self] in
+                    self?.reevaluateAudioAnalysisPlaybackPressure()
+                }
+            }
+        )
+        reevaluateAudioAnalysisPlaybackPressure()
     }
 
     private func handleObservedPlayerTimeJump() {
@@ -899,11 +1009,180 @@ final class HybridPlaybackSession {
         }
     }
 
+    func applyAudioAnalysisPlaybackPressure(
+        _ pressure: HybridAudioAnalysisPlaybackPressure,
+        forwardBufferSeconds: Double?
+    ) {
+        carrierForwardBufferSeconds = forwardBufferSeconds
+        guard pressure != audioAnalysisPlaybackPressure else {
+            return
+        }
+        audioAnalysisPlaybackPressure = pressure
+        analysisPlaybackPressureSequence &+= 1
+        let sequence = analysisPlaybackPressureSequence
+        let coordinator = coordinator
+        Task {
+            await coordinator.setAudioAnalysisPlaybackPressure(
+                pressure,
+                sequence: sequence
+            )
+        }
+        EngineLog.emit(
+            "[HybridPlaybackSession] audio-analysis playback pressure=\(pressure.rawValue) "
+                + "forwardBufferSeconds="
+                + (
+                    forwardBufferSeconds.map {
+                        String(format: "%.3f", $0)
+                    } ?? "unknown"
+                ),
+            category: .session
+        )
+    }
+
+    private func reevaluateAudioAnalysisPlaybackPressure(
+        allowClearingStall: Bool = true
+    ) {
+        let item = avPlayer.currentItem
+        let forwardBufferSeconds = Self.forwardBufferSeconds(
+            player: avPlayer,
+            item: item
+        )
+        let recoveredForwardBuffer: Bool
+        if let forwardBufferSeconds {
+            recoveredForwardBuffer =
+                forwardBufferSeconds
+                >= Self
+                    .analysisForwardBufferPressureThresholdSeconds
+        } else {
+            recoveredForwardBuffer = true
+        }
+        if allowClearingStall,
+           avPlayer.timeControlStatus == .playing,
+           item?.isPlaybackLikelyToKeepUp == true,
+           item?.isPlaybackBufferEmpty == false,
+           recoveredForwardBuffer {
+            playbackStallLatched = false
+        }
+        let pressure = Self.resolveAudioAnalysisPlaybackPressure(
+            state: state,
+            timeControlStatus: avPlayer.timeControlStatus,
+            rate: avPlayer.rate,
+            playbackStalled: playbackStallLatched,
+            isPlaybackBufferEmpty:
+                item?.isPlaybackBufferEmpty ?? false,
+            isPlaybackLikelyToKeepUp:
+                item?.isPlaybackLikelyToKeepUp ?? true,
+            forwardBufferSeconds: forwardBufferSeconds
+        )
+        applyAudioAnalysisPlaybackPressure(
+            pressure,
+            forwardBufferSeconds: forwardBufferSeconds
+        )
+    }
+
+    static func resolveAudioAnalysisPlaybackPressure(
+        state: HybridPlaybackSessionState,
+        timeControlStatus: AVPlayer.TimeControlStatus,
+        rate: Float,
+        playbackStalled: Bool,
+        isPlaybackBufferEmpty: Bool,
+        isPlaybackLikelyToKeepUp: Bool,
+        forwardBufferSeconds: Double?
+    ) -> HybridAudioAnalysisPlaybackPressure {
+        switch state {
+        case .preparing, .seeking:
+            return .carrierPreparingOrSeeking
+        case .idle, .failed, .stopped:
+            return .none
+        case .ready:
+            break
+        }
+
+        let hasPlaybackIntent =
+            timeControlStatus != .paused || rate > 0
+        guard hasPlaybackIntent else {
+            return .none
+        }
+        if playbackStalled {
+            return .carrierPlaybackStalled
+        }
+        if timeControlStatus == .waitingToPlayAtSpecifiedRate {
+            return .carrierWaitingToPlay
+        }
+        if isPlaybackBufferEmpty {
+            return .carrierBufferEmpty
+        }
+        if let forwardBufferSeconds,
+           forwardBufferSeconds
+                < analysisForwardBufferPressureThresholdSeconds {
+            return .carrierForwardBufferLow
+        }
+        if !isPlaybackLikelyToKeepUp {
+            return .carrierNotLikelyToKeepUp
+        }
+        return .none
+    }
+
+    static func forwardBufferSeconds(
+        player: AVPlayer,
+        item: AVPlayerItem?
+    ) -> Double? {
+        guard let item else { return nil }
+        return forwardBufferSeconds(
+            currentTime: player.currentTime(),
+            loadedTimeRanges:
+                item.loadedTimeRanges.map(\.timeRangeValue)
+        )
+    }
+
+    nonisolated static func forwardBufferSeconds(
+        currentTime: CMTime,
+        loadedTimeRanges: [CMTimeRange]
+    ) -> Double? {
+        let current = currentTime.seconds
+        guard current.isFinite else { return nil }
+        let ranges = loadedTimeRanges
+            .sorted {
+                $0.start.seconds < $1.start.seconds
+            }
+        var continuousEnd: Double?
+        for range in ranges {
+            let start = range.start.seconds
+            let end = CMTimeRangeGetEnd(range).seconds
+            guard start.isFinite,
+                  end.isFinite,
+                  end >= start else {
+                continue
+            }
+            if let existingEnd = continuousEnd {
+                guard start <= existingEnd else {
+                    break
+                }
+                continuousEnd = max(existingEnd, end)
+                continue
+            }
+            guard current >= start else {
+                return 0
+            }
+            if current <= end {
+                continuousEnd = end
+            }
+        }
+        if let continuousEnd {
+            return max(0, continuousEnd - current)
+        }
+        return ranges.isEmpty ? nil : 0
+    }
+
     private func teardownObservers() {
         if let periodicTimeObserver {
             avPlayer.removeTimeObserver(periodicTimeObserver)
             self.periodicTimeObserver = nil
         }
+        for observation in playerObservations {
+            observation.invalidate()
+        }
+        playerObservations.removeAll()
         for observer in notificationObservers {
             NotificationCenter.default.removeObserver(observer)
         }
