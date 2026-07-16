@@ -172,17 +172,22 @@ final class MP4SegmentMuxer {
             sessionDir: sessionDir,
             videoConfig: video,
             audioConfig: audio,
+            preserveAudioEncoderPriming: false,
             maxBufferedFragmentSeconds: maxBufferedFragmentSeconds,
             onInitCaptured: onInitCaptured
         )
     }
 
     /// Audio-only fMP4 rendition muxer. Stream index is 0 and all fragment-bound math follows
-    /// the audio DTS axis. Existing A/V and video-only initializers keep video=0/audio=1.
+    /// the audio DTS axis. `preserveEncoderPriming` keeps the encoder's bounded negative
+    /// first DTS, omits `frag_discont`, and writes an edit list so the init segment trims
+    /// priming while each fragment's `tfdt` remains on the presentation timeline.
+    /// Existing A/V and video-only initializers keep video=0/audio=1.
     convenience init(
         initialSegmentIndex: Int,
         sessionDir: URL,
         audioOnly audio: AudioConfig,
+        preserveEncoderPriming: Bool = false,
         maxBufferedFragmentSeconds: Double = 8.0,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
@@ -191,6 +196,7 @@ final class MP4SegmentMuxer {
             sessionDir: sessionDir,
             videoConfig: nil,
             audioConfig: audio,
+            preserveAudioEncoderPriming: preserveEncoderPriming,
             maxBufferedFragmentSeconds: maxBufferedFragmentSeconds,
             onInitCaptured: onInitCaptured
         )
@@ -201,6 +207,7 @@ final class MP4SegmentMuxer {
         sessionDir: URL,
         videoConfig: VideoConfig?,
         audioConfig: AudioConfig?,
+        preserveAudioEncoderPriming: Bool,
         maxBufferedFragmentSeconds: Double,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
@@ -288,7 +295,8 @@ final class MP4SegmentMuxer {
             try Self.configureStreamsAndWriteHeader(
                 ctx: ctx,
                 video: videoConfig,
-                audio: audioConfig
+                audio: audioConfig,
+                preserveAudioEncoderPriming: preserveAudioEncoderPriming
             )
         } catch {
             cleanup()
@@ -375,7 +383,8 @@ final class MP4SegmentMuxer {
             try Self.configureStreamsAndWriteHeader(
                 ctx: ctx,
                 video: Optional(video),
-                audio: audio
+                audio: audio,
+                preserveAudioEncoderPriming: false
             )
             return 0
         } catch MuxerError.copyParametersFailed(let code) {
@@ -413,7 +422,8 @@ final class MP4SegmentMuxer {
             try Self.configureStreamsAndWriteHeader(
                 ctx: ctx,
                 video: nil,
-                audio: audio
+                audio: audio,
+                preserveAudioEncoderPriming: false
             )
             return 0
         } catch MuxerError.copyParametersFailed(let code) {
@@ -430,7 +440,8 @@ final class MP4SegmentMuxer {
     private static func configureStreamsAndWriteHeader(
         ctx: UnsafeMutablePointer<AVFormatContext>,
         video: VideoConfig?,
-        audio: AudioConfig?
+        audio: AudioConfig?,
+        preserveAudioEncoderPriming: Bool
     ) throws {
         guard video != nil || audio != nil else {
             throw MuxerError.noStreams
@@ -482,7 +493,8 @@ final class MP4SegmentMuxer {
 
         var opts: OpaquePointer? = nil
         defer { av_dict_free(&opts) }
-        // +frag_discont with avoid_negative_ts=disabled makes tfdt carry the ABSOLUTE input dts:
+        // The normal A/V path uses +frag_discont with avoid_negative_ts=disabled so tfdt carries
+        // the ABSOLUTE input dts:
         // a muxer built at a producer restart continues the session timeline instead of zero-basing
         // it. Without them, movenc forces the first sample's dts to 0 (movenc.c, the use_editlist=0 +
         // make_zero branch runs before frag_discont can), so every restart-produced segment carried
@@ -491,11 +503,21 @@ final class MP4SegmentMuxer {
         // AVKit's legible renderer (Sodalite#32) and decouples playhead from loaded ranges (#93).
         // The producer guarantees non-negative output timestamps (leading head-of-stream audio is
         // dropped), so disabling the negative-ts rewrite is safe.
-        av_dict_set(&opts, "movflags", "+empty_moov+default_base_moof+frag_custom+delay_moov+frag_discont", 0)
-        // use_editlist=0: +delay_moov derives an elst from the first packet timestamp (restart anchor);
-        // AVPlayer fetches EXT-X-MAP once so post-restart fragments play against a stale elst causing
-        // lipsync drift. Position belongs in each fragment's tfdt; moov stays restart-invariant.
-        av_dict_set(&opts, "use_editlist", "0", 0)
+        let movFlags = preserveAudioEncoderPriming
+            ? "+empty_moov+default_base_moof+frag_custom+delay_moov"
+            : "+empty_moov+default_base_moof+frag_custom+delay_moov+frag_discont"
+        av_dict_set(&opts, "movflags", movFlags, 0)
+        // Normal A/V sessions disable edit lists: +delay_moov would derive an elst from a restart
+        // anchor, while AVPlayer fetches EXT-X-MAP once, so later fragments would play against a
+        // stale elst. The single-pass audio rendition has no restart epochs; it enables an edit list
+        // specifically to trim encoder priming and omits frag_discont so negative first DTS becomes
+        // the track start rather than an unsigned tfdt.
+        av_dict_set(
+            &opts,
+            "use_editlist",
+            preserveAudioEncoderPriming ? "1" : "0",
+            0
+        )
         av_dict_set(&opts, "avoid_negative_ts", "disabled", 0)
 
         let ret = avformat_write_header(ctx, &opts)
