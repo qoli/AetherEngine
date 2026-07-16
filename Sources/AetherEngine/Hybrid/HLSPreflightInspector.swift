@@ -420,12 +420,17 @@ struct HLSPreflightInspector {
         _ renditions: [HLSAudioRendition],
         rootEffectiveURL: URL
     ) async throws -> AudioRenditionResolution {
-        var resources: [HLSVODAudioRenditionResource] = []
+        var inspected: [(
+            ordinal: Int,
+            rendition: HLSAudioRendition,
+            response: HLSPreflightFetchResponse,
+            media: HLSMediaPlaylist
+        )] = []
         var policies:
             [AetherHLSAudioRenditionAnalysisPolicy] = []
         var protectedContent:
             HLSContentProtection?
-        resources.reserveCapacity(renditions.count)
+        inspected.reserveCapacity(renditions.count)
         policies.reserveCapacity(renditions.count)
         for (ordinal, rendition) in renditions.enumerated() {
             guard let playlistURL = HLSPlaylistParser.resolve(
@@ -443,6 +448,12 @@ struct HLSPreflightInspector {
                     "alternate-audio rendition was not a media playlist"
                 )
             }
+            inspected.append((
+                ordinal: ordinal,
+                rendition: rendition,
+                response: response,
+                media: media
+            ))
             if media.contentProtection != .none {
                 protectedContent =
                     protectedContent
@@ -466,20 +477,20 @@ struct HLSPreflightInspector {
                         .requiresPlaybackSessionBinding
                 )
             )
-            resources.append(
-                try HLSVODResourceGraph.makeAudioRendition(
-                    ordinal: ordinal,
-                    metadata: rendition,
-                    playlistURL: response.effectiveURL,
-                    playlistData: response.data,
-                    media: media
-                )
-            )
         }
         if let protectedContent {
             return .protected(
                 protectedContent,
                 policies
+            )
+        }
+        let resources = try inspected.map {
+            try HLSVODResourceGraph.makeAudioRendition(
+                ordinal: $0.ordinal,
+                metadata: $0.rendition,
+                playlistURL: $0.response.effectiveURL,
+                playlistData: $0.response.data,
+                media: $0.media
             )
         }
         return .clear(resources, policies)
