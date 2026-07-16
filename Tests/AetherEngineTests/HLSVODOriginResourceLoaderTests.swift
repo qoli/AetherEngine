@@ -1185,6 +1185,429 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         try await loader.close()
     }
 
+    func testCredentialRejectionInvalidatesTheWholePreflightGeneration()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let key = HLSVODOriginResourceKey.audioSegment(
+            renditionOrdinal: 0,
+            index: 0
+        )
+        let recorder = FetchRecorder(
+            responses: [
+                fixture.audioFirstSegmentURL:
+                    HLSVODOriginFetchResponse(
+                        data: Data(),
+                        effectiveURL:
+                            fixture.audioFirstSegmentURL,
+                        statusCode: 403,
+                        contentLength: 0,
+                        contentEncoding: nil
+                    ),
+            ]
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [
+                "Authorization": "Bearer expired",
+            ],
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+        let directory = await loader.sessionDirectory
+        _ = try await loader.payload(
+            for: .videoSegment(index: 0)
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: directory.path
+            )
+        )
+
+        let invalidation =
+            HLSVODPreflightGenerationInvalidation
+                .credentialRejected(
+                    statusCode: 403,
+                    resource: key
+                )
+        let expected = HLSVODOriginResourceError
+            .preflightGenerationInvalidated(
+                invalidation
+            )
+        do {
+            _ = try await loader.payload(for: key)
+            XCTFail(
+                "expired credential unexpectedly kept the preflight generation usable"
+            )
+        } catch let error as HLSVODOriginResourceError {
+            XCTAssertEqual(error, expected)
+        }
+
+        let invalidated = await loader.snapshot
+        XCTAssertEqual(
+            invalidated.preflightGenerationInvalidation,
+            invalidation
+        )
+        XCTAssertEqual(invalidated.cachedResourceCount, 0)
+        XCTAssertEqual(invalidated.cachedBytes, 0)
+        XCTAssertEqual(invalidated.inFlightResourceCount, 0)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: directory.path
+            )
+        )
+
+        do {
+            _ = try await loader.payload(
+                for: .videoSegment(index: 0)
+            )
+            XCTFail(
+                "invalidated generation unexpectedly served seeded or cached bytes"
+            )
+        } catch let error as HLSVODOriginResourceError {
+            XCTAssertEqual(error, expected)
+        }
+        let requestCount = await recorder.requestCount
+        XCTAssertEqual(
+            requestCount,
+            1,
+            "generation invalidation must not retry the expired request"
+        )
+        try await loader.close()
+    }
+
+    func testGenerationInvalidationMapsToPrivacySafePublicSessionError()
+        throws
+    {
+        let key = HLSVODOriginResourceKey.audioSegment(
+            renditionOrdinal: 2,
+            index: 7
+        )
+        let invalidation =
+            HLSVODPreflightGenerationInvalidation
+                .credentialRejected(
+                    statusCode: 403,
+                    resource: key
+                )
+        let publicReason =
+            AetherHLSPreflightInvalidationReason
+                .credentialRejected(
+                    statusCode: 403,
+                    resource: .audioSegment(
+                        renditionOrdinal: 2,
+                        index: 7
+                    )
+                )
+        XCTAssertEqual(
+            invalidation.publicReason,
+            publicReason
+        )
+
+        let origin = HLSVODOriginResourceError
+            .preflightGenerationInvalidated(
+                invalidation
+            )
+        let provider = HLSVODCarrierProviderError
+            .pump(.origin(origin))
+        XCTAssertEqual(
+            HLSVODCarrierProvider
+                .hybridPlaybackSessionError(
+                    from: provider
+                ),
+            .hlsPreflightGenerationInvalidated(
+                publicReason
+            )
+        )
+        XCTAssertNil(
+            HLSVODCarrierProvider
+                .hybridPlaybackSessionError(
+                    from:
+                        HLSVODCarrierProviderError
+                            .closed
+                )
+        )
+    }
+
+    func testGoneResourceRequiresRepreflightWithoutAutomaticRetry()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let key = HLSVODOriginResourceKey.audioSegment(
+            renditionOrdinal: 0,
+            index: 0
+        )
+        let recorder = FetchRecorder(
+            responses: [
+                fixture.audioFirstSegmentURL:
+                    HLSVODOriginFetchResponse(
+                        data: Data(),
+                        effectiveURL:
+                            fixture.audioFirstSegmentURL,
+                        statusCode: 410,
+                        contentLength: 0,
+                        contentEncoding: nil
+                    ),
+            ]
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [:],
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+        let invalidation =
+            HLSVODPreflightGenerationInvalidation
+                .resourceUnavailable(
+                    statusCode: 410,
+                    resource: key
+                )
+        do {
+            _ = try await loader.payload(for: key)
+            XCTFail(
+                "gone graph resource unexpectedly remained usable"
+            )
+        } catch let error as HLSVODOriginResourceError {
+            XCTAssertEqual(
+                error,
+                .preflightGenerationInvalidated(
+                    invalidation
+                )
+            )
+        }
+        let snapshot = await loader.snapshot
+        XCTAssertEqual(
+            snapshot.preflightGenerationInvalidation,
+            invalidation
+        )
+        let requestCount = await recorder.requestCount
+        XCTAssertEqual(requestCount, 1)
+        try await loader.close()
+    }
+
+    func testGenerationInvalidationFailsOtherInFlightWaiters()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let audioSegments =
+            fixture.graph.audioRenditions[0].segments
+        let blockedKey = HLSVODOriginResourceKey
+            .audioSegment(
+                renditionOrdinal: 0,
+                index: 0
+            )
+        let rejectedKey = HLSVODOriginResourceKey
+            .audioSegment(
+                renditionOrdinal: 0,
+                index: 1
+            )
+        let blockedURL = audioSegments[0].url
+        let rejectedURL = audioSegments[1].url
+        let recorder = ScheduledFetchRecorder(
+            responses: [
+                blockedURL:
+                    response(
+                        data:
+                            fixture.audioFirstSegmentData,
+                        url: blockedURL
+                    ),
+                rejectedURL:
+                    HLSVODOriginFetchResponse(
+                        data: Data(),
+                        effectiveURL: rejectedURL,
+                        statusCode: 401,
+                        contentLength: 0,
+                        contentEncoding: nil
+                    ),
+            ],
+            blockedURLs: [blockedURL]
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [
+                "Authorization": "Bearer expired",
+            ],
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+        let blocked = Task {
+            try await loader.payload(for: blockedKey)
+        }
+        try await recorder.waitForRequestCount(1)
+        let rejected = Task {
+            try await loader.payload(for: rejectedKey)
+        }
+        try await recorder.waitForRequestCount(2)
+
+        let expected = HLSVODOriginResourceError
+            .preflightGenerationInvalidated(
+                .credentialRejected(
+                    statusCode: 401,
+                    resource: rejectedKey
+                )
+            )
+        for task in [blocked, rejected] {
+            do {
+                _ = try await task.value
+                XCTFail(
+                    "invalidated generation unexpectedly delivered an in-flight resource"
+                )
+            } catch let error as HLSVODOriginResourceError {
+                XCTAssertEqual(error, expected)
+            }
+        }
+        let snapshot = await loader.snapshot
+        XCTAssertEqual(snapshot.inFlightResourceCount, 0)
+        XCTAssertEqual(snapshot.inFlightWaiterCount, 0)
+        XCTAssertEqual(
+            snapshot.preflightGenerationInvalidation,
+            .credentialRejected(
+                statusCode: 401,
+                resource: rejectedKey
+            )
+        )
+        try await loader.close()
+    }
+
+    func testAnalysisCredentialFailureDoesNotInvalidatePlayback()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let key = HLSVODOriginResourceKey.audioSegment(
+            renditionOrdinal: 0,
+            index: 0
+        )
+        let recorder = FetchRecorder(
+            responses: [
+                fixture.audioFirstSegmentURL:
+                    HLSVODOriginFetchResponse(
+                        data: Data(),
+                        effectiveURL:
+                            fixture.audioFirstSegmentURL,
+                        statusCode: 403,
+                        contentLength: 0,
+                        contentEncoding: nil
+                    ),
+            ]
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [
+                "Authorization": "Bearer expired",
+            ],
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+
+        do {
+            _ = try await loader.payload(
+                for: key,
+                purpose: .analysis
+            )
+            XCTFail(
+                "expired analysis credential unexpectedly produced bytes"
+            )
+        } catch let error as HLSVODOriginResourceError {
+            XCTAssertEqual(error, .httpStatus(403))
+        }
+        let afterAnalysis = await loader.snapshot
+        XCTAssertNil(
+            afterAnalysis.preflightGenerationInvalidation
+        )
+        XCTAssertFalse(afterAnalysis.isClosed)
+
+        let playback = try await loader.payload(
+            for: .videoSegment(index: 0),
+            purpose: .playback
+        )
+        XCTAssertEqual(
+            playback.data,
+            fixture.videoFirstSegmentData
+        )
+        let requestCount = await recorder.requestCount
+        XCTAssertEqual(requestCount, 1)
+        try await loader.close()
+    }
+
+    func testServerFailureDoesNotInvalidateOrRetryAutomatically()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let key = HLSVODOriginResourceKey.audioSegment(
+            renditionOrdinal: 0,
+            index: 0
+        )
+        let recorder = FetchRecorder(
+            responses: [
+                fixture.audioFirstSegmentURL:
+                    HLSVODOriginFetchResponse(
+                        data: Data(),
+                        effectiveURL:
+                            fixture.audioFirstSegmentURL,
+                        statusCode: 503,
+                        contentLength: 0,
+                        contentEncoding: nil
+                    ),
+            ]
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [:],
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+
+        do {
+            _ = try await loader.payload(for: key)
+            XCTFail("HTTP 503 unexpectedly produced bytes")
+        } catch let error as HLSVODOriginResourceError {
+            XCTAssertEqual(error, .httpStatus(503))
+        }
+        let firstSnapshot = await loader.snapshot
+        XCTAssertNil(
+            firstSnapshot.preflightGenerationInvalidation
+        )
+        let firstRequestCount = await recorder.requestCount
+        XCTAssertEqual(
+            firstRequestCount,
+            1,
+            "the loader must not automatically retry a failed request"
+        )
+
+        do {
+            _ = try await loader.payload(for: key)
+            XCTFail("explicit second request unexpectedly produced bytes")
+        } catch let error as HLSVODOriginResourceError {
+            XCTAssertEqual(error, .httpStatus(503))
+        }
+        let secondRequestCount = await recorder.requestCount
+        XCTAssertEqual(
+            secondRequestCount,
+            2,
+            "only an explicit caller request may retry a non-generation HTTP failure"
+        )
+        try await loader.close()
+    }
+
     func testRuntimeEffectiveOriginMustRemainInsidePreflightScope()
         async throws
     {
@@ -1229,12 +1652,22 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         } catch let error as HLSVODOriginResourceError {
             XCTAssertEqual(
                 error,
-                .effectiveOriginMismatch(key)
+                .preflightGenerationInvalidated(
+                    .effectiveOriginChanged(
+                        resource: key
+                    )
+                )
             )
         }
         let snapshot = await loader.snapshot
         XCTAssertEqual(snapshot.cachedResourceCount, 0)
         XCTAssertEqual(snapshot.cachedBytes, 0)
+        XCTAssertEqual(
+            snapshot.preflightGenerationInvalidation,
+            .effectiveOriginChanged(
+                resource: key
+            )
+        )
         try await loader.close()
     }
 

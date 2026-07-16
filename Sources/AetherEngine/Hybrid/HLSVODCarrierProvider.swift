@@ -266,6 +266,17 @@ final class HLSVODCarrierProvider:
         return _terminalError
     }
 
+    var terminalHybridPlaybackError:
+        HybridPlaybackSessionError?
+    {
+        guard let terminalError else {
+            return nil
+        }
+        return Self.hybridPlaybackSessionError(
+            from: terminalError
+        )
+    }
+
     var hybridVideoFormat: VideoFormat? {
         resolvedHybridVideoFormat
     }
@@ -670,10 +681,46 @@ final class HLSVODCarrierProvider:
             reason: String(describing: error)
         )
     }
+
+    static func hybridPlaybackSessionError(
+        from error: Error
+    ) -> HybridPlaybackSessionError? {
+        if let provider =
+                error as? HLSVODCarrierProviderError {
+            guard case .pump(let pump) = provider else {
+                return nil
+            }
+            return hybridPlaybackSessionError(
+                from: pump
+            )
+        }
+        if let pump = error as? HLSVODMediaPumpError {
+            guard case .origin(let origin) = pump else {
+                return nil
+            }
+            return hybridPlaybackSessionError(
+                from: origin
+            )
+        }
+        if let origin =
+                error as? HLSVODOriginResourceError,
+           case .preflightGenerationInvalidated(
+                let reason
+           ) = origin {
+            return .hlsPreflightGenerationInvalidated(
+                reason.publicReason
+            )
+        }
+        return nil
+    }
 }
 
 extension HLSVODCarrierProvider:
     HybridCarrierTransportProvider
+{}
+
+extension HLSVODCarrierProvider:
+    HybridPlaybackTerminalErrorSource
 {}
 
 private enum BlockingAsyncBridge {

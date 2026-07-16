@@ -1423,6 +1423,169 @@ final class HLSVODMediaPumpTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testHybridSessionRequiresNewPreflightWhenStartupCredentialIsRejected()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let rejectedURL = fixture.audioSegmentURLs[0]
+        let rejected = FetchStore(
+            responses: [
+                rejectedURL:
+                    HLSVODOriginFetchResponse(
+                        data: Data(),
+                        effectiveURL: rejectedURL,
+                        statusCode: 403,
+                        contentLength: 0,
+                        contentEncoding: nil
+                    ),
+            ]
+        )
+        let expected = HybridPlaybackSessionError
+            .hlsPreflightGenerationInvalidated(
+                .credentialRejected(
+                    statusCode: 403,
+                    resource: .audioSegment(
+                        renditionOrdinal: 0,
+                        index: 0
+                    )
+                )
+            )
+
+        do {
+            _ = try await HybridPlaybackSession
+                .makeHLSVOD(
+                    preflight: fixture.preflight,
+                    bandwidthAdmissions: [
+                        BlackCarrierAudioBandwidthAdmission(
+                            ordinal: 0,
+                            evidence: .measuredFullAsset(
+                                peakBandwidth: 512_000,
+                                averageBandwidth: 384_000
+                            )
+                        ),
+                    ],
+                    fetchOverride: {
+                        request,
+                        _ in
+                        if request.url == rejectedURL {
+                            return try rejected.response(
+                                for: request
+                            )
+                        }
+                        return try fixture.fetchStore
+                            .response(for: request)
+                    }
+                )
+            XCTFail(
+                "expired startup credential unexpectedly created a hybrid session"
+            )
+        } catch let error
+                as HybridPlaybackSessionError {
+            XCTAssertEqual(error, expected)
+        }
+        XCTAssertEqual(
+            rejected.count(for: rejectedURL),
+            1,
+            "session creation must not retry the rejected preflight generation"
+        )
+    }
+
+    func testCarrierProviderPublishesTypedRuntimeRepreflightRequirement()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let rejectedURL = fixture.videoSegmentURLs[1]
+        let rejected = FetchStore(
+            responses: [
+                rejectedURL:
+                    HLSVODOriginFetchResponse(
+                        data: Data(),
+                        effectiveURL: rejectedURL,
+                        statusCode: 410,
+                        contentLength: 0,
+                        contentEncoding: nil
+                    ),
+            ]
+        )
+        let provider =
+            try await HLSVODCarrierProvider.make(
+                preflight: fixture.preflight,
+                bandwidthAdmissions: [
+                    BlackCarrierAudioBandwidthAdmission(
+                        ordinal: 0,
+                        evidence: .measuredFullAsset(
+                            peakBandwidth: 512_000,
+                            averageBandwidth: 384_000
+                        )
+                    ),
+                ],
+                fetchOverride: {
+                    request,
+                    _ in
+                    if request.url == rejectedURL {
+                        return try rejected.response(
+                            for: request
+                        )
+                    }
+                    return try fixture.fetchStore
+                        .response(for: request)
+                }
+            )
+        defer { provider.close() }
+        try provider.prepareForTransportStart()
+
+        let expected = HybridPlaybackSessionError
+            .hlsPreflightGenerationInvalidated(
+                .resourceUnavailable(
+                    statusCode: 410,
+                    resource: .videoSegment(index: 1)
+                )
+            )
+        do {
+            try provider.prepareHybridGeneration(
+                segmentIndex: 1
+            )
+            XCTFail(
+                "gone runtime resource unexpectedly kept the provider usable"
+            )
+        } catch {
+            XCTAssertEqual(
+                HLSVODCarrierProvider
+                    .hybridPlaybackSessionError(
+                        from: error
+                    ),
+                expected
+            )
+        }
+        XCTAssertEqual(
+            provider.terminalHybridPlaybackError,
+            expected
+        )
+
+        do {
+            try provider.prepareHybridGeneration(
+                segmentIndex: 1
+            )
+            XCTFail(
+                "invalidated provider unexpectedly retried its old graph"
+            )
+        } catch {
+            XCTAssertEqual(
+                HLSVODCarrierProvider
+                    .hybridPlaybackSessionError(
+                        from: error
+                    ),
+                expected
+            )
+        }
+        XCTAssertEqual(
+            rejected.count(for: rejectedURL),
+            1,
+            "terminal provider must not retry the invalidated graph"
+        )
+    }
+
     func testCarrierProviderRejectsMissingBandwidthEvidence()
         async throws
     {

@@ -38,6 +38,9 @@ public enum HybridPlaybackSessionError:
     case carrierItemMissing
     case carrierClockUnavailable
     case resumeIntentMissing
+    case hlsPreflightGenerationInvalidated(
+        AetherHLSPreflightInvalidationReason
+    )
     case providerFailed(reason: String)
     case carrierFailed(reason: String)
     case rendererFailed(AetherMetalRendererError)
@@ -96,6 +99,8 @@ public enum HybridPlaybackSessionError:
             return "Hybrid carrier AVPlayer did not publish a valid timeline clock"
         case .resumeIntentMissing:
             return "Hybrid seek lost its required transport resume intent"
+        case .hlsPreflightGenerationInvalidated:
+            return "Hybrid HLS preflight generation is no longer valid; run a new preflight before creating another session"
         case .providerFailed(let reason):
             return "Hybrid carrier provider failed: \(reason)"
         case .carrierFailed(let reason):
@@ -170,6 +175,13 @@ extension BlackCarrierLazyCompositeProvider:
     HybridCarrierTransportProvider
 {}
 
+protocol HybridPlaybackTerminalErrorSource:
+    Sendable
+{
+    var terminalHybridPlaybackError:
+        HybridPlaybackSessionError? { get }
+}
+
 protocol HybridAudioAnalysisSource: Sendable {
     var audioAnalysisTrackIDs: [Int] { get }
     func makeAudioAnalysisInput() throws -> AudioAnalysisInput
@@ -216,12 +228,16 @@ actor HybridPlaybackProviderCoordinator {
     private let provider: any HybridCarrierTransportProvider
     private let analysisPlaybackPressureSink:
         (any HybridAudioAnalysisPlaybackPressureSink)?
+    private let terminalErrorSource:
+        (any HybridPlaybackTerminalErrorSource)?
     private var analysisPlaybackPressureSequence: UInt64 = 0
 
     init(provider: any HybridCarrierTransportProvider) {
         self.provider = provider
         analysisPlaybackPressureSink =
             provider as? any HybridAudioAnalysisPlaybackPressureSink
+        terminalErrorSource =
+            provider as? any HybridPlaybackTerminalErrorSource
     }
 
     func prepareInitialGeneration() throws {
@@ -240,6 +256,13 @@ actor HybridPlaybackProviderCoordinator {
 
     func advanceDecodeDemand(to time: CMTime) throws {
         try provider.advanceVideoDecodeDemand(to: time)
+    }
+
+    func terminalHybridPlaybackError()
+        -> HybridPlaybackSessionError?
+    {
+        terminalErrorSource?
+            .terminalHybridPlaybackError
     }
 
     func setAudioAnalysisPlaybackPressure(
@@ -497,6 +520,13 @@ final class HybridPlaybackSession {
             )
         } catch {
             relay.detach()
+            if let typed =
+                    HLSVODCarrierProvider
+                        .hybridPlaybackSessionError(
+                            from: error
+                        ) {
+                throw typed
+            }
             throw error
         }
 
@@ -604,7 +634,7 @@ final class HybridPlaybackSession {
                 category: .session
             )
         } catch {
-            let typed = mapPreparationError(error)
+            let typed = await mapPreparationError(error)
             terminate(with: typed)
             throw typed
         }
@@ -947,7 +977,7 @@ final class HybridPlaybackSession {
                     currentGeneration: classifier.generation
                 )
             }
-            let typed = mapSeekError(error)
+            let typed = await mapSeekError(error)
             terminate(with: typed)
             throw typed
         }
@@ -1306,9 +1336,10 @@ final class HybridPlaybackSession {
                     )
                 } catch {
                     if !Task.isCancelled {
-                        self.terminate(with: .providerFailed(
-                            reason: String(describing: error)
-                        ))
+                        self.terminate(
+                            with: await self
+                                .mapProviderError(error)
+                        )
                     }
                     break
                 }
@@ -1468,8 +1499,19 @@ final class HybridPlaybackSession {
 
     private func mapPreparationError(
         _ error: Error
-    ) -> HybridPlaybackSessionError {
+    ) async -> HybridPlaybackSessionError {
         if let typed = error as? HybridPlaybackSessionError {
+            return typed
+        }
+        if let typed =
+                HLSVODCarrierProvider
+                    .hybridPlaybackSessionError(
+                        from: error
+                    ) {
+            return typed
+        }
+        if let typed = await coordinator
+            .terminalHybridPlaybackError() {
             return typed
         }
         if let renderer = error as? AetherMetalRendererError {
@@ -1483,14 +1525,47 @@ final class HybridPlaybackSession {
 
     private func mapSeekError(
         _ error: Error
-    ) -> HybridPlaybackSessionError {
+    ) async -> HybridPlaybackSessionError {
         if let typed = error as? HybridPlaybackSessionError {
+            return typed
+        }
+        if let typed =
+                HLSVODCarrierProvider
+                    .hybridPlaybackSessionError(
+                        from: error
+                    ) {
+            return typed
+        }
+        if let typed = await coordinator
+            .terminalHybridPlaybackError() {
             return typed
         }
         if let renderer = error as? AetherMetalRendererError {
             return .rendererFailed(renderer)
         }
         return .providerFailed(reason: String(describing: error))
+    }
+
+    private func mapProviderError(
+        _ error: Error
+    ) async -> HybridPlaybackSessionError {
+        if let typed = error as? HybridPlaybackSessionError {
+            return typed
+        }
+        if let typed =
+                HLSVODCarrierProvider
+                    .hybridPlaybackSessionError(
+                        from: error
+                    ) {
+            return typed
+        }
+        if let typed = await coordinator
+            .terminalHybridPlaybackError() {
+            return typed
+        }
+        return .providerFailed(
+            reason: String(describing: error)
+        )
     }
 
     nonisolated private static func isValidTimelineTime(

@@ -2,6 +2,49 @@ import CoreMedia
 import CryptoKit
 import Foundation
 
+/// Privacy-safe structural reference to the HLS resource that invalidated a preflight generation.
+///
+/// URLs and request headers are deliberately not exposed because they may contain signed credentials.
+public enum AetherHLSResourceReference:
+    Sendable,
+    Equatable
+{
+    case videoInit
+    case videoSegment(index: Int)
+    case audioInit(renditionOrdinal: Int)
+    case audioSegment(
+        renditionOrdinal: Int,
+        index: Int
+    )
+}
+
+/// A runtime fact proving that the immutable HLS resource graph admitted by preflight is no longer valid.
+///
+/// The current session must terminate. The host must run a new `AetherHLSPlaybackPreflight`; the engine
+/// never retries the old URL, refreshes credentials in place or selects another route.
+public enum AetherHLSPreflightInvalidationReason:
+    Sendable,
+    Equatable
+{
+    case credentialRejected(
+        statusCode: Int,
+        resource: AetherHLSResourceReference
+    )
+    case resourceUnavailable(
+        statusCode: Int,
+        resource: AetherHLSResourceReference
+    )
+    case contentChanged(
+        resource: AetherHLSResourceReference
+    )
+    case effectiveOriginChanged(
+        resource: AetherHLSResourceReference
+    )
+    case credentialScopeChanged(
+        resource: AetherHLSResourceReference
+    )
+}
+
 /// Public, privacy-safe result of HLS inspection.
 ///
 /// The raw selected playlist, init-segment and media-segment URLs remain engine-private because they may
@@ -10,7 +53,10 @@ import Foundation
 /// the exact playlist bytes, the preflight-inspected video init/first-segment evidence and the request
 /// headers. Native and unsupported routes do not create the hybrid graph. A host may persist the digest,
 /// but must pass this value object back to AetherEngine rather than reconstructing an HLS resource graph
-/// from public fields.
+/// from public fields. If a playback-origin request later proves that credentials, resource availability,
+/// content evidence or effective-origin scope changed, the old graph is sealed and cannot be refreshed in
+/// place. The caller must run preflight again with current credentials; a changed manifest, URL, header or
+/// inspected byte produces a new `resourceIdentity` and therefore a new playback session generation.
 public struct AetherHLSPlaybackPreflight: Sendable, Equatable {
     public let result: PlaybackPreflightResult
     public let hybridTimeline: BlackCarrierTimeline?

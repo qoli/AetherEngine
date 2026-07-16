@@ -18,11 +18,85 @@ enum HLSVODOriginResourceKey: Hashable, Sendable {
             "audio-\(ordinal)-segment-\(index)"
         }
     }
+
+    var publicReference: AetherHLSResourceReference {
+        switch self {
+        case .videoInit:
+            .videoInit
+        case .videoSegment(let index):
+            .videoSegment(index: index)
+        case .audioInit(let ordinal):
+            .audioInit(renditionOrdinal: ordinal)
+        case .audioSegment(let ordinal, let index):
+            .audioSegment(
+                renditionOrdinal: ordinal,
+                index: index
+            )
+        }
+    }
 }
 
 enum HLSVODOriginResourcePurpose: Sendable, Equatable {
     case playback
     case analysis
+}
+
+enum HLSVODPreflightGenerationInvalidation:
+    Sendable,
+    Equatable
+{
+    case credentialRejected(
+        statusCode: Int,
+        resource: HLSVODOriginResourceKey
+    )
+    case resourceUnavailable(
+        statusCode: Int,
+        resource: HLSVODOriginResourceKey
+    )
+    case contentChanged(
+        resource: HLSVODOriginResourceKey
+    )
+    case effectiveOriginChanged(
+        resource: HLSVODOriginResourceKey
+    )
+    case credentialScopeChanged(
+        resource: HLSVODOriginResourceKey
+    )
+
+    var publicReason:
+        AetherHLSPreflightInvalidationReason
+    {
+        switch self {
+        case .credentialRejected(
+            let statusCode,
+            let resource
+        ):
+            .credentialRejected(
+                statusCode: statusCode,
+                resource: resource.publicReference
+            )
+        case .resourceUnavailable(
+            let statusCode,
+            let resource
+        ):
+            .resourceUnavailable(
+                statusCode: statusCode,
+                resource: resource.publicReference
+            )
+        case .contentChanged(let resource):
+            .contentChanged(
+                resource: resource.publicReference
+            )
+        case .effectiveOriginChanged(let resource):
+            .effectiveOriginChanged(
+                resource: resource.publicReference
+            )
+        case .credentialScopeChanged(let resource):
+            .credentialScopeChanged(
+                resource: resource.publicReference
+            )
+        }
+    }
 }
 
 enum HLSVODOriginResourceError:
@@ -43,6 +117,9 @@ enum HLSVODOriginResourceError:
     case preflightEvidenceMismatch(HLSVODOriginResourceKey)
     case effectiveOriginMismatch(HLSVODOriginResourceKey)
     case redirectCredentialScopeViolation
+    case preflightGenerationInvalidated(
+        HLSVODPreflightGenerationInvalidation
+    )
     case transport(URLError.Code)
     case transportFailure
     case cacheDirectoryCreationFailed
@@ -81,6 +158,25 @@ enum HLSVODOriginResourceError:
             "HLS VOD origin resource redirected outside its preflight-admitted origin scope"
         case .redirectCredentialScopeViolation:
             "HLS VOD redirect crossed origin while request-scoped headers were present"
+        case .preflightGenerationInvalidated(let reason):
+            switch reason {
+            case .credentialRejected(
+                let statusCode,
+                let resource
+            ):
+                "HLS VOD preflight generation was invalidated because \(resource.cacheFileName) rejected its credential with HTTP \(statusCode)"
+            case .resourceUnavailable(
+                let statusCode,
+                let resource
+            ):
+                "HLS VOD preflight generation was invalidated because \(resource.cacheFileName) became unavailable with HTTP \(statusCode)"
+            case .contentChanged(let resource):
+                "HLS VOD preflight generation was invalidated because \(resource.cacheFileName) no longer matches preflight content evidence"
+            case .effectiveOriginChanged(let resource):
+                "HLS VOD preflight generation was invalidated because \(resource.cacheFileName) moved outside the preflight-admitted origin scope"
+            case .credentialScopeChanged(let resource):
+                "HLS VOD preflight generation was invalidated because \(resource.cacheFileName) crossed credential scope"
+            }
         case .transport(let code):
             "HLS VOD origin-resource transport failed with URL error \(code.rawValue)"
         case .transportFailure:
@@ -129,6 +225,8 @@ struct HLSVODOriginResourceLoaderSnapshot: Sendable, Equatable {
     let analysisPreemptionCount: Int
     let declaredPlaybackPressure:
         HybridAudioAnalysisPlaybackPressure
+    let preflightGenerationInvalidation:
+        HLSVODPreflightGenerationInvalidation?
     let isClosed: Bool
 }
 
@@ -289,6 +387,10 @@ extension HLSVODResourceGraph {
 /// One analysis request may own an origin fetch at a time. A playback request for a different key cancels
 /// only the analysis transport task, retains its exact graph-bound waiter, and resumes that same key after
 /// all playback fetch pressure settles. A playback waiter for the same key upgrades the shared fetch in place.
+/// A playback-origin credential rejection, gone resource, content-evidence change or origin-scope change
+/// invalidates the entire immutable preflight generation, cancels every other waiter and removes its cache.
+/// The loader never refreshes credentials or reopens the manifest itself. Analysis-only failures remain
+/// isolated to analysis and cannot invalidate the main playback generation.
 ///
 /// Cache paths contain only a UUID session directory and structural resource keys. URLs, signed query
 /// parameters, Authorization and Cookie values remain in memory and are never written as metadata.
@@ -351,6 +453,8 @@ actor HLSVODOriginResourceLoader {
     private var analysisPreemptionCount = 0
     private var declaredPlaybackPressure:
         HybridAudioAnalysisPlaybackPressure = .none
+    private var preflightGenerationInvalidation:
+        HLSVODPreflightGenerationInvalidation?
     private var isClosed = false
     private var closeError: HLSVODOriginResourceError?
 
@@ -520,6 +624,8 @@ actor HLSVODOriginResourceLoader {
                 analysisPreemptionCount,
             declaredPlaybackPressure:
                 declaredPlaybackPressure,
+            preflightGenerationInvalidation:
+                preflightGenerationInvalidation,
             isClosed: isClosed
         )
     }
@@ -528,6 +634,7 @@ actor HLSVODOriginResourceLoader {
         _ pressure: HybridAudioAnalysisPlaybackPressure
     ) {
         guard !isClosed,
+              preflightGenerationInvalidation == nil,
               pressure != declaredPlaybackPressure else {
             return
         }
@@ -573,10 +680,15 @@ actor HLSVODOriginResourceLoader {
         declaredPlaybackPressure = .none
         cache.removeAll()
         cachedBytes = 0
+        preflightGenerationInvalidation = nil
         do {
-            try FileManager.default.removeItem(
-                at: sessionDirectory
-            )
+            if FileManager.default.fileExists(
+                atPath: sessionDirectory.path
+            ) {
+                try FileManager.default.removeItem(
+                    at: sessionDirectory
+                )
+            }
         } catch {
             let error =
                 HLSVODOriginResourceError.cacheCleanupFailed
@@ -590,6 +702,12 @@ actor HLSVODOriginResourceLoader {
         for key: HLSVODOriginResourceKey,
         purpose: HLSVODOriginResourcePurpose
     ) async throws -> HLSVODOriginResourcePayload {
+        if let preflightGenerationInvalidation {
+            throw HLSVODOriginResourceError
+                .preflightGenerationInvalidated(
+                    preflightGenerationInvalidation
+                )
+        }
         guard !isClosed else {
             throw HLSVODOriginResourceError.closed
         }
@@ -644,6 +762,7 @@ actor HLSVODOriginResourceLoader {
         for key: HLSVODOriginResourceKey
     ) {
         guard !isClosed,
+              preflightGenerationInvalidation == nil,
               var flight = flights[key],
               flight.task == nil,
               !flight.isPausedForPlayback else {
@@ -749,6 +868,7 @@ actor HLSVODOriginResourceLoader {
 
     private func resumePausedAnalysisFetchIfPossible() {
         guard !isClosed,
+              preflightGenerationInvalidation == nil,
               !hasPlaybackPressure else {
             return
         }
@@ -774,6 +894,12 @@ actor HLSVODOriginResourceLoader {
         _ permitID: UUID,
         token: HLSVODAnalysisPermitToken
     ) async throws {
+        if let preflightGenerationInvalidation {
+            throw HLSVODOriginResourceError
+                .preflightGenerationInvalidated(
+                    preflightGenerationInvalidation
+                )
+        }
         guard !isClosed else {
             throw HLSVODOriginResourceError.closed
         }
@@ -848,6 +974,7 @@ actor HLSVODOriginResourceLoader {
 
     private func resumeNextAnalysisPermitIfPossible() {
         guard !isClosed,
+              preflightGenerationInvalidation == nil,
               activeAnalysisPermitID == nil,
               !hasPlaybackPressure else {
             return
@@ -938,6 +1065,25 @@ actor HLSVODOriginResourceLoader {
                 )
             }
         } catch let error as HLSVODOriginResourceError {
+            let hasPlaybackWaiter =
+                flight.waiters.values.contains {
+                    $0.purpose == .playback
+                }
+            if hasPlaybackWaiter,
+               let reason = Self.preflightInvalidationReason(
+                for: error,
+                resource: resource.key
+            ) {
+                let invalidated = invalidatePreflightGeneration(
+                    reason
+                )
+                for waiter in flight.waiters.values {
+                    waiter.continuation.resume(
+                        throwing: invalidated
+                    )
+                }
+                return
+            }
             for waiter in flight.waiters.values {
                 waiter.continuation.resume(
                     throwing: error
@@ -960,6 +1106,92 @@ actor HLSVODOriginResourceLoader {
                     throwing: typed
                 )
             }
+        }
+    }
+
+    private func invalidatePreflightGeneration(
+        _ proposed:
+            HLSVODPreflightGenerationInvalidation
+    ) -> HLSVODOriginResourceError {
+        let reason =
+            preflightGenerationInvalidation ?? proposed
+        let error = HLSVODOriginResourceError
+            .preflightGenerationInvalidated(reason)
+        guard preflightGenerationInvalidation == nil else {
+            return error
+        }
+        preflightGenerationInvalidation = reason
+
+        for flight in flights.values {
+            flight.task?.cancel()
+            for waiter in flight.waiters.values {
+                waiter.continuation.resume(
+                    throwing: error
+                )
+            }
+        }
+        flights.removeAll()
+        activeAnalysisPermitID = nil
+        for waiter in analysisPermitWaiters.values {
+            waiter.token.cancel()
+            waiter.continuation.resume(
+                throwing: error
+            )
+        }
+        analysisPermitWaiters.removeAll()
+        analysisPermitOrder.removeAll()
+        declaredPlaybackPressure = .none
+        cache.removeAll()
+        cachedBytes = 0
+        do {
+            if FileManager.default.fileExists(
+                atPath: sessionDirectory.path
+            ) {
+                try FileManager.default.removeItem(
+                    at: sessionDirectory
+                )
+            }
+        } catch {
+            EngineLog.emit(
+                "[HLSVODOriginResourceLoader] invalidated-generation cache cleanup failed",
+                category: .session
+            )
+        }
+        EngineLog.emit(
+            "[HLSVODOriginResourceLoader] preflight generation invalidated: "
+                + error.localizedDescription,
+            category: .session
+        )
+        return error
+    }
+
+    private nonisolated static func preflightInvalidationReason(
+        for error: HLSVODOriginResourceError,
+        resource: HLSVODOriginResourceKey
+    ) -> HLSVODPreflightGenerationInvalidation? {
+        switch error {
+        case .httpStatus(let status)
+        where status == 401 || status == 403:
+            .credentialRejected(
+                statusCode: status,
+                resource: resource
+            )
+        case .httpStatus(let status)
+        where status == 404 || status == 410:
+            .resourceUnavailable(
+                statusCode: status,
+                resource: resource
+            )
+        case .preflightEvidenceMismatch:
+            .contentChanged(resource: resource)
+        case .effectiveOriginMismatch:
+            .effectiveOriginChanged(resource: resource)
+        case .redirectCredentialScopeViolation:
+            .credentialScopeChanged(resource: resource)
+        case .preflightGenerationInvalidated(let reason):
+            reason
+        default:
+            nil
         }
     }
 
