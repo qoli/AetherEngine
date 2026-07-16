@@ -41,11 +41,16 @@ struct BlackCarrierAVPlayerSessionTests {
 
         #expect(session.avPlayer.currentItem == nil)
         #expect(!session.avPlayer.allowsExternalPlayback)
+        #expect(session.transportState == .idle)
+        await #expect(throws: BlackCarrierAVPlayerSessionError.notStarted) {
+            try await session.prepare()
+        }
         try session.start()
 
         let playlistURL = try #require(session.playlistURL)
         #expect(playlistURL.lastPathComponent == "master.m3u8")
         #expect(session.avPlayer.currentItem != nil)
+        #expect(session.transportState == .started)
         #expect(session.avPlayer.currentItem?.preferredForwardBufferDuration == 4)
         #expect(session.avPlayer.currentItem?.appliesPerFrameHDRDisplayMetadata == false)
         #expect(
@@ -73,6 +78,10 @@ struct BlackCarrierAVPlayerSessionTests {
         #expect(!audioInit.isEmpty)
         #expect(!audioSegment.isEmpty)
 
+        try await session.prepare(timeout: 10)
+        #expect(session.transportState == .ready)
+        try await session.prepare(timeout: 10)
+
         #expect(throws: BlackCarrierAVPlayerSessionError.alreadyStarted) {
             try session.start()
         }
@@ -80,11 +89,55 @@ struct BlackCarrierAVPlayerSessionTests {
         session.stop()
         #expect(session.avPlayer.currentItem == nil)
         #expect(session.playlistURL == nil)
+        #expect(session.transportState == .stopped)
         #expect(!FileManager.default.fileExists(atPath: videoDirectory.path))
         #expect(!FileManager.default.fileExists(atPath: audioDirectory.path))
         #expect(throws: BlackCarrierAVPlayerSessionError.alreadyStopped) {
             try session.start()
         }
+    }
+
+    @Test("Preparation rejects a non-positive readiness budget with a typed failure")
+    @MainActor
+    func invalidReadinessBudget() async throws {
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(seconds: 0.25, preferredTimescale: 90_000)
+        )
+        let videoProvider = try BlackCarrierVideoProvider(timeline: timeline)
+        let demuxer = Demuxer()
+        try demuxer.open(reader: DataIOReader(data: makeWAV(seconds: 0.25)))
+        defer { demuxer.close() }
+        let audioStore = try BlackCarrierAudioRenditionStore(
+            metadata: BlackCarrierAudioRenditionMetadata(
+                ordinal: 0,
+                sourceTrackID: 0,
+                language: nil,
+                name: "Audio",
+                isDefault: true,
+                isAutoselect: true
+            ),
+            demuxer: demuxer,
+            audioStreamIndex: demuxer.audioStreamIndex,
+            sourceStartPTS: 0,
+            timeline: timeline
+        )
+        let provider = try BlackCarrierCompositeProvider(
+            videoProvider: videoProvider,
+            audioStores: [audioStore]
+        )
+        let session = BlackCarrierAVPlayerSession(provider: provider)
+        try session.start()
+
+        let error = BlackCarrierAVPlayerSessionError.readinessTimedOut(
+            seconds: 0
+        )
+        await #expect(throws: error) {
+            try await session.prepare(timeout: 0)
+        }
+        #expect(session.transportState == .failed(error))
+
+        session.stop()
+        #expect(session.transportState == .stopped)
     }
 
     private func fetchText(_ url: URL) async throws -> String {
