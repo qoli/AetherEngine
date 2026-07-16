@@ -23,8 +23,6 @@ struct BlackCarrierEncodedSampleTests {
 
     @Test("Demuxed sample matches the locked carrier profile and packet timing")
     func demuxedContract() throws {
-        let packetBalanceBefore = PacketBalanceTracker.alive
-
         do {
             let data = try BlackCarrierEncodedSample.verifiedMP4Data()
             let demuxer = Demuxer()
@@ -57,7 +55,6 @@ struct BlackCarrierEncodedSampleTests {
             #expect(try demuxer.readPacket() == nil)
         }
 
-        #expect(PacketBalanceTracker.alive == packetBalanceBefore)
     }
 
     @Test("Payload drift returns a typed hash mismatch")

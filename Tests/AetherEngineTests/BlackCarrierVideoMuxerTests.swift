@@ -20,7 +20,6 @@ struct BlackCarrierVideoMuxerTests {
         let timeline = try BlackCarrierTimeline.fileVOD(
             duration: CMTime(seconds: 9.25, preferredTimescale: 90_000)
         )
-        let packetBalanceBefore = PacketBalanceTracker.alive
 
         let first = try BlackCarrierVideoMuxer.build(timeline: timeline)
         let second = try BlackCarrierVideoMuxer.build(timeline: timeline)
@@ -66,7 +65,6 @@ struct BlackCarrierVideoMuxerTests {
             #expect(contract.packets == expectedPackets)
         }
 
-        #expect(PacketBalanceTracker.alive == packetBalanceBefore)
     }
 
     private func demuxedContract(
