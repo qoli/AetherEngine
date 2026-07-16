@@ -329,8 +329,8 @@ final class BlackCarrierLazyCompositeProvider:
     }
 
     func prepareForTransportStart() throws {
-        for ordinal in pump.renditionMetadata.indices {
-            do {
+        do {
+            for ordinal in pump.renditionMetadata.indices {
                 guard try pump.initSegment(ordinal: ordinal) != nil,
                       pump.peekMediaSegmentURL(
                           ordinal: ordinal,
@@ -341,11 +341,12 @@ final class BlackCarrierLazyCompositeProvider:
                     record(error)
                     throw error
                 }
-            } catch let error as BlackCarrierMediaFanoutPumpError {
-                let typed = BlackCarrierLazyCompositeProviderError.pump(error)
-                record(typed)
-                throw typed
             }
+            try pump.produce(throughSegment: 0)
+        } catch let error as BlackCarrierMediaFanoutPumpError {
+            let typed = BlackCarrierLazyCompositeProviderError.pump(error)
+            record(typed)
+            throw typed
         }
     }
 
@@ -398,11 +399,13 @@ final class BlackCarrierLazyCompositeProvider:
     }
 
     func mediaSegment(at index: Int) -> Data? {
-        videoProvider.mediaSegment(at: index)
+        guard prepareVideoSegment(index: index) else { return nil }
+        return videoProvider.mediaSegment(at: index)
     }
 
     func mediaSegmentURL(at index: Int) -> URL? {
-        videoProvider.mediaSegmentURL(at: index)
+        guard prepareVideoSegment(index: index) else { return nil }
+        return videoProvider.mediaSegmentURL(at: index)
     }
 
     var segmentCount: Int { videoProvider.segmentCount }
@@ -534,5 +537,19 @@ final class BlackCarrierLazyCompositeProvider:
             return
         }
         record(.pump(error))
+    }
+
+    private func prepareVideoSegment(index: Int) -> Bool {
+        guard 0..<segmentCount ~= index else { return false }
+        do {
+            try pump.produce(throughSegment: index)
+            return true
+        } catch let error as BlackCarrierMediaFanoutPumpError {
+            recordIfTerminal(error)
+            return false
+        } catch {
+            record(.pump(.demuxFailed(reason: String(describing: error))))
+            return false
+        }
     }
 }

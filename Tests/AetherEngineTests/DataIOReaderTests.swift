@@ -70,4 +70,27 @@ struct DataIOReaderTests {
         _ = buf.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 1) }
         #expect(buf[0] == 1)  // cursor still at 0
     }
+
+    @Test("Independent readers do not share cursor position")
+    func independentReader() throws {
+        let original = makeReader([1, 2, 3])
+        let independent = try #require(
+            original.makeIndependentReader() as? DataIOReader
+        )
+        var originalByte = [UInt8](repeating: 0, count: 1)
+        var independentByte = [UInt8](repeating: 0, count: 1)
+
+        _ = originalByte.withUnsafeMutableBufferPointer {
+            original.read($0.baseAddress, size: 1)
+        }
+        _ = originalByte.withUnsafeMutableBufferPointer {
+            original.read($0.baseAddress, size: 1)
+        }
+        _ = independentByte.withUnsafeMutableBufferPointer {
+            independent.read($0.baseAddress, size: 1)
+        }
+
+        #expect(originalByte[0] == 2)
+        #expect(independentByte[0] == 1)
+    }
 }

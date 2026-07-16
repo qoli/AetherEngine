@@ -1,6 +1,7 @@
 import CoreMedia
 import Foundation
 import Libavcodec
+import Libavformat
 import Libavutil
 
 enum BlackCarrierMediaFanoutPumpError:
@@ -9,7 +10,6 @@ enum BlackCarrierMediaFanoutPumpError:
     Sendable,
     Equatable
 {
-    case audioTracksMissing
     case videoStreamMissing
     case invalidRenditionOrdinal(ordinal: Int)
     case invalidSegmentIndex(index: Int)
@@ -34,8 +34,6 @@ enum BlackCarrierMediaFanoutPumpError:
 
     var errorDescription: String? {
         switch self {
-        case .audioTracksMissing:
-            return "Black carrier media fanout requires at least one real audio track"
         case .videoStreamMissing:
             return "Black carrier media fanout video packet sink requires a real video stream"
         case .invalidRenditionOrdinal(let ordinal):
@@ -136,6 +134,9 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     private var videoStreamIndex: Int32
     private let videoPacketSink: VideoPacketSink?
     private let hybridVideoDecodeSink: HybridVideoDecodeSink?
+    private let videoTimeBaseNumerator: Int32
+    private let videoTimeBaseDenominator: Int32
+    private let nominalVideoFrameDuration: CMTime
     private let renditions: [Rendition]
     private var renditionsByStream: [
         Int32: Rendition
@@ -156,6 +157,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     private var requestedRestartGeneration: UInt64?
     private var interruptibleDemuxer: Demuxer
     private var ownsActiveDemuxer = false
+    private var videoProductionEnd: CMTime = .invalid
 
     init(
         demuxer: Demuxer,
@@ -203,10 +205,13 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                 )
             }
         }
-        let tracks = demuxer.audioTrackInfos()
-        guard !tracks.isEmpty else {
-            throw BlackCarrierMediaFanoutPumpError.audioTracksMissing
+        let videoStream = resolvedVideoPacketSink == nil
+            ? nil
+            : demuxer.stream(at: resolvedVideoStreamIndex)
+        if resolvedVideoPacketSink != nil, videoStream == nil {
+            throw BlackCarrierMediaFanoutPumpError.videoStreamMissing
         }
+        let tracks = demuxer.audioTrackInfos()
         let metadata = BlackCarrierCompositeProvider.renditionMetadata(
             for: tracks
         )
@@ -270,6 +275,11 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             : resolvedVideoStreamIndex
         self.videoPacketSink = resolvedVideoPacketSink
         self.hybridVideoDecodeSink = hybridVideoDecodeSink
+        videoTimeBaseNumerator = videoStream?.pointee.time_base.num ?? 0
+        videoTimeBaseDenominator = videoStream?.pointee.time_base.den ?? 0
+        nominalVideoFrameDuration = videoStream.map {
+            Self.nominalFrameDuration(stream: $0)
+        } ?? .invalid
         sourceContract = BlackCarrierDemuxContract(demuxer: demuxer)
         renditionMetadata = metadata
         renditions = prepared
@@ -578,6 +588,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             videoStreamIndex = freshVideoStreamIndex
             summaries.removeAll(keepingCapacity: true)
             isFinished = false
+            videoProductionEnd = .invalid
             generationStartSegmentIndex = expectedSegmentIndex
             retiredDemuxerToClose = demuxer
             demuxer = freshDemuxer
@@ -690,6 +701,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                           let videoPacketSink {
                     do {
                         try videoPacketSink(packet)
+                        updateVideoProductionEnd(packet)
                     } catch {
                         throw BlackCarrierMediaFanoutPumpError
                             .videoPacketSinkFailed(
@@ -929,7 +941,60 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                 && $0.cache.peekURL(index: index) != nil
         }
         guard audioReady else { return false }
+        guard videoSourceCoversSegment(index) else { return false }
         return hybridVideoDecodeSink?.isTargetFrameReady ?? true
+    }
+
+    private func videoSourceCoversSegment(_ index: Int) -> Bool {
+        guard videoPacketSink != nil else { return true }
+        guard timeline.segments.indices.contains(index) else { return false }
+        if isFinished {
+            return true
+        }
+        guard videoProductionEnd.isValid,
+              videoProductionEnd.isNumeric else {
+            return false
+        }
+        let segment = timeline.segments[index]
+        let segmentEnd = CMTimeAdd(
+            segment.startTime,
+            segment.duration
+        )
+        return CMTimeCompare(videoProductionEnd, segmentEnd) >= 0
+    }
+
+    private func updateVideoProductionEnd(
+        _ packet: UnsafeMutablePointer<AVPacket>
+    ) {
+        guard videoTimeBaseNumerator > 0,
+              videoTimeBaseDenominator > 0 else {
+            return
+        }
+        let timestamp = packet.pointee.pts != Int64.min
+            ? packet.pointee.pts
+            : packet.pointee.dts
+        guard timestamp != Int64.min else { return }
+        let start = CMTime(
+            value: timestamp * Int64(videoTimeBaseNumerator),
+            timescale: videoTimeBaseDenominator
+        )
+        let duration = packet.pointee.duration > 0
+            ? CMTime(
+                value: packet.pointee.duration
+                    * Int64(videoTimeBaseNumerator),
+                timescale: videoTimeBaseDenominator
+            )
+            : nominalVideoFrameDuration
+        let end = duration.isValid
+            && duration.isNumeric
+            && CMTimeCompare(duration, .zero) > 0
+            ? CMTimeAdd(start, duration)
+            : start
+        if !videoProductionEnd.isValid
+            || !videoProductionEnd.isNumeric
+            || CMTimeCompare(end, videoProductionEnd) > 0 {
+            videoProductionEnd = end
+        }
     }
 
     private func throwIfVideoDecoderFailed() throws {
@@ -1076,6 +1141,22 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                         )
                 }
             }
+        )
+    }
+
+    private static func nominalFrameDuration(
+        stream: UnsafeMutablePointer<AVStream>
+    ) -> CMTime {
+        let frameRate = stream.pointee.avg_frame_rate.den > 0
+            && stream.pointee.avg_frame_rate.num > 0
+            ? stream.pointee.avg_frame_rate
+            : stream.pointee.r_frame_rate
+        guard frameRate.num > 0, frameRate.den > 0 else {
+            return .invalid
+        }
+        return CMTime(
+            value: Int64(frameRate.den),
+            timescale: frameRate.num
         )
     }
 }

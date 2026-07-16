@@ -42,4 +42,8 @@ final class DataIOReader: IOReader, @unchecked Sendable {
     }
 
     func close() {}
+
+    func makeIndependentReader() -> IOReader? {
+        DataIOReader(data: data)
+    }
 }

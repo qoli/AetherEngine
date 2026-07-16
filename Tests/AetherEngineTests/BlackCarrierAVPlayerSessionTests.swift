@@ -33,6 +33,23 @@ struct BlackCarrierAVPlayerSessionTests {
         var playlistType: HLSPlaylistType { .vod }
     }
 
+    private final class FrameCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+
+        func increment() {
+            lock.lock()
+            value += 1
+            lock.unlock()
+        }
+
+        var count: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
     @Test("Session serves the composite carrier and creates a restricted AVPlayer item")
     @MainActor
     func sessionLifecycle() async throws {
@@ -183,6 +200,52 @@ struct BlackCarrierAVPlayerSessionTests {
         #expect(provider.didClose)
         #expect(session.playlistURL == nil)
         #expect(session.transportState == .stopped)
+    }
+
+    @Test("Video-only carrier reaches AVPlayer readiness without silent audio")
+    @MainActor
+    func videoOnlyCarrierSession() async throws {
+        let sourceData = try BlackCarrierEncodedSample.verifiedMP4Data()
+        let sourceDemuxer = Demuxer()
+        try sourceDemuxer.open(reader: DataIOReader(data: sourceData))
+        let duration = sourceDemuxer.duration
+        sourceDemuxer.close()
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(
+                seconds: duration,
+                preferredTimescale: 90_000
+            )
+        )
+        let videoProvider = try BlackCarrierVideoProvider(
+            timeline: timeline
+        )
+        let frameCounter = FrameCounter()
+        let provider = try BlackCarrierLazyCompositeProvider
+            .buildSeekableVOD(
+                videoProvider: videoProvider,
+                source: .custom(
+                    DataIOReader(data: sourceData),
+                    formatHint: "mp4"
+                ),
+                options: LoadOptions(),
+                timeline: timeline,
+                decodedFrameHandler: { _ in
+                    frameCounter.increment()
+                }
+            )
+        let session = BlackCarrierAVPlayerSession(provider: provider)
+        try session.start()
+        defer { session.stop() }
+
+        let playlistURL = try #require(session.playlistURL)
+        let master = try await fetchText(playlistURL)
+        #expect(master.contains("CODECS=\"avc1.42C01E\""))
+        #expect(!master.contains("#EXT-X-MEDIA:TYPE=AUDIO"))
+        #expect(!master.contains("AUDIO=\"audio\""))
+
+        try await session.prepare(timeout: 10)
+        #expect(session.transportState == .ready)
+        #expect(frameCounter.count > 0)
     }
 
     private func fetchText(_ url: URL) async throws -> String {

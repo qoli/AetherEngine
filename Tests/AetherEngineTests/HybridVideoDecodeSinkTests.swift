@@ -268,6 +268,60 @@ struct HybridVideoDecodeSinkTests {
         #expect(provider.terminalError == nil)
     }
 
+    @Test("Video-only source uses carrier transport without a silent audio rendition")
+    func videoOnlyCarrier() throws {
+        let duration = 5.25
+        let sourceData = try makeVideoOnlySource(seconds: duration)
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(
+                seconds: duration,
+                preferredTimescale: 90_000
+            )
+        )
+        let videoProvider = try BlackCarrierVideoProvider(
+            timeline: timeline
+        )
+        let frames = FrameBox()
+        let provider = try BlackCarrierLazyCompositeProvider
+            .buildSeekableVOD(
+                videoProvider: videoProvider,
+                source: .custom(
+                    ClonableDataReader(data: sourceData),
+                    formatHint: "mp4"
+                ),
+                options: LoadOptions(),
+                timeline: timeline,
+                decodedFrameHandler: { frames.append($0) }
+            )
+        defer { provider.close() }
+
+        try provider.prepareForTransportStart()
+        #expect(provider.alternateAudioRenditions.isEmpty)
+        #expect(provider.masterCodecs == "avc1.42C01E")
+        #expect(provider.mediaSegmentURL(at: 0) != nil)
+        #expect(frames.snapshot().contains(where: {
+            $0.generation == 0
+        }))
+
+        var classifier = HybridSeekIntentClassifier(timeline: timeline)
+        let intent = try classifier.registerExplicitHostSeek(
+            to: CMTime(seconds: 4.5, preferredTimescale: 90_000)
+        )
+        #expect(try provider.restartMedia(for: intent) == .applied(
+            generation: 1,
+            segmentIndex: 1
+        ))
+        #expect(provider.mediaSegmentURL(at: 1) != nil)
+        #expect(frames.snapshot().contains(where: {
+            $0.generation == 1
+                && CMTimeCompare(
+                    $0.presentationTime,
+                    CMTime(seconds: 4, preferredTimescale: 90_000)
+                ) >= 0
+        }))
+        #expect(provider.terminalError == nil)
+    }
+
     private func openDemuxer(data: Data) throws -> Demuxer {
         let demuxer = Demuxer()
         try demuxer.open(reader: DataIOReader(data: data))
@@ -439,6 +493,82 @@ struct HybridVideoDecodeSinkTests {
                     : muxer.muxerAudioTimeBase
             )
             #expect(muxer.writePacket(entry.packet) >= 0)
+        }
+        let finalized = try #require(muxer.finalize())
+        return try #require(initSegment)
+            + Data(contentsOf: finalized.path)
+    }
+
+    private func makeVideoOnlySource(seconds: Double) throws -> Data {
+        let videoData = try BlackCarrierEncodedSample.verifiedMP4Data()
+        let videoDemuxer = try openDemuxer(data: videoData)
+        defer { videoDemuxer.close() }
+        let videoIndex = videoDemuxer.videoStreamIndex
+        let videoStream = try #require(
+            videoDemuxer.stream(at: videoIndex)
+        )
+        let sourceVideoPacket = try #require(
+            try videoDemuxer.readPacket()
+        )
+        defer {
+            var packetToFree: UnsafeMutablePointer<AVPacket>? =
+                sourceVideoPacket
+            trackedPacketFree(&packetToFree)
+        }
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "HybridVideoOnly-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        var initSegment: Data?
+        let muxer = try MP4SegmentMuxer(
+            initialSegmentIndex: 0,
+            sessionDir: directory,
+            video: MP4SegmentMuxer.VideoConfig(
+                codecpar: UnsafePointer(videoStream.pointee.codecpar),
+                timeBase: videoStream.pointee.time_base,
+                codecTagOverride: "avc1"
+            ),
+            audio: nil,
+            onInitCaptured: { initSegment = $0 }
+        )
+
+        for second in 0..<Int(ceil(seconds)) {
+            let start = Double(second)
+            let sampleDuration = min(1, seconds - start)
+            guard sampleDuration > 0,
+                  let packet = av_packet_clone(sourceVideoPacket) else {
+                continue
+            }
+            defer {
+                var packetToFree: UnsafeMutablePointer<AVPacket>? = packet
+                trackedPacketFree(&packetToFree)
+            }
+            packet.pointee.pts = av_rescale_q(
+                Int64(start * 90_000),
+                AVRational(num: 1, den: 90_000),
+                videoStream.pointee.time_base
+            )
+            packet.pointee.dts = packet.pointee.pts
+            packet.pointee.duration = av_rescale_q(
+                Int64(sampleDuration * 90_000),
+                AVRational(num: 1, den: 90_000),
+                videoStream.pointee.time_base
+            )
+            packet.pointee.stream_index = muxer.videoOutputStreamIndex
+            av_packet_rescale_ts(
+                packet,
+                videoStream.pointee.time_base,
+                muxer.muxerVideoTimeBase
+            )
+            #expect(muxer.writePacket(packet) >= 0)
         }
         let finalized = try #require(muxer.finalize())
         return try #require(initSegment)

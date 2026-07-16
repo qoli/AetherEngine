@@ -195,7 +195,6 @@ enum BlackCarrierCompositeProviderError:
     Sendable,
     Equatable
 {
-    case audioTracksMissing
     case audioDemuxFailed(reason: String)
     case audioMuxerFailed(
         trackID: Int,
@@ -216,8 +215,6 @@ enum BlackCarrierCompositeProviderError:
 
     var errorDescription: String? {
         switch self {
-        case .audioTracksMissing:
-            return "Carrier source contains no real audio track"
         case .audioDemuxFailed(let reason):
             return "Carrier audio demux failed: \(reason)"
         case .audioMuxerFailed(let trackID, let error):
@@ -333,8 +330,8 @@ final class BlackCarrierCompositeProvider:
     ///
     /// This is the deterministic VOD assembly boundary for the first hybrid carrier. It adopts
     /// `videoProvider` immediately and closes the video plus every audio cache if any track,
-    /// packet, or final store fails. Inputs without audio fail explicitly; the separate
-    /// silent-carrier path must create its synthetic audio track before calling this builder.
+    /// packet, or final store fails. Inputs without audio remain video-only and never gain a
+    /// synthetic silent rendition.
     static func build(
         videoProvider: BlackCarrierVideoProvider,
         audioDemuxer: Demuxer,
@@ -513,8 +510,6 @@ final class BlackCarrierCompositeProvider:
         from error: BlackCarrierMediaFanoutPumpError
     ) -> BlackCarrierCompositeProviderError {
         switch error {
-        case .audioTracksMissing:
-            return .audioTracksMissing
         case .audioMuxerFailed(let trackID, let error):
             return .audioMuxerFailed(trackID: trackID, error: error)
         case .audioStoreFailed(let error):
