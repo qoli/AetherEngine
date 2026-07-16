@@ -652,6 +652,10 @@ public final class AetherEngine: ObservableObject {
     /// #95 audio tap lifecycle owner; nil when no tap installed. Torn down by stopInternal.
     var audioTapController: AudioTapController?
 
+    /// Independent, range-addressable analysis readers. These are never the playback tap: each session owns a
+    /// separate demuxer cursor and is cancelled on teardown or an audio-track reload.
+    var audioAnalysisSessions: [UUID: AudioAnalysisSession] = [:]
+
     /// #77: in-band CEA-608 tap state. The tap owns the cue buffer and publishes snapshots; `ccCueSnapshot`
     /// is the latest, mirrored into `subtitleCues` while the CC track is active.
     var closedCaptionTap: ClosedCaptionTap?
@@ -2384,6 +2388,9 @@ public final class AetherEngine: ObservableObject {
             "[AetherEngine] selectAudioTrack: scheduling switch to stream \(index)",
             category: .engine
         )
+        // Analysis requests pin an explicit source stream and range. The caller must deliberately reissue one
+        // for the new track; carrying it across this reload would silently analyze the wrong language.
+        cancelAudioAnalysisStreams()
 
         let gen = loadGeneration
         Task { @MainActor [weak self] in
@@ -2517,6 +2524,7 @@ public final class AetherEngine: ObservableObject {
         // #95: stop the tap reader before the session (and its SegmentCache) goes away.
         audioTapController?.teardown()
         audioTapController = nil
+        cancelAudioAnalysisStreams()
         // markClosed() aborts a probe blocked in avformat_open_input/find_stream_info (lock-free, idempotent).
         inFlightProbeDemuxer?.markClosed()
         liveTelemetrySampler?.stop()

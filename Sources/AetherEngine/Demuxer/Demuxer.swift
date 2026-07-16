@@ -905,19 +905,26 @@ public final class Demuxer: @unchecked Sendable {
 
     /// Seek via avformat_seek_file (not av_seek_frame: assertion failures
     /// in matroskadec.c with nested elements).
-    func seek(to seconds: Double) {
+    /// Reposition the demuxer on the source timeline.
+    ///
+    /// The boolean result is deliberately exposed to independent readers such as audio analysis: they
+    /// must not label data from an arbitrary cursor as a requested time range when FFmpeg rejects the seek.
+    @discardableResult
+    func seek(to seconds: Double) -> Bool {
         accessLock.lock()
         defer { accessLock.unlock() }
-        guard let ctx = formatContext else { return }
+        guard let ctx = formatContext else { return false }
         let timestamp = Int64(seconds * Double(AV_TIME_BASE))
         let ret = avformat_seek_file(ctx, -1, Int64.min, timestamp, Int64.max, 0)
         if ret < 0 {
             #if DEBUG
             EngineLog.emit("[Demuxer] Seek to \(seconds)s failed: \(ret)", category: .demux)
             #endif
+            return false
         }
         avformat_flush(ctx)  // prevents assertion failures in matroskadec.c
         lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
+        return true
     }
 
     /// #112 round 10: latched by the side reader once a timestamp positioning seek timed out or failed on this
