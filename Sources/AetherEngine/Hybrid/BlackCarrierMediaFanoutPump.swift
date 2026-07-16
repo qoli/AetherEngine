@@ -137,6 +137,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     private let videoTimeBaseNumerator: Int32
     private let videoTimeBaseDenominator: Int32
     private let nominalVideoFrameDuration: CMTime
+    private let videoSourceStartPTS: Int64
     private let renditions: [Rendition]
     private var renditionsByStream: [
         Int32: Rendition
@@ -196,7 +197,10 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                 throw BlackCarrierMediaFanoutPumpError.videoStreamMissing
             }
             do {
-                guard try hybridVideoDecodeSink.validate(stream: stream) else {
+                guard try hybridVideoDecodeSink.validate(
+                    demuxer: demuxer,
+                    stream: stream
+                ) else {
                     throw HybridVideoDecodeSinkError.streamContractMismatch
                 }
             } catch {
@@ -280,6 +284,12 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         nominalVideoFrameDuration = videoStream.map {
             Self.nominalFrameDuration(stream: $0)
         } ?? .invalid
+        videoSourceStartPTS = resolvedVideoPacketSink == nil
+            ? 0
+            : BlackCarrierSourceAxis.sourceStartPTS(
+                demuxer: demuxer,
+                streamIndex: resolvedVideoStreamIndex
+            )
         sourceContract = BlackCarrierDemuxContract(demuxer: demuxer)
         renditionMetadata = metadata
         renditions = prepared
@@ -523,6 +533,12 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             }
 
             let segment = timeline.segments[expectedSegmentIndex]
+            let videoDecodeRestartAnchor =
+                Self.videoDecodeRestartAnchor(
+                    demuxer: freshDemuxer,
+                    streamIndex: freshVideoStreamIndex,
+                    targetTime: segment.startTime
+                )
             guard freshDemuxer.seek(
                 to: CMTimeGetSeconds(segment.startTime)
             ) else {
@@ -564,6 +580,9 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                     try hybridVideoDecodeSink.beginGeneration(
                         requestedGeneration,
                         targetTime: target,
+                        restartDecodeAnchorTime:
+                            videoDecodeRestartAnchor,
+                        demuxer: freshDemuxer,
                         stream: freshVideoStream
                     )
                 } catch {
@@ -978,9 +997,13 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             ? packet.pointee.pts
             : packet.pointee.dts
         guard timestamp != Int64.min else { return }
-        let start = CMTime(
-            value: timestamp * Int64(videoTimeBaseNumerator),
-            timescale: videoTimeBaseDenominator
+        let start = BlackCarrierSourceAxis.timelineTime(
+            timestamp: timestamp,
+            sourceStartPTS: videoSourceStartPTS,
+            timeBase: AVRational(
+                num: videoTimeBaseNumerator,
+                den: videoTimeBaseDenominator
+            )
         )
         let duration = packet.pointee.duration > 0
             ? CMTime(
@@ -1069,34 +1092,6 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         generationLock.unlock()
     }
 
-    private static func sourceStartPTS(
-        demuxer: Demuxer,
-        streamIndex: Int32
-    ) -> Int64 {
-        guard let stream = demuxer.stream(at: streamIndex) else { return 0 }
-        let formatStart = demuxer.formatStartTime
-        if formatStart != Int64.min {
-            return av_rescale_q(
-                formatStart,
-                AVRational(num: 1, den: AV_TIME_BASE),
-                stream.pointee.time_base
-            )
-        }
-        let videoStreamIndex = demuxer.videoStreamIndex
-        if videoStreamIndex >= 0,
-           let videoStream = demuxer.stream(at: videoStreamIndex),
-           videoStream.pointee.start_time != Int64.min {
-            return av_rescale_q(
-                videoStream.pointee.start_time,
-                videoStream.pointee.time_base,
-                stream.pointee.time_base
-            )
-        }
-        return stream.pointee.start_time == Int64.min
-            ? 0
-            : stream.pointee.start_time
-    }
-
     private static func makeWriter(
         demuxer: Demuxer,
         streamIndex: Int32,
@@ -1113,7 +1108,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         try BlackCarrierAudioRenditionMuxer.makeWriter(
             demuxer: demuxer,
             audioStreamIndex: streamIndex,
-            sourceStartPTS: sourceStartPTS(
+            sourceStartPTS: BlackCarrierSourceAxis.sourceStartPTS(
                 demuxer: demuxer,
                 streamIndex: streamIndex
             ),
@@ -1162,5 +1157,42 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             value: Int64(frameRate.den),
             timescale: frameRate.num
         )
+    }
+
+    private static func videoDecodeRestartAnchor(
+        demuxer: Demuxer,
+        streamIndex: Int32,
+        targetTime: CMTime
+    ) -> CMTime? {
+        guard streamIndex >= 0,
+              let stream = demuxer.stream(at: streamIndex) else {
+            return nil
+        }
+        let sourceStartPTS =
+            BlackCarrierSourceAxis.sourceStartPTS(
+                demuxer: demuxer,
+                streamIndex: streamIndex
+            )
+        let timeBase = stream.pointee.time_base
+        return demuxer.indexedKeyframes(
+            streamIndex: streamIndex
+        )
+        .lazy
+        .map {
+            BlackCarrierSourceAxis.timelineTime(
+                timestamp: $0,
+                sourceStartPTS: sourceStartPTS,
+                timeBase: timeBase
+            )
+        }
+        .filter {
+            $0.isValid
+                && $0.isNumeric
+                && CMTimeCompare($0, .zero) >= 0
+                && CMTimeCompare($0, targetTime) <= 0
+        }
+        .max(by: {
+            CMTimeCompare($0, $1) < 0
+        })
     }
 }

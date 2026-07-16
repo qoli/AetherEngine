@@ -17,8 +17,14 @@ struct HybridVideoStreamContract: Sendable, Equatable {
     let nominalFrameDuration: CMTime
     let packetTimeBaseNumerator: Int32
     let packetTimeBaseDenominator: Int32
+    let sourceStartPTS: Int64
+    let sourceStartTime: CMTime
+    let sourceTimestampTolerance: Int64
 
-    init(stream: UnsafeMutablePointer<AVStream>) throws {
+    init(
+        demuxer: Demuxer,
+        stream: UnsafeMutablePointer<AVStream>
+    ) throws {
         let codecParameters = stream.pointee.codecpar.pointee
         codecID = codecParameters.codec_id.rawValue
         codedWidth = Int(codecParameters.width)
@@ -48,6 +54,27 @@ struct HybridVideoStreamContract: Sendable, Equatable {
         rotationDegrees = try Self.rotationDegrees(stream: stream)
         packetTimeBaseNumerator = stream.pointee.time_base.num
         packetTimeBaseDenominator = stream.pointee.time_base.den
+        guard packetTimeBaseNumerator > 0,
+              packetTimeBaseDenominator > 0 else {
+            throw HybridVideoDecodeSinkError.invalidPacketTimeBase
+        }
+        let resolvedSourceStartPTS =
+            BlackCarrierSourceAxis.sourceStartPTS(
+            demuxer: demuxer,
+            streamIndex: stream.pointee.index
+        )
+        let sourceStartValue =
+            resolvedSourceStartPTS.multipliedReportingOverflow(
+                by: Int64(stream.pointee.time_base.num)
+            )
+        guard !sourceStartValue.overflow else {
+            throw HybridVideoDecodeSinkError.timestampRebaseOverflow
+        }
+        sourceStartPTS = resolvedSourceStartPTS
+        sourceStartTime = CMTime(
+            value: sourceStartValue.partialValue,
+            timescale: stream.pointee.time_base.den
+        )
 
         let frameRate = stream.pointee.avg_frame_rate.den > 0
             && stream.pointee.avg_frame_rate.num > 0
@@ -61,6 +88,29 @@ struct HybridVideoStreamContract: Sendable, Equatable {
         } else {
             nominalFrameDuration = .invalid
         }
+        let timeBase = AVRational(
+            num: packetTimeBaseNumerator,
+            den: packetTimeBaseDenominator
+        )
+        let nominalTicks = BlackCarrierSourceAxis.streamTicks(
+            for: nominalFrameDuration,
+            timeBase: timeBase
+        ) ?? 0
+        let doubledNominal =
+            nominalTicks.multipliedReportingOverflow(by: 2)
+        guard !doubledNominal.overflow else {
+            throw HybridVideoDecodeSinkError.timestampRebaseOverflow
+        }
+        let oneTenthSecond = av_rescale_q(
+            100_000,
+            AVRational(num: 1, den: 1_000_000),
+            timeBase
+        )
+        sourceTimestampTolerance = max(
+            1,
+            doubledNominal.partialValue,
+            oneTenthSecond
+        )
     }
 
     private static func rotationDegrees(
@@ -105,6 +155,12 @@ enum HybridVideoDecodeSinkError:
     case invalidDisplayMatrix
     case packetCloneFailed
     case packetTimestampMissing
+    case invalidPacketTimeBase
+    case restartTimestampRebaseAmbiguous(
+        generation: UInt64,
+        timestamp: Int64
+    )
+    case timestampRebaseOverflow
     case invalidTargetTime
     case invalidDecodeDemand
     case invalidQueueBounds(bytes: Int, packets: Int)
@@ -127,6 +183,15 @@ enum HybridVideoDecodeSinkError:
             return "Hybrid compressed-video packet could not be retained"
         case .packetTimestampMissing:
             return "Hybrid compressed-video packet has no decode or presentation timestamp"
+        case .invalidPacketTimeBase:
+            return "Hybrid video stream has an invalid packet time base"
+        case .restartTimestampRebaseAmbiguous(
+            let generation,
+            let timestamp
+        ):
+            return "Hybrid video generation \(generation) reset near source timestamp \(timestamp) without byte-position evidence"
+        case .timestampRebaseOverflow:
+            return "Hybrid video timestamp rebase exceeded the source timeline range"
         case .invalidTargetTime:
             return "Hybrid video generation requires a finite non-negative target time"
         case .invalidDecodeDemand:
@@ -182,6 +247,11 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
     private var queuedBytes = 0
     private var sourceEnded = false
     private var didFinishDecoder = false
+    private var sourceOriginPacketPosition: Int64?
+    private var acceptsSourceOriginPacketPosition = true
+    private var generationTimestampRebase: Int64? = 0
+    private var restartDecodeAnchorPTS: Int64?
+    private var restartBeyondSourceOrigin = false
 
     init(
         demuxer: Demuxer,
@@ -207,7 +277,10 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
               let codecParameters = stream.pointee.codecpar else {
             throw HybridVideoDecodeSinkError.videoStreamMissing
         }
-        streamContract = try HybridVideoStreamContract(stream: stream)
+        streamContract = try HybridVideoStreamContract(
+            demuxer: demuxer,
+            stream: stream
+        )
         generation = initialGeneration
         targetTime = initialTargetTime
         clockDecodeDemand = CMTimeAdd(
@@ -267,8 +340,14 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         return targetFrameReady
     }
 
-    func validate(stream: UnsafeMutablePointer<AVStream>) throws -> Bool {
-        try HybridVideoStreamContract(stream: stream) == streamContract
+    func validate(
+        demuxer: Demuxer,
+        stream: UnsafeMutablePointer<AVStream>
+    ) throws -> Bool {
+        try HybridVideoStreamContract(
+            demuxer: demuxer,
+            stream: stream
+        ) == streamContract
     }
 
     func consume(
@@ -277,6 +356,7 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         operationLock.lock()
         defer { operationLock.unlock() }
         try throwIfUnavailable()
+        try applyGenerationTimestampRebaseIfNeeded(packet)
         let decodeTime = packetDecodeTime(packet)
         guard decodeTime.isValid, decodeTime.isNumeric else {
             let error = HybridVideoDecodeSinkError.packetTimestampMissing
@@ -331,6 +411,8 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
     func beginGeneration(
         _ generation: UInt64,
         targetTime: CMTime,
+        restartDecodeAnchorTime: CMTime?,
+        demuxer: Demuxer,
         stream: UnsafeMutablePointer<AVStream>
     ) throws {
         operationLock.lock()
@@ -340,7 +422,21 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
             recordFailure(error)
             throw error
         }
-        guard try validate(stream: stream) else {
+        if let restartDecodeAnchorTime {
+            guard Self.isValidTimelineTime(restartDecodeAnchorTime),
+                  CMTimeCompare(
+                    restartDecodeAnchorTime,
+                    targetTime
+                  ) <= 0 else {
+                let error = HybridVideoDecodeSinkError.invalidTargetTime
+                recordFailure(error)
+                throw error
+            }
+        }
+        guard try validate(
+            demuxer: demuxer,
+            stream: stream
+        ) else {
             let error = HybridVideoDecodeSinkError.streamContractMismatch
             recordFailure(error)
             throw error
@@ -366,6 +462,29 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
             targetTime,
             CMTime(seconds: 4, preferredTimescale: 600)
         )
+        let timeBase = AVRational(
+            num: streamContract.packetTimeBaseNumerator,
+            den: streamContract.packetTimeBaseDenominator
+        )
+        if let restartDecodeAnchorTime {
+            guard let anchorTicks =
+                    BlackCarrierSourceAxis.streamTicks(
+                        for: restartDecodeAnchorTime,
+                        timeBase: timeBase
+                    ) else {
+                let error = HybridVideoDecodeSinkError
+                    .invalidTargetTime
+                recordFailure(error)
+                throw error
+            }
+            restartDecodeAnchorPTS = anchorTicks
+        } else {
+            restartDecodeAnchorPTS = nil
+        }
+        restartBeyondSourceOrigin =
+            CMTimeCompare(targetTime, .zero) > 0
+        generationTimestampRebase = nil
+        acceptsSourceOriginPacketPosition = false
         sourceEnded = false
         didFinishDecoder = false
     }
@@ -433,9 +552,18 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
             && streamContract.videoFormat == .hdr10
             ? VideoFormat.hdr10Plus
             : streamContract.videoFormat
+        let normalizedPresentationTime = CMTimeSubtract(
+            presentationTime,
+            streamContract.sourceStartTime
+        )
+        guard normalizedPresentationTime.isValid,
+              normalizedPresentationTime.isNumeric else {
+            recordFailure(.packetTimestampMissing)
+            return
+        }
         let frame = DecodedVideoFrame(
             pixelBuffer: pixelBuffer,
-            presentationTime: presentationTime,
+            presentationTime: normalizedPresentationTime,
             duration: resolvedDuration,
             videoFormat: videoFormat,
             geometry: DecodedVideoFrameGeometry(
@@ -521,11 +649,138 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
               streamContract.packetTimeBaseDenominator > 0 else {
             return .invalid
         }
-        return CMTime(
-            value: timestamp
-                * Int64(streamContract.packetTimeBaseNumerator),
-            timescale: streamContract.packetTimeBaseDenominator
+        return BlackCarrierSourceAxis.timelineTime(
+            timestamp: timestamp,
+            sourceStartPTS: streamContract.sourceStartPTS,
+            timeBase: AVRational(
+                num: streamContract.packetTimeBaseNumerator,
+                den: streamContract.packetTimeBaseDenominator
+            )
         )
+    }
+
+    private func applyGenerationTimestampRebaseIfNeeded(
+        _ packet: UnsafeMutablePointer<AVPacket>
+    ) throws {
+        if sourceOriginPacketPosition == nil,
+           acceptsSourceOriginPacketPosition,
+           packet.pointee.pos >= 0 {
+            sourceOriginPacketPosition = packet.pointee.pos
+        }
+        if let generationTimestampRebase {
+            try applyTimestampRebase(
+                generationTimestampRebase,
+                to: packet
+            )
+            return
+        }
+        let timestamp = packet.pointee.pts != Int64.min
+            ? packet.pointee.pts
+            : packet.pointee.dts
+        guard timestamp != Int64.min else {
+            let error = HybridVideoDecodeSinkError
+                .packetTimestampMissing
+            recordFailure(error)
+            throw error
+        }
+        let originDelta = timestamp.subtractingReportingOverflow(
+            streamContract.sourceStartPTS
+        )
+        guard !originDelta.overflow,
+              originDelta.partialValue != Int64.min else {
+            let error = HybridVideoDecodeSinkError
+                .timestampRebaseOverflow
+            recordFailure(error)
+            throw error
+        }
+        let tolerance = streamContract.sourceTimestampTolerance
+        let isNearSourceOrigin =
+            abs(originDelta.partialValue) <= tolerance
+        let shouldInspectReset =
+            restartBeyondSourceOrigin && isNearSourceOrigin
+        let rebase: Int64
+        if shouldInspectReset {
+            guard let sourceOriginPacketPosition,
+                  packet.pointee.pos >= 0 else {
+                let error = HybridVideoDecodeSinkError
+                    .restartTimestampRebaseAmbiguous(
+                        generation: generation,
+                        timestamp: timestamp
+                    )
+                recordFailure(error)
+                throw error
+            }
+            if packet.pointee.pos == sourceOriginPacketPosition {
+                rebase = 0
+            } else {
+                guard let restartDecodeAnchorPTS else {
+                    let error = HybridVideoDecodeSinkError
+                        .restartTimestampRebaseAmbiguous(
+                            generation: generation,
+                            timestamp: timestamp
+                        )
+                    recordFailure(error)
+                    throw error
+                }
+                let expected = streamContract.sourceStartPTS
+                    .addingReportingOverflow(
+                        restartDecodeAnchorPTS
+                    )
+                let delta = expected.partialValue
+                    .subtractingReportingOverflow(timestamp)
+                guard !expected.overflow, !delta.overflow else {
+                    let error = HybridVideoDecodeSinkError
+                        .timestampRebaseOverflow
+                    recordFailure(error)
+                    throw error
+                }
+                rebase = delta.partialValue
+            }
+        } else {
+            rebase = 0
+        }
+        generationTimestampRebase = rebase
+        try applyTimestampRebase(rebase, to: packet)
+        if rebase != 0 {
+            EngineLog.emit(
+                "[HybridVideoDecodeSink] restart timestamp rebase "
+                    + "generation=\(generation) raw=\(timestamp) "
+                    + "anchor=\(restartDecodeAnchorPTS ?? 0) "
+                    + "delta=\(rebase)",
+                category: .session
+            )
+        }
+    }
+
+    private func applyTimestampRebase(
+        _ rebase: Int64,
+        to packet: UnsafeMutablePointer<AVPacket>
+    ) throws {
+        guard rebase != 0 else { return }
+        if packet.pointee.pts != Int64.min {
+            let value = packet.pointee.pts.addingReportingOverflow(
+                rebase
+            )
+            guard !value.overflow else {
+                let error = HybridVideoDecodeSinkError
+                    .timestampRebaseOverflow
+                recordFailure(error)
+                throw error
+            }
+            packet.pointee.pts = value.partialValue
+        }
+        if packet.pointee.dts != Int64.min {
+            let value = packet.pointee.dts.addingReportingOverflow(
+                rebase
+            )
+            guard !value.overflow else {
+                let error = HybridVideoDecodeSinkError
+                    .timestampRebaseOverflow
+                recordFailure(error)
+                throw error
+            }
+            packet.pointee.dts = value.partialValue
+        }
     }
 
     private func shouldDecode(decodeTime: CMTime) -> Bool {

@@ -139,6 +139,8 @@ struct HybridVideoDecodeSinkTests {
         try sink.beginGeneration(
             8,
             targetTime: .zero,
+            restartDecodeAnchorTime: .zero,
+            demuxer: secondDemuxer,
             stream: secondStream
         )
         try feedVideoPackets(from: secondDemuxer, into: sink)
@@ -212,6 +214,308 @@ struct HybridVideoDecodeSinkTests {
             try sink.consume(packet)
         }
         #expect(sink.failure == .packetTimestampMissing)
+    }
+
+    @Test("Invalid video packet time base fails before decoder creation")
+    func invalidPacketTimeBaseFails() throws {
+        let data = try BlackCarrierEncodedSample.verifiedMP4Data()
+        let demuxer = try openDemuxer(data: data)
+        defer { demuxer.close() }
+        let stream = try #require(demuxer.stream(
+            at: demuxer.videoStreamIndex
+        ))
+        let original = stream.pointee.time_base
+        stream.pointee.time_base = AVRational(num: 0, den: 0)
+        defer { stream.pointee.time_base = original }
+
+        #expect(throws: HybridVideoDecodeSinkError
+            .invalidPacketTimeBase) {
+            _ = try HybridVideoDecodeSink(
+                demuxer: demuxer,
+                initialGeneration: 0,
+                onFrame: { _ in }
+            )
+        }
+    }
+
+    @Test("Non-zero source origin is normalized before decode demand and frame delivery")
+    func nonZeroSourceOriginNormalization() throws {
+        let data = try makeVideoOnlySource(
+            seconds: 1,
+            sourceStartSeconds: 5
+        )
+        let demuxer = try openDemuxer(data: data)
+        defer { demuxer.close() }
+        let frames = FrameBox()
+        let sink = try HybridVideoDecodeSink(
+            demuxer: demuxer,
+            initialGeneration: 0,
+            onFrame: { frames.append($0) }
+        )
+        defer { sink.close() }
+
+        #expect(
+            abs(sink.streamContract.sourceStartTime.seconds - 5)
+                < 0.000_001
+        )
+        try feedVideoPackets(from: demuxer, into: sink)
+
+        let frame = try #require(frames.snapshot().first)
+        #expect(abs(frame.presentationTime.seconds) < 0.000_001)
+        #expect(sink.isTargetFrameReady)
+    }
+
+    @Test("Restart timestamp reset rebases only with distinct packet-position evidence")
+    func restartTimestampResetRebase() throws {
+        let data = try BlackCarrierEncodedSample.verifiedMP4Data()
+        let initialDemuxer = try openDemuxer(data: data)
+        defer { initialDemuxer.close() }
+        let frames = FrameBox()
+        let sink = try HybridVideoDecodeSink(
+            demuxer: initialDemuxer,
+            initialGeneration: 7,
+            onFrame: { frames.append($0) }
+        )
+        defer { sink.close() }
+        let initialPacket = try #require(
+            try initialDemuxer.readPacket()
+        )
+        let originPosition = initialPacket.pointee.pos
+        #expect(originPosition >= 0)
+        try sink.consume(initialPacket)
+        var initialPacketToFree:
+            UnsafeMutablePointer<AVPacket>? = initialPacket
+        trackedPacketFree(&initialPacketToFree)
+        try sink.finish()
+
+        let freshDemuxer = try openDemuxer(data: data)
+        defer { freshDemuxer.close() }
+        let freshStream = try #require(freshDemuxer.stream(
+            at: freshDemuxer.videoStreamIndex
+        ))
+        try sink.beginGeneration(
+            8,
+            targetTime: CMTime(
+                seconds: 4.5,
+                preferredTimescale: 600
+            ),
+            restartDecodeAnchorTime: CMTime(
+                seconds: 4,
+                preferredTimescale: 600
+            ),
+            demuxer: freshDemuxer,
+            stream: freshStream
+        )
+        let resetPacket = try #require(
+            try freshDemuxer.readPacket()
+        )
+        defer {
+            var packetToFree:
+                UnsafeMutablePointer<AVPacket>? = resetPacket
+            trackedPacketFree(&packetToFree)
+        }
+        resetPacket.pointee.pts =
+            sink.streamContract.sourceStartPTS
+        resetPacket.pointee.dts =
+            sink.streamContract.sourceStartPTS
+        resetPacket.pointee.pos = originPosition + 1
+
+        try sink.consume(resetPacket)
+        try sink.finish()
+
+        let rebased = try #require(
+            frames.snapshot().last(where: {
+                $0.generation == 8
+            })
+        )
+        #expect(abs(rebased.presentationTime.seconds - 4) < 0.000_001)
+    }
+
+    @Test("Ambiguous restart timestamp reset fails instead of guessing")
+    func ambiguousRestartTimestampResetFails() throws {
+        let data = try BlackCarrierEncodedSample.verifiedMP4Data()
+        let initialDemuxer = try openDemuxer(data: data)
+        defer { initialDemuxer.close() }
+        let sink = try HybridVideoDecodeSink(
+            demuxer: initialDemuxer,
+            initialGeneration: 0,
+            onFrame: { _ in }
+        )
+        defer { sink.close() }
+        let initialPacket = try #require(
+            try initialDemuxer.readPacket()
+        )
+        try sink.consume(initialPacket)
+        var initialPacketToFree:
+            UnsafeMutablePointer<AVPacket>? = initialPacket
+        trackedPacketFree(&initialPacketToFree)
+        try sink.finish()
+
+        let freshDemuxer = try openDemuxer(data: data)
+        defer { freshDemuxer.close() }
+        let freshStream = try #require(freshDemuxer.stream(
+            at: freshDemuxer.videoStreamIndex
+        ))
+        try sink.beginGeneration(
+            1,
+            targetTime: CMTime(
+                seconds: 4.5,
+                preferredTimescale: 600
+            ),
+            restartDecodeAnchorTime: nil,
+            demuxer: freshDemuxer,
+            stream: freshStream
+        )
+        let resetPacket = try #require(
+            try freshDemuxer.readPacket()
+        )
+        defer {
+            var packetToFree:
+                UnsafeMutablePointer<AVPacket>? = resetPacket
+            trackedPacketFree(&packetToFree)
+        }
+        resetPacket.pointee.pts =
+            sink.streamContract.sourceStartPTS
+        resetPacket.pointee.dts =
+            sink.streamContract.sourceStartPTS
+        resetPacket.pointee.pos = -1
+        let expected = HybridVideoDecodeSinkError
+            .restartTimestampRebaseAmbiguous(
+                generation: 1,
+                timestamp: sink.streamContract.sourceStartPTS
+            )
+
+        #expect(throws: expected) {
+            try sink.consume(resetPacket)
+        }
+        #expect(sink.failure == expected)
+    }
+
+    @Test("Origin packet at the same byte position is not falsely rebased")
+    func sameOriginPacketPositionIsNotRebased() throws {
+        let data = try BlackCarrierEncodedSample.verifiedMP4Data()
+        let initialDemuxer = try openDemuxer(data: data)
+        defer { initialDemuxer.close() }
+        let frames = FrameBox()
+        let sink = try HybridVideoDecodeSink(
+            demuxer: initialDemuxer,
+            initialGeneration: 3,
+            onFrame: { frames.append($0) }
+        )
+        defer { sink.close() }
+        let initialPacket = try #require(
+            try initialDemuxer.readPacket()
+        )
+        let originPosition = initialPacket.pointee.pos
+        #expect(originPosition >= 0)
+        try sink.consume(initialPacket)
+        var initialPacketToFree:
+            UnsafeMutablePointer<AVPacket>? = initialPacket
+        trackedPacketFree(&initialPacketToFree)
+        try sink.finish()
+
+        let freshDemuxer = try openDemuxer(data: data)
+        defer { freshDemuxer.close() }
+        let freshStream = try #require(freshDemuxer.stream(
+            at: freshDemuxer.videoStreamIndex
+        ))
+        try sink.beginGeneration(
+            4,
+            targetTime: CMTime(
+                seconds: 4.5,
+                preferredTimescale: 600
+            ),
+            restartDecodeAnchorTime: .zero,
+            demuxer: freshDemuxer,
+            stream: freshStream
+        )
+        let originPacket = try #require(
+            try freshDemuxer.readPacket()
+        )
+        defer {
+            var packetToFree:
+                UnsafeMutablePointer<AVPacket>? = originPacket
+            trackedPacketFree(&packetToFree)
+        }
+        originPacket.pointee.pts =
+            sink.streamContract.sourceStartPTS
+        originPacket.pointee.dts =
+            sink.streamContract.sourceStartPTS
+        originPacket.pointee.pos = originPosition
+
+        try sink.consume(originPacket)
+        try sink.finish()
+
+        let frame = try #require(frames.snapshot().last(where: {
+            $0.generation == 4
+        }))
+        #expect(abs(frame.presentationTime.seconds) < 0.000_001)
+        #expect(sink.failure == nil)
+    }
+
+    @Test("Non-zero source origin carrier reaches startup and seek readiness")
+    func nonZeroOriginCarrierIntegration() throws {
+        let duration = 5.25
+        let sourceData = try makeVideoOnlySource(
+            seconds: duration,
+            sourceStartSeconds: 5
+        )
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(
+                seconds: duration,
+                preferredTimescale: 90_000
+            )
+        )
+        let videoProvider = try BlackCarrierVideoProvider(
+            timeline: timeline
+        )
+        let frames = FrameBox()
+        let provider = try BlackCarrierLazyCompositeProvider
+            .buildSeekableVOD(
+                videoProvider: videoProvider,
+                source: .custom(
+                    ClonableDataReader(data: sourceData),
+                    formatHint: "mp4"
+                ),
+                options: LoadOptions(),
+                timeline: timeline,
+                decodedFrameHandler: { frames.append($0) }
+            )
+        defer { provider.close() }
+
+        try provider.prepareForTransportStart()
+        #expect(provider.mediaSegmentURL(at: 0) != nil)
+        #expect(frames.snapshot().contains(where: {
+            $0.generation == 0
+                && abs($0.presentationTime.seconds) < 0.000_001
+        }))
+
+        var classifier = HybridSeekIntentClassifier(
+            timeline: timeline
+        )
+        let target = CMTime(
+            seconds: 4.5,
+            preferredTimescale: 90_000
+        )
+        let intent = try classifier.registerExplicitHostSeek(
+            to: target
+        )
+        #expect(try provider.restartMedia(for: intent) == .applied(
+            generation: 1,
+            segmentIndex: 1
+        ))
+        #expect(provider.mediaSegmentURL(at: 1) != nil)
+        #expect(frames.snapshot().contains(where: {
+            $0.generation == 1
+                && CMTimeCompare(
+                    $0.presentationTime,
+                    CMTime(
+                        seconds: 4,
+                        preferredTimescale: 90_000
+                    )
+                ) >= 0
+        }))
+        #expect(provider.terminalError == nil)
     }
 
     @Test("Shared carrier fanout decodes real video on startup and seek generations")
@@ -499,7 +803,10 @@ struct HybridVideoDecodeSinkTests {
             + Data(contentsOf: finalized.path)
     }
 
-    private func makeVideoOnlySource(seconds: Double) throws -> Data {
+    private func makeVideoOnlySource(
+        seconds: Double,
+        sourceStartSeconds: Double = 0
+    ) throws -> Data {
         let videoData = try BlackCarrierEncodedSample.verifiedMP4Data()
         let videoDemuxer = try openDemuxer(data: videoData)
         defer { videoDemuxer.close() }
@@ -542,6 +849,8 @@ struct HybridVideoDecodeSinkTests {
 
         for second in 0..<Int(ceil(seconds)) {
             let start = Double(second)
+            let sourcePresentationTime =
+                sourceStartSeconds + start
             let sampleDuration = min(1, seconds - start)
             guard sampleDuration > 0,
                   let packet = av_packet_clone(sourceVideoPacket) else {
@@ -552,7 +861,7 @@ struct HybridVideoDecodeSinkTests {
                 trackedPacketFree(&packetToFree)
             }
             packet.pointee.pts = av_rescale_q(
-                Int64(start * 90_000),
+                Int64(sourcePresentationTime * 90_000),
                 AVRational(num: 1, den: 90_000),
                 videoStream.pointee.time_base
             )
