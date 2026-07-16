@@ -59,7 +59,10 @@ struct BlackCarrierEncodedSampleTests {
 
     @Test("Payload drift returns a typed hash mismatch")
     func rejectsPayloadDrift() throws {
-        var data = try BlackCarrierEncodedSample.verifiedMP4Data()
+        let verified =
+            try BlackCarrierEncodedSample.verifiedMP4Data()
+        var data = Data(capacity: verified.count)
+        data.append(verified)
         data[data.startIndex] ^= 0x01
 
         do {
