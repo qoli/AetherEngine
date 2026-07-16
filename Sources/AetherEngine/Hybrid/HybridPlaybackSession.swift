@@ -405,6 +405,31 @@ final class HybridPlaybackSession {
         audioAnalysisSource?.audioAnalysisTrackIDs ?? []
     }
 
+    func audioAnalysisAvailability(
+        for audioTrackID: Int
+    ) -> AudioAnalysisTrackAvailability {
+        switch state {
+        case .failed, .stopped:
+            return .unavailable(.noActiveSession)
+        case .idle, .preparing, .ready, .seeking:
+            break
+        }
+        guard let audioAnalysisSource else {
+            return .unavailable(
+                .analysisFailed(
+                    "hybrid session has no independent analysis source"
+                )
+            )
+        }
+        guard audioAnalysisSource.audioAnalysisTrackIDs
+                .contains(audioTrackID) else {
+            return .unavailable(
+                .audioTrackUnavailable(audioTrackID)
+            )
+        }
+        return .available
+    }
+
     var activeAudioAnalysisRequestCount: Int {
         audioAnalysisSessions.count
     }
@@ -712,22 +737,17 @@ final class HybridPlaybackSession {
     func audioAnalysisStream(
         request: AudioAnalysisRequest
     ) throws -> AudioAnalysisStream {
-        switch state {
-        case .failed, .stopped:
-            throw AudioAnalysisError.noActiveSession
-        case .idle, .preparing, .ready, .seeking:
+        switch audioAnalysisAvailability(
+            for: request.audioTrackID
+        ) {
+        case .available:
             break
+        case .unavailable(let error):
+            throw error
         }
         guard let audioAnalysisSource else {
             throw AudioAnalysisError.analysisFailed(
-                "hybrid session has no independent analysis source"
-            )
-        }
-        guard audioAnalysisSource.audioAnalysisTrackIDs.contains(
-            request.audioTrackID
-        ) else {
-            throw AudioAnalysisError.audioTrackUnavailable(
-                request.audioTrackID
+                "available analysis track requires an analysis source"
             )
         }
         let input: AudioAnalysisInput

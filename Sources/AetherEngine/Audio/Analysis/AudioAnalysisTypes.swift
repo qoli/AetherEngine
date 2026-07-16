@@ -62,6 +62,15 @@ public enum AudioAnalysisError: Error, Sendable, Equatable, LocalizedError {
     }
 }
 
+/// Deterministic per-track availability published before a host creates an analysis stream.
+///
+/// `.unavailable` is terminal for that request. It never authorizes retargeting another track,
+/// substituting the playback-following audio tap, or returning synthetic PCM.
+public enum AudioAnalysisTrackAvailability: Sendable, Equatable {
+    case available
+    case unavailable(AudioAnalysisError)
+}
+
 /// Immutable request bound to one engine source-track identity and source-time range.
 ///
 /// For single-file/custom inputs, `audioTrackID` is the source `TrackInfo.id` / FFmpeg stream index.

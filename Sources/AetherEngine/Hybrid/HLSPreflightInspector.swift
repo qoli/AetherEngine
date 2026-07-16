@@ -176,7 +176,11 @@ struct HLSPreflightInspector {
             return AetherHLSPlaybackPreflight(
                 result: protectedResult,
                 resourceGraph: nil,
-                httpHeaders: httpHeaders
+                httpHeaders: httpHeaders,
+                audioAnalysisPolicy:
+                    try await inspectNativeAudioAnalysisPolicy(
+                        resolved
+                    )
             )
         }
 
@@ -271,13 +275,18 @@ struct HLSPreflightInspector {
             hybridCapabilities: hybridCapabilities
         )
         let resourceGraph: HLSVODResourceGraph?
+        let audioAnalysisPolicy:
+            AetherHLSAudioAnalysisPolicy
         if result.route == .hybridCarrierMetal {
             let audioResolution = try await resolveAudioRenditions(
                 resolved.audioRenditions,
                 rootEffectiveURL: resolved.rootEffectiveURL
             )
             switch audioResolution {
-            case .clear(let audioRenditions):
+            case .clear(
+                let audioRenditions,
+                let renditionPolicies
+            ):
                 resourceGraph = try HLSVODResourceGraph.make(
                     requestedRootURL: rootURL,
                     effectiveRootURL: resolved.rootEffectiveURL,
@@ -295,7 +304,16 @@ struct HLSPreflightInspector {
                         segment.effectiveURL,
                     httpHeaders: httpHeaders
                 )
-            case .protected(let protection):
+                audioAnalysisPolicy =
+                    renditionPolicies.isEmpty
+                    ? .sessionScopedTrackAvailability
+                    : .selectedAlternateAudioRenditions(
+                        renditionPolicies
+                    )
+            case .protected(
+                let protection,
+                let renditionPolicies
+            ):
                 return AetherHLSPlaybackPreflight(
                     result: unsupportedProtectedHybridResult(
                         result,
@@ -304,16 +322,26 @@ struct HLSPreflightInspector {
                             hybridCapabilities
                     ),
                     resourceGraph: nil,
-                    httpHeaders: httpHeaders
+                    httpHeaders: httpHeaders,
+                    audioAnalysisPolicy:
+                        .selectedAlternateAudioRenditions(
+                            renditionPolicies
+                        )
                 )
             }
         } else {
             resourceGraph = nil
+            audioAnalysisPolicy =
+                try await inspectNativeAudioAnalysisPolicy(
+                    resolved
+                )
         }
         return AetherHLSPlaybackPreflight(
             result: result,
             resourceGraph: resourceGraph,
-            httpHeaders: httpHeaders
+            httpHeaders: httpHeaders,
+            audioAnalysisPolicy:
+                audioAnalysisPolicy
         )
     }
 
@@ -378,8 +406,14 @@ struct HLSPreflightInspector {
     }
 
     private enum AudioRenditionResolution {
-        case clear([HLSVODAudioRenditionResource])
-        case protected(HLSContentProtection)
+        case clear(
+            [HLSVODAudioRenditionResource],
+            [AetherHLSAudioRenditionAnalysisPolicy]
+        )
+        case protected(
+            HLSContentProtection,
+            [AetherHLSAudioRenditionAnalysisPolicy]
+        )
     }
 
     private func resolveAudioRenditions(
@@ -387,7 +421,12 @@ struct HLSPreflightInspector {
         rootEffectiveURL: URL
     ) async throws -> AudioRenditionResolution {
         var resources: [HLSVODAudioRenditionResource] = []
+        var policies:
+            [AetherHLSAudioRenditionAnalysisPolicy] = []
+        var protectedContent:
+            HLSContentProtection?
         resources.reserveCapacity(renditions.count)
+        policies.reserveCapacity(renditions.count)
         for (ordinal, rendition) in renditions.enumerated() {
             guard let playlistURL = HLSPlaylistParser.resolve(
                 uri: rendition.uri,
@@ -404,9 +443,29 @@ struct HLSPreflightInspector {
                     "alternate-audio rendition was not a media playlist"
                 )
             }
-            guard media.contentProtection == .none else {
-                return .protected(media.contentProtection)
+            if media.contentProtection != .none {
+                protectedContent =
+                    protectedContent
+                    ?? media.contentProtection
+                policies.append(
+                    Self.audioRenditionPolicy(
+                        ordinal: ordinal,
+                        rendition: rendition,
+                        availability: .unavailable(
+                            .contentProtectionUnsupported
+                        )
+                    )
+                )
+                continue
             }
+            policies.append(
+                Self.audioRenditionPolicy(
+                    ordinal: ordinal,
+                    rendition: rendition,
+                    availability:
+                        .requiresPlaybackSessionBinding
+                )
+            )
             resources.append(
                 try HLSVODResourceGraph.makeAudioRendition(
                     ordinal: ordinal,
@@ -417,7 +476,131 @@ struct HLSPreflightInspector {
                 )
             )
         }
-        return .clear(resources)
+        if let protectedContent {
+            return .protected(
+                protectedContent,
+                policies
+            )
+        }
+        return .clear(resources, policies)
+    }
+
+    /// Native playback remains available when optional analysis metadata cannot be inspected. Each failed
+    /// rendition is marked unavailable with a privacy-safe reason; the failure never changes the playback
+    /// route and never triggers a media-body or key request.
+    private func inspectNativeAudioAnalysisPolicy(
+        _ resolved: HLSPreflightResolvedMedia
+    ) async throws -> AetherHLSAudioAnalysisPolicy {
+        guard !resolved.audioRenditions.isEmpty else {
+            return resolved.media.contentProtection == .none
+                ? .sessionScopedTrackAvailability
+                : .unavailableForAllTracks(
+                    .contentProtectionUnsupported
+                )
+        }
+
+        var policies:
+            [AetherHLSAudioRenditionAnalysisPolicy] = []
+        policies.reserveCapacity(
+            resolved.audioRenditions.count
+        )
+        for (ordinal, rendition) in
+                resolved.audioRenditions.enumerated() {
+            let unavailable: AudioAnalysisError =
+                .hlsResourceFailure(
+                    "alternate-audio playlist preflight failed"
+                )
+            guard let playlistURL =
+                    HLSPlaylistParser.resolve(
+                        uri: rendition.uri,
+                        against:
+                            resolved.rootEffectiveURL
+                    ) else {
+                policies.append(
+                    Self.audioRenditionPolicy(
+                        ordinal: ordinal,
+                        rendition: rendition,
+                        availability:
+                            .unavailable(unavailable)
+                    )
+                )
+                continue
+            }
+            do {
+                let response = try await fetch(
+                    playlistURL
+                )
+                guard case .media(let media) =
+                        try parsePlaylist(response.data)
+                else {
+                    policies.append(
+                        Self.audioRenditionPolicy(
+                            ordinal: ordinal,
+                            rendition: rendition,
+                            availability:
+                                .unavailable(unavailable)
+                        )
+                    )
+                    continue
+                }
+                policies.append(
+                    Self.audioRenditionPolicy(
+                        ordinal: ordinal,
+                        rendition: rendition,
+                        availability:
+                            media.contentProtection
+                                == .none
+                            ? .requiresPlaybackSessionBinding
+                            : .unavailable(
+                                .contentProtectionUnsupported
+                            )
+                    )
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as HLSPreflightError {
+                if case .transportFailure(let code) =
+                        error,
+                   code == URLError.cancelled.rawValue {
+                    throw CancellationError()
+                }
+                policies.append(
+                    Self.audioRenditionPolicy(
+                        ordinal: ordinal,
+                        rendition: rendition,
+                        availability:
+                            .unavailable(unavailable)
+                    )
+                )
+            } catch {
+                policies.append(
+                    Self.audioRenditionPolicy(
+                        ordinal: ordinal,
+                        rendition: rendition,
+                        availability:
+                            .unavailable(unavailable)
+                    )
+                )
+            }
+        }
+        return .selectedAlternateAudioRenditions(
+            policies
+        )
+    }
+
+    private static func audioRenditionPolicy(
+        ordinal: Int,
+        rendition: HLSAudioRendition,
+        availability:
+            AetherHLSAudioAnalysisPreflightAvailability
+    ) -> AetherHLSAudioRenditionAnalysisPolicy {
+        AetherHLSAudioRenditionAnalysisPolicy(
+            audioTrackID: ordinal,
+            name: rendition.name,
+            language: rendition.language,
+            isDefault: rendition.isDefault,
+            availability: availability
+        )
     }
 
     private func fetch(_ url: URL) async throws -> HLSPreflightFetchResponse {

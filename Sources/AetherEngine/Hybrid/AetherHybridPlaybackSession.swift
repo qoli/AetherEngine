@@ -278,6 +278,14 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         core.audioAnalysisTrackIDs
     }
 
+    public func audioAnalysisAvailability(
+        for audioTrackID: Int
+    ) -> AudioAnalysisTrackAvailability {
+        core.audioAnalysisAvailability(
+            for: audioTrackID
+        )
+    }
+
     public var diagnostics: AetherHybridPlaybackDiagnostics {
         let time = avPlayer.currentTime()
         return AetherHybridPlaybackDiagnostics(

@@ -121,6 +121,20 @@ final class HLSPreflightInspectorTests: XCTestCase {
             inspected.result.hlsPackaging?.codecVerification,
             .protectedManifestVerified
         )
+        XCTAssertEqual(
+            inspected.audioAnalysisPolicy,
+            .unavailableForAllTracks(
+                .contentProtectionUnsupported
+            )
+        )
+        XCTAssertEqual(
+            inspected.audioAnalysisPreflightAvailability(
+                for: 0
+            ),
+            .unavailable(
+                .contentProtectionUnsupported
+            )
+        )
         XCTAssertNil(inspected.resourceGraph)
         XCTAssertEqual(
             fetchedURLs.snapshot(),
@@ -193,10 +207,251 @@ final class HLSPreflightInspectorTests: XCTestCase {
             inspected.result.hlsPackaging?.contentProtection,
             .sampleAES
         )
+        XCTAssertEqual(
+            inspected.audioAnalysisPolicy,
+            .unavailableForAllTracks(
+                .contentProtectionUnsupported
+            )
+        )
         XCTAssertNil(inspected.resourceGraph)
         XCTAssertEqual(
             fetchedURLs.snapshot(),
             [rootURL, mediaURL]
+        )
+    }
+
+    func testProtectedNativeHLSPublishesPerRenditionAnalysisPolicyWithoutFetchingMedia()
+        async throws
+    {
+        let rootURL = URL(
+            string: "https://example.com/master.m3u8"
+        )!
+        let mediaURL = URL(
+            string: "https://example.com/video.m3u8"
+        )!
+        let clearAudioURL = URL(
+            string: "https://example.com/clear.m3u8"
+        )!
+        let protectedAudioURL = URL(
+            string: "https://example.com/protected.m3u8"
+        )!
+        let fetchedURLs = LockedURLs()
+        let responses: [URL: HLSPreflightFetchResponse] = [
+            rootURL: HLSPreflightFetchResponse(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Clear",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,URI="clear.m3u8"
+                    #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Protected",LANGUAGE="ja",DEFAULT=NO,AUTOSELECT=YES,URI="protected.m3u8"
+                    #EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS="hvc1.2.4.L150",AUDIO="audio"
+                    video.m3u8
+                    """.utf8
+                ),
+                effectiveURL: rootURL
+            ),
+            mediaURL: HLSPreflightFetchResponse(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-TARGETDURATION:4
+                    #EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT="com.apple.streamingkeydelivery",URI="skd://license"
+                    #EXT-X-MAP:URI="init.mp4"
+                    #EXTINF:4,
+                    video0.m4s
+                    #EXT-X-ENDLIST
+                    """.utf8
+                ),
+                effectiveURL: mediaURL
+            ),
+            clearAudioURL: HLSPreflightFetchResponse(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-TARGETDURATION:4
+                    #EXTINF:4,
+                    clear0.aac
+                    #EXT-X-ENDLIST
+                    """.utf8
+                ),
+                effectiveURL: clearAudioURL
+            ),
+            protectedAudioURL: HLSPreflightFetchResponse(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-TARGETDURATION:4
+                    #EXT-X-KEY:METHOD=SAMPLE-AES,URI="audio.key"
+                    #EXTINF:4,
+                    protected0.aac
+                    #EXT-X-ENDLIST
+                    """.utf8
+                ),
+                effectiveURL: protectedAudioURL
+            ),
+        ]
+
+        let inspected = try await HLSPreflightInspector(
+            httpHeaders: [:],
+            fetchOverride: { url, _ in
+                fetchedURLs.append(url)
+                guard let response = responses[url] else {
+                    throw HLSPreflightError.httpStatus(599)
+                }
+                return response
+            }
+        ).inspect(
+            rootURL: rootURL,
+            sourceIsSeekableVOD: true,
+            variantSelection: .highestBandwidth,
+            hybridCapabilities: HybridPlaybackCapabilities(
+                hasDirectVideoDecoder: true,
+                hasMetalRenderer: true,
+                supportedVideoFormats: [.sdr]
+            )
+        )
+
+        XCTAssertEqual(inspected.result.route, .nativeAVPlayer)
+        XCTAssertEqual(
+            inspected.audioAnalysisPolicy,
+            .selectedAlternateAudioRenditions([
+                AetherHLSAudioRenditionAnalysisPolicy(
+                    audioTrackID: 0,
+                    name: "Clear",
+                    language: "en",
+                    isDefault: true,
+                    availability:
+                        .requiresPlaybackSessionBinding
+                ),
+                AetherHLSAudioRenditionAnalysisPolicy(
+                    audioTrackID: 1,
+                    name: "Protected",
+                    language: "ja",
+                    isDefault: false,
+                    availability: .unavailable(
+                        .contentProtectionUnsupported
+                    )
+                ),
+            ])
+        )
+        XCTAssertEqual(
+            inspected.audioAnalysisPreflightAvailability(
+                for: 0
+            ),
+            .requiresPlaybackSessionBinding
+        )
+        XCTAssertEqual(
+            inspected.audioAnalysisPreflightAvailability(
+                for: 1
+            ),
+            .unavailable(
+                .contentProtectionUnsupported
+            )
+        )
+        XCTAssertEqual(
+            inspected.audioAnalysisPreflightAvailability(
+                for: 99
+            ),
+            .unavailable(
+                .audioTrackUnavailable(99)
+            )
+        )
+        XCTAssertEqual(
+            fetchedURLs.snapshot(),
+            [
+                rootURL,
+                mediaURL,
+                clearAudioURL,
+                protectedAudioURL,
+            ]
+        )
+    }
+
+    func testNativePlaybackSurvivesAlternateAudioAnalysisPreflightFailure()
+        async throws
+    {
+        let rootURL = URL(
+            string: "https://example.com/master.m3u8"
+        )!
+        let mediaURL = URL(
+            string: "https://example.com/video.m3u8"
+        )!
+        let brokenAudioURL = URL(
+            string: "https://example.com/broken.m3u8"
+        )!
+        let fetchedURLs = LockedURLs()
+        let responses: [URL: HLSPreflightFetchResponse] = [
+            rootURL: HLSPreflightFetchResponse(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Broken",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,URI="broken.m3u8"
+                    #EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS="hvc1.2.4.L150",AUDIO="audio"
+                    video.m3u8
+                    """.utf8
+                ),
+                effectiveURL: rootURL
+            ),
+            mediaURL: HLSPreflightFetchResponse(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-TARGETDURATION:4
+                    #EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT="com.apple.streamingkeydelivery",URI="skd://license"
+                    #EXT-X-MAP:URI="init.mp4"
+                    #EXTINF:4,
+                    video0.m4s
+                    #EXT-X-ENDLIST
+                    """.utf8
+                ),
+                effectiveURL: mediaURL
+            ),
+        ]
+
+        let inspected = try await HLSPreflightInspector(
+            httpHeaders: [:],
+            fetchOverride: { url, _ in
+                fetchedURLs.append(url)
+                guard let response = responses[url] else {
+                    throw HLSPreflightError.httpStatus(503)
+                }
+                return response
+            }
+        ).inspect(
+            rootURL: rootURL,
+            sourceIsSeekableVOD: true,
+            variantSelection: .highestBandwidth,
+            hybridCapabilities: HybridPlaybackCapabilities(
+                hasDirectVideoDecoder: true,
+                hasMetalRenderer: true,
+                supportedVideoFormats: [.sdr]
+            )
+        )
+
+        XCTAssertEqual(inspected.result.route, .nativeAVPlayer)
+        XCTAssertEqual(
+            inspected.result.reason,
+            .nativeProtectedHLSContractVerified
+        )
+        XCTAssertEqual(
+            inspected.audioAnalysisPolicy,
+            .selectedAlternateAudioRenditions([
+                AetherHLSAudioRenditionAnalysisPolicy(
+                    audioTrackID: 0,
+                    name: "Broken",
+                    language: "en",
+                    isDefault: true,
+                    availability: .unavailable(
+                        .hlsResourceFailure(
+                            "alternate-audio playlist preflight failed"
+                        )
+                    )
+                ),
+            ])
+        )
+        XCTAssertNil(inspected.resourceGraph)
+        XCTAssertEqual(
+            fetchedURLs.snapshot(),
+            [rootURL, mediaURL, brokenAudioURL]
         )
     }
 
@@ -306,6 +561,20 @@ final class HLSPreflightInspectorTests: XCTestCase {
         XCTAssertEqual(
             inspected.result.hlsPackaging?.contentProtection,
             .sampleAES
+        )
+        XCTAssertEqual(
+            inspected.audioAnalysisPolicy,
+            .selectedAlternateAudioRenditions([
+                AetherHLSAudioRenditionAnalysisPolicy(
+                    audioTrackID: 0,
+                    name: "English",
+                    language: nil,
+                    isDefault: true,
+                    availability: .unavailable(
+                        .contentProtectionUnsupported
+                    )
+                ),
+            ])
         )
         XCTAssertNil(inspected.resourceGraph)
         XCTAssertNil(inspected.resourceIdentity)
@@ -463,6 +732,27 @@ final class HLSPreflightInspectorTests: XCTestCase {
         )
 
         XCTAssertEqual(inspected.result.route, .hybridCarrierMetal)
+        XCTAssertEqual(
+            inspected.audioAnalysisPolicy,
+            .selectedAlternateAudioRenditions([
+                AetherHLSAudioRenditionAnalysisPolicy(
+                    audioTrackID: 0,
+                    name: "English",
+                    language: "en",
+                    isDefault: true,
+                    availability:
+                        .requiresPlaybackSessionBinding
+                ),
+                AetherHLSAudioRenditionAnalysisPolicy(
+                    audioTrackID: 1,
+                    name: "Français",
+                    language: "fr",
+                    isDefault: false,
+                    availability:
+                        .requiresPlaybackSessionBinding
+                ),
+            ])
+        )
         XCTAssertEqual(
             inspected.result.reason,
             .hybridHLSManifestSegmentMismatch

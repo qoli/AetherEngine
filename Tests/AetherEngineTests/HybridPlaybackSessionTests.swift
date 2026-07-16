@@ -414,6 +414,18 @@ struct HybridPlaybackSessionTests {
             audioTrackID: 0,
             range: 0.25..<0.75
         )
+        #expect(
+            session.audioAnalysisAvailability(
+                for: 0
+            ) == .available
+        )
+        #expect(
+            session.audioAnalysisAvailability(
+                for: 99
+            ) == .unavailable(
+                .audioTrackUnavailable(99)
+            )
+        )
         let stream = try session.audioAnalysisStream(
             request: request
         )

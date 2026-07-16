@@ -45,6 +45,66 @@ public enum AetherHLSPreflightInvalidationReason:
     )
 }
 
+/// Preflight-only availability for one URI-backed alternate-audio rendition.
+///
+/// Clear rendition metadata can be bound to a stable ordinal before any media body is fetched, but the
+/// actual stream still requires a playback-session-owned source graph and independent decoder. Protected
+/// renditions fail immediately and never authorize a key, init-segment or media-segment fetch.
+public enum AetherHLSAudioAnalysisPreflightAvailability:
+    Sendable,
+    Equatable
+{
+    case requiresPlaybackSessionBinding
+    case unavailable(AudioAnalysisError)
+}
+
+/// Privacy-safe per-rendition analysis policy from the selected HLS audio group.
+///
+/// `audioTrackID` is the selected group's stable rendition ordinal. It is not an AVFoundation object
+/// identity and is never inferred from the currently selected AVPlayer option.
+public struct AetherHLSAudioRenditionAnalysisPolicy:
+    Sendable,
+    Equatable
+{
+    public let audioTrackID: Int
+    public let name: String
+    public let language: String?
+    public let isDefault: Bool
+    public let availability:
+        AetherHLSAudioAnalysisPreflightAvailability
+
+    init(
+        audioTrackID: Int,
+        name: String,
+        language: String?,
+        isDefault: Bool,
+        availability:
+            AetherHLSAudioAnalysisPreflightAvailability
+    ) {
+        self.audioTrackID = audioTrackID
+        self.name = name
+        self.language = language
+        self.isDefault = isDefault
+        self.availability = availability
+    }
+}
+
+/// Audio-analysis ownership policy established by HLS preflight.
+///
+/// Muxed clear audio defers stable track IDs to admitted session demux evidence. URI-backed alternate
+/// audio is reported per rendition without fetching media bodies. Muxed protected audio cannot expose
+/// clear samples, so every runtime track is explicitly unavailable before playback starts.
+public enum AetherHLSAudioAnalysisPolicy:
+    Sendable,
+    Equatable
+{
+    case sessionScopedTrackAvailability
+    case selectedAlternateAudioRenditions(
+        [AetherHLSAudioRenditionAnalysisPolicy]
+    )
+    case unavailableForAllTracks(AudioAnalysisError)
+}
+
 /// Public, privacy-safe result of HLS inspection.
 ///
 /// The raw selected playlist, init-segment and media-segment URLs remain engine-private because they may
@@ -65,6 +125,8 @@ public struct AetherHLSPlaybackPreflight: Sendable, Equatable {
     public let mediaSegmentCount: Int
     public let hasSeparateAudioRenditions: Bool
     public let audioRenditionCount: Int
+    public let audioAnalysisPolicy:
+        AetherHLSAudioAnalysisPolicy
 
     let resourceGraph: HLSVODResourceGraph?
     let httpHeaders: [String: String]
@@ -72,7 +134,9 @@ public struct AetherHLSPlaybackPreflight: Sendable, Equatable {
     init(
         result: PlaybackPreflightResult,
         resourceGraph: HLSVODResourceGraph?,
-        httpHeaders: [String: String]
+        httpHeaders: [String: String],
+        audioAnalysisPolicy:
+            AetherHLSAudioAnalysisPolicy? = nil
     ) {
         self.result = result
         hybridTimeline = resourceGraph?.timeline
@@ -82,8 +146,77 @@ public struct AetherHLSPlaybackPreflight: Sendable, Equatable {
         audioRenditionCount =
             resourceGraph?.audioRenditions.count ?? 0
         hasSeparateAudioRenditions = audioRenditionCount > 0
+        self.audioAnalysisPolicy =
+            audioAnalysisPolicy
+            ?? Self.defaultAudioAnalysisPolicy(
+                result: result,
+                resourceGraph: resourceGraph
+            )
         self.resourceGraph = resourceGraph
         self.httpHeaders = httpHeaders
+    }
+
+    private static func defaultAudioAnalysisPolicy(
+        result: PlaybackPreflightResult,
+        resourceGraph: HLSVODResourceGraph?
+    ) -> AetherHLSAudioAnalysisPolicy {
+        if let renditions =
+                resourceGraph?.audioRenditions,
+           !renditions.isEmpty {
+            return .selectedAlternateAudioRenditions(
+                renditions.map {
+                    AetherHLSAudioRenditionAnalysisPolicy(
+                        audioTrackID: $0.ordinal,
+                        name: $0.name,
+                        language: $0.language,
+                        isDefault: $0.isDefault,
+                        availability:
+                            .requiresPlaybackSessionBinding
+                    )
+                }
+            )
+        }
+        if let protection =
+                result.hlsPackaging?.contentProtection,
+           protection != .none {
+            return .unavailableForAllTracks(
+                .contentProtectionUnsupported
+            )
+        }
+        return .sessionScopedTrackAvailability
+    }
+
+    /// Resolve the preflight-owned policy for one stable engine track ID.
+    ///
+    /// `.requiresPlaybackSessionBinding` is not permission to open an arbitrary URL. The eventual session
+    /// must still publish the track ID and create an independent graph-bound analysis source.
+    public func audioAnalysisPreflightAvailability(
+        for audioTrackID: Int
+    ) -> AetherHLSAudioAnalysisPreflightAvailability {
+        guard audioTrackID >= 0 else {
+            return .unavailable(
+                .audioTrackUnavailable(audioTrackID)
+            )
+        }
+        switch audioAnalysisPolicy {
+        case .sessionScopedTrackAvailability:
+            return .requiresPlaybackSessionBinding
+        case .selectedAlternateAudioRenditions(
+            let renditions
+        ):
+            guard let rendition = renditions.first(
+                where: {
+                    $0.audioTrackID == audioTrackID
+                }
+            ) else {
+                return .unavailable(
+                    .audioTrackUnavailable(audioTrackID)
+                )
+            }
+            return rendition.availability
+        case .unavailableForAllTracks(let error):
+            return .unavailable(error)
+        }
     }
 }
 
