@@ -11,6 +11,14 @@ enum BlackCarrierAudioBandwidthEvidence: Sendable, Equatable {
         maximumContainerOverhead: Int,
         averageContainerOverhead: Int
     )
+    case calibratedConstantRate(
+        payloadBandwidth: Int,
+        peakBandwidth: Int,
+        averageBandwidth: Int,
+        sampleRate: Int,
+        channelCount: Int,
+        measuredSegmentCount: Int
+    )
 
     var peakBandwidth: Int {
         switch self {
@@ -22,6 +30,15 @@ enum BlackCarrierAudioBandwidthEvidence: Sendable, Equatable {
             _
         ):
             return payloadBandwidth + maximumContainerOverhead
+        case .calibratedConstantRate(
+            _,
+            let peakBandwidth,
+            _,
+            _,
+            _,
+            _
+        ):
+            return peakBandwidth
         }
     }
 
@@ -35,6 +52,15 @@ enum BlackCarrierAudioBandwidthEvidence: Sendable, Equatable {
             let averageContainerOverhead
         ):
             return payloadBandwidth + averageContainerOverhead
+        case .calibratedConstantRate(
+            _,
+            _,
+            let averageBandwidth,
+            _,
+            _,
+            _
+        ):
+            return averageBandwidth
         }
     }
 
@@ -51,6 +77,21 @@ enum BlackCarrierAudioBandwidthEvidence: Sendable, Equatable {
                 && maximumOverhead >= 0
                 && averageOverhead >= 0
                 && maximumOverhead >= averageOverhead
+        case .calibratedConstantRate(
+            let payload,
+            let peak,
+            let average,
+            let sampleRate,
+            let channelCount,
+            let measuredSegmentCount
+        ):
+            return payload > 0
+                && peak >= payload
+                && average >= payload
+                && peak >= average
+                && sampleRate > 0
+                && channelCount > 0
+                && measuredSegmentCount > 0
         }
     }
 }
@@ -67,6 +108,401 @@ struct BlackCarrierAudioBandwidthMeasurement: Sendable, Equatable {
     let admissions: [BlackCarrierAudioBandwidthAdmission]
 }
 
+enum BlackCarrierConstantRateBandwidthCalibrationError:
+    Error,
+    LocalizedError,
+    Sendable,
+    Equatable
+{
+    case invalidTimeline
+    case invalidProfile(ordinal: Int)
+    case syntheticSourceTooLarge
+    case segmentMissing(ordinal: Int, index: Int)
+    case byteCountOverflow(ordinal: Int)
+    case outputContractMismatch(ordinal: Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidTimeline:
+            return "Constant-rate bandwidth calibration requires a fixed four-second file-VOD timeline"
+        case .invalidProfile(let ordinal):
+            return "Constant-rate bandwidth calibration profile \(ordinal) is invalid"
+        case .syntheticSourceTooLarge:
+            return "Constant-rate bandwidth calibration source exceeds its bounded RIFF size"
+        case .segmentMissing(let ordinal, let index):
+            return "Constant-rate bandwidth calibration rendition \(ordinal) did not emit segment \(index)"
+        case .byteCountOverflow(let ordinal):
+            return "Constant-rate bandwidth calibration rendition \(ordinal) byte count overflowed"
+        case .outputContractMismatch(let ordinal):
+            return "Constant-rate bandwidth calibration rendition \(ordinal) changed its EAC3 output contract"
+        }
+    }
+}
+
+enum BlackCarrierConstantRateBandwidthCalibration {
+    private struct TimelinePlan {
+        let calibrationTimeline: BlackCarrierTimeline
+        let fullSegmentCount: Int
+        let tailDuration: CMTime?
+    }
+
+    static func admissions(
+        descriptors: [BlackCarrierAudioRenditionDescriptor],
+        timeline: BlackCarrierTimeline
+    ) throws -> [BlackCarrierAudioBandwidthAdmission]? {
+        guard timeline.source == .fixedFileVOD,
+              !descriptors.isEmpty else {
+            return nil
+        }
+        let profiles = descriptors.map(\.constantRateBridgeProfile)
+        guard profiles.allSatisfy({ $0 != nil }) else {
+            return nil
+        }
+        let resolvedProfiles = profiles.compactMap { $0 }
+        let timelineSeconds = timeline.duration.seconds
+        guard timelineSeconds.isFinite, timelineSeconds > 0 else {
+            throw BlackCarrierConstantRateBandwidthCalibrationError
+                .invalidTimeline
+        }
+        for (ordinal, profile) in resolvedProfiles.enumerated() {
+            let durationTolerance =
+                1 / Double(profile.sampleRate)
+            guard profile.sampleRate == 48_000,
+                  profile.channelCount > 0,
+                  profile.channelCount <= 6,
+                  profile.payloadBandwidth > 0,
+                  abs(
+                      profile.sourceDurationSeconds
+                          - timelineSeconds
+                  ) <= durationTolerance else {
+                return nil
+            }
+            guard descriptors[ordinal].pipeline == .bridge(
+                mode: .surroundCompat,
+                codecString: "ec-3"
+            ) else {
+                throw BlackCarrierConstantRateBandwidthCalibrationError
+                    .invalidProfile(ordinal: ordinal)
+            }
+        }
+
+        let plan = try timelinePlan(for: timeline)
+        return try zip(descriptors.indices, resolvedProfiles).map {
+            ordinal,
+            profile in
+            let evidence = try calibrate(
+                ordinal: ordinal,
+                descriptor: descriptors[ordinal],
+                profile: profile,
+                originalTimeline: timeline,
+                plan: plan
+            )
+            return BlackCarrierAudioBandwidthAdmission(
+                ordinal: ordinal,
+                evidence: evidence
+            )
+        }
+    }
+
+    private static func timelinePlan(
+        for timeline: BlackCarrierTimeline
+    ) throws -> TimelinePlan {
+        let profile = BlackCarrierProfile.approved
+        let fullTicks =
+            profile.nominalFileSegmentDurationTicks
+        guard !timeline.segments.isEmpty else {
+            throw BlackCarrierConstantRateBandwidthCalibrationError
+                .invalidTimeline
+        }
+        let tail = timeline.segments.last.flatMap {
+            $0.duration.value == fullTicks ? nil : $0.duration
+        }
+        let fullCount =
+            timeline.segments.count - (tail == nil ? 0 : 1)
+        guard fullCount >= 0,
+              timeline.segments
+                .prefix(fullCount)
+                .allSatisfy({
+                    $0.duration.timescale == profile.timescale
+                        && $0.duration.value == fullTicks
+                }) else {
+            throw BlackCarrierConstantRateBandwidthCalibrationError
+                .invalidTimeline
+        }
+
+        let calibratedFullCount = min(fullCount, 2)
+        var durationTicks =
+            Int64(calibratedFullCount) * fullTicks
+        if let tail {
+            let converted = CMTimeConvertScale(
+                tail,
+                timescale: profile.timescale,
+                method: .roundHalfAwayFromZero
+            )
+            let sum = durationTicks.addingReportingOverflow(
+                converted.value
+            )
+            guard !sum.overflow else {
+                throw BlackCarrierConstantRateBandwidthCalibrationError
+                    .invalidTimeline
+            }
+            durationTicks = sum.partialValue
+        }
+        guard durationTicks > 0 else {
+            throw BlackCarrierConstantRateBandwidthCalibrationError
+                .invalidTimeline
+        }
+        let calibrationTimeline =
+            try BlackCarrierTimeline.fileVOD(
+                duration: CMTime(
+                    value: durationTicks,
+                    timescale: profile.timescale
+                )
+            )
+        return TimelinePlan(
+            calibrationTimeline: calibrationTimeline,
+            fullSegmentCount: fullCount,
+            tailDuration: tail
+        )
+    }
+
+    private static func calibrate(
+        ordinal: Int,
+        descriptor: BlackCarrierAudioRenditionDescriptor,
+        profile: BlackCarrierConstantRateBridgeProfile,
+        originalTimeline: BlackCarrierTimeline,
+        plan: TimelinePlan
+    ) throws -> BlackCarrierAudioBandwidthEvidence {
+        let data = try syntheticWAV(
+            sampleRate: profile.sampleRate,
+            channelCount: profile.channelCount,
+            duration: plan.calibrationTimeline.duration
+        )
+        let demuxer = Demuxer()
+        try demuxer.open(
+            reader: DataIOReader(data: data),
+            formatHint: "wav"
+        )
+        defer { demuxer.close() }
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "AetherBandwidthCalibration-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        var segmentBytes: [Int: Int] = [:]
+        let summary = try BlackCarrierAudioRenditionMuxer.mux(
+            demuxer: demuxer,
+            audioStreamIndex: demuxer.audioStreamIndex,
+            sourceStartPTS: 0,
+            timeline: plan.calibrationTimeline,
+            bridgeMode: .surroundCompat,
+            sessionDirectory: directory,
+            onInit: { _ in },
+            onSegment: { timing, _, bytesWritten in
+                segmentBytes[timing.index] = bytesWritten
+            }
+        )
+        guard summary.pipeline == descriptor.pipeline,
+              summary.codecString == descriptor.codecString,
+              summary.channelsAttribute
+                == descriptor.channelsAttribute,
+              summary.declaredCodecInitialPaddingSamples
+                == descriptor.declaredCodecInitialPaddingSamples else {
+            throw BlackCarrierConstantRateBandwidthCalibrationError
+                .outputContractMismatch(ordinal: ordinal)
+        }
+
+        let fullDuration = Double(
+            BlackCarrierProfile.approved
+                .nominalFileSegmentDurationTicks
+        ) / Double(BlackCarrierProfile.approved.timescale)
+        var totalBytes: Int64 = 0
+        var peakBandwidth = 0
+        var measuredSegmentCount = 0
+        if plan.fullSegmentCount > 0 {
+            let firstBytes = try requiredBytes(
+                segmentBytes,
+                ordinal: ordinal,
+                index: 0
+            )
+            totalBytes = try adding(
+                totalBytes,
+                Int64(firstBytes),
+                ordinal: ordinal
+            )
+            peakBandwidth = max(
+                peakBandwidth,
+                bandwidth(bytes: firstBytes, duration: fullDuration)
+            )
+            measuredSegmentCount += 1
+
+            if plan.fullSegmentCount > 1 {
+                let steadyBytes = try requiredBytes(
+                    segmentBytes,
+                    ordinal: ordinal,
+                    index: 1
+                )
+                let repeated = Int64(plan.fullSegmentCount - 1)
+                    .multipliedReportingOverflow(
+                        by: Int64(steadyBytes)
+                    )
+                guard !repeated.overflow else {
+                    throw BlackCarrierConstantRateBandwidthCalibrationError
+                        .byteCountOverflow(ordinal: ordinal)
+                }
+                totalBytes = try adding(
+                    totalBytes,
+                    repeated.partialValue,
+                    ordinal: ordinal
+                )
+                peakBandwidth = max(
+                    peakBandwidth,
+                    bandwidth(
+                        bytes: steadyBytes,
+                        duration: fullDuration
+                    )
+                )
+                measuredSegmentCount += 1
+            }
+        }
+        if let tailDuration = plan.tailDuration {
+            let tailIndex = min(plan.fullSegmentCount, 2)
+            let tailBytes = try requiredBytes(
+                segmentBytes,
+                ordinal: ordinal,
+                index: tailIndex
+            )
+            totalBytes = try adding(
+                totalBytes,
+                Int64(tailBytes),
+                ordinal: ordinal
+            )
+            peakBandwidth = max(
+                peakBandwidth,
+                bandwidth(
+                    bytes: tailBytes,
+                    duration: tailDuration.seconds
+                )
+            )
+            measuredSegmentCount += 1
+        }
+
+        let averageBandwidth = Int(
+            ceil(
+                Double(totalBytes) * 8
+                    / originalTimeline.duration.seconds
+            )
+        )
+        return .calibratedConstantRate(
+            payloadBandwidth: profile.payloadBandwidth,
+            peakBandwidth: peakBandwidth,
+            averageBandwidth: averageBandwidth,
+            sampleRate: profile.sampleRate,
+            channelCount: profile.channelCount,
+            measuredSegmentCount: measuredSegmentCount
+        )
+    }
+
+    private static func requiredBytes(
+        _ segmentBytes: [Int: Int],
+        ordinal: Int,
+        index: Int
+    ) throws -> Int {
+        guard let bytes = segmentBytes[index], bytes > 0 else {
+            throw BlackCarrierConstantRateBandwidthCalibrationError
+                .segmentMissing(ordinal: ordinal, index: index)
+        }
+        return bytes
+    }
+
+    private static func adding(
+        _ lhs: Int64,
+        _ rhs: Int64,
+        ordinal: Int
+    ) throws -> Int64 {
+        let result = lhs.addingReportingOverflow(rhs)
+        guard !result.overflow else {
+            throw BlackCarrierConstantRateBandwidthCalibrationError
+                .byteCountOverflow(ordinal: ordinal)
+        }
+        return result.partialValue
+    }
+
+    private static func bandwidth(
+        bytes: Int,
+        duration: Double
+    ) -> Int {
+        Int(ceil(Double(bytes) * 8 / duration))
+    }
+
+    private static func syntheticWAV(
+        sampleRate: Int,
+        channelCount: Int,
+        duration: CMTime
+    ) throws -> Data {
+        let seconds = duration.seconds
+        guard seconds.isFinite,
+              seconds > 0,
+              sampleRate > 0,
+              channelCount > 0 else {
+            throw BlackCarrierConstantRateBandwidthCalibrationError
+                .invalidTimeline
+        }
+        let frameCount = Int(
+            ceil(seconds * Double(sampleRate))
+        )
+        let payload = frameCount
+            .multipliedReportingOverflow(
+                by: channelCount * MemoryLayout<Int16>.size
+            )
+        guard !payload.overflow,
+              payload.partialValue <= Int(UInt32.max) - 36 else {
+            throw BlackCarrierConstantRateBandwidthCalibrationError
+                .syntheticSourceTooLarge
+        }
+
+        var data = Data()
+        data.reserveCapacity(44 + payload.partialValue)
+        func appendASCII(_ value: String) {
+            data.append(value.data(using: .ascii)!)
+        }
+        func appendUInt16(_ value: UInt16) {
+            withUnsafeBytes(of: value.littleEndian) {
+                data.append(contentsOf: $0)
+            }
+        }
+        func appendUInt32(_ value: UInt32) {
+            withUnsafeBytes(of: value.littleEndian) {
+                data.append(contentsOf: $0)
+            }
+        }
+        let blockAlign = channelCount
+            * MemoryLayout<Int16>.size
+        appendASCII("RIFF")
+        appendUInt32(UInt32(36 + payload.partialValue))
+        appendASCII("WAVE")
+        appendASCII("fmt ")
+        appendUInt32(16)
+        appendUInt16(1)
+        appendUInt16(UInt16(channelCount))
+        appendUInt32(UInt32(sampleRate))
+        appendUInt32(UInt32(sampleRate * blockAlign))
+        appendUInt16(UInt16(blockAlign))
+        appendUInt16(16)
+        appendASCII("data")
+        appendUInt32(UInt32(payload.partialValue))
+        data.append(Data(count: payload.partialValue))
+        return data
+    }
+}
+
 enum BlackCarrierAudioBandwidthPreflight {
     static func measure(
         sourceFactory: BlackCarrierDemuxSourceFactory,
@@ -74,7 +510,7 @@ enum BlackCarrierAudioBandwidthPreflight {
         bridgeMode: AudioBridgeMode
     ) throws -> BlackCarrierAudioBandwidthMeasurement {
         EngineLog.emit(
-            "[BlackCarrierAudioBandwidthPreflight] full-asset measurement started",
+            "[BlackCarrierAudioBandwidthPreflight] admission started",
             category: .session
         )
         let pump = try BlackCarrierMediaFanoutPump.makeSeekableVOD(
@@ -82,6 +518,40 @@ enum BlackCarrierAudioBandwidthPreflight {
             ownsSourceFactory: false,
             timeline: timeline,
             bridgeMode: bridgeMode
+        )
+        do {
+            if let admissions =
+                    try BlackCarrierConstantRateBandwidthCalibration
+                        .admissions(
+                            descriptors: pump.renditionDescriptors,
+                            timeline: timeline
+                        ) {
+                pump.close()
+                EngineLog.emit(
+                    "[BlackCarrierAudioBandwidthPreflight] "
+                        + "bounded constant-rate calibration completed "
+                        + admissions.map {
+                            "audio[\($0.ordinal)] "
+                                + "peak=\($0.evidence.peakBandwidth) "
+                                + "average=\($0.evidence.averageBandwidth)"
+                        }.joined(separator: " "),
+                    category: .session
+                )
+                return BlackCarrierAudioBandwidthMeasurement(
+                    sourceContract: pump.sourceContract,
+                    renditionMetadata: pump.renditionMetadata,
+                    renditionDescriptors: pump.renditionDescriptors,
+                    admissions: admissions
+                )
+            }
+        } catch {
+            pump.close()
+            throw error
+        }
+        EngineLog.emit(
+            "[BlackCarrierAudioBandwidthPreflight] "
+                + "strategy=full-asset-measurement",
+            category: .session
         )
         let stores = try pump.finishStores()
         defer { stores.forEach { $0.close() } }

@@ -138,15 +138,15 @@ struct BlackCarrierBandwidthPreflightTests {
         }
     }
 
-    @Test("Full-asset measurement supplies exact master admissions")
+    @Test("Bounded PCM-to-EAC3 calibration matches full-asset output")
     func measuredAdmissionsFeedProvider() throws {
         let sourceData = makeWAV(
             sampleRate: 48_000,
             channels: 2,
-            seconds: 5.25
+            seconds: 13.25
         )
         let timeline = try BlackCarrierTimeline.fileVOD(
-            duration: CMTime(seconds: 5.25, preferredTimescale: 90_000)
+            duration: CMTime(seconds: 13.25, preferredTimescale: 90_000)
         )
 
         let measurementState = ReaderState(payloads: [sourceData])
@@ -168,15 +168,45 @@ struct BlackCarrierBandwidthPreflightTests {
         #expect(measurement.admissions.count == 1)
         #expect(admission.ordinal == 0)
         #expect(admission.evidence.isValid)
-        guard case .measuredFullAsset(let peak, let average) =
-                admission.evidence else {
-            Issue.record("Production preflight did not return measured evidence")
+        guard case .calibratedConstantRate(
+            let payload,
+            let peak,
+            let average,
+            let sampleRate,
+            let channelCount,
+            let measuredSegmentCount
+        ) = admission.evidence else {
+            Issue.record(
+                "Production preflight did not return calibrated evidence"
+            )
             return
         }
+        #expect(payload == 256_000)
         #expect(peak >= average)
+        #expect(sampleRate == 48_000)
+        #expect(channelCount == 2)
+        #expect(measuredSegmentCount == 3)
         #expect(measurementState.cloneCount == 1)
         #expect(measurementState.prototypeCloseCount == 1)
         #expect(measurementState.cloneCloseCount == 1)
+
+        let verificationPump =
+            try BlackCarrierMediaFanoutPump.makeSeekableVOD(
+                source: .custom(
+                    DataIOReader(data: sourceData),
+                    formatHint: "wav"
+                ),
+                options: LoadOptions(),
+                timeline: timeline
+            )
+        let verificationStores = try verificationPump
+            .finishStores()
+        defer { verificationStores.forEach { $0.close() } }
+        let verified = try #require(
+            verificationStores.first
+        )
+        #expect(peak == verified.peakBandwidth)
+        #expect(average == verified.averageBandwidth)
 
         let playbackState = ReaderState(payloads: [sourceData])
         let videoProvider = try BlackCarrierVideoProvider(
@@ -252,6 +282,66 @@ struct BlackCarrierBandwidthPreflightTests {
         )
     }
 
+    @Test("Non-48k bridge remains on explicit full-asset measurement")
+    func non48kBridgeUsesFullMeasurement() throws {
+        let sourceData = makeWAV(
+            sampleRate: 44_100,
+            channels: 2,
+            seconds: 1
+        )
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(
+                seconds: 1,
+                preferredTimescale: 90_000
+            )
+        )
+        let state = ReaderState(payloads: [sourceData])
+        let factory = try BlackCarrierDemuxSourceFactory
+            .adopting(
+                source: .custom(
+                    SequencedReader(state: state),
+                    formatHint: "wav"
+                ),
+                options: LoadOptions()
+            )
+        let measurement =
+            try BlackCarrierAudioBandwidthPreflight.measure(
+                sourceFactory: factory,
+                timeline: timeline,
+                bridgeMode: .surroundCompat
+            )
+        factory.close()
+        let admission = try #require(
+            measurement.admissions.first
+        )
+
+        guard case .measuredFullAsset = admission.evidence else {
+            Issue.record(
+                "Non-48k bridge unexpectedly used bounded calibration"
+            )
+            return
+        }
+        #expect(state.cloneCount == 1)
+        #expect(state.prototypeCloseCount == 1)
+        #expect(state.cloneCloseCount == 1)
+    }
+
+    @Test("Bounded calibration handles a tail-only short asset")
+    func calibrationHandlesTailOnlyAsset() throws {
+        try assertCalibrationMatchesFullAsset(
+            seconds: 1.25,
+            expectedMeasuredSegmentCount: 1
+        )
+    }
+
+    @Test("Bounded calibration extrapolates exact full segments")
+    func calibrationHandlesExactSegmentMultiple() throws {
+        try assertCalibrationMatchesFullAsset(
+            seconds: 12,
+            expectedMeasuredSegmentCount: 2
+        )
+    }
+
     @Test("Video-only source skips the full-asset audio measurement generation")
     func videoOnlySkipsAudioMeasurement() throws {
         let sourceData = try BlackCarrierEncodedSample
@@ -299,6 +389,69 @@ struct BlackCarrierBandwidthPreflightTests {
         provider.close()
         #expect(state.prototypeCloseCount == 1)
         #expect(state.cloneCloseCount == 1)
+    }
+
+    private func assertCalibrationMatchesFullAsset(
+        seconds: Double,
+        expectedMeasuredSegmentCount: Int
+    ) throws {
+        let sourceData = makeWAV(
+            sampleRate: 48_000,
+            channels: 2,
+            seconds: seconds
+        )
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(
+                seconds: seconds,
+                preferredTimescale: 90_000
+            )
+        )
+        let sourceFactory =
+            try BlackCarrierDemuxSourceFactory.adopting(
+                source: .custom(
+                    DataIOReader(data: sourceData),
+                    formatHint: "wav"
+                ),
+                options: LoadOptions()
+            )
+        let measurement = try BlackCarrierAudioBandwidthPreflight.measure(
+            sourceFactory: sourceFactory,
+            timeline: timeline,
+            bridgeMode: .surroundCompat
+        )
+        sourceFactory.close()
+        let admission = try #require(measurement.admissions.first)
+        guard case .calibratedConstantRate(
+            _,
+            let calibratedPeak,
+            let calibratedAverage,
+            _,
+            _,
+            let measuredSegmentCount
+        ) = admission.evidence else {
+            Issue.record(
+                "Eligible PCM source did not use bounded calibration"
+            )
+            return
+        }
+        #expect(
+            measuredSegmentCount == expectedMeasuredSegmentCount
+        )
+
+        let verificationPump =
+            try BlackCarrierMediaFanoutPump.makeSeekableVOD(
+                source: .custom(
+                    DataIOReader(data: sourceData),
+                    formatHint: "wav"
+                ),
+                options: LoadOptions(),
+                timeline: timeline
+            )
+        let verificationStores = try verificationPump.finishStores()
+        defer { verificationStores.forEach { $0.close() } }
+        let verified = try #require(verificationStores.first)
+        #expect(calibratedPeak == verified.peakBandwidth)
+        #expect(calibratedAverage == verified.averageBandwidth)
     }
 
     private func makeWAV(
