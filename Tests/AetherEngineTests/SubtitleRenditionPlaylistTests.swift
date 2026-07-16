@@ -11,6 +11,7 @@ private final class MasterMockProvider: HLSSegmentProvider, @unchecked Sendable 
     func segmentDuration(at index: Int) -> Double { 4.0 }
     var playlistType: HLSPlaylistType { .vod }
     var masterCodecs: String? { "hvc1.1.6.L120.90,mp4a.40.2" }
+    var masterBandwidth: Int? { 1_000_000 }
     var masterVideoRange: HLSVideoRange? { .sdr }
     var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { renditions }
 }
@@ -33,6 +34,7 @@ private final class WindowedSubsProvider: HLSSegmentProvider, @unchecked Sendabl
     func segmentDuration(at index: Int) -> Double { segDuration }
     var playlistType: HLSPlaylistType { .vod }
     var masterCodecs: String? { "hvc1.1.6.L120.90,mp4a.40.2" }
+    var masterBandwidth: Int? { 1_000_000 }
     var masterVideoRange: HLSVideoRange? { .sdr }
     var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { [(0, "eng", "English", false)] }
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? {
@@ -121,9 +123,11 @@ struct SubtitleRenditionPlaylistTests {
     }
 
     @Test("master declares SUBTITLES rendition + group when native subs present")
-    func masterHasSubtitleRendition() {
+    func masterHasSubtitleRendition() throws {
         let provider = MasterMockProvider(renditions: [(0, "eng", "English", false)])
-        let m = HLSLocalServer.buildMasterPlaylistText(provider: provider)
+        let m = try HLSLocalServer.buildMasterPlaylistText(
+            provider: provider
+        )
         #expect(m.contains("#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\""))
         #expect(m.contains("LANGUAGE=\"eng\""))
         #expect(m.contains("URI=\"subs_0.m3u8\""))
@@ -132,23 +136,27 @@ struct SubtitleRenditionPlaylistTests {
     }
 
     @Test("a source-forced rendition is NOT emitted FORCED=YES (host owns fullscreen subs)")
-    func masterForcedAttribute() {
+    func masterForcedAttribute() throws {
         // AVKit force-displays a FORCED rendition matching the audio language regardless of
         // DEFAULT/AUTOSELECT and the CC-off preference, self-engaging a rendition the overlay owns
         // (Sodalite#38 follow-on: forced German track shown on German audio with subtitles off). The
         // forced/full pair stays disambiguated by NAME, so neither carries FORCED=YES.
         let provider = MasterMockProvider(renditions: [(0, "ger", "Deutsch", true),
                                                        (1, "ger", "Deutsch 2", false)])
-        let m = HLSLocalServer.buildMasterPlaylistText(provider: provider)
+        let m = try HLSLocalServer.buildMasterPlaylistText(
+            provider: provider
+        )
         #expect(m.contains("NAME=\"Deutsch\",LANGUAGE=\"ger\",DEFAULT=NO,AUTOSELECT=NO,URI=\"subs_0.m3u8\""))
         #expect(m.contains("NAME=\"Deutsch 2\",LANGUAGE=\"ger\",DEFAULT=NO,AUTOSELECT=NO,URI=\"subs_1.m3u8\""))
         #expect(!m.contains("FORCED"))
     }
 
     @Test("master omits SUBTITLES when no native subs")
-    func masterNoSubtitleRendition() {
+    func masterNoSubtitleRendition() throws {
         let provider = MasterMockProvider(renditions: [])
-        let m = HLSLocalServer.buildMasterPlaylistText(provider: provider)
+        let m = try HLSLocalServer.buildMasterPlaylistText(
+            provider: provider
+        )
         #expect(!m.contains("EXT-X-MEDIA:TYPE=SUBTITLES"))
         #expect(!m.contains("SUBTITLES=\"subs\""))
     }
@@ -162,6 +170,7 @@ private final class ReducedMasterMockProvider: HLSSegmentProvider, @unchecked Se
     func segmentDuration(at index: Int) -> Double { 4.0 }
     var playlistType: HLSPlaylistType { .vod }
     var masterCodecs: String? { "hvc1.2.4.L150,ec-3" }
+    var masterBandwidth: Int? { 1_000_000 }
     var masterSupplementalCodecs: String? { "dvh1.08.06/db1p" }
     var masterVideoRange: HLSVideoRange? { .pq }
     var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] {
@@ -172,8 +181,11 @@ private final class ReducedMasterMockProvider: HLSSegmentProvider, @unchecked Se
 struct ReducedMasterPlaylistTests {
 
     @Test("reducedHDR drops SUPPLEMENTAL, keeps the source range + codecs, keeps SUBTITLES")
-    func reducedHDR() {
-        let hdr = HLSLocalServer.buildMasterPlaylistText(provider: ReducedMasterMockProvider(), variant: .reducedHDR)
+    func reducedHDR() throws {
+        let hdr = try HLSLocalServer.buildMasterPlaylistText(
+            provider: ReducedMasterMockProvider(),
+            variant: .reducedHDR
+        )
         #expect(hdr.contains("VIDEO-RANGE=PQ"))
         #expect(!hdr.contains("VIDEO-RANGE=SDR"))
         #expect(!hdr.contains("SUPPLEMENTAL-CODECS"))
@@ -184,8 +196,11 @@ struct ReducedMasterPlaylistTests {
     }
 
     @Test("primary keeps SUPPLEMENTAL and the source range")
-    func primaryUnchanged() {
-        let primary = HLSLocalServer.buildMasterPlaylistText(provider: ReducedMasterMockProvider(), variant: .primary)
+    func primaryUnchanged() throws {
+        let primary = try HLSLocalServer.buildMasterPlaylistText(
+            provider: ReducedMasterMockProvider(),
+            variant: .primary
+        )
         #expect(primary.contains("SUPPLEMENTAL-CODECS=\"dvh1.08.06/db1p\""))
         #expect(primary.contains("VIDEO-RANGE=PQ"))
     }

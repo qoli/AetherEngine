@@ -17,6 +17,10 @@ enum BlackCarrierMediaFanoutPumpError:
     case seekIntentSegmentMismatch(expected: Int, actual: Int)
     case demuxSeekFailed(segmentIndex: Int)
     case restartTimelineOffsetUnavailable(trackID: Int)
+    case freshDemuxerFactoryMissing
+    case freshDemuxerOpenFailed(reason: String)
+    case restartTrackContractMismatch
+    case generationSuperseded(generation: UInt64)
     case closed
     case demuxFailed(reason: String)
     case videoPacketSinkFailed(reason: String)
@@ -45,6 +49,14 @@ enum BlackCarrierMediaFanoutPumpError:
             return "Black carrier demux could not seek to segment \(segmentIndex)"
         case .restartTimelineOffsetUnavailable(let trackID):
             return "Black carrier audio track \(trackID) has no startup timeline offset for restart"
+        case .freshDemuxerFactoryMissing:
+            return "Black carrier lazy restart requires a fresh-demux factory"
+        case .freshDemuxerOpenFailed(let reason):
+            return "Black carrier fresh demux generation could not open: \(reason)"
+        case .restartTrackContractMismatch:
+            return "Black carrier fresh demux generation changed the admitted track contract"
+        case .generationSuperseded(let generation):
+            return "Black carrier generation \(generation) was superseded by an explicit seek"
         case .closed:
             return "Black carrier media fanout pump is closed"
         case .demuxFailed(let reason):
@@ -73,6 +85,8 @@ enum BlackCarrierMediaFanoutRestartResult: Sendable, Equatable {
 /// production does not require a second playback cursor. Calls are serialized; a future provider can
 /// safely invoke them from concurrent HLS request threads.
 final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
+    typealias FreshDemuxerFactory = @Sendable () throws -> Demuxer
+
     typealias VideoPacketSink = (
         _ packet: UnsafeMutablePointer<AVPacket>
     ) throws -> Void
@@ -96,16 +110,20 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     let renditionMetadata: [BlackCarrierAudioRenditionMetadata]
     let renditionDescriptors: [BlackCarrierAudioRenditionDescriptor]
 
-    private let demuxer: Demuxer
+    private var demuxer: Demuxer
+    private let freshDemuxerFactory: FreshDemuxerFactory?
     private let timeline: BlackCarrierTimeline
     private let bridgeMode: AudioBridgeMode
-    private let videoStreamIndex: Int32
+    private var videoStreamIndex: Int32
     private let videoPacketSink: VideoPacketSink?
     private let renditions: [Rendition]
-    private let renditionsByStream: [
+    private var renditionsByStream: [
         Int32: Rendition
     ]
     private let lock = NSLock()
+    private let restartLock = NSLock()
+    private let generationLock = NSLock()
+    private let demuxerReferenceLock = NSLock()
 
     private var summaries: [
         Int: BlackCarrierAudioRenditionSummary
@@ -115,6 +133,9 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     private var isClosed = false
     private var generationStartSegmentIndex: Int
     private var currentGeneration: UInt64
+    private var requestedRestartGeneration: UInt64?
+    private var interruptibleDemuxer: Demuxer
+    private var ownsActiveDemuxer = false
 
     init(
         demuxer: Demuxer,
@@ -122,7 +143,8 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         bridgeMode: AudioBridgeMode = .surroundCompat,
         videoStreamIndex: Int32? = nil,
         videoPacketSink: VideoPacketSink? = nil,
-        initialGeneration: UInt64 = 0
+        initialGeneration: UInt64 = 0,
+        freshDemuxerFactory: FreshDemuxerFactory? = nil
     ) throws {
         guard let firstSegmentIndex = timeline.segments.first?.index else {
             throw BlackCarrierMediaFanoutPumpError
@@ -191,6 +213,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         }
 
         self.demuxer = demuxer
+        self.freshDemuxerFactory = freshDemuxerFactory
         self.timeline = timeline
         self.bridgeMode = bridgeMode
         self.videoStreamIndex = videoPacketSink == nil
@@ -202,6 +225,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         renditionDescriptors = prepared.map(\.writer.descriptor)
         generationStartSegmentIndex = firstSegmentIndex
         currentGeneration = initialGeneration
+        interruptibleDemuxer = demuxer
         renditionsByStream = Dictionary(
             uniqueKeysWithValues: prepared.map {
                 ($0.writer.sourceStreamIndex, $0)
@@ -226,9 +250,13 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     }
 
     var generation: UInt64 {
-        lock.lock()
-        defer { lock.unlock() }
+        generationLock.lock()
+        defer { generationLock.unlock() }
         return currentGeneration
+    }
+
+    var supportsFreshDemuxRestart: Bool {
+        freshDemuxerFactory != nil
     }
 
     func restart(
@@ -242,35 +270,62 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             throw BlackCarrierMediaFanoutPumpError.restartRequiresUserSeek
         }
 
+        restartLock.lock()
+        defer { restartLock.unlock() }
+
+        generationLock.lock()
+        guard requestedGeneration > currentGeneration else {
+            let result = BlackCarrierMediaFanoutRestartResult.stale(
+                currentGeneration: currentGeneration
+            )
+            generationLock.unlock()
+            return result
+        }
+        requestedRestartGeneration = requestedGeneration
+        generationLock.unlock()
+
+        demuxerReferenceLock.lock()
+        let retiringDemuxer = interruptibleDemuxer
+        demuxerReferenceLock.unlock()
+        retiringDemuxer.markClosed()
+
         lock.lock()
-        defer { lock.unlock() }
+        var freshDemuxerToClose: Demuxer?
+        var retiredDemuxerToClose: Demuxer?
+        defer {
+            lock.unlock()
+            freshDemuxerToClose?.close()
+            retiredDemuxerToClose?.close()
+        }
 
         guard !isClosed else {
+            clearRequestedRestart()
             throw BlackCarrierMediaFanoutPumpError.closed
         }
         if let terminalError {
+            clearRequestedRestart()
             throw terminalError
         }
-        guard requestedGeneration > currentGeneration else {
-            return .stale(currentGeneration: currentGeneration)
+        guard let freshDemuxerFactory else {
+            let error = BlackCarrierMediaFanoutPumpError
+                .freshDemuxerFactoryMissing
+            failWhileLocked(error)
+            throw error
         }
         guard let expectedSegmentIndex = timeline.segmentIndex(
             containing: target
         ) else {
-            throw BlackCarrierMediaFanoutPumpError
+            let error = BlackCarrierMediaFanoutPumpError
                 .invalidSegmentIndex(index: requestedSegmentIndex)
+            failWhileLocked(error)
+            throw error
         }
         guard requestedSegmentIndex == expectedSegmentIndex else {
-            throw BlackCarrierMediaFanoutPumpError
+            let error = BlackCarrierMediaFanoutPumpError
                 .seekIntentSegmentMismatch(
                     expected: expectedSegmentIndex,
                     actual: requestedSegmentIndex
                 )
-        }
-        let segment = timeline.segments[expectedSegmentIndex]
-        guard demuxer.seek(to: CMTimeGetSeconds(segment.startTime)) else {
-            let error = BlackCarrierMediaFanoutPumpError
-                .demuxSeekFailed(segmentIndex: expectedSegmentIndex)
             failWhileLocked(error)
             throw error
         }
@@ -286,13 +341,56 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                 }
                 return offset
             }
+            let freshDemuxer: Demuxer
+            do {
+                freshDemuxer = try freshDemuxerFactory()
+            } catch {
+                throw BlackCarrierMediaFanoutPumpError
+                    .freshDemuxerOpenFailed(
+                        reason: String(describing: error)
+                    )
+            }
+            freshDemuxerToClose = freshDemuxer
+            guard freshDemuxer !== retiringDemuxer else {
+                throw BlackCarrierMediaFanoutPumpError
+                    .restartTrackContractMismatch
+            }
+
+            let freshTracks = freshDemuxer.audioTrackInfos()
+            let freshMetadata =
+                BlackCarrierCompositeProvider.renditionMetadata(
+                    for: freshTracks
+                )
+            guard freshMetadata == renditionMetadata else {
+                throw BlackCarrierMediaFanoutPumpError
+                    .restartTrackContractMismatch
+            }
+            let freshVideoStreamIndex: Int32
+            if videoPacketSink == nil {
+                freshVideoStreamIndex = -1
+            } else {
+                freshVideoStreamIndex = freshDemuxer.videoStreamIndex
+                guard freshVideoStreamIndex >= 0 else {
+                    throw BlackCarrierMediaFanoutPumpError.videoStreamMissing
+                }
+            }
+
+            let segment = timeline.segments[expectedSegmentIndex]
+            guard freshDemuxer.seek(
+                to: CMTimeGetSeconds(segment.startTime)
+            ) else {
+                throw BlackCarrierMediaFanoutPumpError
+                    .demuxSeekFailed(segmentIndex: expectedSegmentIndex)
+            }
             let replacementWriters = try zip(
-                renditions,
+                zip(renditions, freshTracks),
                 timelineOffsets
-            ).map { rendition, timelineOffset in
-                try Self.makeWriter(
-                    demuxer: demuxer,
-                    streamIndex: rendition.writer.sourceStreamIndex,
+            ).map { pair, timelineOffset in
+                let rendition = pair.0
+                let freshTrack = pair.1
+                return try Self.makeWriter(
+                    demuxer: freshDemuxer,
+                    streamIndex: Int32(freshTrack.id),
                     metadata: rendition.metadata,
                     cache: rendition.cache,
                     timeline: timeline,
@@ -304,16 +402,42 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                     restartTimestampRebaseEnabled: true
                 )
             }
+            let freshDescriptors = replacementWriters.map(\.descriptor)
+            guard freshDescriptors == renditionDescriptors else {
+                throw BlackCarrierMediaFanoutPumpError
+                    .restartTrackContractMismatch
+            }
             for (rendition, replacement) in zip(
                 renditions,
                 replacementWriters
             ) {
                 rendition.writer = replacement
             }
+            var keep = Set(replacementWriters.map(\.sourceStreamIndex))
+            if freshVideoStreamIndex >= 0 {
+                keep.insert(freshVideoStreamIndex)
+            }
+            freshDemuxer.discardAllStreamsExcept(keep)
+            renditionsByStream = Dictionary(
+                uniqueKeysWithValues: renditions.map {
+                    ($0.writer.sourceStreamIndex, $0)
+                }
+            )
+            videoStreamIndex = freshVideoStreamIndex
             summaries.removeAll(keepingCapacity: true)
             isFinished = false
             generationStartSegmentIndex = expectedSegmentIndex
+            retiredDemuxerToClose = demuxer
+            demuxer = freshDemuxer
+            ownsActiveDemuxer = true
+            demuxerReferenceLock.lock()
+            interruptibleDemuxer = freshDemuxer
+            demuxerReferenceLock.unlock()
+            freshDemuxerToClose = nil
+            generationLock.lock()
             currentGeneration = requestedGeneration
+            requestedRestartGeneration = nil
+            generationLock.unlock()
             return .applied(
                 generation: requestedGeneration,
                 segmentIndex: expectedSegmentIndex
@@ -347,6 +471,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     func produce(throughSegment index: Int) throws {
         lock.lock()
         defer { lock.unlock() }
+        let operationGeneration = generationSnapshot()
 
         guard !isClosed else {
             throw BlackCarrierMediaFanoutPumpError.closed
@@ -373,6 +498,12 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         do {
             while !hasSegment(index), !isFinished {
                 guard let packet = try demuxer.readPacket() else {
+                    if isGenerationSuperseded(operationGeneration) {
+                        throw BlackCarrierMediaFanoutPumpError
+                            .generationSuperseded(
+                                generation: operationGeneration
+                            )
+                    }
                     try finishWriters()
                     break
                 }
@@ -411,9 +542,21 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                     .requestedSegmentUnavailable(index: index)
             }
         } catch let error as BlackCarrierMediaFanoutPumpError {
+            if isGenerationSuperseded(operationGeneration) {
+                throw BlackCarrierMediaFanoutPumpError
+                    .generationSuperseded(
+                        generation: operationGeneration
+                    )
+            }
             fail(error)
             throw error
         } catch {
+            if isGenerationSuperseded(operationGeneration) {
+                throw BlackCarrierMediaFanoutPumpError
+                    .generationSuperseded(
+                        generation: operationGeneration
+                    )
+            }
             let typed = BlackCarrierMediaFanoutPumpError.demuxFailed(
                 reason: String(describing: error)
             )
@@ -543,6 +686,11 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     }
 
     func close() {
+        demuxerReferenceLock.lock()
+        let activeDemuxer = interruptibleDemuxer
+        demuxerReferenceLock.unlock()
+        activeDemuxer.markClosed()
+
         lock.lock()
         guard !isClosed else {
             lock.unlock()
@@ -550,8 +698,12 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         }
         isClosed = true
         let caches = renditions.map(\.cache)
+        let demuxerToClose = ownsActiveDemuxer ? demuxer : nil
+        ownsActiveDemuxer = false
+        clearRequestedRestart()
         lock.unlock()
         caches.forEach { $0.close() }
+        demuxerToClose?.close()
     }
 
     private func finishWriters() throws {
@@ -602,6 +754,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     ) {
         terminalError = error
         isClosed = true
+        clearRequestedRestart()
         renditions.forEach { $0.cache.close() }
     }
 
@@ -614,6 +767,29 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         let caches = renditions.map(\.cache)
         lock.unlock()
         caches.forEach { $0.close() }
+    }
+
+    private func generationSnapshot() -> UInt64 {
+        generationLock.lock()
+        defer { generationLock.unlock() }
+        return currentGeneration
+    }
+
+    private func isGenerationSuperseded(
+        _ generation: UInt64
+    ) -> Bool {
+        generationLock.lock()
+        defer { generationLock.unlock() }
+        if let requestedRestartGeneration {
+            return requestedRestartGeneration > generation
+        }
+        return currentGeneration > generation
+    }
+
+    private func clearRequestedRestart() {
+        generationLock.lock()
+        requestedRestartGeneration = nil
+        generationLock.unlock()
     }
 
     private static func sourceStartPTS(

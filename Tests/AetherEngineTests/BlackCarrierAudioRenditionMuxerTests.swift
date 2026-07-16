@@ -346,7 +346,12 @@ struct BlackCarrierAudioRenditionMuxerTests {
         let pump = try BlackCarrierMediaFanoutPump(
             demuxer: demuxer,
             timeline: timeline,
-            initialGeneration: 10
+            initialGeneration: 10,
+            freshDemuxerFactory: {
+                let fresh = Demuxer()
+                try fresh.open(reader: DataIOReader(data: sourceData))
+                return fresh
+            }
         )
         defer { pump.close() }
 
@@ -434,7 +439,12 @@ struct BlackCarrierAudioRenditionMuxerTests {
         )
         let pump = try BlackCarrierMediaFanoutPump(
             demuxer: demuxer,
-            timeline: timeline
+            timeline: timeline,
+            freshDemuxerFactory: {
+                let fresh = Demuxer()
+                try fresh.open(reader: DataIOReader(data: sourceData))
+                return fresh
+            }
         )
         defer { pump.close() }
 

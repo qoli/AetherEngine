@@ -98,7 +98,9 @@ struct BlackCarrierCompositeProviderTests {
         #expect(provider.sourceTrackID(forAudioOrdinal: 1) == 1)
         #expect(provider.sourceTrackID(forAudioOrdinal: 9) == nil)
 
-        let master = HLSLocalServer.buildMasterPlaylistText(provider: provider)
+        let master = try HLSLocalServer.buildMasterPlaylistText(
+            provider: provider
+        )
         #expect(master.contains("CODECS=\"avc1.42C01E,ec-3\""))
         #expect(master.contains("AUDIO=\"audio\""))
         #expect(master.contains("BANDWIDTH=\(expectedBandwidth)"))

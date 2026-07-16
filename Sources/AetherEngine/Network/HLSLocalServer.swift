@@ -318,6 +318,9 @@ final class HLSLocalServer: @unchecked Sendable {
     // MARK: - Lifecycle
 
     func start() throws {
+        if let provider, provider.masterCodecs != nil {
+            _ = try Self.validatedMasterBandwidth(provider: provider)
+        }
         // SOCK_STREAM = TCP, IPPROTO_TCP = 6.
         let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard fd >= 0 else {
@@ -602,7 +605,16 @@ final class HLSLocalServer: @unchecked Sendable {
         switch normalizedPath {
         case "/master.m3u8":
             if provider?.masterCodecs != nil {
-                let body = buildMasterPlaylist()
+                let body: String
+                do {
+                    body = try buildMasterPlaylist()
+                } catch {
+                    return send500(
+                        fd: fd,
+                        path: normalizedPath,
+                        reason: String(describing: error)
+                    )
+                }
                 stateLock.lock()
                 let firstTime = !loggedMasterPlaylist
                 if firstTime { loggedMasterPlaylist = true }
@@ -621,7 +633,16 @@ final class HLSLocalServer: @unchecked Sendable {
             // #98: HDR-preserving reduced master (DV signaling dropped, source range + subtitle
             // renditions kept), served by the #35 cold-DV-start gate on an HDR TV.
             if provider?.masterCodecs != nil {
-                let body = buildReducedMasterPlaylist(.reducedHDR)
+                let body: String
+                do {
+                    body = try buildReducedMasterPlaylist(.reducedHDR)
+                } catch {
+                    return send500(
+                        fd: fd,
+                        path: normalizedPath,
+                        reason: String(describing: error)
+                    )
+                }
                 stateLock.lock()
                 let firstTime = !loggedReducedMasterPlaylist
                 if firstTime { loggedReducedMasterPlaylist = true }
@@ -742,11 +763,34 @@ final class HLSLocalServer: @unchecked Sendable {
                     ordinal: ordinal,
                     index: index
                 ), !data.isEmpty else {
-                    return send404(
-                        fd: fd,
-                        path: normalizedPath,
-                        reason: "alternate-audio segment \(ordinal)/\(index) is unavailable"
-                    )
+                    let reason =
+                        "alternate-audio segment \(ordinal)/\(index) is unavailable"
+                    switch Self.classifyAlternateAudioSegmentResponse(
+                        ordinal: ordinal,
+                        index: index,
+                        renditions: provider.alternateAudioRenditions,
+                        segmentCount: provider.segmentCount,
+                        hasData: false
+                    ) {
+                    case .serve:
+                        return send404(
+                            fd: fd,
+                            path: normalizedPath,
+                            reason: reason
+                        )
+                    case .retryLater:
+                        return send503(
+                            fd: fd,
+                            path: normalizedPath,
+                            reason: reason
+                        )
+                    case .notFound:
+                        return send404(
+                            fd: fd,
+                            path: normalizedPath,
+                            reason: reason
+                        )
+                    }
                 }
                 return send200(
                     fd: fd,
@@ -983,6 +1027,19 @@ final class HLSLocalServer: @unchecked Sendable {
         return writeAll(fd: fd, data: Data(header.utf8), path: path)
     }
 
+    private func send500(fd: Int32, path: String, reason: String) -> Bool {
+        let response = Self.responseHeader(
+            status: "500 Internal Server Error",
+            contentLength: 0,
+            contentType: nil
+        )
+        EngineLog.emit(
+            "[HLSLocalServer] -> 500 \(path) reason=\(reason)",
+            category: .hlsServer
+        )
+        return writeAll(fd: fd, data: response, path: path)
+    }
+
     /// How to answer a `/seg{N}.mp4` request, given whether the provider
     /// produced bytes and the currently advertised segment count. Pure so
     /// the #50 in-range-is-never-404 rule is unit-testable without sockets.
@@ -1001,6 +1058,23 @@ final class HLSLocalServer: @unchecked Sendable {
         if hasData { return .serve }
         if index >= 0, segmentCount > 0, index < segmentCount { return .retryLater }
         return .notFound
+    }
+
+    static func classifyAlternateAudioSegmentResponse(
+        ordinal: Int,
+        index: Int,
+        renditions: [HLSAudioRenditionInfo],
+        segmentCount: Int,
+        hasData: Bool
+    ) -> SegmentResponseKind {
+        guard renditions.contains(where: { $0.ordinal == ordinal }) else {
+            return .notFound
+        }
+        return classifySegmentResponse(
+            index: index,
+            segmentCount: segmentCount,
+            hasData: hasData
+        )
     }
 
     /// Blocking send loop. Uses withUnsafeBytes so mmap-backed Data stays mmap-backed (kernel page-faults in only the bytes copied to the socket send buffer, no heap accumulation).
@@ -1098,17 +1172,27 @@ final class HLSLocalServer: @unchecked Sendable {
 
     // MARK: - Playlist construction
 
-    private func buildMasterPlaylist() -> String {
-        guard let provider = provider else { return "#EXTM3U\n" }
-        return Self.buildMasterPlaylistText(provider: provider,
-                                             subResourceBaseURL: subResourceBaseURL)
+    private func buildMasterPlaylist() throws -> String {
+        guard let provider else {
+            throw HLSLocalServerError.providerUnavailable
+        }
+        return try Self.buildMasterPlaylistText(
+            provider: provider,
+            subResourceBaseURL: subResourceBaseURL
+        )
     }
 
-    private func buildReducedMasterPlaylist(_ variant: MasterPlaylistVariant) -> String {
-        guard let provider = provider else { return "#EXTM3U\n" }
-        return Self.buildMasterPlaylistText(provider: provider,
-                                             subResourceBaseURL: subResourceBaseURL,
-                                             variant: variant)
+    private func buildReducedMasterPlaylist(
+        _ variant: MasterPlaylistVariant
+    ) throws -> String {
+        guard let provider else {
+            throw HLSLocalServerError.providerUnavailable
+        }
+        return try Self.buildMasterPlaylistText(
+            provider: provider,
+            subResourceBaseURL: subResourceBaseURL,
+            variant: variant
+        )
     }
 
     private func buildMediaPlaylist() -> String {
@@ -1130,12 +1214,15 @@ final class HLSLocalServer: @unchecked Sendable {
     }
 
     /// Pure playlist builders callable without a live server instance. subResourceBaseURL emits absolute URIs for AVAssetResourceLoader; nil emits relative URIs for the HTTP workflow.
-    static func buildMasterPlaylistText(provider: HLSSegmentProvider,
-                                         subResourceBaseURL: URL? = nil,
-                                         variant: MasterPlaylistVariant = .primary) -> String {
+    static func buildMasterPlaylistText(
+        provider: HLSSegmentProvider,
+        subResourceBaseURL: URL? = nil,
+        variant: MasterPlaylistVariant = .primary
+    ) throws -> String {
         guard let codecs = provider.masterCodecs else {
-            return "#EXTM3U\n"
+            throw HLSLocalServerError.missingMasterCodecs
         }
+        let bandwidth = try validatedMasterBandwidth(provider: provider)
         var lines: [String] = []
         lines.append("#EXTM3U")
         lines.append("#EXT-X-VERSION:7")
@@ -1143,7 +1230,6 @@ final class HLSLocalServer: @unchecked Sendable {
 
         // EXT-X-STREAM-INF attribute order per Apple's HLS Authoring Spec Appendixes: BANDWIDTH, AVERAGE-BANDWIDTH, CODECS, SUPPLEMENTAL-CODECS, RESOLUTION/FRAME-RATE/VIDEO-RANGE, HDCP-LEVEL/CLOSED-CAPTIONS.
         var streamInfAttrs: [String] = []
-        let bandwidth = provider.masterBandwidth ?? 5_000_000
         streamInfAttrs.append("BANDWIDTH=\(bandwidth)")
         if let avg = provider.masterAverageBandwidth {
             streamInfAttrs.append("AVERAGE-BANDWIDTH=\(avg)")
@@ -1218,6 +1304,28 @@ final class HLSLocalServer: @unchecked Sendable {
         lines.append("#EXT-X-STREAM-INF:\(streamInfAttrs.joined(separator: ","))")
         lines.append("media.m3u8")
         return lines.joined(separator: "\n") + "\n"
+    }
+
+    private static func validatedMasterBandwidth(
+        provider: HLSSegmentProvider
+    ) throws -> Int {
+        guard let peak = provider.masterBandwidth else {
+            throw HLSLocalServerError.missingMasterBandwidth
+        }
+        guard peak > 0 else {
+            throw HLSLocalServerError.invalidMasterBandwidth(
+                peak: peak,
+                average: provider.masterAverageBandwidth
+            )
+        }
+        if let average = provider.masterAverageBandwidth,
+           average <= 0 || average > peak {
+            throw HLSLocalServerError.invalidMasterBandwidth(
+                peak: peak,
+                average: average
+            )
+        }
+        return peak
     }
 
     static func buildAlternateAudioMediaPlaylistText(
@@ -1494,7 +1602,11 @@ final class HLSLocalServer: @unchecked Sendable {
 
 // MARK: - Errors
 
-enum HLSLocalServerError: Error, CustomStringConvertible {
+enum HLSLocalServerError: Error, CustomStringConvertible, Equatable {
+    case providerUnavailable
+    case missingMasterCodecs
+    case missingMasterBandwidth
+    case invalidMasterBandwidth(peak: Int, average: Int?)
     case socketCreate(errno: Int32)
     case bind(errno: Int32)
     case listen(errno: Int32)
@@ -1502,6 +1614,14 @@ enum HLSLocalServerError: Error, CustomStringConvertible {
 
     var description: String {
         switch self {
+        case .providerUnavailable:
+            return "HLSLocalServer: provider is unavailable"
+        case .missingMasterCodecs:
+            return "HLSLocalServer: master playlist codecs are missing"
+        case .missingMasterBandwidth:
+            return "HLSLocalServer: master playlist bandwidth evidence is missing"
+        case .invalidMasterBandwidth(let peak, let average):
+            return "HLSLocalServer: invalid master bandwidth peak=\(peak) average=\(String(describing: average))"
         case .socketCreate(let e): return "HLSLocalServer: socket() failed (errno=\(e))"
         case .bind(let e):         return "HLSLocalServer: bind() failed (errno=\(e))"
         case .listen(let e):       return "HLSLocalServer: listen() failed (errno=\(e))"

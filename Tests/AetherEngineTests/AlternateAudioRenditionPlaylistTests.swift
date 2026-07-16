@@ -3,6 +3,17 @@ import Testing
 @testable import AetherEngine
 
 private final class AlternateAudioMockProvider: HLSSegmentProvider, @unchecked Sendable {
+    private let peakBandwidth: Int?
+    private let averageBandwidth: Int?
+
+    init(
+        peakBandwidth: Int? = 1_500_000,
+        averageBandwidth: Int? = 900_000
+    ) {
+        self.peakBandwidth = peakBandwidth
+        self.averageBandwidth = averageBandwidth
+    }
+
     func initSegment() -> Data? { Data([0x00]) }
     func mediaSegment(at index: Int) -> Data? { Data([0x00]) }
     var segmentCount: Int { 3 }
@@ -13,8 +24,8 @@ private final class AlternateAudioMockProvider: HLSSegmentProvider, @unchecked S
     var masterCodecs: String? { "avc1.42C01E,mp4a.40.2,ec-3" }
     var masterResolution: (width: Int, height: Int)? { (640, 360) }
     var masterVideoRange: HLSVideoRange? { .sdr }
-    var masterBandwidth: Int? { 1_500_000 }
-    var masterAverageBandwidth: Int? { 900_000 }
+    var masterBandwidth: Int? { peakBandwidth }
+    var masterAverageBandwidth: Int? { averageBandwidth }
     var alternateAudioRenditions: [HLSAudioRenditionInfo] {
         [
             HLSAudioRenditionInfo(
@@ -48,7 +59,9 @@ struct AlternateAudioRenditionPlaylistTests {
     @Test("Master exposes every audio track through one native selection group")
     func masterPlaylist() throws {
         let provider = AlternateAudioMockProvider()
-        let master = HLSLocalServer.buildMasterPlaylistText(provider: provider)
+        let master = try HLSLocalServer.buildMasterPlaylistText(
+            provider: provider
+        )
 
         #expect(master.contains(
             "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"English\",LANGUAGE=\"eng\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"2\",URI=\"audio_0.m3u8\""
@@ -120,5 +133,75 @@ struct AlternateAudioRenditionPlaylistTests {
         #expect(HLSLocalServer.parseAudioResourcePath("/audio_2_seg_-1.mp4") == nil)
         #expect(HLSLocalServer.parseAudioResourcePath("/audio_x_init.mp4") == nil)
         #expect(HLSLocalServer.parseAudioResourcePath("/audio_2.mp4") == nil)
+    }
+
+    @Test("In-range audio generation misses are retriable, not terminal 404s")
+    func segmentResponseClassification() {
+        let provider = AlternateAudioMockProvider()
+        let renditions = provider.alternateAudioRenditions
+
+        #expect(HLSLocalServer.classifyAlternateAudioSegmentResponse(
+            ordinal: 0,
+            index: 1,
+            renditions: renditions,
+            segmentCount: provider.segmentCount,
+            hasData: false
+        ) == .retryLater)
+        #expect(HLSLocalServer.classifyAlternateAudioSegmentResponse(
+            ordinal: 0,
+            index: 1,
+            renditions: renditions,
+            segmentCount: provider.segmentCount,
+            hasData: true
+        ) == .serve)
+        #expect(HLSLocalServer.classifyAlternateAudioSegmentResponse(
+            ordinal: 9,
+            index: 1,
+            renditions: renditions,
+            segmentCount: provider.segmentCount,
+            hasData: false
+        ) == .notFound)
+        #expect(HLSLocalServer.classifyAlternateAudioSegmentResponse(
+            ordinal: 0,
+            index: 9,
+            renditions: renditions,
+            segmentCount: provider.segmentCount,
+            hasData: false
+        ) == .notFound)
+    }
+
+    @Test("Master bandwidth evidence is mandatory and internally consistent")
+    func masterBandwidthValidation() {
+        let missing = AlternateAudioMockProvider(
+            peakBandwidth: nil,
+            averageBandwidth: nil
+        )
+        #expect(throws: HLSLocalServerError.missingMasterBandwidth) {
+            _ = try HLSLocalServer.buildMasterPlaylistText(
+                provider: missing
+            )
+        }
+        #expect(throws: HLSLocalServerError.missingMasterBandwidth) {
+            try HLSLocalServer(provider: missing).start()
+        }
+
+        let inconsistent = AlternateAudioMockProvider(
+            peakBandwidth: 500_000,
+            averageBandwidth: 600_000
+        )
+        #expect(throws: HLSLocalServerError.invalidMasterBandwidth(
+            peak: 500_000,
+            average: 600_000
+        )) {
+            _ = try HLSLocalServer.buildMasterPlaylistText(
+                provider: inconsistent
+            )
+        }
+        #expect(throws: HLSLocalServerError.invalidMasterBandwidth(
+            peak: 500_000,
+            average: 600_000
+        )) {
+            try HLSLocalServer(provider: inconsistent).start()
+        }
     }
 }

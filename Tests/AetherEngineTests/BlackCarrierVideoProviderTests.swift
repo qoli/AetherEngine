@@ -24,7 +24,9 @@ struct BlackCarrierVideoProviderTests {
         #expect(provider.mediaSegment(at: -1) == nil)
         #expect(provider.mediaSegment(at: provider.segmentCount) == nil)
 
-        let master = HLSLocalServer.buildMasterPlaylistText(provider: provider)
+        let master = try HLSLocalServer.buildMasterPlaylistText(
+            provider: provider
+        )
         #expect(master.contains("#EXT-X-INDEPENDENT-SEGMENTS"))
         #expect(master.contains("BANDWIDTH=\(provider.masterBandwidth!)"))
         #expect(master.contains("AVERAGE-BANDWIDTH=\(provider.masterAverageBandwidth!)"))

@@ -12,12 +12,18 @@ struct BlackCarrierLazyCompositeProviderTests {
         )
         let videoProvider = try BlackCarrierVideoProvider(timeline: timeline)
         let videoDirectory = videoProvider.sessionDirectory
+        let sourceData = makeWAV(seconds: 5.25)
         let demuxer = Demuxer()
-        try demuxer.open(reader: DataIOReader(data: makeWAV(seconds: 5.25)))
+        try demuxer.open(reader: DataIOReader(data: sourceData))
         defer { demuxer.close() }
         let pump = try BlackCarrierMediaFanoutPump(
             demuxer: demuxer,
-            timeline: timeline
+            timeline: timeline,
+            freshDemuxerFactory: {
+                let fresh = Demuxer()
+                try fresh.open(reader: DataIOReader(data: sourceData))
+                return fresh
+            }
         )
         let evidence = BlackCarrierAudioBandwidthEvidence
             .verifiedConstantRate(
@@ -112,12 +118,18 @@ struct BlackCarrierLazyCompositeProviderTests {
         )
         let videoProvider = try BlackCarrierVideoProvider(timeline: timeline)
         let videoDirectory = videoProvider.sessionDirectory
+        let sourceData = makeWAV(seconds: 1)
         let demuxer = Demuxer()
-        try demuxer.open(reader: DataIOReader(data: makeWAV(seconds: 1)))
+        try demuxer.open(reader: DataIOReader(data: sourceData))
         defer { demuxer.close() }
         let pump = try BlackCarrierMediaFanoutPump(
             demuxer: demuxer,
-            timeline: timeline
+            timeline: timeline,
+            freshDemuxerFactory: {
+                let fresh = Demuxer()
+                try fresh.open(reader: DataIOReader(data: sourceData))
+                return fresh
+            }
         )
         let evidence = BlackCarrierAudioBandwidthEvidence
             .measuredFullAsset(
@@ -134,6 +146,45 @@ struct BlackCarrierLazyCompositeProviderTests {
                     BlackCarrierAudioBandwidthAdmission(
                         ordinal: 0,
                         evidence: evidence
+                    ),
+                ]
+            )
+        }
+        #expect(!FileManager.default.fileExists(atPath: videoDirectory.path))
+        #expect(throws: BlackCarrierMediaFanoutPumpError.closed) {
+            try pump.produce(throughSegment: 0)
+        }
+    }
+
+    @Test("Lazy provider rejects a pump without a fresh-demux restart factory")
+    func missingFreshDemuxFactory() throws {
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(seconds: 1, preferredTimescale: 90_000)
+        )
+        let videoProvider = try BlackCarrierVideoProvider(timeline: timeline)
+        let videoDirectory = videoProvider.sessionDirectory
+        let demuxer = Demuxer()
+        try demuxer.open(reader: DataIOReader(data: makeWAV(seconds: 1)))
+        defer { demuxer.close() }
+        let pump = try BlackCarrierMediaFanoutPump(
+            demuxer: demuxer,
+            timeline: timeline
+        )
+
+        #expect(throws: BlackCarrierLazyCompositeProviderError.pump(
+            .freshDemuxerFactoryMissing
+        )) {
+            _ = try BlackCarrierLazyCompositeProvider(
+                videoProvider: videoProvider,
+                pump: pump,
+                bandwidthAdmissions: [
+                    BlackCarrierAudioBandwidthAdmission(
+                        ordinal: 0,
+                        evidence: .verifiedConstantRate(
+                            payloadBandwidth: 256_000,
+                            maximumContainerOverhead: 64_000,
+                            averageContainerOverhead: 32_000
+                        )
                     ),
                 ]
             )

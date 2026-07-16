@@ -111,6 +111,13 @@ final class BlackCarrierLazyCompositeProvider:
         pump: BlackCarrierMediaFanoutPump,
         bandwidthAdmissions: [BlackCarrierAudioBandwidthAdmission]
     ) throws {
+        guard pump.supportsFreshDemuxRestart else {
+            videoProvider.close()
+            pump.close()
+            throw BlackCarrierLazyCompositeProviderError.pump(
+                .freshDemuxerFactoryMissing
+            )
+        }
         let expectedCount = pump.renditionMetadata.count
         guard bandwidthAdmissions.count == expectedCount else {
             videoProvider.close()
@@ -282,7 +289,7 @@ final class BlackCarrierLazyCompositeProvider:
         do {
             return try pump.initSegment(ordinal: ordinal)
         } catch let error as BlackCarrierMediaFanoutPumpError {
-            record(.pump(error))
+            recordIfTerminal(error)
             return nil
         } catch {
             record(.pump(.demuxFailed(reason: String(describing: error))))
@@ -304,7 +311,7 @@ final class BlackCarrierLazyCompositeProvider:
                 index: index
             )
         } catch let error as BlackCarrierMediaFanoutPumpError {
-            record(.pump(error))
+            recordIfTerminal(error)
             return nil
         } catch {
             record(.pump(.demuxFailed(reason: String(describing: error))))
@@ -326,7 +333,7 @@ final class BlackCarrierLazyCompositeProvider:
                 index: index
             )
         } catch let error as BlackCarrierMediaFanoutPumpError {
-            record(.pump(error))
+            recordIfTerminal(error)
             return nil
         } catch {
             record(.pump(.demuxFailed(reason: String(describing: error))))
@@ -357,5 +364,14 @@ final class BlackCarrierLazyCompositeProvider:
                 + error.localizedDescription,
             category: .session
         )
+    }
+
+    private func recordIfTerminal(
+        _ error: BlackCarrierMediaFanoutPumpError
+    ) {
+        if case .generationSuperseded = error {
+            return
+        }
+        record(.pump(error))
     }
 }
