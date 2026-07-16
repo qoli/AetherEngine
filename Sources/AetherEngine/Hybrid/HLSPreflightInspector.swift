@@ -15,6 +15,8 @@ public enum HLSPreflightError: Error, Sendable, Equatable, LocalizedError {
     case unresolvableURI(String)
     case requestedVariantNotFound(String)
     case selectedVariantWasNotMediaPlaylist
+    case seekableVODPlaylistNotFinite
+    case unsupportedSeekableVODResourceGraph(reason: String)
 
     public var errorDescription: String? {
         switch self {
@@ -23,6 +25,10 @@ public enum HLSPreflightError: Error, Sendable, Equatable, LocalizedError {
         case .unresolvableURI(let uri): "Unresolvable HLS URI: \(uri)"
         case .requestedVariantNotFound(let uri): "Requested HLS variant not found: \(uri)"
         case .selectedVariantWasNotMediaPlaylist: "Selected HLS variant was not a media playlist"
+        case .seekableVODPlaylistNotFinite:
+            "Seekable HLS VOD requires a finite media playlist with EXT-X-ENDLIST"
+        case .unsupportedSeekableVODResourceGraph(let reason):
+            "Unsupported seekable HLS VOD resource graph: \(reason)"
         }
     }
 }
@@ -41,6 +47,29 @@ extension AetherEngine {
         hybridCapabilities: HybridPlaybackCapabilities,
         options: LoadOptions = .init()
     ) async throws -> PlaybackPreflightResult {
+        try await preflightHLSPlayback(
+            url: url,
+            sourceIsSeekableVOD: sourceIsSeekableVOD,
+            variantSelection: variantSelection,
+            hybridCapabilities: hybridCapabilities,
+            options: options
+        ).result
+    }
+
+    /// Inspect HLS packaging and retain an opaque binding to the exact selected VOD video resources.
+    ///
+    /// Raw signed URLs and HTTP headers remain engine-private. The returned resource digest and mirrored
+    /// timeline are safe for host diagnostics, while a future HLS hybrid session must consume the opaque
+    /// binding instead of reopening the root master and selecting a potentially different variant.
+    /// A separate alternate-audio group is reported but not yet materialized into this binding, so the
+    /// public hybrid session must continue to exclude HLS until that resource graph is complete.
+    public nonisolated static func preflightHLSPlayback(
+        url: URL,
+        sourceIsSeekableVOD: Bool,
+        variantSelection: HLSPreflightVariantSelection,
+        hybridCapabilities: HybridPlaybackCapabilities,
+        options: LoadOptions = .init()
+    ) async throws -> AetherHLSPlaybackPreflight {
         let inspector = HLSPreflightInspector(httpHeaders: options.httpHeaders)
         return try await inspector.inspect(
             rootURL: url,
@@ -51,14 +80,17 @@ extension AetherEngine {
     }
 }
 
-private struct HLSPreflightFetchResponse: Sendable {
+struct HLSPreflightFetchResponse: Sendable {
     let data: Data
     let effectiveURL: URL
 }
 
 private struct HLSPreflightResolvedMedia: Sendable {
     let variant: HLSVariant?
+    let separateAudioGroupID: String?
+    let rootEffectiveURL: URL
     let mediaURL: URL
+    let mediaData: Data
     let media: HLSMediaPlaylist
 }
 
@@ -71,10 +103,20 @@ private struct HLSInspectedVideo: Sendable {
 /// Stateful only through its immutable HTTP header set. Tests exercise parsing and verification helpers
 /// directly; runtime I/O is isolated here so it cannot fall back to the AudioTap retry path.
 struct HLSPreflightInspector {
-    private let httpHeaders: [String: String]
+    typealias Fetch = @Sendable (
+        _ url: URL,
+        _ httpHeaders: [String: String]
+    ) async throws -> HLSPreflightFetchResponse
 
-    init(httpHeaders: [String: String]) {
+    private let httpHeaders: [String: String]
+    private let fetchOverride: Fetch?
+
+    init(
+        httpHeaders: [String: String],
+        fetchOverride: Fetch? = nil
+    ) {
         self.httpHeaders = httpHeaders
+        self.fetchOverride = fetchOverride
     }
 
     func inspect(
@@ -82,7 +124,7 @@ struct HLSPreflightInspector {
         sourceIsSeekableVOD: Bool,
         variantSelection: HLSPreflightVariantSelection,
         hybridCapabilities: HybridPlaybackCapabilities
-    ) async throws -> PlaybackPreflightResult {
+    ) async throws -> AetherHLSPlaybackPreflight {
         let resolved = try await resolveMedia(
             rootURL: rootURL,
             selection: variantSelection
@@ -93,11 +135,30 @@ struct HLSPreflightInspector {
         // Protected media has no clear-packet hybrid contract. Return a normal typed route result rather
         // than fetching keys, asking AVPlayer to try it, or silently changing to a legacy path.
         guard resolved.media.contentProtection == .none else {
-            return unresolvedResult(
-                isSeekableVOD: sourceIsSeekableVOD,
-                manifestCodecs: manifestCodecs,
-                contentProtection: resolved.media.contentProtection,
-                hybridCapabilities: hybridCapabilities
+            return AetherHLSPlaybackPreflight(
+                result: unresolvedResult(
+                    isSeekableVOD: sourceIsSeekableVOD,
+                    manifestCodecs: manifestCodecs,
+                    contentProtection: resolved.media.contentProtection,
+                    hybridCapabilities: hybridCapabilities
+                ),
+                resourceGraph: nil,
+                httpHeaders: httpHeaders
+            )
+        }
+
+        // The parser currently records only that a byte range exists, not its offset/length. Fetching the
+        // whole backing object would be both unbounded and different from the selected HLS resource.
+        guard !resolved.media.hasByteRange else {
+            return AetherHLSPlaybackPreflight(
+                result: unresolvedResult(
+                    isSeekableVOD: sourceIsSeekableVOD,
+                    manifestCodecs: manifestCodecs,
+                    contentProtection: .none,
+                    hybridCapabilities: hybridCapabilities
+                ),
+                resourceGraph: nil,
+                httpHeaders: httpHeaders
             )
         }
 
@@ -119,11 +180,15 @@ struct HLSPreflightInspector {
             container = .mpegTransport
             initSegment = nil
         } else {
-            return unresolvedResult(
-                isSeekableVOD: sourceIsSeekableVOD,
-                manifestCodecs: manifestCodecs,
-                contentProtection: .none,
-                hybridCapabilities: hybridCapabilities
+            return AetherHLSPlaybackPreflight(
+                result: unresolvedResult(
+                    isSeekableVOD: sourceIsSeekableVOD,
+                    manifestCodecs: manifestCodecs,
+                    contentProtection: .none,
+                    hybridCapabilities: hybridCapabilities
+                ),
+                resourceGraph: nil,
+                httpHeaders: httpHeaders
             )
         }
 
@@ -132,12 +197,16 @@ struct HLSPreflightInspector {
             segment: segment.data,
             container: container
         ) else {
-            return unresolvedResult(
-                isSeekableVOD: sourceIsSeekableVOD,
-                manifestCodecs: manifestCodecs,
-                contentProtection: .none,
-                hybridCapabilities: hybridCapabilities,
-                container: container
+            return AetherHLSPlaybackPreflight(
+                result: unresolvedResult(
+                    isSeekableVOD: sourceIsSeekableVOD,
+                    manifestCodecs: manifestCodecs,
+                    contentProtection: .none,
+                    hybridCapabilities: hybridCapabilities,
+                    container: container
+                ),
+                resourceGraph: nil,
+                httpHeaders: httpHeaders
             )
         }
 
@@ -159,10 +228,28 @@ struct HLSPreflightInspector {
             videoCodec: inspected.codec,
             videoFormat: inspected.format
         )
-        return PlaybackPreflight.resolve(
+        let result = PlaybackPreflight.resolve(
             sourceProfile: source,
             hlsPackaging: packaging,
             hybridCapabilities: hybridCapabilities
+        )
+        let resourceGraph = try result.route == .hybridCarrierMetal
+            ? HLSVODResourceGraph.make(
+                requestedRootURL: rootURL,
+                effectiveRootURL: resolved.rootEffectiveURL,
+                selectedMediaPlaylistURL: resolved.mediaURL,
+                selectedVariant: resolved.variant,
+                separateAudioGroupID:
+                    resolved.separateAudioGroupID,
+                mediaPlaylistData: resolved.mediaData,
+                media: resolved.media,
+                httpHeaders: httpHeaders
+            )
+            : nil
+        return AetherHLSPlaybackPreflight(
+            result: result,
+            resourceGraph: resourceGraph,
+            httpHeaders: httpHeaders
         )
     }
 
@@ -174,7 +261,14 @@ struct HLSPreflightInspector {
         let rootPlaylist = try parsePlaylist(root.data)
         switch rootPlaylist {
         case .media(let media):
-            return HLSPreflightResolvedMedia(variant: nil, mediaURL: root.effectiveURL, media: media)
+            return HLSPreflightResolvedMedia(
+                variant: nil,
+                separateAudioGroupID: nil,
+                rootEffectiveURL: root.effectiveURL,
+                mediaURL: root.effectiveURL,
+                mediaData: root.data,
+                media: media
+            )
 
         case .master(let master):
             let variant: HLSVariant
@@ -197,11 +291,25 @@ struct HLSPreflightInspector {
             guard case .media(let media) = try parsePlaylist(response.data) else {
                 throw HLSPreflightError.selectedVariantWasNotMediaPlaylist
             }
-            return HLSPreflightResolvedMedia(variant: variant, mediaURL: response.effectiveURL, media: media)
+            return HLSPreflightResolvedMedia(
+                variant: variant,
+                separateAudioGroupID: variant.audioGroupID.flatMap {
+                    master.demuxedAudioGroupIDs.contains($0)
+                        ? $0
+                        : nil
+                },
+                rootEffectiveURL: root.effectiveURL,
+                mediaURL: response.effectiveURL,
+                mediaData: response.data,
+                media: media
+            )
         }
     }
 
     private func fetch(_ url: URL) async throws -> HLSPreflightFetchResponse {
+        if let fetchOverride {
+            return try await fetchOverride(url, httpHeaders)
+        }
         var request = URLRequest(url: url)
         for (field, value) in httpHeaders { request.setValue(value, forHTTPHeaderField: field) }
         let config = URLSessionConfiguration.ephemeral

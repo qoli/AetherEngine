@@ -56,6 +56,23 @@ final class HLSPlaylistTests: XCTestCase {
         XCTAssertEqual(variants[0].bandwidth, 100)
     }
 
+    func testMasterRejectsMissingOrInvalidBandwidth() {
+        for text in [
+            """
+            #EXTM3U
+            #EXT-X-STREAM-INF:CODECS="avc1.42C01E"
+            media.m3u8
+            """,
+            """
+            #EXTM3U
+            #EXT-X-STREAM-INF:BANDWIDTH=0
+            media.m3u8
+            """,
+        ] {
+            XCTAssertThrowsError(try HLSPlaylistParser.parse(text))
+        }
+    }
+
     func testParsesVariantCodecAndHDRAttributes() throws {
         let text = """
         #EXTM3U
@@ -171,6 +188,32 @@ final class HLSPlaylistTests: XCTestCase {
         XCTAssertFalse(media.hasEndList)
         XCTAssertFalse(media.isEncrypted)
         XCTAssertFalse(media.hasMap)
+        XCTAssertFalse(media.hasByteRange)
+    }
+
+    func testMediaPlaylistRejectsSegmentWithoutEXTINF() {
+        let text = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:4
+        seg0.ts
+        """
+        XCTAssertThrowsError(try HLSPlaylistParser.parse(text))
+    }
+
+    func testDetectsByteRangeResources() throws {
+        let text = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:4
+        #EXT-X-MAP:URI="init.mp4",BYTERANGE="720@0"
+        #EXTINF:4,
+        #EXT-X-BYTERANGE:4096@720
+        media.mp4
+        #EXT-X-ENDLIST
+        """
+        guard case .media(let media) = try HLSPlaylistParser.parse(text) else {
+            return XCTFail("expected media playlist")
+        }
+        XCTAssertTrue(media.hasByteRange)
     }
 
     func testDetectsEncryptionAndMapAndEndlist() throws {

@@ -72,6 +72,9 @@ struct HLSMediaPlaylist: Equatable {
     let hasMap: Bool
     /// Required to inspect fMP4 packaging. A Boolean `hasMap` cannot establish which init segment was used.
     let mapURI: String?
+    /// Byte-range media or map resources need a range-aware immutable resource contract. Preflight refuses
+    /// them explicitly instead of fetching the whole backing URI or ignoring the declared offset.
+    let hasByteRange: Bool
     let contentProtection: HLSContentProtection
 
     var isEncrypted: Bool { contentProtection != .none }
@@ -84,6 +87,7 @@ struct HLSMediaPlaylist: Equatable {
         hasUnsupportedEncryption: Bool,
         hasMap: Bool,
         mapURI: String?,
+        hasByteRange: Bool = false,
         contentProtection: HLSContentProtection
     ) {
         self.targetDuration = targetDuration
@@ -93,6 +97,7 @@ struct HLSMediaPlaylist: Equatable {
         self.hasUnsupportedEncryption = hasUnsupportedEncryption
         self.hasMap = hasMap
         self.mapURI = mapURI
+        self.hasByteRange = hasByteRange
         self.contentProtection = contentProtection
     }
 }
@@ -136,7 +141,14 @@ enum HLSPlaylistParser {
         var pendingSupplementalCodecs: [String] = []
         for line in lines {
             if line.hasPrefix("#EXT-X-STREAM-INF:") {
-                pendingBandwidth = attribute("BANDWIDTH", in: line).flatMap(Int.init) ?? 0
+                guard let rawBandwidth = attribute("BANDWIDTH", in: line),
+                      let bandwidth = Int(rawBandwidth),
+                      bandwidth > 0 else {
+                    throw HLSIngestError.playlistInvalid(
+                        reason: "STREAM-INF missing valid BANDWIDTH"
+                    )
+                }
+                pendingBandwidth = bandwidth
                 pendingAudioGroup = attribute("AUDIO", in: line)
                 pendingCodecs = codecTokens(attribute("CODECS", in: line))
                 pendingVideoRange = attribute("VIDEO-RANGE", in: line)
@@ -187,6 +199,7 @@ enum HLSPlaylistParser {
         var hasUnsupportedEncryption = false
         var hasMap = false
         var mapURI: String?
+        var hasByteRange = false
         var pendingDuration: Double?
         var pendingDiscontinuity = false
         // AES-128 keys are "sticky": one EXT-X-KEY tag governs all following segments until the next tag. Pluto/Samsung-TV+ emit one tag per segment with the same URI and an incrementing explicit IV.
@@ -195,14 +208,37 @@ enum HLSPlaylistParser {
 
         for line in lines {
             if line.hasPrefix("#EXT-X-TARGETDURATION:") {
-                targetDuration = Double(line.dropFirst("#EXT-X-TARGETDURATION:".count))
+                guard let parsed = Double(
+                    line.dropFirst("#EXT-X-TARGETDURATION:".count)
+                ), parsed > 0, parsed.isFinite else {
+                    throw HLSIngestError.playlistInvalid(
+                        reason: "invalid TARGETDURATION"
+                    )
+                }
+                targetDuration = parsed
             } else if line.hasPrefix("#EXT-X-MEDIA-SEQUENCE:") {
-                mediaSequence = Int(line.dropFirst("#EXT-X-MEDIA-SEQUENCE:".count)) ?? 0
+                guard let parsed = Int(
+                    line.dropFirst("#EXT-X-MEDIA-SEQUENCE:".count)
+                ), parsed >= 0 else {
+                    throw HLSIngestError.playlistInvalid(
+                        reason: "invalid MEDIA-SEQUENCE"
+                    )
+                }
+                mediaSequence = parsed
             } else if line.hasPrefix("#EXTINF:") {
                 let payload = line.dropFirst("#EXTINF:".count)
-                pendingDuration = Double(payload.split(separator: ",").first.map(String.init) ?? "")
+                guard let parsed = Double(
+                    payload.split(separator: ",").first.map(String.init) ?? ""
+                ), parsed > 0, parsed.isFinite else {
+                    throw HLSIngestError.playlistInvalid(
+                        reason: "invalid EXTINF duration"
+                    )
+                }
+                pendingDuration = parsed
             } else if line.hasPrefix("#EXT-X-DISCONTINUITY") && !line.hasPrefix("#EXT-X-DISCONTINUITY-SEQUENCE") {
                 pendingDiscontinuity = true
+            } else if line.hasPrefix("#EXT-X-BYTERANGE:") {
+                hasByteRange = true
             } else if line.hasPrefix("#EXT-X-KEY:") {
                 let method = attribute("METHOD", in: line) ?? "NONE"
                 switch method {
@@ -235,9 +271,17 @@ enum HLSPlaylistParser {
             } else if line.hasPrefix("#EXT-X-MAP:") {
                 hasMap = true
                 mapURI = attribute("URI", in: line)
+                if attribute("BYTERANGE", in: line) != nil {
+                    hasByteRange = true
+                }
             } else if line.hasPrefix("#EXT-X-ENDLIST") {
                 hasEndList = true
             } else if !line.hasPrefix("#") {
+                guard let duration = pendingDuration else {
+                    throw HLSIngestError.playlistInvalid(
+                        reason: "media segment missing EXTINF"
+                    )
+                }
                 let crypt: HLSSegmentCrypt?
                 if let keyURI = currentKeyURI {
                     let sequence = mediaSequence + segments.count
@@ -250,7 +294,7 @@ enum HLSPlaylistParser {
                 }
                 segments.append(HLSMediaSegment(
                     uri: line,
-                    duration: pendingDuration ?? targetDuration ?? 0,
+                    duration: duration,
                     discontinuityBefore: pendingDiscontinuity,
                     crypt: crypt
                 ))
@@ -272,6 +316,7 @@ enum HLSPlaylistParser {
             hasUnsupportedEncryption: hasUnsupportedEncryption,
             hasMap: hasMap,
             mapURI: mapURI,
+            hasByteRange: hasByteRange,
             contentProtection: contentProtection
         )
     }
