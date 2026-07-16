@@ -154,6 +154,13 @@ enum HybridVideoDecodeSinkError:
     case streamContractMismatch
     case decoderOpenFailed(reason: String)
     case decoderFailed(VideoDecoderError)
+    case invalidDecodedFrameGeometry
+    case decodedFrameDimensionsDiverged(
+        pixelWidth: Int,
+        pixelHeight: Int,
+        metadataWidth: Int,
+        metadataHeight: Int
+    )
     case invalidDisplayMatrix
     case packetCloneFailed
     case packetTimestampMissing
@@ -179,6 +186,15 @@ enum HybridVideoDecodeSinkError:
             return "Hybrid video decoder could not open: \(reason)"
         case .decoderFailed(let error):
             return "Hybrid video decoder failed: \(error.localizedDescription)"
+        case .invalidDecodedFrameGeometry:
+            return "Hybrid decoded frame has invalid presentation geometry"
+        case .decodedFrameDimensionsDiverged(
+            let pixelWidth,
+            let pixelHeight,
+            let metadataWidth,
+            let metadataHeight
+        ):
+            return "Hybrid decoded pixel buffer \(pixelWidth)x\(pixelHeight) does not match geometry metadata \(metadataWidth)x\(metadataHeight)"
         case .invalidDisplayMatrix:
             return "Hybrid video stream has an invalid display matrix"
         case .packetCloneFailed:
@@ -310,12 +326,15 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
                 [weak callbackBox] pixelBuffer,
                 presentationTime,
                 duration,
-                hdr10PlusT35 in
+                hdr10PlusT35,
+                presentationMetadata in
                 callbackBox?.sink?.receiveFrame(
                     pixelBuffer: pixelBuffer,
                     presentationTime: presentationTime,
                     duration: duration,
-                    hdr10PlusT35: hdr10PlusT35
+                    hdr10PlusT35: hdr10PlusT35,
+                    presentationMetadata:
+                        presentationMetadata
                 )
             }
         } catch {
@@ -559,7 +578,9 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         pixelBuffer: CVPixelBuffer,
         presentationTime: CMTime,
         duration: CMTime,
-        hdr10PlusT35: Data?
+        hdr10PlusT35: Data?,
+        presentationMetadata:
+            DecodedFramePresentationMetadata
     ) {
         lock.lock()
         guard !isClosed, terminalError == nil else {
@@ -570,8 +591,24 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         let target = targetTime
         lock.unlock()
 
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let geometry: DecodedVideoFrameGeometry
+        do {
+            geometry = try Self.resolveFrameGeometry(
+                pixelBufferWidth:
+                    CVPixelBufferGetWidth(pixelBuffer),
+                pixelBufferHeight:
+                    CVPixelBufferGetHeight(pixelBuffer),
+                metadata: presentationMetadata,
+                rotationDegrees:
+                    streamContract.rotationDegrees
+            )
+        } catch let error as HybridVideoDecodeSinkError {
+            recordFailure(error)
+            return
+        } catch {
+            recordFailure(.invalidDecodedFrameGeometry)
+            return
+        }
         let resolvedDuration = duration.isValid
             && duration.isNumeric
             && CMTimeCompare(duration, .zero) > 0
@@ -595,21 +632,7 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
             presentationTime: normalizedPresentationTime,
             duration: resolvedDuration,
             videoFormat: videoFormat,
-            geometry: DecodedVideoFrameGeometry(
-                codedWidth: width,
-                codedHeight: height,
-                cleanAperture: .init(
-                    x: 0,
-                    y: 0,
-                    width: Double(width),
-                    height: Double(height)
-                ),
-                pixelAspectRatioNumerator:
-                    streamContract.pixelAspectRatioNumerator,
-                pixelAspectRatioDenominator:
-                    streamContract.pixelAspectRatioDenominator,
-                rotationDegrees: streamContract.rotationDegrees
-            ),
+            geometry: geometry,
             hdr10PlusT35: hdr10PlusT35,
             generation: frameGeneration
         )
@@ -632,6 +655,61 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
             lock.unlock()
         }
         frameHandler(frame)
+    }
+
+    /// Accept exactly the two decoder contracts observed on Apple platforms: a coded-size pixel buffer with
+    /// an explicit clean aperture, or a decoder-cropped pixel buffer whose dimensions equal that aperture.
+    /// Any other size relationship is ambiguous and must fail instead of scaling guessed coordinates.
+    static func resolveFrameGeometry(
+        pixelBufferWidth: Int,
+        pixelBufferHeight: Int,
+        metadata: DecodedFramePresentationMetadata,
+        rotationDegrees: Int
+    ) throws -> DecodedVideoFrameGeometry {
+        guard pixelBufferWidth > 0,
+              pixelBufferHeight > 0 else {
+            throw HybridVideoDecodeSinkError
+                .invalidDecodedFrameGeometry
+        }
+        let cleanAperture:
+            DecodedVideoFrameGeometry.CleanAperture
+        if pixelBufferWidth == metadata.codedWidth,
+           pixelBufferHeight == metadata.codedHeight {
+            cleanAperture = .init(
+                x: Double(metadata.cleanApertureX),
+                y: Double(metadata.cleanApertureY),
+                width: Double(metadata.cleanApertureWidth),
+                height: Double(metadata.cleanApertureHeight)
+            )
+        } else if pixelBufferWidth
+                    == metadata.cleanApertureWidth,
+                  pixelBufferHeight
+                    == metadata.cleanApertureHeight {
+            cleanAperture = .init(
+                x: 0,
+                y: 0,
+                width: Double(pixelBufferWidth),
+                height: Double(pixelBufferHeight)
+            )
+        } else {
+            throw HybridVideoDecodeSinkError
+                .decodedFrameDimensionsDiverged(
+                    pixelWidth: pixelBufferWidth,
+                    pixelHeight: pixelBufferHeight,
+                    metadataWidth: metadata.codedWidth,
+                    metadataHeight: metadata.codedHeight
+                )
+        }
+        return DecodedVideoFrameGeometry(
+            codedWidth: pixelBufferWidth,
+            codedHeight: pixelBufferHeight,
+            cleanAperture: cleanAperture,
+            pixelAspectRatioNumerator:
+                metadata.pixelAspectRatioNumerator,
+            pixelAspectRatioDenominator:
+                metadata.pixelAspectRatioDenominator,
+            rotationDegrees: rotationDegrees
+        )
     }
 
     private func recordFailure(_ error: HybridVideoDecodeSinkError) {

@@ -36,8 +36,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// True when the source is >8-bit (HDR10, AV1 HDR).
     private var use10Bit = false
 
-    /// Container-declared SAR fallback for anamorphic DVD/SD content (NTSC 720x480, PAL 720x576, widescreen DVDs).
-    /// Native VideoToolbox gets this from the container automatically; the software path must attach it explicitly.
+    /// Container-declared SAR for frames that do not repeat the static stream value (NTSC 720x480, PAL
+    /// 720x576, widescreen DVDs). Frame-level SAR has explicit precedence when present.
     private var streamSAR = AVRational(num: 1, den: 1)
 
     private var pixelBufferPool: CVPixelBufferPool?
@@ -85,7 +85,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
         timeBase = stream.pointee.time_base
 
-        // Container SAR fallback; see streamSAR. Frames usually carry their own (MPEG-2 seq header, from frame 1).
+        // Preserve the container SAR; frames usually repeat it from the MPEG-2 sequence header.
         streamSAR = codecpar.pointee.sample_aspect_ratio
 
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
@@ -235,6 +235,19 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             clearSkip(ifStillAt: threshold)
         }
 
+        let framePresentationMetadata:
+            DecodedFramePresentationMetadata
+        do {
+            framePresentationMetadata = try
+                DecodedFramePresentationMetadata(
+                    frame: f,
+                    streamPixelAspectRatio: streamSAR
+                )
+        } catch {
+            onFailure?(.invalidFrameGeometry)
+            return
+        }
+
         guard let pixelBuffer = convertFrameToPixelBuffer(f) else {
             onFailure?(.pixelBufferConversionFailed)
             return
@@ -265,7 +278,13 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 timescale: Int32(timeBase.den)
             )
             : .invalid
-        onFrame?(pixelBuffer, cmPTS, duration, hdr10PlusData)
+        onFrame?(
+            pixelBuffer,
+            cmPTS,
+            duration,
+            hdr10PlusData,
+            framePresentationMetadata
+        )
     }
 
     func flush() {

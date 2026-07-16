@@ -6,6 +6,8 @@ import Foundation
 ///
 /// The carrier canvas is deliberately not a geometry source. A hybrid renderer uses this contract to
 /// calculate the real video's viewport, including clean aperture, pixel aspect ratio and rotation.
+/// Clean-aperture coordinates use the decoded pixel buffer's lower-left origin. `rotationDegrees` is a
+/// canonical clockwise quarter turn and must be exactly 0, 90, 180 or 270.
 public struct DecodedVideoFrameGeometry: Sendable, Equatable {
     public struct CleanAperture: Sendable, Equatable {
         public let x: Double

@@ -323,7 +323,8 @@ final class SoftwarePlaybackHost {
             [weak self] pixelBuffer,
             pts,
             _,
-            hdr10PlusData in
+            hdr10PlusData,
+            _ in
             // Decoder callback is off-main; SampleBufferRenderer is internally locked.
             self?.renderer.enqueue(pixelBuffer: pixelBuffer, pts: pts, hdr10PlusData: hdr10PlusData)
             // First-frame milestone: demux reached a video packet + decoder produced a pixel buffer.

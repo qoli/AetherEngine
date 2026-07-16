@@ -152,7 +152,12 @@ extension AetherEngine {
         let accum = Accum()
 
         do {
-            try decoder.open(stream: stream) { pixelBuffer, _, _, _ in
+            try decoder.open(stream: stream) {
+                pixelBuffer,
+                _,
+                _,
+                _,
+                _ in
                 accum.framesDecoded += 1
                 if accum.firstFramePixelFormat == nil {
                     let pfType = CVPixelBufferGetPixelFormatType(pixelBuffer)

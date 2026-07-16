@@ -3,6 +3,159 @@ import CoreMedia
 import CoreVideo
 import Libavformat
 import Libavcodec
+import Libavutil
+
+/// Decoder-owned geometry for the pixel buffer delivered with a frame.
+///
+/// Clean-aperture coordinates use the Core Image lower-left origin. Rotation remains a stream-level
+/// presentation property and is added by `HybridVideoDecodeSink` after decoding.
+struct DecodedFramePresentationMetadata: Sendable, Equatable {
+    let codedWidth: Int
+    let codedHeight: Int
+    let cleanApertureX: Int
+    let cleanApertureY: Int
+    let cleanApertureWidth: Int
+    let cleanApertureHeight: Int
+    let pixelAspectRatioNumerator: Int
+    let pixelAspectRatioDenominator: Int
+
+    init(
+        codedWidth: Int,
+        codedHeight: Int,
+        cropTop: Int,
+        cropBottom: Int,
+        cropLeft: Int,
+        cropRight: Int,
+        pixelAspectRatioNumerator: Int,
+        pixelAspectRatioDenominator: Int
+    ) throws {
+        guard codedWidth > 0,
+              codedHeight > 0,
+              cropTop >= 0,
+              cropBottom >= 0,
+              cropLeft >= 0,
+              cropRight >= 0 else {
+            throw VideoDecoderError.invalidFrameGeometry
+        }
+        let horizontalCrop = cropLeft
+            .addingReportingOverflow(cropRight)
+        let verticalCrop = cropTop
+            .addingReportingOverflow(cropBottom)
+        guard !horizontalCrop.overflow,
+              !verticalCrop.overflow,
+              horizontalCrop.partialValue < codedWidth,
+              verticalCrop.partialValue < codedHeight,
+              pixelAspectRatioNumerator > 0,
+              pixelAspectRatioDenominator > 0 else {
+            throw VideoDecoderError.invalidFrameGeometry
+        }
+        self.codedWidth = codedWidth
+        self.codedHeight = codedHeight
+        cleanApertureX = cropLeft
+        // FFmpeg crop values are top/left based; Core Image uses a lower-left origin.
+        cleanApertureY = cropBottom
+        cleanApertureWidth = codedWidth
+            - horizontalCrop.partialValue
+        cleanApertureHeight = codedHeight
+            - verticalCrop.partialValue
+        self.pixelAspectRatioNumerator =
+            pixelAspectRatioNumerator
+        self.pixelAspectRatioDenominator =
+            pixelAspectRatioDenominator
+    }
+
+    init(
+        frame: UnsafeMutablePointer<AVFrame>,
+        streamPixelAspectRatio: AVRational
+    ) throws {
+        let frameSAR = frame.pointee.sample_aspect_ratio
+        let resolvedSAR = frameSAR.num > 0 && frameSAR.den > 0
+            ? frameSAR
+            : streamPixelAspectRatio
+        let numerator = resolvedSAR.num > 0
+            ? Int(resolvedSAR.num)
+            : 1
+        let denominator = resolvedSAR.den > 0
+            ? Int(resolvedSAR.den)
+            : 1
+        guard let cropTop = Int(exactly: frame.pointee.crop_top),
+              let cropBottom = Int(exactly: frame.pointee.crop_bottom),
+              let cropLeft = Int(exactly: frame.pointee.crop_left),
+              let cropRight = Int(exactly: frame.pointee.crop_right) else {
+            throw VideoDecoderError.invalidFrameGeometry
+        }
+        try self.init(
+            codedWidth: Int(frame.pointee.width),
+            codedHeight: Int(frame.pointee.height),
+            cropTop: cropTop,
+            cropBottom: cropBottom,
+            cropLeft: cropLeft,
+            cropRight: cropRight,
+            pixelAspectRatioNumerator: numerator,
+            pixelAspectRatioDenominator: denominator
+        )
+    }
+
+    init(stream: UnsafeMutablePointer<AVStream>) throws {
+        guard let codecParameters = stream.pointee.codecpar else {
+            throw VideoDecoderError.noCodecParameters
+        }
+        let parameters = codecParameters.pointee
+        var cropTop = 0
+        var cropBottom = 0
+        var cropLeft = 0
+        var cropRight = 0
+        let sideDataCount = Int(parameters.nb_coded_side_data)
+        if sideDataCount > 0,
+           let sideData = parameters.coded_side_data {
+            for index in 0..<sideDataCount {
+                let item = sideData[index]
+                guard item.type == AV_PKT_DATA_FRAME_CROPPING else {
+                    continue
+                }
+                guard item.size >= 16,
+                      let bytes = item.data else {
+                    throw VideoDecoderError.invalidFrameGeometry
+                }
+                func readUInt32LE(_ offset: Int) -> UInt32 {
+                    UInt32(bytes[offset])
+                        | (UInt32(bytes[offset + 1]) << 8)
+                        | (UInt32(bytes[offset + 2]) << 16)
+                        | (UInt32(bytes[offset + 3]) << 24)
+                }
+                guard let top = Int(exactly: readUInt32LE(0)),
+                      let bottom = Int(exactly: readUInt32LE(4)),
+                      let left = Int(exactly: readUInt32LE(8)),
+                      let right = Int(exactly: readUInt32LE(12)) else {
+                    throw VideoDecoderError.invalidFrameGeometry
+                }
+                cropTop = top
+                cropBottom = bottom
+                cropLeft = left
+                cropRight = right
+                break
+            }
+        }
+        let parameterSAR = parameters.sample_aspect_ratio
+        let streamSAR = stream.pointee.sample_aspect_ratio
+        let resolvedSAR = parameterSAR.num > 0
+            && parameterSAR.den > 0
+            ? parameterSAR
+            : streamSAR
+        try self.init(
+            codedWidth: Int(parameters.width),
+            codedHeight: Int(parameters.height),
+            cropTop: cropTop,
+            cropBottom: cropBottom,
+            cropLeft: cropLeft,
+            cropRight: cropRight,
+            pixelAspectRatioNumerator:
+                resolvedSAR.num > 0 ? Int(resolvedSAR.num) : 1,
+            pixelAspectRatioDenominator:
+                resolvedSAR.den > 0 ? Int(resolvedSAR.den) : 1
+        )
+    }
+}
 
 /// Decoded frame callback. `hdr10PlusT35` carries HDR10+ dynamic metadata serialised to ITU-T T.35 bytes
 /// (kCMSampleAttachmentKey_HDR10PlusPerFrameData format); nil for non-HDR10+ streams.
@@ -10,7 +163,8 @@ typealias DecodedFrameHandler = @Sendable (
     CVPixelBuffer,
     CMTime,
     CMTime,
-    Data?
+    Data?,
+    DecodedFramePresentationMetadata
 ) -> Void
 typealias VideoDecoderFailureHandler = @Sendable (VideoDecoderError) -> Void
 
@@ -45,6 +199,7 @@ enum VideoDecoderError: Error, LocalizedError, Sendable, Equatable {
     case asynchronousDecodeFailed(status: OSStatus)
     case asynchronousFrameMissing
     case frameAllocationFailed
+    case invalidFrameGeometry
     case softwareSendPacketFailed(code: Int32)
     case softwareReceiveFrameFailed(code: Int32)
     case pixelBufferConversionFailed
@@ -63,6 +218,7 @@ enum VideoDecoderError: Error, LocalizedError, Sendable, Equatable {
         case .asynchronousDecodeFailed(let s): "VideoToolbox asynchronous decode failed (\(s))"
         case .asynchronousFrameMissing: "VideoToolbox completed decode without an image buffer"
         case .frameAllocationFailed: "Software video decoder could not allocate a frame"
+        case .invalidFrameGeometry: "Decoded video frame geometry is invalid"
         case .softwareSendPacketFailed(let c): "Software video decoder rejected packet (\(c))"
         case .softwareReceiveFrameFailed(let c): "Software video decoder failed receiving frame (\(c))"
         case .pixelBufferConversionFailed: "Software video frame could not be converted to a pixel buffer"

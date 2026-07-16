@@ -57,6 +57,14 @@ public final class AetherMetalPlayerView: PlatformBaseView {
     private var activeVideoFormat: VideoFormat = .sdr
     private var lastPresentedTime: CMTime?
 
+    /// Scaling policy for the real decoded video. The fixed carrier canvas never participates in geometry.
+    public var videoGravity: AetherHybridVideoGravity = .resizeAspect {
+        didSet {
+            renderer.videoGravity = videoGravity
+            requestDraw()
+        }
+    }
+
     public init(device: MTLDevice? = MTLCreateSystemDefaultDevice()) throws {
         guard let device else { throw AetherMetalRendererError.metalDeviceUnavailable }
         self.renderer = try AetherMetalFrameRenderer(device: device)
@@ -121,12 +129,9 @@ public final class AetherMetalPlayerView: PlatformBaseView {
               Self.verifiedVideoFormats.contains(frame.videoFormat) else {
             throw AetherMetalRendererError.unsupportedVideoFormat(frame.videoFormat)
         }
-        guard Self.isValid(geometry: frame.geometry) else {
-            throw AetherMetalRendererError.invalidGeometry
-        }
-        guard Self.isSupported(rotationDegrees: frame.geometry.rotationDegrees) else {
-            throw AetherMetalRendererError.unsupportedRotation(frame.geometry.rotationDegrees)
-        }
+        try HybridVideoPresentationLayout.validate(
+            geometry: frame.geometry
+        )
         return scheduler.enqueue(frame)
     }
 
@@ -157,25 +162,6 @@ public final class AetherMetalPlayerView: PlatformBaseView {
         )
     }
 
-    private static func isValid(geometry: DecodedVideoFrameGeometry) -> Bool {
-        geometry.codedWidth > 0
-            && geometry.codedHeight > 0
-            && geometry.cleanAperture.width > 0
-            && geometry.cleanAperture.height > 0
-            && geometry.cleanAperture.x >= 0
-            && geometry.cleanAperture.y >= 0
-            && geometry.cleanAperture.x + geometry.cleanAperture.width <= Double(geometry.codedWidth)
-            && geometry.cleanAperture.y + geometry.cleanAperture.height <= Double(geometry.codedHeight)
-            && geometry.pixelAspectRatioNumerator > 0
-            && geometry.pixelAspectRatioDenominator > 0
-            && geometry.displayAspectRatio.isFinite
-            && geometry.displayAspectRatio > 0
-    }
-
-    private static func isSupported(rotationDegrees: Int) -> Bool {
-        rotationDegrees % 360 == 0
-    }
-
     private func requestDraw() {
         #if canImport(UIKit)
         metalView.setNeedsDisplay()
@@ -190,6 +176,7 @@ private final class AetherMetalFrameRenderer: NSObject, MTKViewDelegate {
     private let commandQueue: MTLCommandQueue
     private let ciContext: CIContext
     var frame: DecodedVideoFrame?
+    var videoGravity: AetherHybridVideoGravity = .resizeAspect
 
     init(device: MTLDevice) throws {
         guard let queue = device.makeCommandQueue() else {
@@ -218,71 +205,58 @@ private final class AetherMetalFrameRenderer: NSObject, MTKViewDelegate {
         }
 
         let source = CIImage(cvPixelBuffer: frame.pixelBuffer)
-        let cleanAperture = CGRect(
-            x: frame.geometry.cleanAperture.x,
-            y: frame.geometry.cleanAperture.y,
-            width: frame.geometry.cleanAperture.width,
-            height: frame.geometry.cleanAperture.height
-        ).intersection(source.extent)
-        guard !cleanAperture.isEmpty else {
+        let layout: HybridVideoPresentationLayout
+        do {
+            guard let resolved = try HybridVideoPresentationLayout(
+                geometry: frame.geometry,
+                drawableSize: view.drawableSize,
+                gravity: videoGravity
+            ) else {
+                commandBuffer.present(drawable)
+                commandBuffer.commit()
+                return
+            }
+            layout = resolved
+        } catch {
+            // `enqueue` validates the immutable frame first. Reaching this branch is an engine invariant
+            // violation, not permission to redraw with guessed geometry.
+            assertionFailure(
+                "Validated hybrid frame geometry became invalid: \(error)"
+            )
             commandBuffer.present(drawable)
             commandBuffer.commit()
             return
         }
-        let target = aspectFitRect(
-            displayAspectRatio: frame.geometry.displayAspectRatio,
-            drawableSize: view.drawableSize
-        )
-        guard target.width > 0, target.height > 0 else {
-            commandBuffer.present(drawable)
-            commandBuffer.commit()
-            return
-        }
-
-        let scaleX = target.width / cleanAperture.width
-        let scaleY = target.height / cleanAperture.height
         let transformed = source
-            .cropped(to: cleanAperture)
-            .transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+            .cropped(to: layout.sourceCrop)
             .transformed(by: CGAffineTransform(
-                translationX: target.minX - cleanAperture.minX * scaleX,
-                y: target.minY - cleanAperture.minY * scaleY
+                translationX: -layout.sourceCrop.minX,
+                y: -layout.sourceCrop.minY
+            ))
+            .transformed(by: CGAffineTransform(
+                scaleX: layout.pixelAspectRatio,
+                y: 1
+            ))
+            .transformed(by: layout.rotationTransform)
+            .transformed(by: CGAffineTransform(
+                scaleX: layout.uniformScale,
+                y: layout.uniformScale
+            ))
+            .transformed(by: CGAffineTransform(
+                translationX: layout.targetRect.minX,
+                y: layout.targetRect.minY
             ))
         ciContext.render(
             transformed,
             to: drawable.texture,
             commandBuffer: commandBuffer,
-            bounds: target,
+            bounds: CGRect(
+                origin: .zero,
+                size: view.drawableSize
+            ),
             colorSpace: CGColorSpace(name: CGColorSpace.itur_709)!
         )
         commandBuffer.present(drawable)
         commandBuffer.commit()
-    }
-
-    private func aspectFitRect(
-        displayAspectRatio: Double,
-        drawableSize: CGSize
-    ) -> CGRect {
-        guard drawableSize.width > 0,
-              drawableSize.height > 0 else {
-            return .zero
-        }
-        let targetAspect = CGFloat(displayAspectRatio)
-        let drawableAspect = drawableSize.width / drawableSize.height
-        let width: CGFloat
-        let height: CGFloat
-        if targetAspect > drawableAspect {
-            width = drawableSize.width
-            height = width / targetAspect
-        } else {
-            height = drawableSize.height
-            width = height * targetAspect
-        }
-        return CGRect(
-            x: (drawableSize.width - width) / 2,
-            y: (drawableSize.height - height) / 2,
-            width: width,
-            height: height
-        )
     }
 }

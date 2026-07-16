@@ -56,6 +56,8 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var timeBase: AVRational = AVRational(num: 1, den: 90000)
     private var width: Int32 = 0
     private var height: Int32 = 0
+    private var framePresentationMetadata:
+        DecodedFramePresentationMetadata?
 
     /// Color metadata from codecpar, re-applied to every CVPixelBuffer.
     /// VTDecompressionSession should propagate these from SPS+hvcC but has been observed not to;
@@ -89,6 +91,8 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         timeBase = stream.pointee.time_base
         width = codecpar.pointee.width
         height = codecpar.pointee.height
+        framePresentationMetadata = try
+            DecodedFramePresentationMetadata(stream: stream)
 
         guard codecpar.pointee.codec_id == AV_CODEC_ID_HEVC else {
             throw VideoDecoderError.unsupportedCodec(id: codecpar.pointee.codec_id.rawValue)
@@ -330,6 +334,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             self.session = nil
         }
         formatDescription = nil
+        framePresentationMetadata = nil
         lock.unlock()
 
         if let box = refConBox {
@@ -371,7 +376,17 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             CVBufferSetAttachment(imageBuffer, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate)
         }
 
-        onFrame?(imageBuffer, pts, duration, nil)
+        guard let framePresentationMetadata else {
+            onFailure?(.invalidFrameGeometry)
+            return
+        }
+        onFrame?(
+            imageBuffer,
+            pts,
+            duration,
+            nil,
+            framePresentationMetadata
+        )
     }
 
     fileprivate func handleDecodeFailure(
