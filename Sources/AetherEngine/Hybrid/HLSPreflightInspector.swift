@@ -83,9 +83,9 @@ extension AetherEngine {
     /// Raw signed URLs and HTTP headers remain engine-private. The returned resource digest and mirrored
     /// timeline are safe for host diagnostics, while every HLS hybrid session must consume the opaque
     /// binding instead of reopening the root master and selecting a potentially different variant. Every
-    /// separate alternate-audio playlist in the selected group is bound too. Internal graph-bound
-    /// fetch/demux/carrier composition exists, but the public hybrid session must continue to exclude HLS
-    /// until startup bandwidth ownership and the remaining public/device gates are complete.
+    /// separate alternate-audio playlist in the selected group is bound too. An admitted result can be
+    /// passed only to `AetherHybridPlaybackSession.makeHLSVOD(preflight:)`; the generic seekable-VOD
+    /// factory rejects HLS so callers cannot bypass this graph binding.
     /// Gate 1 hosts that require a structured started/completed/failed lifecycle must execute this work
     /// through `AetherPlaybackPreflightOperation.inspectHLS`.
     public nonisolated static func preflightHLSPlayback(

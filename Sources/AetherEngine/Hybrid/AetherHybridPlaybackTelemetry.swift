@@ -14,6 +14,8 @@ public enum AetherHybridPlaybackTelemetryFailure:
     case renderSurfaceMissing
     case invalidSeekableVODOptions
     case sourceIndependentReaderUnavailable
+    case hlsPreflightRequired
+    case hlsPreflightResourceGraphMissing
     case sourceKindMismatch
     case timelineSourceMismatch
     case preflightRequiresHybrid
@@ -51,6 +53,10 @@ public enum AetherHybridPlaybackTelemetryFailure:
             .invalidSeekableVODOptions
         case .sourceIndependentReaderUnavailable:
             .sourceIndependentReaderUnavailable
+        case .hlsPreflightRequired:
+            .hlsPreflightRequired
+        case .hlsPreflightResourceGraphMissing:
+            .hlsPreflightResourceGraphMissing
         case .sourceKindMismatch:
             .sourceKindMismatch
         case .timelineSourceMismatch:

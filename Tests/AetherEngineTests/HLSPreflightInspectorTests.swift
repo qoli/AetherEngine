@@ -791,11 +791,8 @@ final class HLSPreflightInspectorTests: XCTestCase {
             }
             return response
         }
-        let capabilities = HybridPlaybackCapabilities(
-            hasDirectVideoDecoder: true,
-            hasMetalRenderer: true,
-            supportedVideoFormats: [.sdr]
-        )
+        let capabilities =
+            AetherHybridPlaybackSession.capabilities
         let inspected = try await HLSPreflightInspector(
             httpHeaders: headers,
             fetchOverride: fetch
@@ -807,6 +804,18 @@ final class HLSPreflightInspectorTests: XCTestCase {
         )
 
         XCTAssertEqual(inspected.result.route, .hybridCarrierMetal)
+        XCTAssertEqual(
+            PlaybackPreflight.resolve(
+                sourceProfile:
+                    inspected.result.sourceProfile,
+                hlsPackaging:
+                    inspected.result.hlsPackaging,
+                hybridCapabilities:
+                    AetherHybridPlaybackSession
+                        .capabilities
+            ),
+            inspected.result
+        )
         XCTAssertEqual(
             inspected.audioAnalysisPolicy,
             .selectedAlternateAudioRenditions([

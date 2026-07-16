@@ -153,16 +153,20 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
 public final class AetherHybridPlaybackSession: ObservableObject {
     /// Capabilities that the current public session can actually admit.
     ///
-    /// HLS is deliberately absent until the remaining public and real-device acceptance gates land. Its
-    /// fixed loopback transport budget is already engine-owned. The verified renderer remains
-    /// SDR-only; unsupported color formats are rejected by preflight rather than tone-mapped.
+    /// Clear, finite, seekable HLS VOD is admitted only through an opaque
+    /// `AetherHLSPlaybackPreflight` resource binding. The verified renderer remains SDR-only;
+    /// unsupported color formats are rejected by preflight rather than tone-mapped.
     public nonisolated static var capabilities: HybridPlaybackCapabilities {
         HybridPlaybackCapabilities(
             hasDirectVideoDecoder: true,
             hasMetalRenderer: MTLCreateSystemDefaultDevice() != nil,
             supportedVideoFormats: AetherMetalPlayerView
                 .verifiedVideoFormats,
-            supportedSourceKinds: [.progressive, .custom]
+            supportedSourceKinds: [
+                .hls,
+                .progressive,
+                .custom,
+            ]
         )
     }
 
@@ -242,6 +246,11 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                     reason: currentResult.reason
                 )
         }
+        guard preflightResult.sourceProfile.sourceKind
+                != .hls else {
+            throw HybridPlaybackSessionError
+                .hlsPreflightRequired
+        }
         try validate(
             source: source,
             options: options,
@@ -288,6 +297,116 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         return AetherHybridPlaybackSession(
             core: core,
             preflightResult: preflightResult,
+            timeline: timeline,
+            metalPlayerView: metalPlayerView
+        )
+    }
+
+    /// Construct a graph-bound Hybrid session from the exact HLS preflight used for route selection.
+    ///
+    /// The opaque preflight owns every selected playlist, init segment, media segment and request-header
+    /// binding. This factory never reopens the root master, chooses another variant or falls through to
+    /// native/legacy playback. A stale capability result, missing resource graph or invalidated origin
+    /// generation fails explicitly.
+    public static func makeHLSVOD(
+        preflight: AetherHLSPlaybackPreflight,
+        bridgeMode: AudioBridgeMode = .surroundCompat,
+        initialGeneration: UInt64 = 0
+    ) async throws -> AetherHybridPlaybackSession {
+        try await makeHLSVOD(
+            preflight: preflight,
+            bridgeMode: bridgeMode,
+            initialGeneration: initialGeneration,
+            fetchOverride: nil
+        )
+    }
+
+    static func makeHLSVOD(
+        preflight: AetherHLSPlaybackPreflight,
+        bridgeMode: AudioBridgeMode = .surroundCompat,
+        initialGeneration: UInt64 = 0,
+        fetchOverride:
+            HLSVODOriginResourceLoader.Fetch?
+    ) async throws -> AetherHybridPlaybackSession {
+        guard preflight.result.route
+                == .hybridCarrierMetal else {
+            throw HybridPlaybackSessionError
+                .preflightRequiresHybrid(
+                    route: preflight.result.route,
+                    reason: preflight.result.reason
+                )
+        }
+        let currentResult = PlaybackPreflight.resolve(
+            sourceProfile: preflight.result.sourceProfile,
+            hlsPackaging: preflight.result.hlsPackaging,
+            hybridCapabilities: capabilities
+        )
+        guard currentResult == preflight.result else {
+            throw HybridPlaybackSessionError
+                .preflightContractChanged(
+                    route: currentResult.route,
+                    reason: currentResult.reason
+                )
+        }
+        guard preflight.result.sourceProfile.sourceKind
+                == .hls else {
+            throw HybridPlaybackSessionError
+                .sourceKindMismatch(expected: .hls)
+        }
+        guard let resourceGraph = preflight.resourceGraph else {
+            throw HybridPlaybackSessionError
+                .hlsPreflightResourceGraphMissing
+        }
+        let timeline = resourceGraph.timeline
+        guard timeline.source == .mirroredHLSVOD else {
+            throw HybridPlaybackSessionError
+                .timelineSourceMismatch(
+                    sourceKind: .hls,
+                    timelineSource: timeline.source
+                )
+        }
+
+        let core: HybridPlaybackSession
+        do {
+            core = try await HybridPlaybackSession
+                .makeHLSVOD(
+                    preflight: preflight,
+                    bridgeMode: bridgeMode,
+                    initialGeneration:
+                        initialGeneration,
+                    fetchOverride: fetchOverride
+                )
+        } catch let error as HybridPlaybackSessionError {
+            throw error
+        } catch let error as AetherMetalRendererError {
+            throw HybridPlaybackSessionError
+                .rendererFailed(error)
+        } catch {
+            throw HybridPlaybackSessionError
+                .providerFailed(
+                    reason: String(describing: error)
+                )
+        }
+        guard core.sourceVideoFormat
+                == preflight.result.sourceProfile.videoFormat else {
+            let decoded = core.sourceVideoFormat
+            core.stop()
+            throw HybridPlaybackSessionError
+                .sourceVideoFormatDiverged(
+                    preflight:
+                        preflight.result.sourceProfile
+                            .videoFormat,
+                    decoded: decoded
+                )
+        }
+        guard let metalPlayerView = core.metalPlayerView else {
+            core.stop()
+            throw HybridPlaybackSessionError
+                .renderSurfaceMissing
+        }
+        return AetherHybridPlaybackSession(
+            core: core,
+            preflightResult: preflight.result,
             timeline: timeline,
             metalPlayerView: metalPlayerView
         )
@@ -458,8 +577,7 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         }
 
         switch (source, sourceKind) {
-        case (.url, .hls), (.url, .progressive),
-             (.custom, .custom):
+        case (.url, .progressive), (.custom, .custom):
             break
         default:
             throw HybridPlaybackSessionError
@@ -467,10 +585,10 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         }
 
         let timelineMatches = switch sourceKind {
-        case .hls:
-            timeline.source == .mirroredHLSVOD
         case .progressive, .custom:
             timeline.source == .fixedFileVOD
+        case .hls:
+            false
         }
         guard timelineMatches else {
             throw HybridPlaybackSessionError

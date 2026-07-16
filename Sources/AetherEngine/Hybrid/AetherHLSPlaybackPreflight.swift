@@ -274,8 +274,7 @@ enum HLSVODResourceDigest {
 /// route selection. Future hybrid demux generations must consume these resolved URLs; reopening the root
 /// master and choosing a different adaptive variant would violate the preflight contract. Every separate
 /// audio rendition in the selected variant's group is bound to the same identity. The graph now feeds the
-/// incremental media pump and internal carrier session; public HLS admission remains blocked by startup
-/// bandwidth ownership and the remaining public/device gates.
+/// incremental media pump and the public graph-bound carrier session. Callers never receive these URLs.
 struct HLSVODResourceGraph: Sendable, Equatable {
     let requestedRootURL: URL
     let effectiveRootURL: URL

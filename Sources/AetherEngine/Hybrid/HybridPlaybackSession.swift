@@ -12,6 +12,8 @@ public enum HybridPlaybackSessionError:
     case renderSurfaceMissing
     case invalidSeekableVODOptions
     case sourceIndependentReaderUnavailable
+    case hlsPreflightRequired
+    case hlsPreflightResourceGraphMissing
     case sourceKindMismatch(expected: AetherMediaSourceKind)
     case timelineSourceMismatch(
         sourceKind: AetherMediaSourceKind,
@@ -64,6 +66,10 @@ public enum HybridPlaybackSessionError:
             return "Hybrid playback requires non-live, video-bearing, seekable VOD load options"
         case .sourceIndependentReaderUnavailable:
             return "Hybrid playback source cannot create the independent readers required by its session"
+        case .hlsPreflightRequired:
+            return "Hybrid HLS playback requires an opaque AetherHLSPlaybackPreflight and makeHLSVOD"
+        case .hlsPreflightResourceGraphMissing:
+            return "Hybrid HLS preflight did not retain its required immutable resource graph"
         case .sourceKindMismatch(let expected):
             return "Hybrid playback source does not match preflight source kind \(expected.rawValue)"
         case .timelineSourceMismatch(
@@ -561,13 +567,16 @@ final class HybridPlaybackSession {
             HLSVODOriginResourceLoader.Fetch? = nil
     ) async throws -> HybridPlaybackSession {
         guard preflight.result.route
-                == .hybridCarrierMetal,
-              preflight.resourceGraph != nil else {
+                == .hybridCarrierMetal else {
             throw HybridPlaybackSessionError
                 .preflightRequiresHybrid(
                     route: preflight.result.route,
                     reason: preflight.result.reason
                 )
+        }
+        guard preflight.resourceGraph != nil else {
+            throw HybridPlaybackSessionError
+                .hlsPreflightResourceGraphMissing
         }
 
         let relay = HybridPlaybackFrameRelay()

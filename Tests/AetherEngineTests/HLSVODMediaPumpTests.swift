@@ -1279,12 +1279,12 @@ final class HLSVODMediaPumpTests: XCTestCase {
     }
 
     @MainActor
-    func testHybridSessionComposesHLSProviderIntoAVPlayerAndMetal()
+    func testPublicHybridSessionComposesHLSProviderIntoAVPlayerAndMetal()
         async throws
     {
         let fixture = try makeFixture()
         let session =
-            try await HybridPlaybackSession
+            try await AetherHybridPlaybackSession
                 .makeHLSVOD(
                     preflight: fixture.preflight,
                     fetchOverride: {
@@ -1302,10 +1302,20 @@ final class HLSVODMediaPumpTests: XCTestCase {
             session.state,
             .ready(generation: 0)
         )
-        XCTAssertNotNil(session.avPlayer.currentItem)
-        let metalView = try XCTUnwrap(
-            session.metalPlayerView
+        XCTAssertEqual(
+            session.preflightResult,
+            fixture.preflight.result
         )
+        XCTAssertEqual(
+            session.timeline.source,
+            .mirroredHLSVOD
+        )
+        XCTAssertEqual(
+            session.audioAnalysisTrackIDs,
+            [0]
+        )
+        XCTAssertNotNil(session.avPlayer.currentItem)
+        let metalView = session.metalPlayerView
         XCTAssertEqual(
             metalView.diagnostics.generation,
             0
@@ -1318,10 +1328,15 @@ final class HLSVODMediaPumpTests: XCTestCase {
             0,
             accuracy: 0.000_001
         )
+        XCTAssertEqual(
+            session.diagnostics.carrierBandwidth
+                .declaredTransportBudget,
+            2_000_000
+        )
     }
 
     @MainActor
-    func testHybridSessionRejectsNonHybridHLSBeforeOriginFetch()
+    func testPublicHybridSessionRejectsNonHybridHLSBeforeOriginFetch()
         async throws
     {
         let fixture = try makeFixture()
@@ -1347,7 +1362,7 @@ final class HLSVODMediaPumpTests: XCTestCase {
             )
 
         do {
-            _ = try await HybridPlaybackSession
+            _ = try await AetherHybridPlaybackSession
                 .makeHLSVOD(
                     preflight: preflight,
                     fetchOverride: {
@@ -1359,6 +1374,116 @@ final class HLSVODMediaPumpTests: XCTestCase {
                 )
             XCTFail(
                 "non-hybrid HLS unexpectedly created a hybrid session"
+            )
+        } catch let error
+                as HybridPlaybackSessionError {
+            XCTAssertEqual(error, expected)
+        }
+        for url in
+            fixture.videoSegmentURLs
+                + fixture.audioSegmentURLs {
+            XCTAssertEqual(
+                fixture.fetchStore.count(for: url),
+                0
+            )
+        }
+    }
+
+    @MainActor
+    func testPublicHybridSessionRejectsMissingResourceGraphBeforeOriginFetch()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let preflight = AetherHLSPlaybackPreflight(
+            result: fixture.preflight.result,
+            resourceGraph: nil,
+            httpHeaders: [:]
+        )
+
+        do {
+            _ = try await AetherHybridPlaybackSession
+                .makeHLSVOD(
+                    preflight: preflight,
+                    fetchOverride: {
+                        request,
+                        _ in
+                        try fixture.fetchStore
+                            .response(for: request)
+                    }
+                )
+            XCTFail(
+                "graphless HLS preflight unexpectedly created a public session"
+            )
+        } catch let error
+                as HybridPlaybackSessionError {
+            XCTAssertEqual(
+                error,
+                .hlsPreflightResourceGraphMissing
+            )
+        }
+        for url in
+            fixture.videoSegmentURLs
+                + fixture.audioSegmentURLs {
+            XCTAssertEqual(
+                fixture.fetchStore.count(for: url),
+                0
+            )
+        }
+    }
+
+    @MainActor
+    func testPublicHybridSessionRevalidatesColorCapabilityBeforeOriginFetch()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let source = AetherSourceProfile(
+            sourceKind: .hls,
+            isSeekableVOD: true,
+            videoCodec: .h264,
+            videoFormat: .hdr10
+        )
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source,
+            hlsPackaging:
+                fixture.preflight.result
+                    .hlsPackaging,
+            hybridCapabilities:
+                HybridPlaybackCapabilities(
+                    hasDirectVideoDecoder: true,
+                    hasMetalRenderer: true,
+                    supportedVideoFormats: [.hdr10]
+                )
+        )
+        XCTAssertEqual(
+            result.route,
+            .hybridCarrierMetal
+        )
+        let preflight = AetherHLSPlaybackPreflight(
+            result: result,
+            resourceGraph:
+                fixture.preflight.resourceGraph,
+            httpHeaders: [:]
+        )
+        let expected = HybridPlaybackSessionError
+            .preflightContractChanged(
+                route: .unsupported,
+                reason:
+                    .unsupportedHybridVideoFormat
+            )
+
+        do {
+            _ = try await AetherHybridPlaybackSession
+                .makeHLSVOD(
+                    preflight: preflight,
+                    fetchOverride: {
+                        request,
+                        _ in
+                        try fixture.fetchStore
+                            .response(for: request)
+                    }
+                )
+            XCTFail(
+                "stale HDR capability unexpectedly created a public session"
             )
         } catch let error
                 as HybridPlaybackSessionError {
@@ -1404,7 +1529,7 @@ final class HLSVODMediaPumpTests: XCTestCase {
             )
 
         do {
-            _ = try await HybridPlaybackSession
+            _ = try await AetherHybridPlaybackSession
                 .makeHLSVOD(
                     preflight: fixture.preflight,
                     fetchOverride: {
@@ -2057,7 +2182,7 @@ final class HLSVODMediaPumpTests: XCTestCase {
                 manifestCodecs:
                     ["avc1.42c01e"],
                 actualVideoCodec: .h264,
-                codecVerification: .verified,
+                codecVerification: .mismatch,
                 contentProtection: .none
             ),
             route: .hybridCarrierMetal,
@@ -2209,7 +2334,7 @@ final class HLSVODMediaPumpTests: XCTestCase {
                     "ec-3",
                 ],
                 actualVideoCodec: .h264,
-                codecVerification: .verified,
+                codecVerification: .mismatch,
                 contentProtection: .none
             ),
             route: .hybridCarrierMetal,

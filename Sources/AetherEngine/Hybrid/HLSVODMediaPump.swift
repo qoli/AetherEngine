@@ -181,9 +181,9 @@ struct HLSVODMediaPumpSnapshot: Sendable, Equatable {
 /// enter the real-video sink or long-lived carrier-audio writer. FFmpeg never receives a URL and cannot
 /// reopen the master playlist, choose a different variant or perform network I/O.
 ///
-/// This remains an engine-private source pump. Transport, seek-generation replacement and an independent
-/// graph-bound analysis cursor own the same bounded origin loader; public HLS session admission stays
-/// disabled until the remaining public-session and real-device gates land.
+/// This remains an engine-private source pump. The public HLS session factory, transport,
+/// seek-generation replacement and independent graph-bound analysis cursor own the same bounded origin
+/// loader; callers receive only the AVPlayer, Metal surface and typed public diagnostics.
 /// Audio production may read one upstream segment ahead because an audio access unit from
 /// the next carrier interval is the evidence that lets the long-lived fMP4 writer finalize the requested
 /// fragment; the following carrier fragment is not finalized until a later demand.

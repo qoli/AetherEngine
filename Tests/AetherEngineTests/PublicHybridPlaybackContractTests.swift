@@ -32,6 +32,7 @@ struct PublicHybridPlaybackContractTests {
         let capabilities = AetherHybridPlaybackSession.capabilities
 
         #expect(capabilities.supportedSourceKinds == [
+            .hls,
             .progressive,
             .custom,
         ])
@@ -59,8 +60,8 @@ struct PublicHybridPlaybackContractTests {
         )
     }
 
-    @Test("Public capabilities reject HLS hybrid before session creation")
-    func hlsHybridAdmissionIsTypedUnsupported() {
+    @Test("Public capabilities admit graph-bound SDR HLS hybrid")
+    func hlsHybridAdmissionIsPublic() {
         let source = AetherSourceProfile(
             sourceKind: .hls,
             isSeekableVOD: true,
@@ -82,8 +83,8 @@ struct PublicHybridPlaybackContractTests {
                 AetherHybridPlaybackSession.capabilities
         )
 
-        #expect(result.route == .unsupported)
-        #expect(result.reason == .unsupportedHybridSourceKind)
+        #expect(result.route == .hybridCarrierMetal)
+        #expect(result.reason == .hybridHEV1SampleEntry)
     }
 
     @MainActor
@@ -128,8 +129,8 @@ struct PublicHybridPlaybackContractTests {
     }
 
     @MainActor
-    @Test("Public factory revalidates a previously admitted HLS route")
-    func publicFactoryRejectsStaleHLSAdmission() async throws {
+    @Test("Generic seekable factory requires the opaque HLS preflight factory")
+    func publicSeekableFactoryRejectsHLSBypass() async throws {
         let sourceProfile = AetherSourceProfile(
             sourceKind: .hls,
             isSeekableVOD: true,
@@ -161,10 +162,7 @@ struct PublicHybridPlaybackContractTests {
                 ),
             ])
         let expected = HybridPlaybackSessionError
-            .preflightContractChanged(
-                route: .unsupported,
-                reason: .unsupportedHybridSourceKind
-            )
+            .hlsPreflightRequired
 
         await #expect(throws: expected) {
             try await AetherHybridPlaybackSession

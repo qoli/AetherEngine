@@ -106,6 +106,24 @@ struct HybridPlaybackTelemetryTests {
         )
     }
 
+    @Test("Public HLS admission failures remain distinct typed telemetry")
+    func publicHLSAdmissionFailuresRemainTyped() {
+        #expect(
+            AetherHybridPlaybackTelemetryState(
+                .failed(.hlsPreflightRequired)
+            ) == .failed(.hlsPreflightRequired)
+        )
+        #expect(
+            AetherHybridPlaybackTelemetryState(
+                .failed(
+                    .hlsPreflightResourceGraphMissing
+                )
+            ) == .failed(
+                .hlsPreflightResourceGraphMissing
+            )
+        )
+    }
+
     @MainActor
     private func makeSnapshot(
         state: AetherHybridPlaybackTelemetryState
