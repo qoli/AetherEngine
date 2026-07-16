@@ -1546,6 +1546,80 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         )
     }
 
+    func testBoundedHTTPTransportKeepsOnlySafeCrossOriginHeaders()
+        async throws
+    {
+        let sourceURL = URL(
+            string: "https://origin.test/redirect-safe.m4s"
+        )!
+        let targetURL = URL(
+            string: "https://cdn.test/segment-safe.m4s"
+        )!
+        HLSVODOriginURLProtocol.reset()
+        HLSVODOriginURLProtocol.fixtures[
+            sourceURL.absoluteString
+        ] = .init(
+            statusCode: 302,
+            headers: [
+                "Location": targetURL.absoluteString,
+            ],
+            body: Data(),
+            redirectURL: targetURL
+        )
+        HLSVODOriginURLProtocol.fixtures[
+            targetURL.absoluteString
+        ] = .init(
+            statusCode: 200,
+            headers: ["Content-Length": "1"],
+            body: Data([0xAB])
+        )
+        let configuration =
+            URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [
+            HLSVODOriginURLProtocol.self,
+        ]
+        var request = URLRequest(url: sourceURL)
+        request.setValue(
+            "bytes=0-15",
+            forHTTPHeaderField: "Range"
+        )
+        request.setValue(
+            "AetherTests/1",
+            forHTTPHeaderField: "User-Agent"
+        )
+        request.setValue(
+            "identity",
+            forHTTPHeaderField: "Accept-Encoding"
+        )
+
+        let response =
+            try await HLSVODBoundedHTTPFetcher.fetch(
+                request: request,
+                maximumBytes: 4,
+                configuration: configuration
+            )
+
+        XCTAssertEqual(response.effectiveURL, targetURL)
+        XCTAssertEqual(response.data, Data([0xAB]))
+        let recorded = try XCTUnwrap(
+            HLSVODOriginURLProtocol.recordedHeaders(
+                for: targetURL
+            )
+        )
+        XCTAssertEqual(recorded["Range"], "bytes=0-15")
+        XCTAssertEqual(
+            recorded["User-Agent"],
+            "AetherTests/1"
+        )
+        XCTAssertEqual(
+            recorded["Accept-Encoding"],
+            "identity"
+        )
+        XCTAssertNil(recorded["Authorization"])
+        XCTAssertNil(recorded["Cookie"])
+        XCTAssertNil(recorded["Referer"])
+    }
+
     func testBoundedHTTPTransportKeepsHeadersOnSameOriginRedirect()
         async throws
     {

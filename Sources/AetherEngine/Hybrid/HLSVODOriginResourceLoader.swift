@@ -1101,9 +1101,10 @@ actor HLSVODOriginResourceLoader {
     }
 }
 
-/// One-shot bounded HTTP fetch used by the HLS VOD origin loader. Redirects retain the exact admitted
-/// request headers, including Authorization/Referer, while the response body is cancelled as soon as it
-/// crosses the configured cap. No retry or alternate URL is attempted.
+/// One-shot bounded HTTP fetch used by the HLS VOD origin loader. Same-origin redirects retain the exact
+/// admitted request headers. Cross-origin redirects are rejected when request-scoped headers are present;
+/// otherwise only an explicit safe transport-header set is retained. The response body is cancelled as
+/// soon as it crosses the configured cap. No retry or alternate URL is attempted.
 final class HLSVODBoundedHTTPFetcher:
     NSObject,
     URLSessionDataDelegate,
@@ -1169,6 +1170,9 @@ final class HLSVODBoundedHTTPFetcher:
             self.continuation = continuation
             configuration.timeoutIntervalForRequest = 10
             configuration.timeoutIntervalForResource = 30
+            configuration.httpCookieStorage = nil
+            configuration.httpShouldSetCookies = false
+            configuration.urlCredentialStorage = nil
             let session = URLSession(
                 configuration: configuration,
                 delegate: self,
@@ -1212,6 +1216,7 @@ final class HLSVODBoundedHTTPFetcher:
         let originalHeaders =
             self.request.allHTTPHeaderFields ?? [:]
         var redirected = request
+        redirected.allHTTPHeaderFields = nil
         if sourceOrigin == targetOrigin {
             for (field, value) in originalHeaders {
                 redirected.setValue(
@@ -1231,12 +1236,6 @@ final class HLSVODBoundedHTTPFetcher:
                     )
                 )
                 return
-            }
-            for field in originalHeaders.keys {
-                redirected.setValue(
-                    nil,
-                    forHTTPHeaderField: field
-                )
             }
             for (field, value) in originalHeaders
             where Self.safeCrossOriginHeaders.contains(
