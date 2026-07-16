@@ -82,10 +82,19 @@ final class HLSPreflightInspectorTests: XCTestCase {
             string:
                 "https://cdn.example/catalog/video/seg0.m4s?token=segment-secret"
         )!
+        let audioPlaylistURL = URL(
+            string:
+                "https://cdn.example/audio/en.m3u8?token=audio-playlist-secret"
+        )!
+        let alternateAudioPlaylistURL = URL(
+            string:
+                "https://cdn.example/audio/fr.m3u8?token=alternate-audio-playlist-secret"
+        )!
         let master = Data(
             """
             #EXTM3U
-            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",DEFAULT=YES,URI="../audio/en.m3u8"
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2",URI="../audio/en.m3u8?token=audio-playlist-secret"
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Français",LANGUAGE="fr",DEFAULT=NO,AUTOSELECT=YES,CHANNELS="2",URI="../audio/fr.m3u8?token=alternate-audio-playlist-secret"
             #EXT-X-STREAM-INF:BANDWIDTH=900000,CODECS="avc1.42C01E"
             video/low.m3u8
             #EXT-X-STREAM-INF:BANDWIDTH=1400000,CODECS="hvc1.2.4.L150",AUDIO="audio"
@@ -100,6 +109,30 @@ final class HLSPreflightInspectorTests: XCTestCase {
             #EXT-X-MAP:URI="init.mp4?token=init-secret"
             #EXTINF:1.250,
             seg0.m4s?token=segment-secret
+            #EXT-X-ENDLIST
+            """.utf8
+        )
+        let audioMedia = Data(
+            """
+            #EXTM3U
+            #EXT-X-TARGETDURATION:2
+            #EXT-X-MEDIA-SEQUENCE:31
+            #EXTINF:0.625,
+            a0.aac?token=audio-segment-0-secret
+            #EXTINF:0.625,
+            a1.aac?token=audio-segment-1-secret
+            #EXT-X-ENDLIST
+            """.utf8
+        )
+        let alternateAudioMedia = Data(
+            """
+            #EXTM3U
+            #EXT-X-TARGETDURATION:2
+            #EXT-X-MEDIA-SEQUENCE:41
+            #EXTINF:0.625,
+            a0.aac?token=alternate-audio-segment-0-secret
+            #EXTINF:0.625,
+            a1.aac?token=alternate-audio-segment-1-secret
             #EXT-X-ENDLIST
             """.utf8
         )
@@ -119,6 +152,14 @@ final class HLSPreflightInspectorTests: XCTestCase {
             segmentURL: HLSPreflightFetchResponse(
                 data: segmentData,
                 effectiveURL: segmentURL
+            ),
+            audioPlaylistURL: HLSPreflightFetchResponse(
+                data: audioMedia,
+                effectiveURL: audioPlaylistURL
+            ),
+            alternateAudioPlaylistURL: HLSPreflightFetchResponse(
+                data: alternateAudioMedia,
+                effectiveURL: alternateAudioPlaylistURL
             ),
         ]
         let headers = [
@@ -157,6 +198,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
         XCTAssertEqual(inspected.selectedVariantBandwidth, 1_400_000)
         XCTAssertEqual(inspected.mediaSegmentCount, 1)
         XCTAssertTrue(inspected.hasSeparateAudioRenditions)
+        XCTAssertEqual(inspected.audioRenditionCount, 2)
         XCTAssertEqual(
             inspected.hybridTimeline?.segments.map(\.duration),
             timeline.segments.map(\.duration)
@@ -175,6 +217,36 @@ final class HLSPreflightInspectorTests: XCTestCase {
         XCTAssertEqual(
             inspected.resourceGraph?.segments.first?.url,
             segmentURL
+        )
+        XCTAssertEqual(
+            inspected.resourceGraph?.audioRenditions.first?.name,
+            "English"
+        )
+        XCTAssertEqual(
+            inspected.resourceGraph?.audioRenditions.first?.language,
+            "en"
+        )
+        XCTAssertEqual(
+            inspected.resourceGraph?.audioRenditions.first?.channels,
+            "2"
+        )
+        XCTAssertEqual(
+            inspected.resourceGraph?.audioRenditions.first?.segments
+                .map(\.mediaSequence),
+            [31, 32]
+        )
+        XCTAssertEqual(
+            inspected.resourceGraph?.audioRenditions.last?.name,
+            "Français"
+        )
+        XCTAssertEqual(
+            inspected.resourceGraph?.audioRenditions.last?.language,
+            "fr"
+        )
+        XCTAssertEqual(
+            inspected.resourceGraph?.audioRenditions.last?.segments
+                .map(\.mediaSequence),
+            [41, 42]
         )
 
         guard case .media(let parsedMedia) = try HLSPlaylistParser.parse(
@@ -195,12 +267,71 @@ final class HLSPreflightInspectorTests: XCTestCase {
             separateAudioGroupID: "audio",
             mediaPlaylistData: media,
             media: parsedMedia,
+            audioRenditions:
+                try XCTUnwrap(inspected.resourceGraph)
+                    .audioRenditions,
             httpHeaders: [
                 "Authorization": "Bearer changed-secret",
                 "User-Agent": "AetherTests/1",
             ]
         )
         XCTAssertNotEqual(changed.identity, identity)
+    }
+
+    func testResourceGraphRejectsAlternateAudioOutsideSelectedGroup() throws {
+        let baseURL = URL(
+            string: "https://example.com/video/media.m3u8"
+        )!
+        let media = HLSMediaPlaylist(
+            targetDuration: 4,
+            mediaSequence: 0,
+            segments: [
+                HLSMediaSegment(
+                    uri: "seg0.ts",
+                    duration: 4,
+                    discontinuityBefore: false
+                ),
+            ],
+            hasEndList: true,
+            hasUnsupportedEncryption: false,
+            hasMap: false,
+            mapURI: nil,
+            contentProtection: .none
+        )
+        let wrongGroup = HLSVODAudioRenditionResource(
+            ordinal: 0,
+            groupID: "commentary",
+            name: "Commentary",
+            language: "en",
+            isDefault: false,
+            isAutoselect: true,
+            channels: "2",
+            playlistURL: baseURL,
+            playlistData: Data(),
+            initSegmentURL: nil,
+            segments: []
+        )
+
+        XCTAssertThrowsError(
+            try HLSVODResourceGraph.make(
+                requestedRootURL: baseURL,
+                effectiveRootURL: baseURL,
+                selectedMediaPlaylistURL: baseURL,
+                selectedVariant: nil,
+                separateAudioGroupID: "audio",
+                mediaPlaylistData: Data(),
+                media: media,
+                audioRenditions: [wrongGroup],
+                httpHeaders: [:]
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? HLSPreflightError,
+                .unsupportedSeekableVODResourceGraph(
+                    reason: "invalid separate alternate-audio group"
+                )
+            )
+        }
     }
 
     func testSeekableVODResourceGraphRejectsNonFiniteOrAmbiguousPlaylists() throws {
@@ -248,6 +379,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
                 separateAudioGroupID: nil,
                 mediaPlaylistData: Data(),
                 media: makeMedia(false, false, false),
+                audioRenditions: [],
                 httpHeaders: [:]
             )
         ) { error in
@@ -269,6 +401,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
                     separateAudioGroupID: nil,
                     mediaPlaylistData: Data(),
                     media: media,
+                    audioRenditions: [],
                     httpHeaders: [:]
                 )
             )

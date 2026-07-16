@@ -60,9 +60,9 @@ extension AetherEngine {
     ///
     /// Raw signed URLs and HTTP headers remain engine-private. The returned resource digest and mirrored
     /// timeline are safe for host diagnostics, while a future HLS hybrid session must consume the opaque
-    /// binding instead of reopening the root master and selecting a potentially different variant.
-    /// A separate alternate-audio group is reported but not yet materialized into this binding, so the
-    /// public hybrid session must continue to exclude HLS until that resource graph is complete.
+    /// binding instead of reopening the root master and selecting a potentially different variant. Every
+    /// separate alternate-audio playlist in the selected group is bound too; segment fetch/demux and carrier
+    /// mux integration remain pending, so the public hybrid session must continue to exclude HLS.
     public nonisolated static func preflightHLSPlayback(
         url: URL,
         sourceIsSeekableVOD: Bool,
@@ -88,6 +88,7 @@ struct HLSPreflightFetchResponse: Sendable {
 private struct HLSPreflightResolvedMedia: Sendable {
     let variant: HLSVariant?
     let separateAudioGroupID: String?
+    let audioRenditions: [HLSAudioRendition]
     let rootEffectiveURL: URL
     let mediaURL: URL
     let mediaData: Data
@@ -233,19 +234,26 @@ struct HLSPreflightInspector {
             hlsPackaging: packaging,
             hybridCapabilities: hybridCapabilities
         )
-        let resourceGraph = try result.route == .hybridCarrierMetal
-            ? HLSVODResourceGraph.make(
+        let resourceGraph: HLSVODResourceGraph?
+        if result.route == .hybridCarrierMetal {
+            let audioRenditions = try await resolveAudioRenditions(
+                resolved.audioRenditions,
+                rootEffectiveURL: resolved.rootEffectiveURL
+            )
+            resourceGraph = try HLSVODResourceGraph.make(
                 requestedRootURL: rootURL,
                 effectiveRootURL: resolved.rootEffectiveURL,
                 selectedMediaPlaylistURL: resolved.mediaURL,
                 selectedVariant: resolved.variant,
-                separateAudioGroupID:
-                    resolved.separateAudioGroupID,
+                separateAudioGroupID: resolved.separateAudioGroupID,
                 mediaPlaylistData: resolved.mediaData,
                 media: resolved.media,
+                audioRenditions: audioRenditions,
                 httpHeaders: httpHeaders
             )
-            : nil
+        } else {
+            resourceGraph = nil
+        }
         return AetherHLSPlaybackPreflight(
             result: result,
             resourceGraph: resourceGraph,
@@ -264,6 +272,7 @@ struct HLSPreflightInspector {
             return HLSPreflightResolvedMedia(
                 variant: nil,
                 separateAudioGroupID: nil,
+                audioRenditions: [],
                 rootEffectiveURL: root.effectiveURL,
                 mediaURL: root.effectiveURL,
                 mediaData: root.data,
@@ -298,12 +307,53 @@ struct HLSPreflightInspector {
                         ? $0
                         : nil
                 },
+                audioRenditions: variant.audioGroupID.map {
+                    groupID in
+                    master.audioRenditions.filter {
+                        $0.groupID == groupID
+                    }
+                } ?? [],
                 rootEffectiveURL: root.effectiveURL,
                 mediaURL: response.effectiveURL,
                 mediaData: response.data,
                 media: media
             )
         }
+    }
+
+    private func resolveAudioRenditions(
+        _ renditions: [HLSAudioRendition],
+        rootEffectiveURL: URL
+    ) async throws -> [HLSVODAudioRenditionResource] {
+        var resources: [HLSVODAudioRenditionResource] = []
+        resources.reserveCapacity(renditions.count)
+        for (ordinal, rendition) in renditions.enumerated() {
+            guard let playlistURL = HLSPlaylistParser.resolve(
+                uri: rendition.uri,
+                against: rootEffectiveURL
+            ) else {
+                throw HLSPreflightError.unresolvableURI(
+                    rendition.uri
+                )
+            }
+            let response = try await fetch(playlistURL)
+            guard case .media(let media) =
+                    try parsePlaylist(response.data) else {
+                throw HLSPreflightError.invalidPlaylist(
+                    "alternate-audio rendition was not a media playlist"
+                )
+            }
+            resources.append(
+                try HLSVODResourceGraph.makeAudioRendition(
+                    ordinal: ordinal,
+                    metadata: rendition,
+                    playlistURL: response.effectiveURL,
+                    playlistData: response.data,
+                    media: media
+                )
+            )
+        }
+        return resources
     }
 
     private func fetch(_ url: URL) async throws -> HLSPreflightFetchResponse {

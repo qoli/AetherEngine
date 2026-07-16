@@ -6,10 +6,10 @@ import Foundation
 ///
 /// The raw selected playlist, init-segment and media-segment URLs remain engine-private because they may
 /// contain signed query parameters. For an admitted `.hybridCarrierMetal` route, `resourceIdentity` is a
-/// SHA-256 binding over those resolved video resources, the exact media-playlist bytes and the request
-/// headers. A separate alternate-audio group is reported but is not yet part of this first binding. Native
-/// and unsupported routes do not create the hybrid graph. A host may persist the digest, but must pass this
-/// value object back to AetherEngine rather than reconstructing an HLS resource graph from public fields.
+/// SHA-256 binding over those resolved video resources, every separate alternate-audio playlist/resource,
+/// the exact playlist bytes and the request headers. Native and unsupported routes do not create the hybrid
+/// graph. A host may persist the digest, but must pass this value object back to AetherEngine rather than
+/// reconstructing an HLS resource graph from public fields.
 public struct AetherHLSPlaybackPreflight: Sendable, Equatable {
     public let result: PlaybackPreflightResult
     public let hybridTimeline: BlackCarrierTimeline?
@@ -17,6 +17,7 @@ public struct AetherHLSPlaybackPreflight: Sendable, Equatable {
     public let selectedVariantBandwidth: Int?
     public let mediaSegmentCount: Int
     public let hasSeparateAudioRenditions: Bool
+    public let audioRenditionCount: Int
 
     let resourceGraph: HLSVODResourceGraph?
     let httpHeaders: [String: String]
@@ -31,8 +32,9 @@ public struct AetherHLSPlaybackPreflight: Sendable, Equatable {
         resourceIdentity = resourceGraph?.identity
         selectedVariantBandwidth = resourceGraph?.selectedVariantBandwidth
         mediaSegmentCount = resourceGraph?.segments.count ?? 0
-        hasSeparateAudioRenditions =
-            resourceGraph?.separateAudioGroupID != nil
+        audioRenditionCount =
+            resourceGraph?.audioRenditions.count ?? 0
+        hasSeparateAudioRenditions = audioRenditionCount > 0
         self.resourceGraph = resourceGraph
         self.httpHeaders = httpHeaders
     }
@@ -45,10 +47,25 @@ struct HLSVODSegmentResource: Sendable, Equatable {
     let url: URL
 }
 
+struct HLSVODAudioRenditionResource: Sendable, Equatable {
+    let ordinal: Int
+    let groupID: String
+    let name: String
+    let language: String?
+    let isDefault: Bool
+    let isAutoselect: Bool
+    let channels: String?
+    let playlistURL: URL
+    let playlistData: Data
+    let initSegmentURL: URL?
+    let segments: [HLSVODSegmentResource]
+}
+
 /// Engine-private immutable snapshot of the exact clear, finite HLS VOD video resources inspected before
 /// route selection. Future hybrid demux generations must consume these resolved URLs; reopening the root
-/// master and choosing a different adaptive variant would violate the preflight contract. Alternate-audio
-/// playlists remain a separate pending graph and therefore still block public HLS session admission.
+/// master and choosing a different adaptive variant would violate the preflight contract. Every separate
+/// audio rendition in the selected variant's group is bound to the same identity, but segment fetch/demux
+/// and carrier mux integration remain pending and therefore still block public HLS session admission.
 struct HLSVODResourceGraph: Sendable, Equatable {
     let requestedRootURL: URL
     let effectiveRootURL: URL
@@ -58,6 +75,7 @@ struct HLSVODResourceGraph: Sendable, Equatable {
     let separateAudioGroupID: String?
     let initSegmentURL: URL?
     let segments: [HLSVODSegmentResource]
+    let audioRenditions: [HLSVODAudioRenditionResource]
     let timeline: BlackCarrierTimeline
     let identity: String
 
@@ -69,66 +87,39 @@ struct HLSVODResourceGraph: Sendable, Equatable {
         separateAudioGroupID: String?,
         mediaPlaylistData: Data,
         media: HLSMediaPlaylist,
+        audioRenditions: [HLSVODAudioRenditionResource],
         httpHeaders: [String: String]
     ) throws -> HLSVODResourceGraph {
-        guard media.hasEndList else {
-            throw HLSPreflightError.seekableVODPlaylistNotFinite
-        }
-        guard !media.hasByteRange else {
-            throw HLSPreflightError.unsupportedSeekableVODResourceGraph(
-                reason: "byte-range media or init resources"
-            )
-        }
-        guard media.segments.allSatisfy({
-            $0.duration > 0
-                && $0.duration.isFinite
-                && !$0.discontinuityBefore
-        }) else {
-            throw HLSPreflightError.unsupportedSeekableVODResourceGraph(
-                reason: "invalid duration or discontinuity"
-            )
-        }
-
-        let initSegmentURL: URL?
-        if let mapURI = media.mapURI {
-            guard let resolved = HLSPlaylistParser.resolve(
-                uri: mapURI,
-                against: selectedMediaPlaylistURL
-            ) else {
-                throw HLSPreflightError.unresolvableURI(mapURI)
+        if let separateAudioGroupID {
+            guard !audioRenditions.isEmpty,
+                  audioRenditions.allSatisfy({
+                      $0.groupID == separateAudioGroupID
+                  }),
+                  audioRenditions.map(\.ordinal)
+                    == Array(audioRenditions.indices),
+                  audioRenditions.filter(\.isDefault).count <= 1 else {
+                throw HLSPreflightError
+                    .unsupportedSeekableVODResourceGraph(
+                        reason:
+                            "invalid separate alternate-audio group"
+                    )
             }
-            initSegmentURL = resolved
-        } else {
-            initSegmentURL = nil
-        }
-
-        let segmentResources = try media.segments.enumerated().map {
-            index,
-            segment -> HLSVODSegmentResource in
-            guard let url = HLSPlaylistParser.resolve(
-                uri: segment.uri,
-                against: selectedMediaPlaylistURL
-            ) else {
-                throw HLSPreflightError.unresolvableURI(segment.uri)
-            }
-            let (mediaSequence, overflow) =
-                media.mediaSequence.addingReportingOverflow(index)
-            guard !overflow else {
-                throw HLSPreflightError.invalidPlaylist(
-                    "MEDIA-SEQUENCE overflow"
+        } else if !audioRenditions.isEmpty {
+            throw HLSPreflightError
+                .unsupportedSeekableVODResourceGraph(
+                    reason:
+                        "alternate-audio resources without a selected group"
                 )
-            }
-            return HLSVODSegmentResource(
-                index: index,
-                mediaSequence: mediaSequence,
-                duration: CMTime(
-                    seconds: segment.duration,
-                    preferredTimescale:
-                        BlackCarrierProfile.approved.timescale
-                ),
-                url: url
-            )
         }
+        let initSegmentURL = try resolvedInitSegmentURL(
+            media: media,
+            playlistURL: selectedMediaPlaylistURL
+        )
+        let segmentResources = try validatedSegments(
+            media: media,
+            playlistURL: selectedMediaPlaylistURL,
+            label: "selected video rendition"
+        )
         let timeline = try BlackCarrierTimeline.mirroredHLSVOD(
             segmentDurations: segmentResources.map(\.duration)
         )
@@ -141,6 +132,7 @@ struct HLSVODResourceGraph: Sendable, Equatable {
             mediaPlaylistData: mediaPlaylistData,
             initSegmentURL: initSegmentURL,
             segmentResources: segmentResources,
+            audioRenditions: audioRenditions,
             httpHeaders: httpHeaders
         )
         return HLSVODResourceGraph(
@@ -152,8 +144,46 @@ struct HLSVODResourceGraph: Sendable, Equatable {
             separateAudioGroupID: separateAudioGroupID,
             initSegmentURL: initSegmentURL,
             segments: segmentResources,
+            audioRenditions: audioRenditions,
             timeline: timeline,
             identity: identity
+        )
+    }
+
+    static func makeAudioRendition(
+        ordinal: Int,
+        metadata: HLSAudioRendition,
+        playlistURL: URL,
+        playlistData: Data,
+        media: HLSMediaPlaylist
+    ) throws -> HLSVODAudioRenditionResource {
+        guard media.contentProtection == .none else {
+            throw HLSPreflightError.unsupportedSeekableVODResourceGraph(
+                reason:
+                    "protected alternate-audio rendition \(metadata.name)"
+            )
+        }
+        let segments = try validatedSegments(
+            media: media,
+            playlistURL: playlistURL,
+            label: "alternate-audio rendition \(metadata.name)"
+        )
+        let initSegmentURL = try resolvedInitSegmentURL(
+            media: media,
+            playlistURL: playlistURL
+        )
+        return HLSVODAudioRenditionResource(
+            ordinal: ordinal,
+            groupID: metadata.groupID,
+            name: metadata.name,
+            language: metadata.language,
+            isDefault: metadata.isDefault,
+            isAutoselect: metadata.isAutoselect,
+            channels: metadata.channels,
+            playlistURL: playlistURL,
+            playlistData: playlistData,
+            initSegmentURL: initSegmentURL,
+            segments: segments
         )
     }
 
@@ -166,6 +196,7 @@ struct HLSVODResourceGraph: Sendable, Equatable {
         mediaPlaylistData: Data,
         initSegmentURL: URL?,
         segmentResources: [HLSVODSegmentResource],
+        audioRenditions: [HLSVODAudioRenditionResource],
         httpHeaders: [String: String]
     ) -> String {
         var evidence = Data()
@@ -190,6 +221,37 @@ struct HLSVODResourceGraph: Sendable, Equatable {
             )
             append(segment.url.absoluteString, to: &evidence)
         }
+        for rendition in audioRenditions {
+            append(String(rendition.ordinal), to: &evidence)
+            append(rendition.groupID, to: &evidence)
+            append(rendition.name, to: &evidence)
+            append(rendition.language ?? "<no-language>", to: &evidence)
+            append(rendition.isDefault ? "default" : "not-default", to: &evidence)
+            append(
+                rendition.isAutoselect
+                    ? "autoselect"
+                    : "not-autoselect",
+                to: &evidence
+            )
+            append(rendition.channels ?? "<no-channels>", to: &evidence)
+            append(rendition.playlistURL.absoluteString, to: &evidence)
+            append(
+                rendition.initSegmentURL?.absoluteString
+                    ?? "<no-audio-init-segment>",
+                to: &evidence
+            )
+            evidence.append(rendition.playlistData)
+            evidence.append(0)
+            for segment in rendition.segments {
+                append(String(segment.index), to: &evidence)
+                append(String(segment.mediaSequence), to: &evidence)
+                append(
+                    "\(segment.duration.value)/\(segment.duration.timescale)",
+                    to: &evidence
+                )
+                append(segment.url.absoluteString, to: &evidence)
+            }
+        }
         for (field, value) in httpHeaders.sorted(by: {
             let left = $0.key.lowercased()
             let right = $1.key.lowercased()
@@ -206,5 +268,72 @@ struct HLSVODResourceGraph: Sendable, Equatable {
     private static func append(_ value: String, to data: inout Data) {
         data.append(contentsOf: value.utf8)
         data.append(0)
+    }
+
+    private static func resolvedInitSegmentURL(
+        media: HLSMediaPlaylist,
+        playlistURL: URL
+    ) throws -> URL? {
+        guard let mapURI = media.mapURI else {
+            return nil
+        }
+        guard let resolved = HLSPlaylistParser.resolve(
+            uri: mapURI,
+            against: playlistURL
+        ) else {
+            throw HLSPreflightError.unresolvableURI(mapURI)
+        }
+        return resolved
+    }
+
+    private static func validatedSegments(
+        media: HLSMediaPlaylist,
+        playlistURL: URL,
+        label: String
+    ) throws -> [HLSVODSegmentResource] {
+        guard media.hasEndList else {
+            throw HLSPreflightError.seekableVODPlaylistNotFinite
+        }
+        guard !media.hasByteRange else {
+            throw HLSPreflightError.unsupportedSeekableVODResourceGraph(
+                reason: "\(label) uses byte ranges"
+            )
+        }
+        guard media.segments.allSatisfy({
+            $0.duration > 0
+                && $0.duration.isFinite
+                && !$0.discontinuityBefore
+        }) else {
+            throw HLSPreflightError.unsupportedSeekableVODResourceGraph(
+                reason: "\(label) has invalid duration or discontinuity"
+            )
+        }
+        return try media.segments.enumerated().map {
+            index,
+            segment -> HLSVODSegmentResource in
+            guard let url = HLSPlaylistParser.resolve(
+                uri: segment.uri,
+                against: playlistURL
+            ) else {
+                throw HLSPreflightError.unresolvableURI(segment.uri)
+            }
+            let (mediaSequence, overflow) =
+                media.mediaSequence.addingReportingOverflow(index)
+            guard !overflow else {
+                throw HLSPreflightError.invalidPlaylist(
+                    "MEDIA-SEQUENCE overflow"
+                )
+            }
+            return HLSVODSegmentResource(
+                index: index,
+                mediaSequence: mediaSequence,
+                duration: CMTime(
+                    seconds: segment.duration,
+                    preferredTimescale:
+                        BlackCarrierProfile.approved.timescale
+                ),
+                url: url
+            )
+        }
     }
 }

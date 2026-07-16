@@ -107,8 +107,8 @@ final class HLSPlaylistTests: XCTestCase {
     func testExtractsAudioRenditions() throws {
         let text = """
         #EXTM3U
-        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aac",NAME="Klare Sprache",DEFAULT=NO,URI="audio/ks/index.m3u8"
-        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aac",NAME="Deutsch",DEFAULT=YES,URI="audio/de/index.m3u8"
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aac",NAME="Klare Sprache",LANGUAGE="de",DEFAULT=NO,AUTOSELECT=YES,CHANNELS="2",URI="audio/ks/index.m3u8"
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aac",NAME="Deutsch",LANGUAGE="de-DE",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="6",URI="audio/de/index.m3u8"
         #EXT-X-STREAM-INF:BANDWIDTH=8500800,RESOLUTION=1920x1080,AUDIO="aac"
         video/high.m3u8
         """
@@ -118,9 +118,17 @@ final class HLSPlaylistTests: XCTestCase {
         XCTAssertEqual(master.audioRenditions.count, 2)
         XCTAssertEqual(master.audioRenditions[0].groupID, "aac")
         XCTAssertEqual(master.audioRenditions[0].uri, "audio/ks/index.m3u8")
+        XCTAssertEqual(master.audioRenditions[0].name, "Klare Sprache")
+        XCTAssertEqual(master.audioRenditions[0].language, "de")
         XCTAssertFalse(master.audioRenditions[0].isDefault)
+        XCTAssertTrue(master.audioRenditions[0].isAutoselect)
+        XCTAssertEqual(master.audioRenditions[0].channels, "2")
         XCTAssertEqual(master.audioRenditions[1].uri, "audio/de/index.m3u8")
+        XCTAssertEqual(master.audioRenditions[1].name, "Deutsch")
+        XCTAssertEqual(master.audioRenditions[1].language, "de-DE")
         XCTAssertTrue(master.audioRenditions[1].isDefault)
+        XCTAssertTrue(master.audioRenditions[1].isAutoselect)
+        XCTAssertEqual(master.audioRenditions[1].channels, "6")
         let group = master.audioRenditions.filter { $0.groupID == "aac" }
         XCTAssertEqual(
             (group.first(where: { $0.isDefault }) ?? group.first)?.uri,

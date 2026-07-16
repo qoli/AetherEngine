@@ -32,7 +32,29 @@ struct HLSVariant: Equatable {
 struct HLSAudioRendition: Equatable {
     let groupID: String
     let uri: String
+    let name: String
+    let language: String?
     let isDefault: Bool
+    let isAutoselect: Bool
+    let channels: String?
+
+    init(
+        groupID: String,
+        uri: String,
+        name: String = "Audio",
+        language: String? = nil,
+        isDefault: Bool,
+        isAutoselect: Bool = false,
+        channels: String? = nil
+    ) {
+        self.groupID = groupID
+        self.uri = uri
+        self.name = name
+        self.language = language
+        self.isDefault = isDefault
+        self.isAutoselect = isAutoselect
+        self.channels = channels
+    }
 }
 
 /// `demuxedAudioGroupIDs` is kept as a stable Set for O(1) membership checks even though it is derivable from `audioRenditions`. EXT-X-MEDIA without a URI means audio is muxed into the variant stream.
@@ -155,13 +177,27 @@ enum HLSPlaylistParser {
                 pendingSupplementalCodecs = codecTokens(attribute("SUPPLEMENTAL-CODECS", in: line))
             } else if line.hasPrefix("#EXT-X-MEDIA:") {
                 if attribute("TYPE", in: line) == "AUDIO",
-                   let uri = attribute("URI", in: line),
-                   let group = attribute("GROUP-ID", in: line) {
+                   let uri = attribute("URI", in: line) {
+                    guard let group = attribute("GROUP-ID", in: line),
+                          let name = attribute("NAME", in: line),
+                          !group.isEmpty,
+                          !name.isEmpty else {
+                        throw HLSIngestError.playlistInvalid(
+                            reason:
+                                "separate AUDIO rendition missing GROUP-ID or NAME"
+                        )
+                    }
                     demuxedAudioGroups.insert(group)
                     audioRenditions.append(HLSAudioRendition(
                         groupID: group,
                         uri: uri,
-                        isDefault: attribute("DEFAULT", in: line) == "YES"
+                        name: name,
+                        language: attribute("LANGUAGE", in: line),
+                        isDefault:
+                            attribute("DEFAULT", in: line) == "YES",
+                        isAutoselect:
+                            attribute("AUTOSELECT", in: line) == "YES",
+                        channels: attribute("CHANNELS", in: line)
                     ))
                 }
             } else if !line.hasPrefix("#"), let bw = pendingBandwidth {
