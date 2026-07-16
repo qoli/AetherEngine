@@ -270,12 +270,39 @@ final class HLSPreflightInspectorTests: XCTestCase {
             audioRenditions:
                 try XCTUnwrap(inspected.resourceGraph)
                     .audioRenditions,
+            inspectedInitSegmentData: initData,
+            inspectedFirstMediaSegmentData: segmentData,
             httpHeaders: [
                 "Authorization": "Bearer changed-secret",
                 "User-Agent": "AetherTests/1",
             ]
         )
         XCTAssertNotEqual(changed.identity, identity)
+
+        var changedFirstSegment = segmentData
+        changedFirstSegment.append(0)
+        let changedEvidence = try HLSVODResourceGraph.make(
+            requestedRootURL: requestedRoot,
+            effectiveRootURL: effectiveRoot,
+            selectedMediaPlaylistURL: selectedMediaURL,
+            selectedVariant: HLSVariant(
+                bandwidth: 1_400_000,
+                uri: selectedURI,
+                audioGroupID: "audio",
+                codecs: ["avc1.42c01e"]
+            ),
+            separateAudioGroupID: "audio",
+            mediaPlaylistData: media,
+            media: parsedMedia,
+            audioRenditions:
+                try XCTUnwrap(inspected.resourceGraph)
+                    .audioRenditions,
+            inspectedInitSegmentData: initData,
+            inspectedFirstMediaSegmentData:
+                changedFirstSegment,
+            httpHeaders: headers
+        )
+        XCTAssertNotEqual(changedEvidence.identity, identity)
     }
 
     func testResourceGraphRejectsAlternateAudioOutsideSelectedGroup() throws {
@@ -322,6 +349,8 @@ final class HLSPreflightInspectorTests: XCTestCase {
                 mediaPlaylistData: Data(),
                 media: media,
                 audioRenditions: [wrongGroup],
+                inspectedInitSegmentData: nil,
+                inspectedFirstMediaSegmentData: Data([0x47]),
                 httpHeaders: [:]
             )
         ) { error in
@@ -380,6 +409,8 @@ final class HLSPreflightInspectorTests: XCTestCase {
                 mediaPlaylistData: Data(),
                 media: makeMedia(false, false, false),
                 audioRenditions: [],
+                inspectedInitSegmentData: nil,
+                inspectedFirstMediaSegmentData: Data([0x47]),
                 httpHeaders: [:]
             )
         ) { error in
@@ -402,6 +433,8 @@ final class HLSPreflightInspectorTests: XCTestCase {
                     mediaPlaylistData: Data(),
                     media: media,
                     audioRenditions: [],
+                    inspectedInitSegmentData: nil,
+                    inspectedFirstMediaSegmentData: Data([0x47]),
                     httpHeaders: [:]
                 )
             )

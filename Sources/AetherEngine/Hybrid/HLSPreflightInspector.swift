@@ -17,6 +17,11 @@ public enum HLSPreflightError: Error, Sendable, Equatable, LocalizedError {
     case selectedVariantWasNotMediaPlaylist
     case seekableVODPlaylistNotFinite
     case unsupportedSeekableVODResourceGraph(reason: String)
+    case resourceTooLarge(limit: Int)
+    case unsupportedContentEncoding(String)
+    case contentLengthMismatch(expected: Int64, actual: Int)
+    case nonHTTPResponse
+    case transportFailure(code: Int?)
 
     public var errorDescription: String? {
         switch self {
@@ -29,6 +34,20 @@ public enum HLSPreflightError: Error, Sendable, Equatable, LocalizedError {
             "Seekable HLS VOD requires a finite media playlist with EXT-X-ENDLIST"
         case .unsupportedSeekableVODResourceGraph(let reason):
             "Unsupported seekable HLS VOD resource graph: \(reason)"
+        case .resourceTooLarge(let limit):
+            "HLS preflight resource exceeded \(limit) bytes"
+        case .unsupportedContentEncoding(let value):
+            "HLS preflight requires identity content encoding, found \(value)"
+        case .contentLengthMismatch(let expected, let actual):
+            "HLS preflight resource declared \(expected) bytes but delivered \(actual)"
+        case .nonHTTPResponse:
+            "HLS preflight response was not HTTP"
+        case .transportFailure(let code):
+            if let code {
+                "HLS preflight transport failed with URL error \(code)"
+            } else {
+                "HLS preflight transport failed"
+            }
         }
     }
 }
@@ -249,6 +268,8 @@ struct HLSPreflightInspector {
                 mediaPlaylistData: resolved.mediaData,
                 media: resolved.media,
                 audioRenditions: audioRenditions,
+                inspectedInitSegmentData: initSegment,
+                inspectedFirstMediaSegmentData: segment.data,
                 httpHeaders: httpHeaders
             )
         } else {
@@ -362,17 +383,66 @@ struct HLSPreflightInspector {
         }
         var request = URLRequest(url: url)
         for (field, value) in httpHeaders { request.setValue(value, forHTTPHeaderField: field) }
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 10
-        config.timeoutIntervalForResource = 30
-        let (data, response) = try await URLSession(configuration: config).data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw HLSPreflightError.invalidPlaylist("non-HTTP response")
+        request.setValue(
+            "identity",
+            forHTTPHeaderField: "Accept-Encoding"
+        )
+        do {
+            let response = try await HLSVODBoundedHTTPFetcher
+                .fetch(
+                    request: request,
+                    maximumBytes:
+                        HLSVODOriginResourceLoader
+                            .defaultMaximumResourceBytes
+                )
+            return HLSPreflightFetchResponse(
+                data: response.data,
+                effectiveURL: response.effectiveURL
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as HLSVODOriginResourceError {
+            switch error {
+            case .httpStatus(let status):
+                throw HLSPreflightError.httpStatus(status)
+            case .resourceTooLarge(let limit, _):
+                throw HLSPreflightError.resourceTooLarge(
+                    limit: limit
+                )
+            case .unsupportedContentEncoding(let value):
+                throw HLSPreflightError
+                    .unsupportedContentEncoding(value)
+            case .contentLengthMismatch(
+                let expected,
+                let actual
+            ):
+                throw HLSPreflightError
+                    .contentLengthMismatch(
+                        expected: expected,
+                        actual: actual
+                    )
+            case .nonHTTPResponse:
+                throw HLSPreflightError.nonHTTPResponse
+            case .transport(let code):
+                throw HLSPreflightError.transportFailure(
+                    code: code.rawValue
+                )
+            case .transportFailure:
+                throw HLSPreflightError.transportFailure(
+                    code: nil
+                )
+            default:
+                throw HLSPreflightError.invalidPlaylist(
+                    error.localizedDescription
+                )
+            }
+        } catch let error as URLError {
+            throw HLSPreflightError.transportFailure(
+                code: error.code.rawValue
+            )
+        } catch {
+            throw HLSPreflightError.transportFailure(code: nil)
         }
-        guard (200..<300).contains(http.statusCode) else {
-            throw HLSPreflightError.httpStatus(http.statusCode)
-        }
-        return HLSPreflightFetchResponse(data: data, effectiveURL: response.url ?? url)
     }
 
     private func parsePlaylist(_ data: Data) throws -> HLSPlaylist {

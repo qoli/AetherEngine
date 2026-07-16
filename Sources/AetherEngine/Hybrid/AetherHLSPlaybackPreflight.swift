@@ -7,9 +7,10 @@ import Foundation
 /// The raw selected playlist, init-segment and media-segment URLs remain engine-private because they may
 /// contain signed query parameters. For an admitted `.hybridCarrierMetal` route, `resourceIdentity` is a
 /// SHA-256 binding over those resolved video resources, every separate alternate-audio playlist/resource,
-/// the exact playlist bytes and the request headers. Native and unsupported routes do not create the hybrid
-/// graph. A host may persist the digest, but must pass this value object back to AetherEngine rather than
-/// reconstructing an HLS resource graph from public fields.
+/// the exact playlist bytes, the preflight-inspected video init/first-segment evidence and the request
+/// headers. Native and unsupported routes do not create the hybrid graph. A host may persist the digest,
+/// but must pass this value object back to AetherEngine rather than reconstructing an HLS resource graph
+/// from public fields.
 public struct AetherHLSPlaybackPreflight: Sendable, Equatable {
     public let result: PlaybackPreflightResult
     public let hybridTimeline: BlackCarrierTimeline?
@@ -61,6 +62,14 @@ struct HLSVODAudioRenditionResource: Sendable, Equatable {
     let segments: [HLSVODSegmentResource]
 }
 
+enum HLSVODResourceDigest {
+    static func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data)
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+}
+
 /// Engine-private immutable snapshot of the exact clear, finite HLS VOD video resources inspected before
 /// route selection. Future hybrid demux generations must consume these resolved URLs; reopening the root
 /// master and choosing a different adaptive variant would violate the preflight contract. Every separate
@@ -76,6 +85,8 @@ struct HLSVODResourceGraph: Sendable, Equatable {
     let initSegmentURL: URL?
     let segments: [HLSVODSegmentResource]
     let audioRenditions: [HLSVODAudioRenditionResource]
+    let inspectedInitSegmentData: Data?
+    let inspectedFirstMediaSegmentData: Data
     let timeline: BlackCarrierTimeline
     let identity: String
 
@@ -88,6 +99,8 @@ struct HLSVODResourceGraph: Sendable, Equatable {
         mediaPlaylistData: Data,
         media: HLSMediaPlaylist,
         audioRenditions: [HLSVODAudioRenditionResource],
+        inspectedInitSegmentData: Data?,
+        inspectedFirstMediaSegmentData: Data,
         httpHeaders: [String: String]
     ) throws -> HLSVODResourceGraph {
         if let separateAudioGroupID {
@@ -120,6 +133,25 @@ struct HLSVODResourceGraph: Sendable, Equatable {
             playlistURL: selectedMediaPlaylistURL,
             label: "selected video rendition"
         )
+        guard !inspectedFirstMediaSegmentData.isEmpty else {
+            throw HLSPreflightError.invalidPlaylist(
+                "selected video first-segment evidence is empty"
+            )
+        }
+        if initSegmentURL == nil {
+            guard inspectedInitSegmentData == nil else {
+                throw HLSPreflightError.invalidPlaylist(
+                    "selected video init-segment evidence has no bound URI"
+                )
+            }
+        } else {
+            guard let inspectedInitSegmentData,
+                  !inspectedInitSegmentData.isEmpty else {
+                throw HLSPreflightError.invalidPlaylist(
+                    "selected video init-segment evidence is missing"
+                )
+            }
+        }
         let timeline = try BlackCarrierTimeline.mirroredHLSVOD(
             segmentDurations: segmentResources.map(\.duration)
         )
@@ -133,6 +165,9 @@ struct HLSVODResourceGraph: Sendable, Equatable {
             initSegmentURL: initSegmentURL,
             segmentResources: segmentResources,
             audioRenditions: audioRenditions,
+            inspectedInitSegmentData: inspectedInitSegmentData,
+            inspectedFirstMediaSegmentData:
+                inspectedFirstMediaSegmentData,
             httpHeaders: httpHeaders
         )
         return HLSVODResourceGraph(
@@ -145,6 +180,9 @@ struct HLSVODResourceGraph: Sendable, Equatable {
             initSegmentURL: initSegmentURL,
             segments: segmentResources,
             audioRenditions: audioRenditions,
+            inspectedInitSegmentData: inspectedInitSegmentData,
+            inspectedFirstMediaSegmentData:
+                inspectedFirstMediaSegmentData,
             timeline: timeline,
             identity: identity
         )
@@ -197,6 +235,8 @@ struct HLSVODResourceGraph: Sendable, Equatable {
         initSegmentURL: URL?,
         segmentResources: [HLSVODSegmentResource],
         audioRenditions: [HLSVODAudioRenditionResource],
+        inspectedInitSegmentData: Data?,
+        inspectedFirstMediaSegmentData: Data,
         httpHeaders: [String: String]
     ) -> String {
         var evidence = Data()
@@ -210,6 +250,17 @@ struct HLSVODResourceGraph: Sendable, Equatable {
         )
         append(separateAudioGroupID ?? "<no-separate-audio>", to: &evidence)
         append(initSegmentURL?.absoluteString ?? "<no-init-segment>", to: &evidence)
+        append(
+            inspectedInitSegmentData.map(HLSVODResourceDigest.sha256)
+                ?? "<no-inspected-init-segment>",
+            to: &evidence
+        )
+        append(
+            HLSVODResourceDigest.sha256(
+                inspectedFirstMediaSegmentData
+            ),
+            to: &evidence
+        )
         evidence.append(mediaPlaylistData)
         evidence.append(0)
         for segment in segmentResources {
@@ -260,9 +311,7 @@ struct HLSVODResourceGraph: Sendable, Equatable {
             append(field.lowercased(), to: &evidence)
             append(value, to: &evidence)
         }
-        return SHA256.hash(data: evidence)
-            .map { String(format: "%02x", $0) }
-            .joined()
+        return HLSVODResourceDigest.sha256(evidence)
     }
 
     private static func append(_ value: String, to data: inout Data) {
