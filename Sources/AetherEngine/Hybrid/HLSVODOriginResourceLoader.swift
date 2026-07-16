@@ -20,6 +20,11 @@ enum HLSVODOriginResourceKey: Hashable, Sendable {
     }
 }
 
+enum HLSVODOriginResourcePurpose: Sendable, Equatable {
+    case playback
+    case analysis
+}
+
 enum HLSVODOriginResourceError:
     Error,
     LocalizedError,
@@ -108,6 +113,8 @@ struct HLSVODOriginResourceLoaderSnapshot: Sendable, Equatable {
     let cachedBytes: Int64
     let inFlightResourceCount: Int
     let inFlightWaiterCount: Int
+    let inFlightPlaybackWaiterCount: Int
+    let inFlightAnalysisWaiterCount: Int
     let isClosed: Bool
 }
 
@@ -208,13 +215,16 @@ actor HLSVODOriginResourceLoader {
     }
 
     private struct Flight {
-        var waiters: [
-            UUID:
+        struct Waiter {
+            let purpose: HLSVODOriginResourcePurpose
+            let continuation:
                 CheckedContinuation<
                     HLSVODOriginResourcePayload,
                     Error
                 >
-        ]
+        }
+
+        var waiters: [UUID: Waiter]
         var task: Task<Void, Never>?
     }
 
@@ -297,14 +307,16 @@ actor HLSVODOriginResourceLoader {
     }
 
     nonisolated func payload(
-        for key: HLSVODOriginResourceKey
+        for key: HLSVODOriginResourceKey,
+        purpose: HLSVODOriginResourcePurpose = .playback
     ) async throws -> HLSVODOriginResourcePayload {
         try Task.checkCancellation()
         let waiterID = UUID()
         return try await withTaskCancellationHandler {
             try await registerWaiter(
                 waiterID,
-                for: key
+                for: key,
+                purpose: purpose
             )
         } onCancel: {
             Task {
@@ -324,6 +336,20 @@ actor HLSVODOriginResourceLoader {
             inFlightWaiterCount: flights.values.reduce(0) {
                 $0 + $1.waiters.count
             },
+            inFlightPlaybackWaiterCount:
+                flights.values.reduce(0) { count, flight in
+                    count
+                        + flight.waiters.values.filter {
+                            $0.purpose == .playback
+                        }.count
+                },
+            inFlightAnalysisWaiterCount:
+                flights.values.reduce(0) { count, flight in
+                    count
+                        + flight.waiters.values.filter {
+                            $0.purpose == .analysis
+                        }.count
+                },
             isClosed: isClosed
         )
     }
@@ -337,8 +363,10 @@ actor HLSVODOriginResourceLoader {
         let error = HLSVODOriginResourceError.closed
         for flight in flights.values {
             flight.task?.cancel()
-            for continuation in flight.waiters.values {
-                continuation.resume(throwing: error)
+            for waiter in flight.waiters.values {
+                waiter.continuation.resume(
+                    throwing: error
+                )
             }
         }
         flights.removeAll()
@@ -358,7 +386,8 @@ actor HLSVODOriginResourceLoader {
 
     private func registerWaiter(
         _ waiterID: UUID,
-        for key: HLSVODOriginResourceKey
+        for key: HLSVODOriginResourceKey,
+        purpose: HLSVODOriginResourcePurpose
     ) async throws -> HLSVODOriginResourcePayload {
         guard !isClosed else {
             throw HLSVODOriginResourceError.closed
@@ -371,13 +400,23 @@ actor HLSVODOriginResourceLoader {
         return try await withCheckedThrowingContinuation {
             continuation in
             if var flight = flights[key] {
-                flight.waiters[waiterID] = continuation
+                flight.waiters[waiterID] =
+                    Flight.Waiter(
+                        purpose: purpose,
+                        continuation: continuation
+                    )
                 flights[key] = flight
                 return
             }
 
             flights[key] = Flight(
-                waiters: [waiterID: continuation],
+                waiters: [
+                    waiterID:
+                        Flight.Waiter(
+                            purpose: purpose,
+                            continuation: continuation
+                        ),
+                ],
                 task: nil
             )
             let fetch = self.fetch
@@ -436,11 +475,13 @@ actor HLSVODOriginResourceLoader {
         for key: HLSVODOriginResourceKey
     ) {
         guard var flight = flights[key],
-              let continuation =
+              let waiter =
                 flight.waiters.removeValue(forKey: waiterID) else {
             return
         }
-        continuation.resume(throwing: CancellationError())
+        waiter.continuation.resume(
+            throwing: CancellationError()
+        )
         if flight.waiters.isEmpty {
             flight.task?.cancel()
             flights.removeValue(forKey: key)
@@ -464,31 +505,39 @@ actor HLSVODOriginResourceLoader {
                 response,
                 for: resource
             )
-            for continuation in flight.waiters.values {
-                continuation.resume(returning: payload)
+            for waiter in flight.waiters.values {
+                waiter.continuation.resume(
+                    returning: payload
+                )
             }
         } catch is CancellationError {
-            for continuation in flight.waiters.values {
-                continuation.resume(
+            for waiter in flight.waiters.values {
+                waiter.continuation.resume(
                     throwing: CancellationError()
                 )
             }
         } catch let error as HLSVODOriginResourceError {
-            for continuation in flight.waiters.values {
-                continuation.resume(throwing: error)
+            for waiter in flight.waiters.values {
+                waiter.continuation.resume(
+                    throwing: error
+                )
             }
         } catch let error as URLError {
             let typed = HLSVODOriginResourceError.transport(
                 error.code
             )
-            for continuation in flight.waiters.values {
-                continuation.resume(throwing: typed)
+            for waiter in flight.waiters.values {
+                waiter.continuation.resume(
+                    throwing: typed
+                )
             }
         } catch {
             let typed =
                 HLSVODOriginResourceError.transportFailure
-            for continuation in flight.waiters.values {
-                continuation.resume(throwing: typed)
+            for waiter in flight.waiters.values {
+                waiter.continuation.resume(
+                    throwing: typed
+                )
             }
         }
     }

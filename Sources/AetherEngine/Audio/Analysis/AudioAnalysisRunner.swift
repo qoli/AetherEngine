@@ -1,6 +1,9 @@
+import CoreMedia
 import Foundation
 import AVFAudio
 import Libavcodec
+import Libavformat
+import Libavutil
 
 /// A fresh source owned by one analysis session. URL analysis intentionally opens its own demuxer; it never
 /// observes or moves the playback demuxer's cursor. A custom source must already be an independent clone.
@@ -11,6 +14,7 @@ enum AudioAnalysisInput: Sendable {
         sourceByteStore: SourceByteStore?
     )
     case reader(IOReader, formatHint: String?)
+    case hlsVOD(HLSVODAudioAnalysisInput)
 }
 
 /// Thread-safe lifecycle handle for one independent analysis cursor.
@@ -114,6 +118,15 @@ enum AudioAnalysisRunner {
                 )
             case .reader(let reader, let formatHint):
                 try session.demuxer.open(reader: reader, formatHint: formatHint, isLive: false)
+            case .hlsVOD(let source):
+                try await pumpHLS(
+                    source: source,
+                    session: session,
+                    request: request,
+                    hasOutstandingDemand: true
+                )
+                await session.gate.finish()
+                return
             }
             try session.throwIfCancelled()
 
@@ -215,6 +228,452 @@ enum AudioAnalysisRunner {
                 }
                 break
             }
+        }
+    }
+
+    private static func pumpHLS(
+        source: HLSVODAudioAnalysisInput,
+        session: AudioAnalysisSession,
+        request: AudioAnalysisRequest,
+        hasOutstandingDemand: Bool
+    ) async throws {
+        let (track, segments) = try source.track(
+            for: request
+        )
+        var initData: Data?
+        var didLoadInit = false
+        var segmentCursor = 0
+        var segmentDecoder: HLSAudioSegmentDecoder?
+        let decoder = AudioTapDecoder()
+        defer { decoder.close() }
+        var decoderOpened = false
+        var decoderDrained = false
+        var drainedChunks: [AudioTapChunk] = []
+        var demandIsOutstanding = hasOutstandingDemand
+        var expectedSourceSamplePosition = Int64(
+            (
+                request.range.lowerBound
+                    * AetherEngine.audioAnalysisFormat.sampleRate
+            ).rounded()
+        )
+
+        while true {
+            if !demandIsOutstanding {
+                try await session.gate.waitForDemand()
+            }
+            try session.throwIfCancelled()
+
+            while true {
+                let chunk: AudioTapChunk
+                if !drainedChunks.isEmpty {
+                    chunk = drainedChunks.removeFirst()
+                } else {
+                    if segmentDecoder == nil {
+                        guard segments.indices.contains(segmentCursor) else {
+                            guard !decoderDrained else {
+                                await session.gate.finish()
+                                return
+                            }
+                            decoderDrained = true
+                            try append(
+                                decoder.drain(),
+                                to: &drainedChunks
+                            )
+                            guard !drainedChunks.isEmpty else {
+                                throw AudioAnalysisError
+                                    .hlsSegmentDecodeFailed(
+                                        audioTrackID:
+                                            request.audioTrackID,
+                                        segmentIndex:
+                                            segments.last?.index
+                                            ?? 0
+                                    )
+                            }
+                            continue
+                        }
+                        if !didLoadInit {
+                            didLoadInit = true
+                            if let key = track.initResourceKey {
+                                initData = try await hlsPayload(
+                                    source: source,
+                                    key: key
+                                )
+                            }
+                        }
+                        let segment = segments[segmentCursor]
+                        let segmentData = try await hlsPayload(
+                            source: source,
+                            key: segment.resourceKey
+                        )
+                        try session.throwIfCancelled()
+                        segmentDecoder =
+                            try HLSAudioSegmentDecoder(
+                                track: track,
+                                segment: segment,
+                                initData: initData,
+                                segmentData: segmentData,
+                                decoder: decoder,
+                                openDecoder:
+                                    !decoderOpened
+                            )
+                        decoderOpened = true
+                    }
+
+                    guard let activeDecoder = segmentDecoder else {
+                        throw AudioAnalysisError
+                            .hlsSegmentDecodeFailed(
+                                audioTrackID:
+                                    request.audioTrackID,
+                                segmentIndex:
+                                    segments[segmentCursor].index
+                            )
+                    }
+                    guard let nextChunk =
+                            try activeDecoder.nextChunk() else {
+                        segmentDecoder = nil
+                        segmentCursor += 1
+                        continue
+                    }
+                    chunk = nextChunk
+                }
+
+                switch clip(
+                    chunk: chunk,
+                    to: request.range
+                ) {
+                case .skip:
+                    continue
+                case .finish:
+                    await session.gate.finish()
+                    return
+                case .emit(
+                    let pcm,
+                    let sourceSamplePosition
+                ):
+                    let buffer = AudioAnalysisBuffer(
+                        pcm: pcm,
+                        sourceSamplePosition:
+                            sourceSamplePosition,
+                        isDiscontinuous:
+                            sourceSamplePosition
+                            != expectedSourceSamplePosition
+                    )
+                    guard await session.gate.yield(buffer) else {
+                        return
+                    }
+                    expectedSourceSamplePosition =
+                        sourceSamplePosition
+                        + Int64(pcm.frameLength)
+                    demandIsOutstanding = false
+                }
+                break
+            }
+        }
+    }
+
+    private static func hlsPayload(
+        source: HLSVODAudioAnalysisInput,
+        key: HLSVODOriginResourceKey
+    ) async throws -> Data {
+        do {
+            return try await source.loader.payload(
+                for: key,
+                purpose: .analysis
+            ).data
+        } catch is CancellationError {
+            throw AudioAnalysisError.cancelled
+        } catch let error as HLSVODOriginResourceError {
+            throw AudioAnalysisError.hlsResourceFailure(
+                error.localizedDescription
+            )
+        } catch {
+            throw AudioAnalysisError.hlsResourceFailure(
+                String(describing: error)
+            )
+        }
+    }
+
+    private final class HLSAudioSegmentDecoder {
+        private let track: HLSVODAudioAnalysisTrack
+        private let segment: HLSVODAudioAnalysisSegment
+        private let demuxer = Demuxer()
+        private let decoder: AudioTapDecoder
+        private let streamIndex: Int32
+        private var pendingChunks: [AudioTapChunk] = []
+        private var inputEOF = false
+        private var selectedPacketCount = 0
+
+        init(
+            track: HLSVODAudioAnalysisTrack,
+            segment: HLSVODAudioAnalysisSegment,
+            initData: Data?,
+            segmentData: Data,
+            decoder: AudioTapDecoder,
+            openDecoder: Bool
+        ) throws {
+            self.track = track
+            self.segment = segment
+            self.decoder = decoder
+
+            var data = Data(
+                capacity:
+                    (initData?.count ?? 0)
+                    + segmentData.count
+            )
+            if let initData {
+                data.append(initData)
+            }
+            data.append(segmentData)
+
+            let formatHint: String?
+            if initData != nil {
+                formatHint = "mp4"
+            } else if LiveSegmentFormat.classify(
+                segmentData
+            ) == .mpegts {
+                formatHint = "mpegts"
+            } else {
+                formatHint = nil
+            }
+            do {
+                try demuxer.open(
+                    reader: DataIOReader(data: data),
+                    formatHint: formatHint,
+                    isLive: false
+                )
+            } catch {
+                throw AudioAnalysisError
+                    .hlsSegmentDecodeFailed(
+                        audioTrackID:
+                            track.sourceTrackID,
+                        segmentIndex:
+                            segment.index
+                    )
+            }
+
+            let audioStreams = Self.streamIndices(
+                demuxer: demuxer,
+                mediaType: AVMEDIA_TYPE_AUDIO
+            )
+            switch track.layout {
+            case .separateRendition:
+                let videoStreams = Self.streamIndices(
+                    demuxer: demuxer,
+                    mediaType: AVMEDIA_TYPE_VIDEO
+                )
+                guard videoStreams.isEmpty,
+                      audioStreams.count == 1 else {
+                    throw AudioAnalysisError
+                        .hlsAudioContractChanged(
+                            audioTrackID:
+                                track.sourceTrackID,
+                            segmentIndex:
+                                segment.index
+                        )
+                }
+                streamIndex = audioStreams[0]
+            case .muxedVideo(let audioOrdinal):
+                guard audioStreams.indices.contains(
+                    audioOrdinal
+                ) else {
+                    throw AudioAnalysisError
+                        .hlsAudioContractChanged(
+                            audioTrackID:
+                                track.sourceTrackID,
+                            segmentIndex:
+                                segment.index
+                        )
+                }
+                streamIndex = audioStreams[audioOrdinal]
+            }
+
+            guard let stream = demuxer.stream(
+                at: streamIndex
+            ),
+                  HLSVODAudioStreamContract(
+                    stream: stream
+                  ) == track.contract else {
+                throw AudioAnalysisError
+                    .hlsAudioContractChanged(
+                        audioTrackID:
+                            track.sourceTrackID,
+                        segmentIndex:
+                            segment.index
+                    )
+            }
+            if openDecoder {
+                do {
+                    try decoder.open(stream: stream)
+                } catch {
+                    throw AudioAnalysisError
+                        .hlsSegmentDecodeFailed(
+                            audioTrackID:
+                                track.sourceTrackID,
+                            segmentIndex:
+                                segment.index
+                        )
+                }
+            }
+        }
+
+        deinit {
+            demuxer.close()
+        }
+
+        func nextChunk() throws -> AudioTapChunk? {
+            if !pendingChunks.isEmpty {
+                return pendingChunks.removeFirst()
+            }
+
+            while true {
+                if inputEOF {
+                    guard selectedPacketCount > 0 else {
+                        throw AudioAnalysisError
+                            .hlsSegmentDecodeFailed(
+                                audioTrackID:
+                                    track.sourceTrackID,
+                                segmentIndex:
+                                    segment.index
+                            )
+                    }
+                    return nil
+                }
+
+                let packet: UnsafeMutablePointer<AVPacket>?
+                do {
+                    packet = try demuxer.readPacket()
+                } catch {
+                    throw AudioAnalysisError
+                        .hlsSegmentDecodeFailed(
+                            audioTrackID:
+                                track.sourceTrackID,
+                            segmentIndex:
+                                segment.index
+                        )
+                }
+                guard let packet else {
+                    inputEOF = true
+                    continue
+                }
+                var packetToFree:
+                    UnsafeMutablePointer<AVPacket>? = packet
+                defer {
+                    trackedPacketFree(&packetToFree)
+                }
+                guard packet.pointee.stream_index
+                    == streamIndex else {
+                    continue
+                }
+                try normalize(packet)
+                selectedPacketCount += 1
+                try append(
+                    decoder.decode(packet: packet)
+                )
+                if !pendingChunks.isEmpty {
+                    return pendingChunks.removeFirst()
+                }
+            }
+        }
+
+        private func append(
+            _ chunks: [AudioTapChunk]
+        ) throws {
+            guard pendingChunks.count + chunks.count
+                    <= AudioAnalysisRunner
+                        .maxPacketDerivedChunks else {
+                throw AudioAnalysisError.analysisFailed(
+                    "one HLS decoder operation produced more than \(AudioAnalysisRunner.maxPacketDerivedChunks) audio buffers"
+                )
+            }
+            pendingChunks.append(contentsOf: chunks)
+        }
+
+        private func normalize(
+            _ packet: UnsafeMutablePointer<AVPacket>
+        ) throws {
+            guard let stream = demuxer.stream(
+                at: streamIndex
+            ) else {
+                throw timestampError()
+            }
+            let localStart =
+                BlackCarrierSourceAxis.sourceStartPTS(
+                    demuxer: demuxer,
+                    streamIndex: streamIndex
+                )
+            guard let globalStart =
+                    BlackCarrierSourceAxis.streamTicks(
+                        for: segment.startTime,
+                        timeBase:
+                            stream.pointee.time_base
+                    ),
+                  packet.pointee.pts != Int64.min
+                    || packet.pointee.dts != Int64.min else {
+                throw timestampError()
+            }
+            if packet.pointee.pts != Int64.min {
+                packet.pointee.pts = try normalized(
+                    packet.pointee.pts,
+                    localStart: localStart,
+                    globalStart: globalStart
+                )
+            }
+            if packet.pointee.dts != Int64.min {
+                packet.pointee.dts = try normalized(
+                    packet.pointee.dts,
+                    localStart: localStart,
+                    globalStart: globalStart
+                )
+            }
+            packet.pointee.pos = -1
+        }
+
+        private func normalized(
+            _ timestamp: Int64,
+            localStart: Int64,
+            globalStart: Int64
+        ) throws -> Int64 {
+            let local =
+                timestamp.subtractingReportingOverflow(
+                    localStart
+                )
+            let global =
+                local.partialValue.addingReportingOverflow(
+                    globalStart
+                )
+            guard !local.overflow, !global.overflow else {
+                throw timestampError()
+            }
+            return global.partialValue
+        }
+
+        private func timestampError()
+            -> AudioAnalysisError
+        {
+            .hlsTimestampInvalid(
+                audioTrackID: track.sourceTrackID,
+                segmentIndex: segment.index
+            )
+        }
+
+        private static func streamIndices(
+            demuxer: Demuxer,
+            mediaType: AVMediaType
+        ) -> [Int32] {
+            var indices: [Int32] = []
+            for index in 0..<demuxer.streamCount {
+                guard let stream = demuxer.stream(
+                    at: Int32(index)
+                ),
+                      let parameters =
+                        stream.pointee.codecpar,
+                      parameters.pointee.codec_type
+                        == mediaType else {
+                    continue
+                }
+                indices.append(Int32(index))
+            }
+            return indices
         }
     }
 

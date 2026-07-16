@@ -10,7 +10,21 @@ public enum AudioAnalysisError: Error, Sendable, Equatable, LocalizedError {
     case sourceNotSeekable
     case sourceCannotCreateIndependentReader
     case audioTrackUnavailable(Int)
+    case rangeOutsideSource
     case contentProtectionUnsupported
+    case hlsResourceFailure(String)
+    case hlsAudioContractChanged(
+        audioTrackID: Int,
+        segmentIndex: Int
+    )
+    case hlsSegmentDecodeFailed(
+        audioTrackID: Int,
+        segmentIndex: Int
+    )
+    case hlsTimestampInvalid(
+        audioTrackID: Int,
+        segmentIndex: Int
+    )
     case concurrentConsumer
     case cancelled
     case analysisFailed(String)
@@ -23,7 +37,24 @@ public enum AudioAnalysisError: Error, Sendable, Equatable, LocalizedError {
         case .sourceNotSeekable: "Source cannot seek independently for audio analysis"
         case .sourceCannotCreateIndependentReader: "Source cannot create an independent analysis reader"
         case .audioTrackUnavailable(let id): "Audio track \(id) is not available in this source"
+        case .rangeOutsideSource: "Audio analysis range is outside the admitted source timeline"
         case .contentProtectionUnsupported: "Content protection prevents clear audio analysis"
+        case .hlsResourceFailure(let reason): "HLS audio-analysis resource failed: \(reason)"
+        case .hlsAudioContractChanged(
+            let audioTrackID,
+            let segmentIndex
+        ):
+            "HLS audio track \(audioTrackID) changed contract in segment \(segmentIndex)"
+        case .hlsSegmentDecodeFailed(
+            let audioTrackID,
+            let segmentIndex
+        ):
+            "HLS audio track \(audioTrackID) could not decode segment \(segmentIndex)"
+        case .hlsTimestampInvalid(
+            let audioTrackID,
+            let segmentIndex
+        ):
+            "HLS audio track \(audioTrackID) has invalid timestamps in segment \(segmentIndex)"
         case .concurrentConsumer: "AudioAnalysisStream supports exactly one consumer"
         case .cancelled: "Audio analysis was cancelled"
         case .analysisFailed(let message): "Audio analysis failed: \(message)"
@@ -31,10 +62,11 @@ public enum AudioAnalysisError: Error, Sendable, Equatable, LocalizedError {
     }
 }
 
-/// Immutable request bound to one source stream index and source-time range.
+/// Immutable request bound to one engine source-track identity and source-time range.
 ///
-/// `audioTrackID` is a `TrackInfo.id` / FFmpeg stream index, not a user-facing ordinal. It is never
-/// automatically retargeted after an AVKit audio-selection change.
+/// For single-file/custom inputs, `audioTrackID` is the source `TrackInfo.id` / FFmpeg stream index.
+/// For graph-bound HLS alternate audio, it is the stable engine track ID published by the hybrid session.
+/// It is never automatically retargeted after an AVKit audio-selection change.
 public struct AudioAnalysisRequest: Sendable, Equatable {
     public let audioTrackID: Int
     public let range: Range<Double>

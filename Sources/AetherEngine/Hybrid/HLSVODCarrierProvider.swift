@@ -52,10 +52,12 @@ enum HLSVODCarrierProviderError:
 /// The existing server/provider surface is synchronous because each request owns a dedicated connection
 /// worker. This adapter blocks only that worker while an unstructured task awaits the pump actor. It never
 /// invents master bandwidth: the caller must supply explicit, valid evidence for every rendition before
-/// the provider can exist. Public HLS session admission remains disabled until seek generation, analysis
-/// reuse and a source-specific startup bandwidth strategy own this provider.
+/// the provider can exist. Playback and independent analysis share the same graph-bound loader while
+/// retaining separate demux/decoder cursors. Public HLS session admission remains disabled until a
+/// source-specific startup bandwidth strategy and the remaining public-session gates own this provider.
 final class HLSVODCarrierProvider:
     BlackCarrierTransportProvider,
+    HybridAudioAnalysisSource,
     @unchecked Sendable
 {
     private let videoProvider: BlackCarrierVideoProvider
@@ -69,6 +71,7 @@ final class HLSVODCarrierProvider:
     private let bandwidth: Int
     private let averageBandwidth: Int
     private let resolvedHybridVideoFormat: VideoFormat?
+    private let analysisInput: AudioAnalysisInput
 
     private let closeLock = NSLock()
     private let restartLock = NSLock()
@@ -213,6 +216,8 @@ final class HLSVODCarrierProvider:
         self.timeline = timeline
         resolvedHybridVideoFormat =
             await pump.hybridVideoFormat
+        analysisInput =
+            try await pump.makeAudioAnalysisInput()
 
         var uniqueCodecs = [
             BlackCarrierProfile.approved.codecString
@@ -266,6 +271,22 @@ final class HLSVODCarrierProvider:
 
     var audioAnalysisTrackIDs: [Int] {
         metadata.map(\.sourceTrackID)
+    }
+
+    func makeAudioAnalysisInput() throws
+        -> AudioAnalysisInput
+    {
+        try requireOpen()
+        return analysisInput
+    }
+
+    func mediaPumpSnapshot() throws
+        -> HLSVODMediaPumpSnapshot
+    {
+        try requireOpen()
+        return try BlockingAsyncBridge.wait {
+            await self.pump.snapshot()
+        }
     }
 
     func prepareForTransportStart() throws {

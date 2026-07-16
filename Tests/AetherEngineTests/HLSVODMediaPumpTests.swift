@@ -282,6 +282,279 @@ final class HLSVODMediaPumpTests: XCTestCase {
         )
     }
 
+    func testHLSAudioAnalysisIsDemandDrivenRangeExactAndCursorIndependent()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let pump = try await HLSVODMediaPump.make(
+            preflight: fixture.preflight,
+            fetchOverride: { request, _ in
+                try fixture.fetchStore.response(
+                    for: request
+                )
+            }
+        )
+        addTeardownBlock {
+            try await pump.close()
+        }
+        let before = await pump.snapshot()
+        let input = try await pump
+            .makeAudioAnalysisInput()
+        let request = try AudioAnalysisRequest(
+            audioTrackID: 0,
+            range: 0.25..<1.75
+        )
+        let session = AudioAnalysisSession()
+        let stream = AudioAnalysisStream(
+            gate: session.gate,
+            cancel: { session.cancel() }
+        )
+        let task = Task.detached {
+            await AudioAnalysisRunner.run(
+                session: session,
+                input: input,
+                request: request
+            )
+        }
+        session.install(task: task)
+
+        try await Task.sleep(
+            for: .milliseconds(25)
+        )
+        XCTAssertEqual(
+            fixture.fetchStore.count(
+                for: fixture.audioSegmentURLs[1]
+            ),
+            0,
+            "creating an analysis stream must not fetch the requested segment"
+        )
+
+        var iterator = stream.makeAsyncIterator()
+        var totalFrames: Int64 = 0
+        var firstPosition: Int64?
+        var finalPosition: Int64?
+        var sawDiscontinuity = false
+        while let buffer = try await iterator.next() {
+            firstPosition = firstPosition
+                ?? buffer.sourceSamplePosition
+            totalFrames += Int64(
+                buffer.pcm.frameLength
+            )
+            finalPosition =
+                buffer.sourceSamplePosition
+                + Int64(buffer.pcm.frameLength)
+            sawDiscontinuity =
+                sawDiscontinuity
+                || buffer.isDiscontinuous
+        }
+        await task.value
+
+        XCTAssertEqual(
+            Double(try XCTUnwrap(firstPosition)),
+            12_000,
+            accuracy: 128
+        )
+        XCTAssertEqual(
+            Double(try XCTUnwrap(finalPosition)),
+            84_000,
+            accuracy: 128
+        )
+        XCTAssertEqual(
+            Double(totalFrames),
+            72_000,
+            accuracy: 256
+        )
+        XCTAssertFalse(sawDiscontinuity)
+        XCTAssertEqual(
+            fixture.fetchStore.count(
+                for: fixture.audioSegmentURLs[0]
+            ),
+            1,
+            "analysis must reuse the first segment already admitted by playback"
+        )
+        XCTAssertEqual(
+            fixture.fetchStore.count(
+                for: fixture.audioSegmentURLs[1]
+            ),
+            1
+        )
+        let after = await pump.snapshot()
+        XCTAssertEqual(
+            after,
+            before,
+            "analysis must not advance the playback pump cursor or generation"
+        )
+    }
+
+    func testCancellingBlockedHLSAnalysisReleasesItsWaiterAndPlaybackRemainsUsable()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let blocker = FetchBlocker(
+            store: fixture.fetchStore,
+            blockedURL:
+                fixture.audioSegmentURLs[1]
+        )
+        let pump = try await HLSVODMediaPump.make(
+            preflight: fixture.preflight,
+            fetchOverride: { request, _ in
+                try await blocker.response(
+                    for: request
+                )
+            }
+        )
+        addTeardownBlock {
+            try await pump.close()
+        }
+        let input = try await pump
+            .makeAudioAnalysisInput()
+        let source: HLSVODAudioAnalysisInput
+        guard case .hlsVOD(let hlsSource) = input else {
+            return XCTFail(
+                "HLS pump did not expose its graph-bound analysis source"
+            )
+        }
+        source = hlsSource
+        let request = try AudioAnalysisRequest(
+            audioTrackID: 0,
+            range: 1.1..<1.8
+        )
+        let session = AudioAnalysisSession()
+        let stream = AudioAnalysisStream(
+            gate: session.gate,
+            cancel: { session.cancel() }
+        )
+        let runner = Task.detached {
+            await AudioAnalysisRunner.run(
+                session: session,
+                input: input,
+                request: request
+            )
+        }
+        session.install(task: runner)
+        let consumer = Task {
+            var iterator =
+                stream.makeAsyncIterator()
+            return try await iterator.next()
+        }
+
+        try await blocker.waitForRequestCount(1)
+        let blocked = await source.loaderSnapshot()
+        XCTAssertEqual(
+            blocked.inFlightAnalysisWaiterCount,
+            1
+        )
+        XCTAssertEqual(
+            blocked.inFlightPlaybackWaiterCount,
+            0
+        )
+        stream.cancel()
+        do {
+            _ = try await consumer.value
+            XCTFail(
+                "cancelled analysis unexpectedly produced PCM"
+            )
+        } catch let error as AudioAnalysisError {
+            XCTAssertEqual(error, .cancelled)
+        }
+        await runner.value
+
+        let cancelled = await source.loaderSnapshot()
+        XCTAssertEqual(
+            cancelled.inFlightAnalysisWaiterCount,
+            0
+        )
+        XCTAssertEqual(
+            cancelled.inFlightResourceCount,
+            0
+        )
+        XCTAssertEqual(
+            fixture.fetchStore.count(
+                for: fixture.audioSegmentURLs[1]
+            ),
+            0,
+            "the cancelled origin task must not publish bytes into the shared cache"
+        )
+
+        await blocker.release()
+        try await pump.produce(
+            throughSegment: 1
+        )
+        let playback = await pump.snapshot()
+        XCTAssertEqual(
+            playback.highestProducedVideoSegmentIndex,
+            1
+        )
+        XCTAssertEqual(
+            playback.highestFinalizedAudioSegmentIndices,
+            [1]
+        )
+        XCTAssertEqual(
+            fixture.fetchStore.count(
+                for: fixture.audioSegmentURLs[1]
+            ),
+            1,
+            "playback must be able to issue a fresh graph-bound request after analysis cancellation"
+        )
+    }
+
+    func testHLSAudioAnalysisRejectsUnknownTrackAndOutOfTimelineRangeWithoutFetching()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let pump = try await HLSVODMediaPump.make(
+            preflight: fixture.preflight,
+            fetchOverride: { request, _ in
+                try fixture.fetchStore.response(
+                    for: request
+                )
+            }
+        )
+        addTeardownBlock {
+            try await pump.close()
+        }
+        let input = try await pump
+            .makeAudioAnalysisInput()
+        let source: HLSVODAudioAnalysisInput
+        guard case .hlsVOD(let hlsSource) = input else {
+            return XCTFail(
+                "HLS pump did not expose its graph-bound analysis source"
+            )
+        }
+        source = hlsSource
+
+        let unknownTrack = try AudioAnalysisRequest(
+            audioTrackID: 99,
+            range: 0..<1
+        )
+        XCTAssertThrowsError(
+            try source.track(for: unknownTrack)
+        ) { error in
+            XCTAssertEqual(
+                error as? AudioAnalysisError,
+                .audioTrackUnavailable(99)
+            )
+        }
+        let outsideTimeline = try AudioAnalysisRequest(
+            audioTrackID: 0,
+            range: 1.5..<2.5
+        )
+        XCTAssertThrowsError(
+            try source.track(for: outsideTimeline)
+        ) { error in
+            XCTAssertEqual(
+                error as? AudioAnalysisError,
+                .rangeOutsideSource
+            )
+        }
+        XCTAssertEqual(
+            fixture.fetchStore.count(
+                for: fixture.audioSegmentURLs[1]
+            ),
+            0
+        )
+    }
+
     func testConcurrentDemandUsesOneSerializedProductionRun()
         async throws
     {
@@ -962,8 +1235,290 @@ final class HLSVODMediaPumpTests: XCTestCase {
         }
     }
 
+    func testHLSAnalysisReusesThePlaybackOriginGraph()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let provider =
+            try await HLSVODCarrierProvider.make(
+                preflight: fixture.preflight,
+                bandwidthAdmissions:
+                    validBandwidthAdmissions(),
+                fetchOverride: { request, _ in
+                    try fixture.fetchStore.response(
+                        for: request
+                    )
+                }
+            )
+        addTeardownBlock {
+            provider.close()
+        }
+        XCTAssertEqual(
+            provider.audioAnalysisTrackIDs,
+            [0]
+        )
+        let input =
+            try provider.makeAudioAnalysisInput()
+        let playbackBeforeAnalysis =
+            try provider.mediaPumpSnapshot()
+        let session = AudioAnalysisSession()
+        let stream = AudioAnalysisStream(
+            gate: session.gate,
+            cancel: { session.cancel() }
+        )
+        let request = try AudioAnalysisRequest(
+            audioTrackID: 0,
+            range: 0.25..<1.75
+        )
+        let task = Task.detached {
+            await AudioAnalysisRunner.run(
+                session: session,
+                input: input,
+                request: request
+            )
+        }
+        session.install(task: task)
+
+        try await Task.sleep(
+            for: .milliseconds(25)
+        )
+        XCTAssertEqual(
+            fixture.fetchStore.count(
+                for: fixture.audioSegmentURLs[1]
+            ),
+            0,
+            "creating an HLS analysis stream must not fetch before first demand"
+        )
+
+        var totalFrames: Int64 = 0
+        var firstPosition: Int64?
+        var finalPosition: Int64?
+        var iterator = stream.makeAsyncIterator()
+        while let buffer = try await iterator.next() {
+            firstPosition = firstPosition
+                ?? buffer.sourceSamplePosition
+            totalFrames += Int64(
+                buffer.pcm.frameLength
+            )
+            finalPosition =
+                buffer.sourceSamplePosition
+                + Int64(buffer.pcm.frameLength)
+        }
+        await task.value
+
+        XCTAssertEqual(
+            Double(totalFrames),
+            72_000,
+            accuracy: 2_400
+        )
+        XCTAssertEqual(
+            Double(try XCTUnwrap(firstPosition)),
+            12_000,
+            accuracy: 240
+        )
+        XCTAssertEqual(
+            Double(try XCTUnwrap(finalPosition)),
+            84_000,
+            accuracy: 240
+        )
+        XCTAssertEqual(
+            fixture.fetchStore.count(
+                for: fixture.audioSegmentURLs[0]
+            ),
+            1
+        )
+        XCTAssertEqual(
+            fixture.fetchStore.count(
+                for: fixture.audioSegmentURLs[1]
+            ),
+            1
+        )
+        let playbackAfterAnalysis =
+            try provider.mediaPumpSnapshot()
+        XCTAssertEqual(
+            playbackAfterAnalysis,
+            playbackBeforeAnalysis,
+            "independent analysis must not move or produce the playback cursor"
+        )
+
+        try provider.prepareForTransportStart()
+        XCTAssertEqual(
+            fixture.fetchStore.count(
+                for: fixture.audioSegmentURLs[1]
+            ),
+            1,
+            "playback must reuse the segment fetched by analysis"
+        )
+    }
+
+    func testCancellingHLSAnalysisDoesNotCancelAPlaybackWaiter()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let blocker = FetchBlocker(
+            store: fixture.fetchStore,
+            blockedURL:
+                fixture.audioSegmentURLs[1]
+        )
+        let provider =
+            try await HLSVODCarrierProvider.make(
+                preflight: fixture.preflight,
+                bandwidthAdmissions:
+                    validBandwidthAdmissions(),
+                fetchOverride: { request, _ in
+                    try await blocker.response(
+                        for: request
+                    )
+                }
+            )
+        addTeardownBlock {
+            provider.close()
+        }
+        let input =
+            try provider.makeAudioAnalysisInput()
+        let hlsInput: HLSVODAudioAnalysisInput
+        guard case .hlsVOD(let resolved) = input else {
+            XCTFail("provider returned a non-HLS analysis input")
+            return
+        }
+        hlsInput = resolved
+
+        let session = AudioAnalysisSession()
+        let stream = AudioAnalysisStream(
+            gate: session.gate,
+            cancel: { session.cancel() }
+        )
+        let request = try AudioAnalysisRequest(
+            audioTrackID: 0,
+            range: 1.1..<1.8
+        )
+        let analysisTask = Task.detached {
+            await AudioAnalysisRunner.run(
+                session: session,
+                input: input,
+                request: request
+            )
+        }
+        session.install(task: analysisTask)
+        let nextTask = Task {
+            var iterator =
+                stream.makeAsyncIterator()
+            return try await iterator.next()
+        }
+        try await blocker.waitForRequestCount(1)
+
+        let playbackTask = Task.detached {
+            try provider.prepareForTransportStart()
+        }
+        while true {
+            let snapshot =
+                await hlsInput.loaderSnapshot()
+            if snapshot.inFlightPlaybackWaiterCount == 1,
+               snapshot.inFlightAnalysisWaiterCount == 1 {
+                break
+            }
+            try await Task.sleep(
+                for: .milliseconds(5)
+            )
+        }
+
+        stream.cancel()
+        while true {
+            let snapshot =
+                await hlsInput.loaderSnapshot()
+            if snapshot.inFlightPlaybackWaiterCount == 1,
+               snapshot.inFlightAnalysisWaiterCount == 0 {
+                break
+            }
+            try await Task.sleep(
+                for: .milliseconds(5)
+            )
+        }
+        await blocker.release()
+
+        do {
+            _ = try await nextTask.value
+            XCTFail(
+                "cancelled analysis unexpectedly produced a buffer"
+            )
+        } catch let error as AudioAnalysisError {
+            XCTAssertEqual(error, .cancelled)
+        }
+        await analysisTask.value
+        try await playbackTask.value
+        let blockedRequestCount =
+            await blocker.count
+        XCTAssertEqual(
+            blockedRequestCount,
+            1,
+            "analysis and playback must share one graph-bound origin fetch"
+        )
+    }
+
+    func testHLSAnalysisFailsWhenAGraphResourceIsMissing()
+        async throws
+    {
+        let fixture = try makeFixture(
+            omitSecondAudioSegment: true
+        )
+        let provider =
+            try await HLSVODCarrierProvider.make(
+                preflight: fixture.preflight,
+                bandwidthAdmissions:
+                    validBandwidthAdmissions(),
+                fetchOverride: { request, _ in
+                    try fixture.fetchStore.response(
+                        for: request
+                    )
+                }
+            )
+        addTeardownBlock {
+            provider.close()
+        }
+        let input =
+            try provider.makeAudioAnalysisInput()
+        let session = AudioAnalysisSession()
+        let stream = AudioAnalysisStream(
+            gate: session.gate,
+            cancel: { session.cancel() }
+        )
+        let request = try AudioAnalysisRequest(
+            audioTrackID: 0,
+            range: 1.1..<1.8
+        )
+        let task = Task.detached {
+            await AudioAnalysisRunner.run(
+                session: session,
+                input: input,
+                request: request
+            )
+        }
+        session.install(task: task)
+
+        do {
+            var iterator =
+                stream.makeAsyncIterator()
+            _ = try await iterator.next()
+            XCTFail(
+                "missing HLS resource unexpectedly produced analysis output"
+            )
+        } catch let error as AudioAnalysisError {
+            guard case .hlsResourceFailure(
+                let reason
+            ) = error else {
+                XCTFail(
+                    "unexpected analysis error \(error)"
+                )
+                return
+            }
+            XCTAssertTrue(reason.contains("404"))
+        }
+        await task.value
+    }
+
     private func makeFixture(
-        declaredAudioChannels: String = "2"
+        declaredAudioChannels: String = "2",
+        omitSecondAudioSegment: Bool = false
     ) throws -> Fixture {
         let timeline =
             try BlackCarrierTimeline.mirroredHLSVOD(
@@ -1153,7 +1708,8 @@ final class HLSVODMediaPumpTests: XCTestCase {
             data: audio.initData,
             url: audioInitURL
         )
-        for index in audioSegmentURLs.indices {
+        for index in audioSegmentURLs.indices
+        where !omitSecondAudioSegment || index != 1 {
             responses[audioSegmentURLs[index]] =
                 response(
                     data: audio.mediaSegments[index],
@@ -1178,6 +1734,20 @@ final class HLSVODMediaPumpTests: XCTestCase {
                     )
                 }
         )
+    }
+
+    private func validBandwidthAdmissions()
+        -> [BlackCarrierAudioBandwidthAdmission]
+    {
+        [
+            BlackCarrierAudioBandwidthAdmission(
+                ordinal: 0,
+                evidence: .measuredFullAsset(
+                    peakBandwidth: 512_000,
+                    averageBandwidth: 384_000
+                )
+            ),
+        ]
     }
 
     private func response(

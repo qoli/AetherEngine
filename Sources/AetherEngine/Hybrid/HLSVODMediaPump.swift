@@ -181,9 +181,10 @@ struct HLSVODMediaPumpSnapshot: Sendable, Equatable {
 /// enter the real-video sink or long-lived carrier-audio writer. FFmpeg never receives a URL and cannot
 /// reopen the master playlist, choose a different variant or perform network I/O.
 ///
-/// This remains an engine-private source pump. Public HLS session admission stays disabled until a
-/// transport provider, seek-generation replacement, analysis reader and exact master-bandwidth admission
-/// own this pump. Audio production may read one upstream segment ahead because an audio access unit from
+/// This remains an engine-private source pump. Transport, seek-generation replacement and an independent
+/// graph-bound analysis cursor own the same bounded origin loader; public HLS session admission stays
+/// disabled until exact startup master-bandwidth admission and the remaining public-session gates land.
+/// Audio production may read one upstream segment ahead because an audio access unit from
 /// the next carrier interval is the evidence that lets the long-lived fMP4 writer finalize the requested
 /// fragment; the following carrier fragment is not finalized until a later demand.
 actor HLSVODMediaPump {
@@ -198,6 +199,7 @@ actor HLSVODMediaPump {
     private let worker: Worker
     private let videoInitData: Data?
     private let audioInitData: [Data?]
+    private let analysisInput: AudioAnalysisInput
 
     private var nextVideoInputSegmentIndex = 0
     private var nextAudioInputSegmentIndices: [Int]
@@ -319,7 +321,7 @@ actor HLSVODMediaPump {
                     videoFailureHandler,
                 initialGeneration: initialGeneration
             )
-            return HLSVODMediaPump(
+            return try HLSVODMediaPump(
                 graph: graph,
                 loader: loader,
                 worker: worker,
@@ -348,12 +350,20 @@ actor HLSVODMediaPump {
         videoInitData: Data?,
         audioInitData: [Data?],
         initialGeneration: UInt64
-    ) {
+    ) throws {
         self.graph = graph
         self.loader = loader
         self.worker = worker
         self.videoInitData = videoInitData
         self.audioInitData = audioInitData
+        analysisInput = .hlsVOD(
+            try HLSVODAudioAnalysisInput(
+                graph: graph,
+                loader: loader,
+                metadata: worker.renditionMetadata,
+                contracts: worker.audioAnalysisContracts
+            )
+        )
         currentGeneration = initialGeneration
         renditionMetadata = worker.renditionMetadata
         renditionDescriptors = worker.renditionDescriptors
@@ -658,6 +668,13 @@ actor HLSVODMediaPump {
                 .requestedSegmentUnavailable(last)
         }
         return summaries
+    }
+
+    func makeAudioAnalysisInput() throws
+        -> AudioAnalysisInput
+    {
+        try requireAvailable()
+        return analysisInput
     }
 
     func advanceVideoDecodeDemand(
@@ -982,82 +999,11 @@ private extension HLSVODMediaPump {
         let audioPacketCounts: [Int]
     }
 
-    struct AudioStreamContract: Equatable {
-        let codecID: UInt32
-        let codecTag: UInt32
-        let profile: Int32
-        let sampleRate: Int32
-        let frameSize: Int32
-        let channelCount: Int32
-        let channelLayoutDescription: String
-        let sampleFormat: Int32
-        let bitsPerCodedSample: Int32
-        let bitsPerRawSample: Int32
-        let blockAlign: Int32
-        let timeBaseNumerator: Int32
-        let timeBaseDenominator: Int32
-        let codecConfiguration: Data
-
-        init(stream: UnsafeMutablePointer<AVStream>) {
-            let parameters =
-                stream.pointee.codecpar.pointee
-            codecID = parameters.codec_id.rawValue
-            codecTag = parameters.codec_tag
-            profile = parameters.profile
-            sampleRate = parameters.sample_rate
-            frameSize = parameters.frame_size
-            channelCount =
-                parameters.ch_layout.nb_channels
-            var channelLayout =
-                parameters.ch_layout
-            var channelLayoutBuffer = [
-                CChar
-            ](
-                repeating: 0,
-                count: 256
-            )
-            channelLayoutDescription =
-                channelLayoutBuffer
-                    .withUnsafeMutableBufferPointer {
-                        buffer in
-                        _ = av_channel_layout_describe(
-                            &channelLayout,
-                            buffer.baseAddress,
-                            buffer.count
-                        )
-                        return String(
-                            cString:
-                                buffer.baseAddress!
-                        )
-                    }
-            sampleFormat = parameters.format
-            bitsPerCodedSample =
-                parameters.bits_per_coded_sample
-            bitsPerRawSample =
-                parameters.bits_per_raw_sample
-            blockAlign = parameters.block_align
-            timeBaseNumerator =
-                stream.pointee.time_base.num
-            timeBaseDenominator =
-                stream.pointee.time_base.den
-            if let bytes = parameters.extradata,
-               parameters.extradata_size > 0 {
-                codecConfiguration = Data(
-                    bytes: bytes,
-                    count:
-                        Int(parameters.extradata_size)
-                )
-            } else {
-                codecConfiguration = Data()
-            }
-        }
-    }
-
     final class AudioRendition {
         let metadata: BlackCarrierAudioRenditionMetadata
         let descriptor:
             BlackCarrierAudioRenditionDescriptor
-        let contract: AudioStreamContract
+        let contract: HLSVODAudioStreamContract
         let cache: SegmentCache
         var writer:
             BlackCarrierAudioRenditionMuxer.Writer
@@ -1069,7 +1015,7 @@ private extension HLSVODMediaPump {
             metadata: BlackCarrierAudioRenditionMetadata,
             descriptor:
                 BlackCarrierAudioRenditionDescriptor,
-            contract: AudioStreamContract,
+            contract: HLSVODAudioStreamContract,
             cache: SegmentCache,
             writer:
                 BlackCarrierAudioRenditionMuxer.Writer
@@ -1330,6 +1276,12 @@ private extension HLSVODMediaPump {
                 .streamContract.videoFormat
         }
 
+        var audioAnalysisContracts:
+            [HLSVODAudioStreamContract]
+        {
+            audioRenditions.map(\.contract)
+        }
+
         var isTargetFrameReady: Bool {
             videoDecodeSink?.isTargetFrameReady
                 ?? true
@@ -1467,7 +1419,7 @@ private extension HLSVODMediaPump {
                                         audioStreams.count
                                 )
                         }
-                        guard AudioStreamContract(
+                        guard HLSVODAudioStreamContract(
                             stream: stream
                         ) == rendition.contract else {
                             throw HLSVODMediaPumpError
@@ -1565,7 +1517,7 @@ private extension HLSVODMediaPump {
                                 videoDemuxer.stream(
                                     at: streamIndex
                                 ),
-                              AudioStreamContract(
+                              HLSVODAudioStreamContract(
                                 stream: stream
                               ) == rendition
                                 .contract else {
@@ -1756,7 +1708,7 @@ private extension HLSVODMediaPump {
                             demuxer.stream(
                                 at: streamIndex
                             ),
-                          AudioStreamContract(
+                          HLSVODAudioStreamContract(
                             stream: stream
                           ) == audioRenditions[
                             ordinal
@@ -1935,7 +1887,7 @@ private extension HLSVODMediaPump {
             }
             let rendition =
                 audioRenditions[renditionOrdinal]
-            guard AudioStreamContract(stream: stream)
+            guard HLSVODAudioStreamContract(stream: stream)
                     == rendition.contract else {
                 throw HLSVODMediaPumpError
                     .audioContractChanged(
@@ -2327,7 +2279,7 @@ private extension HLSVODMediaPump {
                     metadata: metadata,
                     descriptor: descriptor,
                     contract:
-                        AudioStreamContract(
+                        HLSVODAudioStreamContract(
                             stream: stream
                         ),
                     cache: cache,
