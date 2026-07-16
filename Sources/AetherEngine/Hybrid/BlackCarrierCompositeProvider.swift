@@ -1,5 +1,7 @@
 import CoreMedia
 import Foundation
+import Libavcodec
+import Libavutil
 
 struct BlackCarrierAudioRenditionMetadata: Sendable, Equatable {
     let ordinal: Int
@@ -114,6 +116,29 @@ final class BlackCarrierAudioRenditionStore: @unchecked Sendable {
         }
     }
 
+    fileprivate init(
+        metadata: BlackCarrierAudioRenditionMetadata,
+        summary: BlackCarrierAudioRenditionSummary,
+        cache: SegmentCache,
+        timeline: BlackCarrierTimeline
+    ) throws {
+        guard cache.fetchInit(timeout: 0) != nil,
+              timeline.segments.allSatisfy({
+                  cache.peekURL(index: $0.index) != nil
+              }) else {
+            cache.close()
+            throw BlackCarrierAudioRenditionStoreError.incompleteStorage(
+                trackID: metadata.sourceTrackID
+            )
+        }
+        self.metadata = metadata
+        self.summary = summary
+        self.cache = cache
+        segmentDurations = timeline.segments.map {
+            CMTimeGetSeconds($0.duration)
+        }
+    }
+
     deinit {
         close()
     }
@@ -172,6 +197,13 @@ enum BlackCarrierCompositeProviderError:
     Sendable,
     Equatable
 {
+    case audioTracksMissing
+    case audioDemuxFailed(reason: String)
+    case audioMuxerFailed(
+        trackID: Int,
+        error: BlackCarrierAudioRenditionMuxerError
+    )
+    case audioStoreFailed(error: BlackCarrierAudioRenditionStoreError)
     case nonContiguousOrdinal(expected: Int, actual: Int)
     case duplicateSourceTrackID(id: Int)
     case duplicateName(name: String)
@@ -186,6 +218,14 @@ enum BlackCarrierCompositeProviderError:
 
     var errorDescription: String? {
         switch self {
+        case .audioTracksMissing:
+            return "Carrier source contains no real audio track"
+        case .audioDemuxFailed(let reason):
+            return "Carrier audio demux failed: \(reason)"
+        case .audioMuxerFailed(let trackID, let error):
+            return "Carrier audio track \(trackID) failed: \(error.localizedDescription)"
+        case .audioStoreFailed(let error):
+            return error.localizedDescription
         case .nonContiguousOrdinal(let expected, let actual):
             return "Carrier audio ordinal \(actual) is invalid; expected \(expected)"
         case .duplicateSourceTrackID(let id):
@@ -285,6 +325,193 @@ final class BlackCarrierCompositeProvider: HLSSegmentProvider, @unchecked Sendab
                 isDefault: ordinal == defaultIndex,
                 isAutoselect: true
             )
+        }
+    }
+
+    /// Eagerly builds every real-audio rendition from one shared demux pass.
+    ///
+    /// This is the deterministic VOD assembly boundary for the first hybrid carrier. It adopts
+    /// `videoProvider` immediately and closes the video plus every audio cache if any track,
+    /// packet, or final store fails. Inputs without audio fail explicitly; the separate
+    /// silent-carrier path must create its synthetic audio track before calling this builder.
+    static func build(
+        videoProvider: BlackCarrierVideoProvider,
+        audioDemuxer: Demuxer,
+        timeline: BlackCarrierTimeline,
+        bridgeMode: AudioBridgeMode = .surroundCompat
+    ) throws -> BlackCarrierCompositeProvider {
+        struct PendingRendition {
+            let metadata: BlackCarrierAudioRenditionMetadata
+            let cache: SegmentCache
+            let writer: BlackCarrierAudioRenditionMuxer.Writer
+        }
+
+        let tracks = audioDemuxer.audioTrackInfos()
+        guard !tracks.isEmpty else {
+            videoProvider.close()
+            throw BlackCarrierCompositeProviderError.audioTracksMissing
+        }
+        let metadata = renditionMetadata(for: tracks)
+        var pending: [PendingRendition] = []
+
+        func closePending() {
+            pending.forEach { $0.cache.close() }
+        }
+
+        for (track, renditionMetadata) in zip(tracks, metadata) {
+            let cache = SegmentCache(
+                forwardWindow: max(1, timeline.segments.count),
+                backwardWindow: max(1, timeline.segments.count)
+            )
+            do {
+                let streamIndex = Int32(track.id)
+                let writer = try BlackCarrierAudioRenditionMuxer.makeWriter(
+                    demuxer: audioDemuxer,
+                    audioStreamIndex: streamIndex,
+                    sourceStartPTS: sourceStartPTS(
+                        demuxer: audioDemuxer,
+                        streamIndex: streamIndex
+                    ),
+                    timeline: timeline,
+                    bridgeMode: bridgeMode,
+                    sessionDirectory: cache.sessionDir,
+                    onInit: { cache.setInit($0) },
+                    onSegment: { timing, stagingPath, bytesWritten in
+                        cache.adopt(
+                            index: timing.index,
+                            stagingPath: stagingPath,
+                            byteCount: bytesWritten
+                        )
+                        guard cache.peekURL(index: timing.index) != nil else {
+                            throw BlackCarrierAudioRenditionStoreError
+                                .segmentStoreFailed(
+                                    trackID: renditionMetadata.sourceTrackID,
+                                    index: timing.index
+                                )
+                        }
+                    }
+                )
+                pending.append(PendingRendition(
+                    metadata: renditionMetadata,
+                    cache: cache,
+                    writer: writer
+                ))
+            } catch let error as BlackCarrierAudioRenditionMuxerError {
+                cache.close()
+                closePending()
+                videoProvider.close()
+                throw BlackCarrierCompositeProviderError.audioMuxerFailed(
+                    trackID: track.id,
+                    error: error
+                )
+            } catch let error as BlackCarrierAudioRenditionStoreError {
+                cache.close()
+                closePending()
+                videoProvider.close()
+                throw BlackCarrierCompositeProviderError.audioStoreFailed(
+                    error: error
+                )
+            } catch {
+                cache.close()
+                closePending()
+                videoProvider.close()
+                throw BlackCarrierCompositeProviderError.audioDemuxFailed(
+                    reason: String(describing: error)
+                )
+            }
+        }
+
+        let pendingByStream = Dictionary(
+            uniqueKeysWithValues: pending.map {
+                ($0.writer.sourceStreamIndex, $0)
+            }
+        )
+        audioDemuxer.discardAllStreamsExcept(Set(pendingByStream.keys))
+
+        do {
+            while let packet = try audioDemuxer.readPacket() {
+                var packetToFree: UnsafeMutablePointer<AVPacket>? = packet
+                defer { trackedPacketFree(&packetToFree) }
+                guard let rendition = pendingByStream[
+                    packet.pointee.stream_index
+                ] else {
+                    continue
+                }
+                do {
+                    try rendition.writer.consume(packet)
+                } catch let error as BlackCarrierAudioRenditionMuxerError {
+                    throw BlackCarrierCompositeProviderError.audioMuxerFailed(
+                        trackID: rendition.metadata.sourceTrackID,
+                        error: error
+                    )
+                } catch let error as BlackCarrierAudioRenditionStoreError {
+                    throw BlackCarrierCompositeProviderError.audioStoreFailed(
+                        error: error
+                    )
+                }
+            }
+        } catch let error as BlackCarrierCompositeProviderError {
+            closePending()
+            videoProvider.close()
+            throw error
+        } catch {
+            closePending()
+            videoProvider.close()
+            throw BlackCarrierCompositeProviderError.audioDemuxFailed(
+                reason: String(describing: error)
+            )
+        }
+
+        var summaries: [BlackCarrierAudioRenditionSummary] = []
+        summaries.reserveCapacity(pending.count)
+        for rendition in pending {
+            do {
+                summaries.append(try rendition.writer.finish())
+            } catch let error as BlackCarrierAudioRenditionMuxerError {
+                closePending()
+                videoProvider.close()
+                throw BlackCarrierCompositeProviderError.audioMuxerFailed(
+                    trackID: rendition.metadata.sourceTrackID,
+                    error: error
+                )
+            } catch let error as BlackCarrierAudioRenditionStoreError {
+                closePending()
+                videoProvider.close()
+                throw BlackCarrierCompositeProviderError.audioStoreFailed(
+                    error: error
+                )
+            } catch {
+                closePending()
+                videoProvider.close()
+                throw BlackCarrierCompositeProviderError.audioDemuxFailed(
+                    reason: String(describing: error)
+                )
+            }
+        }
+
+        do {
+            let stores = try zip(pending, summaries).map { rendition, summary in
+                try BlackCarrierAudioRenditionStore(
+                    metadata: rendition.metadata,
+                    summary: summary,
+                    cache: rendition.cache,
+                    timeline: timeline
+                )
+            }
+            return try BlackCarrierCompositeProvider(
+                videoProvider: videoProvider,
+                audioStores: stores
+            )
+        } catch let error as BlackCarrierAudioRenditionStoreError {
+            closePending()
+            videoProvider.close()
+            throw BlackCarrierCompositeProviderError.audioStoreFailed(
+                error: error
+            )
+        } catch {
+            closePending()
+            videoProvider.close()
+            throw error
         }
     }
 
@@ -420,5 +647,33 @@ final class BlackCarrierCompositeProvider: HLSSegmentProvider, @unchecked Sendab
                 }
             }
         }
+    }
+
+    private static func sourceStartPTS(
+        demuxer: Demuxer,
+        streamIndex: Int32
+    ) -> Int64 {
+        guard let stream = demuxer.stream(at: streamIndex) else { return 0 }
+        let formatStart = demuxer.formatStartTime
+        if formatStart != Int64.min {
+            return av_rescale_q(
+                formatStart,
+                AVRational(num: 1, den: AV_TIME_BASE),
+                stream.pointee.time_base
+            )
+        }
+        let videoStreamIndex = demuxer.videoStreamIndex
+        if videoStreamIndex >= 0,
+           let videoStream = demuxer.stream(at: videoStreamIndex),
+           videoStream.pointee.start_time != Int64.min {
+            return av_rescale_q(
+                videoStream.pointee.start_time,
+                videoStream.pointee.time_base,
+                stream.pointee.time_base
+            )
+        }
+        return stream.pointee.start_time == Int64.min
+            ? 0
+            : stream.pointee.start_time
     }
 }

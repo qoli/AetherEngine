@@ -198,6 +198,32 @@ struct BlackCarrierCompositeProviderTests {
         }
     }
 
+    @Test("Shared-demux builder rejects missing real audio without a hidden fallback")
+    func builderRejectsMissingAudio() throws {
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(seconds: 1, preferredTimescale: 90_000)
+        )
+        let videoProvider = try BlackCarrierVideoProvider(timeline: timeline)
+        let directory = videoProvider.sessionDirectory
+        let videoInit = try #require(videoProvider.initSegment())
+        let videoMedia = try #require(videoProvider.mediaSegment(at: 0))
+        let videoOnlyData = videoInit + videoMedia
+        let demuxer = Demuxer()
+        try demuxer.open(reader: DataIOReader(data: videoOnlyData))
+        defer { demuxer.close() }
+
+        #expect(
+            throws: BlackCarrierCompositeProviderError.audioTracksMissing
+        ) {
+            _ = try BlackCarrierCompositeProvider.build(
+                videoProvider: videoProvider,
+                audioDemuxer: demuxer,
+                timeline: timeline
+            )
+        }
+        #expect(!FileManager.default.fileExists(atPath: directory.path))
+    }
+
     private func makeTrack(
         id: Int,
         name: String,

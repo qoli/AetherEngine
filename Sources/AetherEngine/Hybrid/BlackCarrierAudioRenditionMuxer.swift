@@ -19,6 +19,7 @@ enum BlackCarrierAudioRenditionMuxerError: Error, LocalizedError, Sendable, Equa
     case packetWriteFailed(segmentIndex: Int, code: Int32)
     case segmentFinalizeFailed(index: Int)
     case initSegmentMissing
+    case alreadyFinished
 
     var errorDescription: String? {
         switch self {
@@ -50,6 +51,8 @@ enum BlackCarrierAudioRenditionMuxerError: Error, LocalizedError, Sendable, Equa
             return "Black carrier audio segment \(index) could not be finalized"
         case .initSegmentMissing:
             return "Black carrier audio muxer did not produce an init segment"
+        case .alreadyFinished:
+            return "Black carrier audio rendition writer is already finished"
         }
     }
 }
@@ -70,6 +73,12 @@ struct BlackCarrierAudioRenditionSummary: Sendable, Equatable {
 }
 
 enum BlackCarrierAudioRenditionMuxer {
+    typealias SegmentSink = (
+        _ timing: BlackCarrierSegmentTiming,
+        _ stagingPath: URL,
+        _ bytesWritten: Int
+    ) throws -> Void
+
     private struct PreparedRoute {
         let pipeline: BlackCarrierAudioPipeline
         let codecString: String
@@ -86,65 +95,162 @@ enum BlackCarrierAudioRenditionMuxer {
         let bridge: AudioBridge?
     }
 
-    static func mux(
-        demuxer: Demuxer,
-        audioStreamIndex: Int32,
-        sourceStartPTS: Int64,
-        timeline: BlackCarrierTimeline,
-        bridgeMode: AudioBridgeMode = .surroundCompat,
-        sessionDirectory: URL,
-        onInit: (Data) -> Void,
-        onSegment: (
-            _ timing: BlackCarrierSegmentTiming,
-            _ stagingPath: URL,
-            _ bytesWritten: Int
-        ) throws -> Void
-    ) throws -> BlackCarrierAudioRenditionSummary {
-        guard let firstTiming = timeline.segments.first,
-              let lastTiming = timeline.segments.last else {
-            throw BlackCarrierAudioRenditionMuxerError.emptyTimeline
-        }
-        guard audioStreamIndex >= 0,
-              let sourceStream = demuxer.stream(at: audioStreamIndex),
-              sourceStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_AUDIO else {
-            throw BlackCarrierAudioRenditionMuxerError.audioStreamMissing(
-                index: audioStreamIndex
-            )
-        }
-        demuxer.discardAllStreamsExcept([audioStreamIndex])
-
-        let route = try prepareRoute(
-            sourceStream: sourceStream,
-            sourceStartPTS: sourceStartPTS,
-            bridgeMode: bridgeMode
-        )
-        defer { route.bridge?.close() }
-        _ = route.ownedCodecParameters
-
-        var capturedInitSegment: Data?
-        let muxer: MP4SegmentMuxer
-        do {
-            muxer = try MP4SegmentMuxer(
-                initialSegmentIndex: firstTiming.index,
-                sessionDir: sessionDirectory,
-                audioOnly: route.audioConfig,
-                preserveEncoderPriming: true,
-                maxBufferedFragmentSeconds: maxBufferedFragmentSeconds(for: timeline),
-                onInitCaptured: { capturedInitSegment = $0 }
-            )
-        } catch {
-            throw BlackCarrierAudioRenditionMuxerError.muxerSetupFailed(
-                reason: String(describing: error)
-            )
+    final class Writer {
+        private final class InitCapture {
+            var data: Data?
         }
 
-        var currentOffset = 0
-        var wroteCurrentSegment = false
-        var peakBandwidth = 0
-        var totalMediaBytes = 0
-        var presentationTimelineOffset: Int64?
+        let sourceStreamIndex: Int32
 
-        func emitFinalized(
+        private let timeline: BlackCarrierTimeline
+        private let lastTiming: BlackCarrierSegmentTiming
+        private let route: PreparedRoute
+        private let muxer: MP4SegmentMuxer
+        private let initCapture: InitCapture
+        private let onInit: (Data) -> Void
+        private let onSegment: SegmentSink
+
+        private var currentOffset = 0
+        private var wroteCurrentSegment = false
+        private var peakBandwidth = 0
+        private var totalMediaBytes = 0
+        private var presentationTimelineOffset: Int64?
+        private var isFinished = false
+
+        fileprivate init(
+            sourceStreamIndex: Int32,
+            sourceStream: UnsafeMutablePointer<AVStream>,
+            sourceStartPTS: Int64,
+            timeline: BlackCarrierTimeline,
+            bridgeMode: AudioBridgeMode,
+            sessionDirectory: URL,
+            onInit: @escaping (Data) -> Void,
+            onSegment: @escaping SegmentSink
+        ) throws {
+            guard let firstTiming = timeline.segments.first,
+                  let lastTiming = timeline.segments.last else {
+                throw BlackCarrierAudioRenditionMuxerError.emptyTimeline
+            }
+            self.sourceStreamIndex = sourceStreamIndex
+            self.timeline = timeline
+            self.lastTiming = lastTiming
+            self.onInit = onInit
+            self.onSegment = onSegment
+            route = try prepareRoute(
+                sourceStream: sourceStream,
+                sourceStartPTS: sourceStartPTS,
+                bridgeMode: bridgeMode
+            )
+            _ = route.ownedCodecParameters
+
+            let capture = InitCapture()
+            initCapture = capture
+            do {
+                muxer = try MP4SegmentMuxer(
+                    initialSegmentIndex: firstTiming.index,
+                    sessionDir: sessionDirectory,
+                    audioOnly: route.audioConfig,
+                    preserveEncoderPriming: true,
+                    maxBufferedFragmentSeconds: maxBufferedFragmentSeconds(
+                        for: timeline
+                    ),
+                    onInitCaptured: { capture.data = $0 }
+                )
+            } catch {
+                route.bridge?.close()
+                throw BlackCarrierAudioRenditionMuxerError.muxerSetupFailed(
+                    reason: String(describing: error)
+                )
+            }
+        }
+
+        deinit {
+            route.bridge?.close()
+        }
+
+        func consume(
+            _ sourcePacket: UnsafeMutablePointer<AVPacket>
+        ) throws {
+            guard !isFinished else {
+                throw BlackCarrierAudioRenditionMuxerError.alreadyFinished
+            }
+            guard sourcePacket.pointee.stream_index == sourceStreamIndex else {
+                return
+            }
+
+            if let bridge = route.bridge {
+                let outputs: [UnsafeMutablePointer<AVPacket>]
+                do {
+                    outputs = try bridge.feed(packet: sourcePacket)
+                } catch {
+                    throw BlackCarrierAudioRenditionMuxerError.bridgeFeedFailed(
+                        reason: String(describing: error)
+                    )
+                }
+                for output in outputs {
+                    var outputToFree: UnsafeMutablePointer<AVPacket>? = output
+                    defer { trackedPacketFree(&outputToFree) }
+                    try writeOutputPacket(output)
+                }
+            } else {
+                try writeOutputPacket(sourcePacket)
+            }
+        }
+
+        func finish() throws -> BlackCarrierAudioRenditionSummary {
+            guard !isFinished else {
+                throw BlackCarrierAudioRenditionMuxerError.alreadyFinished
+            }
+            isFinished = true
+            defer { route.bridge?.close() }
+
+            if let bridge = route.bridge {
+                for output in bridge.flush() {
+                    var outputToFree: UnsafeMutablePointer<AVPacket>? = output
+                    defer { trackedPacketFree(&outputToFree) }
+                    try writeOutputPacket(output)
+                }
+            }
+
+            guard currentOffset == timeline.segments.count - 1,
+                  wroteCurrentSegment else {
+                let missingOffset = min(
+                    currentOffset + (wroteCurrentSegment ? 1 : 0),
+                    timeline.segments.count - 1
+                )
+                throw BlackCarrierAudioRenditionMuxerError.emptySegment(
+                    index: timeline.segments[missingOffset].index
+                )
+            }
+            try emitFinalized(muxer.finalize(), timing: lastTiming)
+
+            guard let initSegment = initCapture.data else {
+                throw BlackCarrierAudioRenditionMuxerError.initSegmentMissing
+            }
+            onInit(initSegment)
+
+            let duration = CMTimeGetSeconds(timeline.duration)
+            let presentationTrimSamples = samples(
+                forTicks: presentationTimelineOffset ?? 0,
+                packetTimeBase: route.packetTimeBase,
+                sampleRate: route.sampleRate
+            )
+            return BlackCarrierAudioRenditionSummary(
+                pipeline: route.pipeline,
+                codecString: route.codecString,
+                channelsAttribute: route.channelsAttribute,
+                declaredCodecInitialPaddingSamples:
+                    route.declaredCodecInitialPaddingSamples,
+                presentationTrimSamples: presentationTrimSamples,
+                peakBandwidth: max(1, peakBandwidth),
+                averageBandwidth: max(
+                    1,
+                    Int(ceil(Double(totalMediaBytes) * 8 / duration))
+                )
+            )
+        }
+
+        private func emitFinalized(
             _ finalized: (path: URL, bytesWritten: Int)?,
             timing: BlackCarrierSegmentTiming
         ) throws {
@@ -162,7 +268,7 @@ enum BlackCarrierAudioRenditionMuxer {
             totalMediaBytes += finalized.bytesWritten
         }
 
-        func writeOutputPacket(
+        private func writeOutputPacket(
             _ packet: UnsafeMutablePointer<AVPacket>
         ) throws {
             if packet.pointee.pts == Int64.min {
@@ -249,75 +355,64 @@ enum BlackCarrierAudioRenditionMuxer {
             }
             wroteCurrentSegment = true
         }
+    }
 
+    static func makeWriter(
+        demuxer: Demuxer,
+        audioStreamIndex: Int32,
+        sourceStartPTS: Int64,
+        timeline: BlackCarrierTimeline,
+        bridgeMode: AudioBridgeMode = .surroundCompat,
+        sessionDirectory: URL,
+        onInit: @escaping (Data) -> Void,
+        onSegment: @escaping SegmentSink
+    ) throws -> Writer {
+        guard audioStreamIndex >= 0,
+              let sourceStream = demuxer.stream(at: audioStreamIndex),
+              sourceStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_AUDIO else {
+            throw BlackCarrierAudioRenditionMuxerError.audioStreamMissing(
+                index: audioStreamIndex
+            )
+        }
+        return try Writer(
+            sourceStreamIndex: audioStreamIndex,
+            sourceStream: sourceStream,
+            sourceStartPTS: sourceStartPTS,
+            timeline: timeline,
+            bridgeMode: bridgeMode,
+            sessionDirectory: sessionDirectory,
+            onInit: onInit,
+            onSegment: onSegment
+        )
+    }
+
+    static func mux(
+        demuxer: Demuxer,
+        audioStreamIndex: Int32,
+        sourceStartPTS: Int64,
+        timeline: BlackCarrierTimeline,
+        bridgeMode: AudioBridgeMode = .surroundCompat,
+        sessionDirectory: URL,
+        onInit: @escaping (Data) -> Void,
+        onSegment: @escaping SegmentSink
+    ) throws -> BlackCarrierAudioRenditionSummary {
+        let writer = try makeWriter(
+            demuxer: demuxer,
+            audioStreamIndex: audioStreamIndex,
+            sourceStartPTS: sourceStartPTS,
+            timeline: timeline,
+            bridgeMode: bridgeMode,
+            sessionDirectory: sessionDirectory,
+            onInit: onInit,
+            onSegment: onSegment
+        )
+        demuxer.discardAllStreamsExcept([audioStreamIndex])
         while let sourcePacket = try demuxer.readPacket() {
             var sourcePacketToFree: UnsafeMutablePointer<AVPacket>? = sourcePacket
             defer { trackedPacketFree(&sourcePacketToFree) }
-            guard sourcePacket.pointee.stream_index == audioStreamIndex else { continue }
-
-            if let bridge = route.bridge {
-                let outputs: [UnsafeMutablePointer<AVPacket>]
-                do {
-                    outputs = try bridge.feed(packet: sourcePacket)
-                } catch {
-                    throw BlackCarrierAudioRenditionMuxerError.bridgeFeedFailed(
-                        reason: String(describing: error)
-                    )
-                }
-                for output in outputs {
-                    var outputToFree: UnsafeMutablePointer<AVPacket>? = output
-                    defer { trackedPacketFree(&outputToFree) }
-                    try writeOutputPacket(output)
-                }
-            } else {
-                try writeOutputPacket(sourcePacket)
-            }
+            try writer.consume(sourcePacket)
         }
-
-        if let bridge = route.bridge {
-            for output in bridge.flush() {
-                var outputToFree: UnsafeMutablePointer<AVPacket>? = output
-                defer { trackedPacketFree(&outputToFree) }
-                try writeOutputPacket(output)
-            }
-        }
-
-        guard currentOffset == timeline.segments.count - 1,
-              wroteCurrentSegment else {
-            let missingOffset = min(
-                currentOffset + (wroteCurrentSegment ? 1 : 0),
-                timeline.segments.count - 1
-            )
-            throw BlackCarrierAudioRenditionMuxerError.emptySegment(
-                index: timeline.segments[missingOffset].index
-            )
-        }
-        try emitFinalized(muxer.finalize(), timing: lastTiming)
-
-        guard let initSegment = capturedInitSegment else {
-            throw BlackCarrierAudioRenditionMuxerError.initSegmentMissing
-        }
-        onInit(initSegment)
-
-        let duration = CMTimeGetSeconds(timeline.duration)
-        let presentationTrimSamples = samples(
-            forTicks: presentationTimelineOffset ?? 0,
-            packetTimeBase: route.packetTimeBase,
-            sampleRate: route.sampleRate
-        )
-        return BlackCarrierAudioRenditionSummary(
-            pipeline: route.pipeline,
-            codecString: route.codecString,
-            channelsAttribute: route.channelsAttribute,
-            declaredCodecInitialPaddingSamples:
-                route.declaredCodecInitialPaddingSamples,
-            presentationTrimSamples: presentationTrimSamples,
-            peakBandwidth: max(1, peakBandwidth),
-            averageBandwidth: max(
-                1,
-                Int(ceil(Double(totalMediaBytes) * 8 / duration))
-            )
-        )
+        return try writer.finish()
     }
 
     private static let approvedTimelineTimeBase = AVRational(
