@@ -760,6 +760,60 @@ struct HybridPlaybackSessionTests {
         )
     }
 
+    @Test("Presentation drift before provider prewarm is terminal and never starts carrier")
+    @MainActor
+    func presentationDriftBeforeProviderPrewarm() async throws {
+        let fixture = try makeSession()
+        let expected = HybridPlaybackSessionError
+            .carrierPresentationContractChanged
+        var validationCount = 0
+
+        await #expect(throws: expected) {
+            try await fixture.session.prepare(
+                timeout: 1
+            ) {
+                validationCount += 1
+                if validationCount == 2 {
+                    throw expected
+                }
+            }
+        }
+
+        #expect(validationCount == 2)
+        #expect(!fixture.provider.snapshot().prepared)
+        #expect(!fixture.transport.didStart)
+        #expect(fixture.transport.didStop)
+        #expect(fixture.renderSurface.flushCount == 1)
+        #expect(fixture.session.state == .failed(expected))
+    }
+
+    @Test("Presentation drift after provider prewarm is terminal before carrier startup")
+    @MainActor
+    func presentationDriftAfterProviderPrewarm() async throws {
+        let fixture = try makeSession()
+        let expected = HybridPlaybackSessionError
+            .carrierPresentationContractChanged
+        var validationCount = 0
+
+        await #expect(throws: expected) {
+            try await fixture.session.prepare(
+                timeout: 1
+            ) {
+                validationCount += 1
+                if validationCount == 3 {
+                    throw expected
+                }
+            }
+        }
+
+        #expect(validationCount == 3)
+        #expect(fixture.provider.snapshot().prepared)
+        #expect(!fixture.transport.didStart)
+        #expect(fixture.transport.didStop)
+        #expect(fixture.renderSurface.flushCount == 1)
+        #expect(fixture.session.state == .failed(expected))
+    }
+
     @Test("Hybrid telemetry emits immediate transport changes and at most one clock sample per second")
     @MainActor
     func structuredTelemetryTriggerCadence() async throws {

@@ -13,12 +13,14 @@ Prove that the fixed 640×360 SDR black carrier never becomes the source of trut
 geometry, refresh rate or dynamic range. AVPlayerViewController remains the native control/audio host;
 AetherEngine remains the sole real-video renderer and display-criteria writer.
 
-On tvOS, the host must call `configureCarrierPlayerViewController(_:realVideoGravity:)` before
-`prepare()`. The contract fixes carrier `videoGravity` to `.resizeAspect`, sets
+On tvOS, the host must `try configureCarrierPlayerViewController(_:realVideoGravity:)` while the
+session is idle, attach `metalPlayerView` beneath `contentOverlayView`, then call `prepare()`. The
+contract fixes carrier `videoGravity` to `.resizeAspect`, sets
 `appliesPreferredDisplayCriteriaAutomatically = false`, binds the session AVPlayer, and leaves real-video
 aspect-fit/fill to `AetherMetalPlayerView`. Missing or mutated configuration is terminal
 `carrierPresentationNotConfigured` / `carrierPresentationContractChanged`; it does not start AVPlayer,
-guess display criteria or switch route.
+guess display criteria or switch route. Configuration attempted after idle throws
+`carrierPresentationConfigurationTooLate` without mutating the controller.
 
 ## Fixture contract
 
@@ -55,10 +57,11 @@ the explicitly named control rows with them disabled.
 4. For a standard real-video rate, confirm the display switches to the requested rate and structured
    diagnostics report that source rate. For the unusual/unknown-rate row, confirm Aether does not invent
    24 fps or issue a criteria write from the carrier.
-5. Confirm the host keeps `appliesPreferredDisplayCriteriaAutomatically = false` for the whole session.
-   Deliberately mutate player binding, carrier gravity and automatic-criteria ownership in diagnostic
-   builds; each mutation must produce the matching typed terminal failure without playback startup or
-   route change.
+5. Confirm the host keeps `appliesPreferredDisplayCriteriaAutomatically = false` and the Metal surface
+   beneath `contentOverlayView` for the whole session. Deliberately mutate player binding, carrier gravity,
+   automatic-criteria ownership and overlay attachment in diagnostic builds; each mutation must produce
+   the matching typed terminal failure without playback startup or route change. Also attempt configuration
+   after `prepare()` begins and confirm `carrierPresentationConfigurationTooLate` without controller mutation.
 6. Stop and dismiss. Confirm Aether resets `preferredDisplayCriteria`, releases the Metal drawable/queue,
    removes the carrier item and leaves no previous generation visible on reopen.
 7. For each future HDR/HLG/Dolby Vision row, confirm the panel enters the intended mode, the Metal output
