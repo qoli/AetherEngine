@@ -421,7 +421,9 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         targetTime: CMTime,
         restartDecodeAnchorTime: CMTime?,
         demuxer: Demuxer,
-        stream: UnsafeMutablePointer<AVStream>
+        stream: UnsafeMutablePointer<AVStream>,
+        sourceStartPTSOverride: Int64? = nil,
+        packetsAreNormalizedToSourceAxis: Bool = false
     ) throws {
         operationLock.lock()
         defer { operationLock.unlock() }
@@ -443,7 +445,9 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         }
         guard try validate(
             demuxer: demuxer,
-            stream: stream
+            stream: stream,
+            sourceStartPTSOverride:
+                sourceStartPTSOverride
         ) else {
             let error = HybridVideoDecodeSinkError.streamContractMismatch
             recordFailure(error)
@@ -470,29 +474,46 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
             targetTime,
             CMTime(seconds: 4, preferredTimescale: 600)
         )
-        let timeBase = AVRational(
-            num: streamContract.packetTimeBaseNumerator,
-            den: streamContract.packetTimeBaseDenominator
-        )
-        if let restartDecodeAnchorTime {
-            guard let anchorTicks =
-                    BlackCarrierSourceAxis.streamTicks(
-                        for: restartDecodeAnchorTime,
-                        timeBase: timeBase
-                    ) else {
-                let error = HybridVideoDecodeSinkError
-                    .invalidTargetTime
-                recordFailure(error)
-                throw error
-            }
-            restartDecodeAnchorPTS = anchorTicks
-        } else {
+        if packetsAreNormalizedToSourceAxis {
             restartDecodeAnchorPTS = nil
+            restartBeyondSourceOrigin = false
+            generationTimestampRebase = 0
+            acceptsSourceOriginPacketPosition = false
+        } else {
+            let timeBase = AVRational(
+                num:
+                    streamContract
+                        .packetTimeBaseNumerator,
+                den:
+                    streamContract
+                        .packetTimeBaseDenominator
+            )
+            if let restartDecodeAnchorTime {
+                guard let anchorTicks =
+                        BlackCarrierSourceAxis.streamTicks(
+                            for:
+                                restartDecodeAnchorTime,
+                            timeBase: timeBase
+                        ) else {
+                    let error =
+                        HybridVideoDecodeSinkError
+                            .invalidTargetTime
+                    recordFailure(error)
+                    throw error
+                }
+                restartDecodeAnchorPTS = anchorTicks
+            } else {
+                restartDecodeAnchorPTS = nil
+            }
+            restartBeyondSourceOrigin =
+                CMTimeCompare(
+                    targetTime,
+                    .zero
+                ) > 0
+            generationTimestampRebase = nil
+            acceptsSourceOriginPacketPosition =
+                false
         }
-        restartBeyondSourceOrigin =
-            CMTimeCompare(targetTime, .zero) > 0
-        generationTimestampRebase = nil
-        acceptsSourceOriginPacketPosition = false
         sourceEnded = false
         didFinishDecoder = false
     }

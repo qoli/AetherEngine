@@ -71,6 +71,7 @@ final class HLSVODCarrierProvider:
     private let resolvedHybridVideoFormat: VideoFormat?
 
     private let closeLock = NSLock()
+    private let restartLock = NSLock()
     private var isClosed = false
     private let failureLock = NSLock()
     private var _terminalError:
@@ -326,6 +327,25 @@ final class HLSVODCarrierProvider:
         }
     }
 
+    func restartMedia(
+        for intent: HybridSeekIntent
+    ) throws -> BlackCarrierMediaFanoutRestartResult {
+        restartLock.lock()
+        defer { restartLock.unlock() }
+        try requireOpen()
+        do {
+            return try BlockingAsyncBridge.wait {
+                try await self.pump.restart(
+                    for: intent
+                )
+            }
+        } catch {
+            let typed = Self.typed(error)
+            recordIfTerminal(typed)
+            throw typed
+        }
+    }
+
     func prepareHybridGeneration(
         segmentIndex: Int
     ) throws {
@@ -339,7 +359,7 @@ final class HLSVODCarrierProvider:
             }
         } catch {
             let typed = Self.typed(error)
-            record(typed)
+            recordIfTerminal(typed)
             throw typed
         }
     }
@@ -457,7 +477,9 @@ final class HLSVODCarrierProvider:
                     )
             }
         } catch {
-            record(Self.typed(error))
+            recordIfTerminal(
+                Self.typed(error)
+            )
             return nil
         }
     }
@@ -481,7 +503,9 @@ final class HLSVODCarrierProvider:
                     )
             }
         } catch {
-            record(Self.typed(error))
+            recordIfTerminal(
+                Self.typed(error)
+            )
             return nil
         }
     }
@@ -505,7 +529,9 @@ final class HLSVODCarrierProvider:
                     )
             }
         } catch {
-            record(Self.typed(error))
+            recordIfTerminal(
+                Self.typed(error)
+            )
             return nil
         }
     }
@@ -555,9 +581,22 @@ final class HLSVODCarrierProvider:
             }
             return true
         } catch {
-            record(Self.typed(error))
+            recordIfTerminal(
+                Self.typed(error)
+            )
             return false
         }
+    }
+
+    private func recordIfTerminal(
+        _ error: HLSVODCarrierProviderError
+    ) {
+        if case .pump(
+            .generationSuperseded
+        ) = error {
+            return
+        }
+        record(error)
     }
 
     private func record(
@@ -596,6 +635,10 @@ final class HLSVODCarrierProvider:
         )
     }
 }
+
+extension HLSVODCarrierProvider:
+    HybridCarrierTransportProvider
+{}
 
 private enum BlockingAsyncBridge {
     private final class ResultBox<Value>:

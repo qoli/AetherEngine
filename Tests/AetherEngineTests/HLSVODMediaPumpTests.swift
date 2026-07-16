@@ -71,21 +71,74 @@ final class HLSVODMediaPumpTests: XCTestCase {
         @unchecked Sendable
     {
         private let lock = NSLock()
-        private var presentationTimes: [CMTime] = []
+        private var frames: [DecodedVideoFrame] = []
 
         func append(_ frame: DecodedVideoFrame) {
             lock.lock()
-            presentationTimes.append(
-                frame.presentationTime
-            )
+            frames.append(frame)
             lock.unlock()
         }
 
         var values: [CMTime] {
             lock.lock()
             defer { lock.unlock() }
-            return presentationTimes
+            return frames.map(\.presentationTime)
         }
+
+        var generations: [UInt64] {
+            lock.lock()
+            defer { lock.unlock() }
+            return frames.map(\.generation)
+        }
+    }
+
+    private actor FetchBlocker {
+        private let store: FetchStore
+        private let blockedURL: URL
+        private var requestCount = 0
+        private var isReleased = false
+
+        init(
+            store: FetchStore,
+            blockedURL: URL
+        ) {
+            self.store = store
+            self.blockedURL = blockedURL
+        }
+
+        func response(
+            for request: URLRequest
+        ) async throws
+            -> HLSVODOriginFetchResponse
+        {
+            if request.url == blockedURL {
+                requestCount += 1
+                while !isReleased {
+                    try await Task.sleep(
+                        for: .milliseconds(5)
+                    )
+                }
+            }
+            return try store.response(
+                for: request
+            )
+        }
+
+        func waitForRequestCount(
+            _ expected: Int
+        ) async throws {
+            while requestCount < expected {
+                try await Task.sleep(
+                    for: .milliseconds(5)
+                )
+            }
+        }
+
+        func release() {
+            isReleased = true
+        }
+
+        var count: Int { requestCount }
     }
 
     private struct Fixture {
@@ -324,6 +377,399 @@ final class HLSVODMediaPumpTests: XCTestCase {
         )
     }
 
+    func testExplicitSeekReplacesTheHLSGeneration()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let capture = FrameCapture()
+        let pump = try await HLSVODMediaPump.make(
+            preflight: fixture.preflight,
+            decodedFrameHandler: { frame in
+                capture.append(frame)
+            },
+            fetchOverride: { request, _ in
+                try fixture.fetchStore.response(
+                    for: request
+                )
+            }
+        )
+        addTeardownBlock {
+            try await pump.close()
+        }
+
+        try await pump.produce(
+            throughSegment: 0
+        )
+        let optionalInitialAudioInit =
+            try await pump.audioInitSegment(
+                renditionOrdinal: 0
+            )
+        let initialAudioInit = try XCTUnwrap(
+            optionalInitialAudioInit
+        )
+        var classifier =
+            HybridSeekIntentClassifier(
+                timeline:
+                    try XCTUnwrap(
+                        fixture.preflight
+                            .hybridTimeline
+                    )
+            )
+        let intent =
+            try classifier
+                .registerExplicitHostSeek(
+                    to: CMTime(
+                        seconds: 1.5,
+                        preferredTimescale:
+                            90_000
+                    )
+                )
+
+        let restartResult =
+            try await pump.restart(for: intent)
+        XCTAssertEqual(
+            restartResult,
+            .applied(
+                generation: 1,
+                segmentIndex: 1
+            )
+        )
+        let restarted =
+            await pump.snapshot()
+        XCTAssertEqual(restarted.generation, 1)
+        XCTAssertEqual(
+            restarted
+                .nextVideoInputSegmentIndex,
+            1
+        )
+        XCTAssertEqual(
+            restarted
+                .nextAudioInputSegmentIndices,
+            [1]
+        )
+        XCTAssertEqual(
+            restarted
+                .highestProducedVideoSegmentIndex,
+            0
+        )
+        XCTAssertEqual(
+            restarted
+                .highestFinalizedAudioSegmentIndices,
+            [0]
+        )
+
+        try await pump.produce(
+            throughSegment: 1
+        )
+        let final = await pump.snapshot()
+        XCTAssertEqual(
+            final.highestProducedVideoSegmentIndex,
+            1
+        )
+        XCTAssertEqual(
+            final
+                .highestFinalizedAudioSegmentIndices,
+            [1]
+        )
+        XCTAssertTrue(
+            capture.generations.contains(1)
+        )
+        XCTAssertTrue(
+            zip(
+                capture.generations,
+                capture.values
+            ).contains {
+                generation,
+                presentationTime in
+                generation == 1
+                    && CMTimeCompare(
+                        presentationTime,
+                        CMTime(
+                            value: 90_000,
+                            timescale: 90_000
+                        )
+                    ) == 0
+            }
+        )
+
+        let optionalRestartedAudioInit =
+            try await pump.audioInitSegment(
+                renditionOrdinal: 0
+            )
+        let restartedAudioInit =
+            try XCTUnwrap(
+                optionalRestartedAudioInit
+            )
+        XCTAssertEqual(
+            restartedAudioInit,
+            initialAudioInit
+        )
+        let optionalRestartedAudio =
+            try await pump.audioMediaSegment(
+                renditionOrdinal: 0,
+                segmentIndex: 1
+            )
+        let restartedAudio =
+            try XCTUnwrap(
+                optionalRestartedAudio
+            )
+        XCTAssertEqual(
+            fragmentBaseMediaDecodeTime(
+                restartedAudio
+            ),
+            fixture
+                .audioSegmentBaseDecodeTimes[1]
+        )
+        let staleResult =
+            try await pump.restart(for: intent)
+        XCTAssertEqual(
+            staleResult,
+            .stale(currentGeneration: 1)
+        )
+        do {
+            _ = try await pump
+                .finishProduction()
+            XCTFail(
+                "seek generation unexpectedly produced full-asset bandwidth evidence"
+            )
+        } catch let error
+                as HLSVODMediaPumpError {
+            XCTAssertEqual(
+                error,
+                .fullAssetSummaryUnavailableAfterRestart(
+                    generation: 1
+                )
+            )
+        }
+
+        let backwardIntent =
+            try classifier
+                .registerPlayerTimeJump(
+                    to: CMTime(
+                        seconds: 0.25,
+                        preferredTimescale:
+                            90_000
+                    )
+                )
+        let backwardRestart =
+            try await pump.restart(
+                for: backwardIntent
+            )
+        XCTAssertEqual(
+            backwardRestart,
+            .applied(
+                generation: 2,
+                segmentIndex: 0
+            )
+        )
+        try await pump.produce(
+            throughSegment: 0
+        )
+        let backwardSnapshot =
+            await pump.snapshot()
+        XCTAssertEqual(
+            backwardSnapshot.generation,
+            2
+        )
+        XCTAssertEqual(
+            backwardSnapshot
+                .generationStartSegmentIndex,
+            0
+        )
+        XCTAssertTrue(
+            zip(
+                capture.generations,
+                capture.values
+            ).contains {
+                generation,
+                presentationTime in
+                generation == 2
+                    && CMTimeCompare(
+                        presentationTime,
+                        .zero
+                    ) == 0
+            }
+        )
+        let optionalBackwardAudio =
+            try await pump.audioMediaSegment(
+                renditionOrdinal: 0,
+                segmentIndex: 0
+            )
+        let backwardAudio =
+            try XCTUnwrap(
+                optionalBackwardAudio
+            )
+        XCTAssertEqual(
+            fragmentBaseMediaDecodeTime(
+                backwardAudio
+            ),
+            fixture
+                .audioSegmentBaseDecodeTimes[0]
+        )
+    }
+
+    func testHLSRestartRejectsNonSeekAndMismatchedIntent()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let pump = try await HLSVODMediaPump.make(
+            preflight: fixture.preflight,
+            fetchOverride: { request, _ in
+                try fixture.fetchStore.response(
+                    for: request
+                )
+            }
+        )
+        addTeardownBlock {
+            try await pump.close()
+        }
+
+        do {
+            _ = try await pump.restart(
+                for: .prefetch(
+                    segmentIndex: 1,
+                    generation: 0
+                )
+            )
+            XCTFail(
+                "prefetch unexpectedly restarted HLS media"
+            )
+        } catch let error
+                as HLSVODMediaPumpError {
+            XCTAssertEqual(
+                error,
+                .restartRequiresUserSeek
+            )
+        }
+
+        do {
+            _ = try await pump.restart(
+                for: .userSeek(
+                    target: CMTime(
+                        seconds: 1.5,
+                        preferredTimescale:
+                            90_000
+                    ),
+                    segmentIndex: 0,
+                    generation: 1
+                )
+            )
+            XCTFail(
+                "mismatched seek intent unexpectedly restarted HLS media"
+            )
+        } catch let error
+                as HLSVODMediaPumpError {
+            XCTAssertEqual(
+                error,
+                .seekIntentSegmentMismatch(
+                    expected: 1,
+                    actual: 0
+                )
+            )
+        }
+    }
+
+    func testSeekSupersedesInFlightHLSProduction()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let blocker = FetchBlocker(
+            store: fixture.fetchStore,
+            blockedURL:
+                fixture.videoSegmentURLs[1]
+        )
+        let pump = try await HLSVODMediaPump.make(
+            preflight: fixture.preflight,
+            fetchOverride: { request, _ in
+                try await blocker.response(
+                    for: request
+                )
+            }
+        )
+        addTeardownBlock {
+            try await pump.close()
+        }
+
+        try await pump.produce(
+            throughSegment: 0
+        )
+        let retiringProduction = Task {
+            try await pump.produce(
+                throughSegment: 1
+            )
+        }
+        try await blocker.waitForRequestCount(1)
+
+        var classifier =
+            HybridSeekIntentClassifier(
+                timeline:
+                    try XCTUnwrap(
+                        fixture.preflight
+                            .hybridTimeline
+                    )
+            )
+        let intent =
+            try classifier
+                .registerExplicitHostSeek(
+                    to: CMTime(
+                        seconds: 1.5,
+                        preferredTimescale:
+                            90_000
+                    )
+                )
+        let restart = Task {
+            try await pump.restart(for: intent)
+        }
+        try await blocker.waitForRequestCount(2)
+        await blocker.release()
+
+        let restartResult =
+            try await restart.value
+        XCTAssertEqual(
+            restartResult,
+            .applied(
+                generation: 1,
+                segmentIndex: 1
+            )
+        )
+        do {
+            try await retiringProduction.value
+            XCTFail(
+                "retiring generation unexpectedly completed"
+            )
+        } catch let error
+                as HLSVODMediaPumpError {
+            XCTAssertEqual(
+                error,
+                .generationSuperseded(
+                    generation: 0
+                )
+            )
+        }
+        let blockedRequestCount =
+            await blocker.count
+        XCTAssertEqual(
+            blockedRequestCount,
+            2
+        )
+
+        try await pump.produce(
+            throughSegment: 1
+        )
+        let snapshot = await pump.snapshot()
+        XCTAssertEqual(snapshot.generation, 1)
+        XCTAssertEqual(
+            snapshot
+                .generationStartSegmentIndex,
+            1
+        )
+        XCTAssertEqual(
+            snapshot
+                .highestFinalizedAudioSegmentIndices,
+            [1]
+        )
+    }
+
     func testFactoryRejectsManifestChannelMismatch()
         async throws
     {
@@ -437,6 +883,38 @@ final class HLSVODMediaPumpTests: XCTestCase {
             baseURL.appendingPathComponent(
                 "audio_0_seg_0.mp4"
             )
+        )
+        var classifier =
+            HybridSeekIntentClassifier(
+                timeline:
+                    try XCTUnwrap(
+                        fixture.preflight
+                            .hybridTimeline
+                    )
+            )
+        let intent =
+            try classifier
+                .registerExplicitHostSeek(
+                    to: CMTime(
+                        seconds: 1.5,
+                        preferredTimescale:
+                            90_000
+                    )
+                )
+        XCTAssertEqual(
+            try provider.restartMedia(
+                for: intent
+            ),
+            .applied(
+                generation: 1,
+                segmentIndex: 1
+            )
+        )
+        XCTAssertEqual(
+            try provider.restartMedia(
+                for: intent
+            ),
+            .stale(currentGeneration: 1)
         )
         let secondVideo = try await fetchData(
             baseURL.appendingPathComponent(

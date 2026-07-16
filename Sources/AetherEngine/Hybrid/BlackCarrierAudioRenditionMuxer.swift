@@ -15,6 +15,7 @@ enum BlackCarrierAudioRenditionMuxerError: Error, LocalizedError, Sendable, Equa
     case muxerSetupFailed(reason: String)
     case bridgeFeedFailed(reason: String)
     case invalidStartingSegment(index: Int)
+    case restartTimestampOffsetOverflow
     case nonMonotonicSegment(previous: Int, next: Int)
     case emptySegment(index: Int)
     case packetWriteFailed(segmentIndex: Int, code: Int32)
@@ -44,6 +45,8 @@ enum BlackCarrierAudioRenditionMuxerError: Error, LocalizedError, Sendable, Equa
             return "Black carrier audio bridge failed while decoding: \(reason)"
         case .invalidStartingSegment(let index):
             return "Black carrier audio restart segment \(index) is out of range"
+        case .restartTimestampOffsetOverflow:
+            return "Black carrier audio restart timestamp offset overflowed"
         case .nonMonotonicSegment(let previous, let next):
             return "Black carrier audio segment order regressed from \(previous) to \(next)"
         case .emptySegment(let index):
@@ -228,6 +231,44 @@ enum BlackCarrierAudioRenditionMuxer {
                 constantRateBridgeProfile:
                     route.constantRateBridgeProfile
             )
+        }
+
+        func restartDecodeTimestampOffset(
+            sourceDecodeDelta: Int64,
+            sourceTimeBase: AVRational
+        ) throws -> Int64 {
+            guard sourceTimeBase.num > 0,
+                  sourceTimeBase.den > 0,
+                  route.packetTimeBase.num > 0,
+                  route.packetTimeBase.den > 0 else {
+                throw BlackCarrierAudioRenditionMuxerError
+                    .restartTimestampOffsetOverflow
+            }
+            let rescaledBoundaryDelta =
+                av_rescale_q(
+                    sourceDecodeDelta,
+                    sourceTimeBase,
+                    route.packetTimeBase
+                )
+            guard rescaledBoundaryDelta
+                    != Int64.min,
+                  rescaledBoundaryDelta
+                    != Int64.max else {
+                throw BlackCarrierAudioRenditionMuxerError
+                    .restartTimestampOffsetOverflow
+            }
+            let presentationOffset =
+                presentationTimelineOffset ?? 0
+            let result =
+                presentationOffset
+                    .addingReportingOverflow(
+                        rescaledBoundaryDelta
+                    )
+            guard !result.overflow else {
+                throw BlackCarrierAudioRenditionMuxerError
+                    .restartTimestampOffsetOverflow
+            }
+            return result.partialValue
         }
 
         func consume(

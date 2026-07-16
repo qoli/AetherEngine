@@ -14,6 +14,22 @@ enum HLSVODMediaPumpError:
     case closed
     case cancelled
     case targetSegmentOutOfRange(Int)
+    case restartRequiresUserSeek
+    case seekIntentSegmentMismatch(
+        expected: Int,
+        actual: Int
+    )
+    case generationSuperseded(generation: UInt64)
+    case restartTimelineOffsetUnavailable(
+        renditionOrdinal: Int
+    )
+    case fragmentDecodeTimeMissing(
+        trackID: UInt32,
+        segmentIndex: Int
+    )
+    case fullAssetSummaryUnavailableAfterRestart(
+        generation: UInt64
+    )
     case origin(HLSVODOriginResourceError)
     case demuxOpenFailed
     case packetReadFailed
@@ -80,6 +96,28 @@ enum HLSVODMediaPumpError:
             "HLS VOD media pump was cancelled"
         case .targetSegmentOutOfRange(let index):
             "HLS VOD media pump target segment \(index) is out of range"
+        case .restartRequiresUserSeek:
+            "HLS VOD media pump restart requires an explicit user-seek intent"
+        case .seekIntentSegmentMismatch(
+            let expected,
+            let actual
+        ):
+            "HLS VOD seek intent segment \(actual) does not match target segment \(expected)"
+        case .generationSuperseded(let generation):
+            "HLS VOD media pump generation \(generation) was superseded by a later seek"
+        case .restartTimelineOffsetUnavailable(
+            let ordinal
+        ):
+            "HLS VOD audio rendition \(ordinal) has no startup timeline offset for restart"
+        case .fragmentDecodeTimeMissing(
+            let trackID,
+            let segmentIndex
+        ):
+            "HLS VOD fMP4 segment \(segmentIndex) has no unique tfdt evidence for track \(trackID)"
+        case .fullAssetSummaryUnavailableAfterRestart(
+            let generation
+        ):
+            "HLS VOD generation \(generation) cannot produce full-asset bandwidth evidence after seek restart"
         case .origin(let error):
             error.localizedDescription
         case .demuxOpenFailed:
@@ -125,6 +163,8 @@ enum HLSVODMediaPumpError:
 }
 
 struct HLSVODMediaPumpSnapshot: Sendable, Equatable {
+    let generation: UInt64
+    let generationStartSegmentIndex: Int
     let nextVideoInputSegmentIndex: Int
     let nextAudioInputSegmentIndices: [Int]
     let highestProducedVideoSegmentIndex: Int
@@ -164,6 +204,12 @@ actor HLSVODMediaPump {
     private var terminalError: HLSVODMediaPumpError?
     private var isClosed = false
     private var productionInProgress = false
+    private var restartInProgress = false
+    private var currentGeneration: UInt64
+    private var generationStartSegmentIndex = 0
+    private var didRestart = false
+    private var requestedRestartGeneration: UInt64?
+    private var productionTask: Task<Void, Never>?
     private var productionWaiters: [
         CheckedContinuation<Void, Never>
     ] = []
@@ -278,7 +324,8 @@ actor HLSVODMediaPump {
                 loader: loader,
                 worker: worker,
                 videoInitData: videoInitData,
-                audioInitData: audioInitData
+                audioInitData: audioInitData,
+                initialGeneration: initialGeneration
             )
         } catch {
             do {
@@ -299,13 +346,15 @@ actor HLSVODMediaPump {
         loader: HLSVODOriginResourceLoader,
         worker: Worker,
         videoInitData: Data?,
-        audioInitData: [Data?]
+        audioInitData: [Data?],
+        initialGeneration: UInt64
     ) {
         self.graph = graph
         self.loader = loader
         self.worker = worker
         self.videoInitData = videoInitData
         self.audioInitData = audioInitData
+        currentGeneration = initialGeneration
         renditionMetadata = worker.renditionMetadata
         renditionDescriptors = worker.renditionDescriptors
         nextAudioInputSegmentIndices = Array(
@@ -319,24 +368,220 @@ actor HLSVODMediaPump {
             throw HLSVODMediaPumpError
                 .targetSegmentOutOfRange(target)
         }
+        let operationGeneration = currentGeneration
 
         while true {
-            try requireAvailable()
+            try requireAvailable(
+                generation: operationGeneration
+            )
+            if target < generationStartSegmentIndex {
+                guard worker.cachedSegmentExists(
+                    target
+                ) else {
+                    throw HLSVODMediaPumpError
+                        .requestedSegmentUnavailable(
+                            target
+                        )
+                }
+                return
+            }
             if worker.hasProduced(segment: target) {
                 return
             }
-            if productionInProgress {
+            if productionInProgress
+                || restartInProgress {
                 try await waitForProduction()
                 continue
             }
 
             productionInProgress = true
-            Task {
+            let task = Task {
                 await performProduction(
-                    throughSegment: target
+                    throughSegment: target,
+                    generation:
+                        operationGeneration
                 )
             }
+            productionTask = task
             try await waitForProduction()
+        }
+    }
+
+    func restart(
+        for intent: HybridSeekIntent
+    ) async throws
+        -> BlackCarrierMediaFanoutRestartResult
+    {
+        guard case .userSeek(
+            let target,
+            let requestedSegmentIndex,
+            let requestedGeneration
+        ) = intent else {
+            throw HLSVODMediaPumpError
+                .restartRequiresUserSeek
+        }
+        guard let expectedSegmentIndex =
+                graph.timeline.segmentIndex(
+                    containing: target
+                ) else {
+            throw HLSVODMediaPumpError
+                .targetSegmentOutOfRange(
+                    requestedSegmentIndex
+                )
+        }
+        guard requestedSegmentIndex
+                == expectedSegmentIndex else {
+            throw HLSVODMediaPumpError
+                .seekIntentSegmentMismatch(
+                    expected: expectedSegmentIndex,
+                    actual: requestedSegmentIndex
+                )
+        }
+
+        while restartInProgress {
+            try requireAvailable()
+            try await waitForProduction()
+        }
+        try requireAvailable()
+        if requestedGeneration
+                <= currentGeneration {
+            return .stale(
+                currentGeneration:
+                    currentGeneration
+            )
+        }
+
+        requestedRestartGeneration =
+            requestedGeneration
+        let retiringProduction =
+            productionTask
+        retiringProduction?.cancel()
+        if let retiringProduction {
+            await retiringProduction.value
+        }
+        try requireRestartCurrent(
+            requestedGeneration
+        )
+        restartInProgress = true
+
+        do {
+            try Task.checkCancellation()
+            let videoSegmentData =
+                try await loader.payload(
+                    for: .videoSegment(
+                        index:
+                            expectedSegmentIndex
+                    )
+                ).data
+            try requireRestartCurrent(
+                requestedGeneration
+            )
+            var audioInputSegmentIndices: [Int] =
+                []
+            var audioSegmentData: [Data] = []
+            audioInputSegmentIndices.reserveCapacity(
+                graph.audioRenditions.count
+            )
+            audioSegmentData.reserveCapacity(
+                graph.audioRenditions.count
+            )
+            let targetSegmentStart =
+                graph.timeline.segments[
+                    expectedSegmentIndex
+                ].startTime
+            for rendition in
+                    graph.audioRenditions {
+                let inputSegmentIndex =
+                    try Self.audioInputSegmentIndex(
+                        containing:
+                            targetSegmentStart,
+                        segments:
+                            rendition.segments
+                    )
+                audioInputSegmentIndices.append(
+                    inputSegmentIndex
+                )
+                audioSegmentData.append(
+                    try await loader.payload(
+                        for: .audioSegment(
+                            renditionOrdinal:
+                                rendition.ordinal,
+                            index:
+                                inputSegmentIndex
+                        )
+                    ).data
+                )
+                try requireRestartCurrent(
+                    requestedGeneration
+                )
+            }
+            try Task.checkCancellation()
+            try requireRestartCurrent(
+                requestedGeneration
+            )
+            try worker.restart(
+                generation: requestedGeneration,
+                targetTime: target,
+                segmentIndex:
+                    expectedSegmentIndex,
+                videoInitData:
+                    videoInitData,
+                videoSegmentData:
+                    videoSegmentData,
+                audioInitData:
+                    audioInitData,
+                audioInputSegmentIndices:
+                    audioInputSegmentIndices,
+                audioSegmentData:
+                    audioSegmentData
+            )
+            nextVideoInputSegmentIndex =
+                expectedSegmentIndex
+            nextAudioInputSegmentIndices =
+                audioInputSegmentIndices
+            currentGeneration =
+                requestedGeneration
+            generationStartSegmentIndex =
+                expectedSegmentIndex
+            didRestart = true
+            requestedRestartGeneration = nil
+            restartInProgress = false
+            resumeProductionWaiters()
+            return .applied(
+                generation: requestedGeneration,
+                segmentIndex:
+                    expectedSegmentIndex
+            )
+        } catch {
+            restartInProgress = false
+            resumeProductionWaiters()
+            let typed = Self.typed(error)
+            if case .generationSuperseded =
+                    typed {
+                return .stale(
+                    currentGeneration:
+                        max(
+                            currentGeneration,
+                            requestedRestartGeneration
+                                ?? currentGeneration
+                        )
+                )
+            }
+            requestedRestartGeneration = nil
+            if !isClosed {
+                terminalError = typed
+            }
+            worker.close()
+            do {
+                try await loader.close()
+            } catch {
+                EngineLog.emit(
+                    "[HLSVODMediaPump] restart failure cleanup failed: "
+                        + String(describing: error),
+                    category: .session
+                )
+            }
+            throw typed
         }
     }
 
@@ -394,6 +639,13 @@ actor HLSVODMediaPump {
     func finishProduction() async throws
         -> [BlackCarrierAudioRenditionSummary]
     {
+        guard !didRestart else {
+            throw HLSVODMediaPumpError
+                .fullAssetSummaryUnavailableAfterRestart(
+                    generation:
+                        currentGeneration
+                )
+        }
         guard let last =
                 graph.segments.indices.last else {
             throw HLSVODMediaPumpError
@@ -436,6 +688,9 @@ actor HLSVODMediaPump {
     func snapshot() -> HLSVODMediaPumpSnapshot {
         let workerSnapshot = worker.snapshot()
         return HLSVODMediaPumpSnapshot(
+            generation: currentGeneration,
+            generationStartSegmentIndex:
+                generationStartSegmentIndex,
             nextVideoInputSegmentIndex:
                 nextVideoInputSegmentIndex,
             nextAudioInputSegmentIndices:
@@ -457,6 +712,8 @@ actor HLSVODMediaPump {
     func close() async throws {
         guard !isClosed else { return }
         isClosed = true
+        requestedRestartGeneration = nil
+        productionTask?.cancel()
         worker.close()
         resumeProductionWaiters()
         do {
@@ -467,7 +724,8 @@ actor HLSVODMediaPump {
     }
 
     private func runProduction(
-        throughSegment target: Int
+        throughSegment target: Int,
+        generation: UInt64
     ) async throws {
         while nextVideoInputSegmentIndex
                 < graph.segments.count,
@@ -475,12 +733,16 @@ actor HLSVODMediaPump {
                 || worker.muxedAudioNeedsInput(
                     throughSegment: target
                 ) {
-            try requireAvailable()
+            try requireAvailable(
+                generation: generation
+            )
             let index = nextVideoInputSegmentIndex
             let data = try await loader.payload(
                 for: .videoSegment(index: index)
             ).data
-            try requireAvailable()
+            try requireAvailable(
+                generation: generation
+            )
             try worker.consumeVideoSegment(
                 index: index,
                 initData: videoInitData,
@@ -502,7 +764,9 @@ actor HLSVODMediaPump {
                     renditionOrdinal: ordinal,
                     throughSegment: target
                   ) {
-                try requireAvailable()
+                try requireAvailable(
+                    generation: generation
+                )
                 let index =
                     nextAudioInputSegmentIndices[ordinal]
                 let data = try await loader.payload(
@@ -511,7 +775,9 @@ actor HLSVODMediaPump {
                         index: index
                     )
                 ).data
-                try requireAvailable()
+                try requireAvailable(
+                    generation: generation
+                )
                 try worker.consumeAudioSegment(
                     renditionOrdinal: ordinal,
                     inputSegmentIndex: index,
@@ -536,39 +802,66 @@ actor HLSVODMediaPump {
         }
     }
 
-    private func requireAvailable() throws {
+    private func requireAvailable(
+        generation: UInt64? = nil
+    ) throws {
         if let terminalError {
             throw terminalError
         }
         guard !isClosed else {
             throw HLSVODMediaPumpError.closed
         }
+        if let generation,
+           currentGeneration > generation
+            || (
+                requestedRestartGeneration
+                    ?? generation
+            ) > generation {
+            throw HLSVODMediaPumpError
+                .generationSuperseded(
+                    generation: generation
+                )
+        }
     }
 
     private func performProduction(
-        throughSegment target: Int
+        throughSegment target: Int,
+        generation: UInt64
     ) async {
         do {
             try await runProduction(
-                throughSegment: target
+                throughSegment: target,
+                generation: generation
             )
         } catch {
             let typed = Self.typed(error)
-            if !isClosed {
-                terminalError = typed
-            }
-            worker.close()
-            do {
-                try await loader.close()
-            } catch {
-                EngineLog.emit(
-                    "[HLSVODMediaPump] failure cleanup failed: "
-                        + String(describing: error),
-                    category: .session
+            let superseded =
+                Self.isSuperseded(
+                    typed,
+                    generation: generation,
+                    currentGeneration:
+                        currentGeneration,
+                    requestedRestartGeneration:
+                        requestedRestartGeneration
                 )
+            if !isClosed, !superseded {
+                terminalError = typed
+                worker.close()
+                do {
+                    try await loader.close()
+                } catch {
+                    EngineLog.emit(
+                        "[HLSVODMediaPump] failure cleanup failed: "
+                            + String(
+                                describing: error
+                            ),
+                        category: .session
+                    )
+                }
             }
         }
         productionInProgress = false
+        productionTask = nil
         resumeProductionWaiters()
     }
 
@@ -595,6 +888,70 @@ actor HLSVODMediaPump {
             keepingCapacity: true
         )
         waiters.forEach { $0.resume() }
+    }
+
+    private func requireRestartCurrent(
+        _ generation: UInt64
+    ) throws {
+        try requireAvailable()
+        guard requestedRestartGeneration
+                == generation,
+              currentGeneration
+                < generation else {
+            throw HLSVODMediaPumpError
+                .generationSuperseded(
+                    generation: generation
+                )
+        }
+    }
+
+    nonisolated private static func isSuperseded(
+        _ error: HLSVODMediaPumpError,
+        generation: UInt64,
+        currentGeneration: UInt64,
+        requestedRestartGeneration: UInt64?
+    ) -> Bool {
+        if case .generationSuperseded =
+                error {
+            return true
+        }
+        return currentGeneration > generation
+            || (
+                requestedRestartGeneration
+                    ?? generation
+            ) > generation
+    }
+
+    nonisolated private static func audioInputSegmentIndex(
+        containing time: CMTime,
+        segments: [HLSVODSegmentResource]
+    ) throws -> Int {
+        guard time.isValid,
+              time.isNumeric,
+              CMTimeCompare(time, .zero) >= 0,
+              !segments.isEmpty else {
+            throw HLSVODMediaPumpError
+                .targetSegmentOutOfRange(0)
+        }
+        var start = CMTime.zero
+        for segment in segments {
+            let end = CMTimeAdd(
+                start,
+                segment.duration
+            )
+            if CMTimeCompare(time, end) < 0 {
+                return segment.index
+            }
+            start = end
+        }
+        if CMTimeCompare(time, start) == 0,
+           let last = segments.last {
+            return last.index
+        }
+        throw HLSVODMediaPumpError
+            .targetSegmentOutOfRange(
+                segments.count
+            )
     }
 
     nonisolated private static func typed(
@@ -702,7 +1059,7 @@ private extension HLSVODMediaPump {
             BlackCarrierAudioRenditionDescriptor
         let contract: AudioStreamContract
         let cache: SegmentCache
-        let writer:
+        var writer:
             BlackCarrierAudioRenditionMuxer.Writer
         var summary:
             BlackCarrierAudioRenditionSummary?
@@ -976,6 +1333,334 @@ private extension HLSVODMediaPump {
         var isTargetFrameReady: Bool {
             videoDecodeSink?.isTargetFrameReady
                 ?? true
+        }
+
+        func restart(
+            generation: UInt64,
+            targetTime: CMTime,
+            segmentIndex: Int,
+            videoInitData: Data?,
+            videoSegmentData: Data,
+            audioInitData: [Data?],
+            audioInputSegmentIndices: [Int],
+            audioSegmentData: [Data]
+        ) throws {
+            try requireOpen()
+            guard graph.segments.indices
+                    .contains(segmentIndex) else {
+                throw HLSVODMediaPumpError
+                    .targetSegmentOutOfRange(
+                        segmentIndex
+                    )
+            }
+
+            let videoDemuxer =
+                try Self.openVideoDemuxer(
+                    initData: videoInitData,
+                    segmentData:
+                        videoSegmentData
+                )
+            defer { videoDemuxer.close() }
+            let videoStreams =
+                try Self.streamIndices(
+                    demuxer: videoDemuxer,
+                    mediaType:
+                        AVMEDIA_TYPE_VIDEO
+                )
+            guard videoStreams.count == 1,
+                  let videoStream =
+                    videoDemuxer.stream(
+                        at: videoStreams[0]
+                    ) else {
+                throw HLSVODMediaPumpError
+                    .videoStreamCount(
+                        segmentIndex:
+                            segmentIndex,
+                        count: videoStreams.count
+                    )
+            }
+            guard try HybridVideoStreamContract(
+                demuxer: videoDemuxer,
+                stream: videoStream,
+                sourceStartPTSOverride: 0
+            ) == videoContract else {
+                throw HLSVODMediaPumpError
+                    .videoContractChanged(
+                        segmentIndex:
+                            segmentIndex
+                    )
+            }
+
+            let replacementWriters: [
+                BlackCarrierAudioRenditionMuxer
+                    .Writer
+            ]
+            if usesSeparateAudio {
+                guard audioInitData.count
+                        == audioRenditions.count,
+                      audioInputSegmentIndices.count
+                        == audioRenditions.count,
+                      audioSegmentData.count
+                        == audioRenditions.count else {
+                    throw HLSVODMediaPumpError
+                        .invalidPreflight
+                }
+                replacementWriters =
+                    try audioRenditions.map {
+                        rendition in
+                        let ordinal =
+                            rendition.metadata.ordinal
+                        let inputSegmentIndex =
+                            audioInputSegmentIndices[
+                                ordinal
+                            ]
+                        let demuxer =
+                            try Self.openAudioDemuxer(
+                                initData:
+                                    audioInitData[
+                                        ordinal
+                                    ],
+                                segmentData:
+                                    audioSegmentData[
+                                        ordinal
+                                    ]
+                            )
+                        defer { demuxer.close() }
+                        let unexpectedVideo =
+                            try Self.streamIndices(
+                                demuxer: demuxer,
+                                mediaType:
+                                    AVMEDIA_TYPE_VIDEO
+                            )
+                        guard unexpectedVideo
+                                .isEmpty else {
+                            throw HLSVODMediaPumpError
+                                .audioRenditionContainsVideo(
+                                    renditionOrdinal:
+                                        ordinal,
+                                    inputSegmentIndex:
+                                        inputSegmentIndex
+                                )
+                        }
+                        let audioStreams =
+                            try Self.streamIndices(
+                                demuxer: demuxer,
+                                mediaType:
+                                    AVMEDIA_TYPE_AUDIO
+                            )
+                        guard audioStreams.count
+                                == 1,
+                              let stream =
+                                demuxer.stream(
+                                    at:
+                                        audioStreams[
+                                            0
+                                        ]
+                                ) else {
+                            throw HLSVODMediaPumpError
+                                .audioStreamCount(
+                                    renditionOrdinal:
+                                        ordinal,
+                                    inputSegmentIndex:
+                                        inputSegmentIndex,
+                                    count:
+                                        audioStreams.count
+                                )
+                        }
+                        guard AudioStreamContract(
+                            stream: stream
+                        ) == rendition.contract else {
+                            throw HLSVODMediaPumpError
+                                .audioContractChanged(
+                                    renditionOrdinal:
+                                        ordinal,
+                                    inputSegmentIndex:
+                                        inputSegmentIndex
+                                )
+                        }
+                        return try Self
+                            .makeReplacementWriter(
+                                graph: graph,
+                                rendition:
+                                    rendition,
+                                demuxer: demuxer,
+                                streamIndex:
+                                    audioStreams[0],
+                                bridgeMode:
+                                    bridgeMode,
+                                sourceSegmentData:
+                                    audioSegmentData[
+                                        ordinal
+                                    ],
+                                sourceAudioStreamOrdinal:
+                                    0,
+                                requiresFragmentDecodeTime:
+                                    audioInitData[
+                                        ordinal
+                                    ] != nil,
+                                sourceSegmentStart:
+                                    try Self.startTime(
+                                        segments:
+                                            graph
+                                                .audioRenditions[
+                                                    ordinal
+                                                ]
+                                                .segments,
+                                        index:
+                                            inputSegmentIndex
+                                    ),
+                                startingSegmentIndex:
+                                    segmentIndex
+                            )
+                    }
+            } else {
+                guard audioInputSegmentIndices
+                        .isEmpty,
+                      audioSegmentData.isEmpty else {
+                    throw HLSVODMediaPumpError
+                        .invalidPreflight
+                }
+                let actualAudioStreams =
+                    try Self.streamIndices(
+                        demuxer: videoDemuxer,
+                        mediaType:
+                            AVMEDIA_TYPE_AUDIO
+                    )
+                guard actualAudioStreams.count
+                        == audioRenditions.count else {
+                    throw HLSVODMediaPumpError
+                        .muxedAudioStreamCount(
+                            segmentIndex:
+                                segmentIndex,
+                            expected:
+                                audioRenditions.count,
+                            actual:
+                                actualAudioStreams.count
+                        )
+                }
+                let actualMetadata =
+                    BlackCarrierCompositeProvider
+                        .renditionMetadata(
+                            for:
+                                videoDemuxer
+                                    .audioTrackInfos()
+                        )
+                guard actualMetadata
+                        == renditionMetadata else {
+                    throw HLSVODMediaPumpError
+                        .muxedAudioContractChanged(
+                            ordinal: 0,
+                            segmentIndex:
+                                segmentIndex
+                        )
+                }
+                replacementWriters =
+                    try zip(
+                        audioRenditions,
+                        actualAudioStreams
+                    ).map {
+                        rendition,
+                        streamIndex in
+                        guard let stream =
+                                videoDemuxer.stream(
+                                    at: streamIndex
+                                ),
+                              AudioStreamContract(
+                                stream: stream
+                              ) == rendition
+                                .contract else {
+                            throw HLSVODMediaPumpError
+                                .muxedAudioContractChanged(
+                                    ordinal:
+                                        rendition
+                                            .metadata
+                                            .ordinal,
+                                    segmentIndex:
+                                        segmentIndex
+                                )
+                        }
+                        return try Self
+                            .makeReplacementWriter(
+                                graph: graph,
+                                rendition:
+                                    rendition,
+                                demuxer:
+                                    videoDemuxer,
+                                streamIndex:
+                                    streamIndex,
+                                bridgeMode:
+                                    bridgeMode,
+                                sourceSegmentData:
+                                    videoSegmentData,
+                                sourceAudioStreamOrdinal:
+                                    rendition
+                                        .metadata
+                                        .ordinal,
+                                requiresFragmentDecodeTime:
+                                    videoInitData
+                                        != nil,
+                                sourceSegmentStart:
+                                    graph.timeline
+                                        .segments[
+                                            segmentIndex
+                                        ]
+                                        .startTime,
+                                startingSegmentIndex:
+                                    segmentIndex
+                            )
+                    }
+            }
+            guard replacementWriters.map(
+                \.descriptor
+            ) == renditionDescriptors else {
+                throw HLSVODMediaPumpError
+                    .audioContractChanged(
+                        renditionOrdinal: 0,
+                        inputSegmentIndex:
+                            segmentIndex
+                    )
+            }
+
+            if let videoDecodeSink {
+                do {
+                    try videoDecodeSink
+                        .beginGeneration(
+                            generation,
+                            targetTime:
+                                targetTime,
+                            restartDecodeAnchorTime:
+                                nil,
+                            demuxer:
+                                videoDemuxer,
+                            stream:
+                                videoStream,
+                            sourceStartPTSOverride:
+                                0,
+                            packetsAreNormalizedToSourceAxis:
+                                true
+                        )
+                } catch {
+                    throw HLSVODMediaPumpError
+                        .videoSinkFailed(
+                            reason:
+                                String(
+                                    describing: error
+                                )
+                        )
+                }
+            }
+
+            for (rendition, replacement) in
+                    zip(
+                        audioRenditions,
+                        replacementWriters
+                    ) {
+                rendition.writer = replacement
+                rendition.summary = nil
+            }
+            highestProducedVideoSegmentIndex =
+                segmentIndex - 1
+            videoInputFinished = false
         }
 
         func consumeVideoSegment(
@@ -1370,6 +2055,15 @@ private extension HLSVODMediaPump {
             }
         }
 
+        func cachedSegmentExists(
+            _ index: Int
+        ) -> Bool {
+            audioRenditions.allSatisfy {
+                $0.cache.peekURL(index: index)
+                    != nil
+            }
+        }
+
         func muxedAudioNeedsInput(
             throughSegment index: Int
         ) -> Bool {
@@ -1642,6 +2336,484 @@ private extension HLSVODMediaPump {
             } catch {
                 cache.close()
                 throw error
+            }
+        }
+
+        private static func makeReplacementWriter(
+            graph: HLSVODResourceGraph,
+            rendition: AudioRendition,
+            demuxer: Demuxer,
+            streamIndex: Int32,
+            bridgeMode: AudioBridgeMode,
+            sourceSegmentData: Data,
+            sourceAudioStreamOrdinal: Int,
+            requiresFragmentDecodeTime: Bool,
+            sourceSegmentStart: CMTime,
+            startingSegmentIndex: Int
+        ) throws
+            -> BlackCarrierAudioRenditionMuxer
+                .Writer
+        {
+            guard let timelineOffset =
+                    rendition.writer
+                        .presentationTimelineOffset else {
+                throw HLSVODMediaPumpError
+                    .restartTimelineOffsetUnavailable(
+                        renditionOrdinal:
+                            rendition.metadata.ordinal
+                    )
+            }
+            guard let stream =
+                    demuxer.stream(
+                        at: streamIndex
+                    ),
+                  let globalSourceStart =
+                    BlackCarrierSourceAxis
+                        .streamTicks(
+                            for:
+                                sourceSegmentStart,
+                            timeBase:
+                                stream.pointee
+                                    .time_base
+                        ) else {
+                throw HLSVODMediaPumpError
+                    .timestampOverflow(
+                        streamIndex:
+                            Int(streamIndex),
+                        segmentIndex:
+                            startingSegmentIndex
+                    )
+            }
+            let sourceDecodeTimestamp =
+                try restartSourceDecodeTimestamp(
+                    segmentData:
+                        sourceSegmentData,
+                    requiresFragmentDecodeTime:
+                        requiresFragmentDecodeTime,
+                    demuxer: demuxer,
+                    streamIndex: streamIndex,
+                    sourceAudioStreamOrdinal:
+                        sourceAudioStreamOrdinal,
+                    renditionOrdinal:
+                        rendition.metadata.ordinal,
+                    segmentIndex:
+                        startingSegmentIndex
+                )
+            let decodeDelta =
+                sourceDecodeTimestamp
+                    .subtractingReportingOverflow(
+                        globalSourceStart
+                    )
+            guard !decodeDelta.overflow else {
+                throw HLSVODMediaPumpError
+                    .timestampOverflow(
+                        streamIndex:
+                            Int(streamIndex),
+                        segmentIndex:
+                            startingSegmentIndex
+                    )
+            }
+            let decodeTimestampOffset =
+                try rendition.writer
+                    .restartDecodeTimestampOffset(
+                        sourceDecodeDelta:
+                            decodeDelta.partialValue,
+                        sourceTimeBase:
+                            stream.pointee.time_base
+                    )
+            let writer =
+                try BlackCarrierAudioRenditionMuxer
+                    .makeWriter(
+                        demuxer: demuxer,
+                        audioStreamIndex:
+                            streamIndex,
+                        sourceStartPTS: 0,
+                        timeline: graph.timeline,
+                        bridgeMode: bridgeMode,
+                        startingSegmentIndex:
+                            startingSegmentIndex,
+                        preserveEncoderPriming:
+                            false,
+                        presentationTimelineOffset:
+                            timelineOffset,
+                        decodeTimestampOffset:
+                            decodeTimestampOffset,
+                        restartTimestampRebaseEnabled:
+                            false,
+                        sessionDirectory:
+                            rendition.cache
+                                .sessionDir,
+                        onInit: {
+                            if rendition.cache
+                                .fetchInit(
+                                    timeout: 0
+                                ) == nil {
+                                rendition.cache
+                                    .setInit($0)
+                            }
+                        },
+                        onSegment: {
+                            timing,
+                            stagingPath,
+                            bytesWritten in
+                            rendition.cache.adopt(
+                                index:
+                                    timing.index,
+                                stagingPath:
+                                    stagingPath,
+                                byteCount:
+                                    bytesWritten
+                            )
+                            guard rendition.cache
+                                    .peekURL(
+                                        index:
+                                            timing.index
+                                    ) != nil else {
+                                throw BlackCarrierAudioRenditionStoreError
+                                    .segmentStoreFailed(
+                                        trackID:
+                                            rendition
+                                                .metadata
+                                                .sourceTrackID,
+                                        index:
+                                            timing.index
+                                    )
+                            }
+                        }
+                    )
+            guard writer.descriptor
+                    == rendition.descriptor else {
+                throw HLSVODMediaPumpError
+                    .audioContractChanged(
+                        renditionOrdinal:
+                            rendition.metadata.ordinal,
+                        inputSegmentIndex:
+                            startingSegmentIndex
+                    )
+            }
+            return writer
+        }
+
+        private static func restartSourceDecodeTimestamp(
+            segmentData: Data,
+            requiresFragmentDecodeTime: Bool,
+            demuxer: Demuxer,
+            streamIndex: Int32,
+            sourceAudioStreamOrdinal: Int,
+            renditionOrdinal: Int,
+            segmentIndex: Int
+        ) throws -> Int64 {
+            if requiresFragmentDecodeTime {
+                let fragmentDecodeTimes =
+                    try fragmentDecodeTimes(
+                        segmentData
+                    )
+                guard let stream =
+                        demuxer.stream(
+                            at: streamIndex
+                        ) else {
+                    throw HLSVODMediaPumpError
+                        .demuxOpenFailed
+                }
+                let trackID =
+                    UInt32(
+                        bitPattern:
+                            stream.pointee.id
+                    )
+                guard let decodeTime =
+                        fragmentDecodeTimes[
+                            trackID
+                        ],
+                      decodeTime
+                        <= UInt64(Int64.max) else {
+                    throw HLSVODMediaPumpError
+                        .fragmentDecodeTimeMissing(
+                            trackID: trackID,
+                            segmentIndex:
+                                segmentIndex
+                        )
+                }
+                return Int64(decodeTime)
+            }
+
+            let packetDemuxer =
+                try openAudioDemuxer(
+                    initData: nil,
+                    segmentData: segmentData
+                )
+            defer { packetDemuxer.close() }
+            let audioStreams =
+                try streamIndices(
+                    demuxer: packetDemuxer,
+                    mediaType:
+                        AVMEDIA_TYPE_AUDIO
+                )
+            guard audioStreams.indices.contains(
+                sourceAudioStreamOrdinal
+            ) else {
+                throw HLSVODMediaPumpError
+                    .audioStreamCount(
+                        renditionOrdinal:
+                            renditionOrdinal,
+                        inputSegmentIndex:
+                            segmentIndex,
+                        count: audioStreams.count
+                    )
+            }
+            let packetStreamIndex =
+                audioStreams[
+                    sourceAudioStreamOrdinal
+                ]
+            while let packet =
+                    try packetDemuxer
+                        .readPacket() {
+                var packetToFree:
+                    UnsafeMutablePointer<AVPacket>? =
+                        packet
+                defer {
+                    trackedPacketFree(
+                        &packetToFree
+                    )
+                }
+                guard packet.pointee
+                    .stream_index
+                        == packetStreamIndex else {
+                    continue
+                }
+                let timestamp =
+                    packet.pointee.dts
+                        != Int64.min
+                    ? packet.pointee.dts
+                    : packet.pointee.pts
+                guard timestamp != Int64.min else {
+                    throw HLSVODMediaPumpError
+                        .timestampMissing(
+                            streamIndex:
+                                Int(streamIndex),
+                            segmentIndex:
+                                segmentIndex
+                        )
+                }
+                return timestamp
+            }
+            throw HLSVODMediaPumpError
+                .audioPacketMissing(
+                    renditionOrdinal:
+                        renditionOrdinal,
+                    inputSegmentIndex:
+                        segmentIndex
+                )
+        }
+
+        private static func fragmentDecodeTimes(
+            _ data: Data
+        ) throws -> [UInt32: UInt64] {
+            let topLevel = try bmffBoxes(
+                in: data,
+                range: 0..<data.count
+            )
+            let moofs = topLevel.filter {
+                $0.type == "moof"
+            }
+            guard !moofs.isEmpty else {
+                return [:]
+            }
+            var result: [UInt32: UInt64] =
+                [:]
+            for moof in moofs {
+                let trafs = try bmffBoxes(
+                    in: data,
+                    range: moof.body
+                ).filter {
+                    $0.type == "traf"
+                }
+                for traf in trafs {
+                    let children =
+                        try bmffBoxes(
+                            in: data,
+                            range: traf.body
+                        )
+                    guard let tfhd =
+                            children.first(
+                                where: {
+                                    $0.type == "tfhd"
+                                }
+                            ),
+                          let tfdt =
+                            children.first(
+                                where: {
+                                    $0.type == "tfdt"
+                                }
+                            ),
+                          tfhd.body.count >= 8,
+                          tfdt.body.count >= 8 else {
+                        throw HLSVODMediaPumpError
+                            .demuxOpenFailed
+                    }
+                    let trackID = try readUInt32(
+                        data,
+                        at:
+                            tfhd.body.lowerBound
+                                + 4
+                    )
+                    let version =
+                        data[tfdt.body.lowerBound]
+                    let decodeTime: UInt64
+                    if version == 1 {
+                        guard tfdt.body.count
+                                >= 12 else {
+                            throw HLSVODMediaPumpError
+                                .demuxOpenFailed
+                        }
+                        decodeTime =
+                            try readUInt64(
+                                data,
+                                at:
+                                    tfdt.body
+                                        .lowerBound
+                                        + 4
+                            )
+                    } else if version == 0 {
+                        decodeTime = UInt64(
+                            try readUInt32(
+                                data,
+                                at:
+                                    tfdt.body
+                                        .lowerBound
+                                        + 4
+                            )
+                        )
+                    } else {
+                        throw HLSVODMediaPumpError
+                            .demuxOpenFailed
+                    }
+                    guard result[trackID] == nil else {
+                        throw HLSVODMediaPumpError
+                            .demuxOpenFailed
+                    }
+                    result[trackID] =
+                        decodeTime
+                }
+            }
+            return result
+        }
+
+        private static func bmffBoxes(
+            in data: Data,
+            range: Range<Int>
+        ) throws -> [
+            (type: String, body: Range<Int>)
+        ] {
+            var boxes: [
+                (type: String, body: Range<Int>)
+            ] = []
+            var offset = range.lowerBound
+            while offset < range.upperBound {
+                guard offset + 8
+                        <= range.upperBound else {
+                    throw HLSVODMediaPumpError
+                        .demuxOpenFailed
+                }
+                let size32 =
+                    try readUInt32(
+                        data,
+                        at: offset
+                    )
+                let typeData =
+                    data[
+                        (offset + 4)..<(offset + 8)
+                    ]
+                guard let type = String(
+                    data: typeData,
+                    encoding: .ascii
+                ) else {
+                    throw HLSVODMediaPumpError
+                        .demuxOpenFailed
+                }
+                let headerSize: Int
+                let size: UInt64
+                if size32 == 1 {
+                    guard offset + 16
+                            <= range.upperBound else {
+                        throw HLSVODMediaPumpError
+                            .demuxOpenFailed
+                    }
+                    headerSize = 16
+                    size = try readUInt64(
+                        data,
+                        at: offset + 8
+                    )
+                } else if size32 == 0 {
+                    headerSize = 8
+                    size = UInt64(
+                        range.upperBound
+                            - offset
+                    )
+                } else {
+                    headerSize = 8
+                    size = UInt64(size32)
+                }
+                guard size
+                        >= UInt64(headerSize),
+                      size
+                        <= UInt64(
+                            range.upperBound
+                                - offset
+                        ) else {
+                    throw HLSVODMediaPumpError
+                        .demuxOpenFailed
+                }
+                let end = offset + Int(size)
+                boxes.append(
+                    (
+                        type,
+                        (offset + headerSize)..<end
+                    )
+                )
+                offset = end
+            }
+            return boxes
+        }
+
+        private static func readUInt32(
+            _ data: Data,
+            at offset: Int
+        ) throws -> UInt32 {
+            guard offset >= 0,
+                  offset + 4 <= data.count else {
+                throw HLSVODMediaPumpError
+                    .demuxOpenFailed
+            }
+            return data.withUnsafeBytes {
+                UInt32(
+                    bigEndian:
+                        $0.loadUnaligned(
+                            fromByteOffset:
+                                offset,
+                            as: UInt32.self
+                        )
+                )
+            }
+        }
+
+        private static func readUInt64(
+            _ data: Data,
+            at offset: Int
+        ) throws -> UInt64 {
+            guard offset >= 0,
+                  offset + 8 <= data.count else {
+                throw HLSVODMediaPumpError
+                    .demuxOpenFailed
+            }
+            return data.withUnsafeBytes {
+                UInt64(
+                    bigEndian:
+                        $0.loadUnaligned(
+                            fromByteOffset:
+                                offset,
+                            as: UInt64.self
+                        )
+                )
             }
         }
 
