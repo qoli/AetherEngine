@@ -135,6 +135,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     private let bridgeMode: AudioBridgeMode
     private var videoStreamIndex: Int32
     private let videoPacketSink: VideoPacketSink?
+    private let hybridVideoDecodeSink: HybridVideoDecodeSink?
     private let renditions: [Rendition]
     private var renditionsByStream: [
         Int32: Rendition
@@ -162,6 +163,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         bridgeMode: AudioBridgeMode = .surroundCompat,
         videoStreamIndex: Int32? = nil,
         videoPacketSink: VideoPacketSink? = nil,
+        hybridVideoDecodeSink: HybridVideoDecodeSink? = nil,
         initialGeneration: UInt64 = 0,
         freshDemuxerFactory: FreshDemuxerFactory? = nil,
         ownsInitialDemuxer: Bool = false,
@@ -171,10 +173,35 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             throw BlackCarrierMediaFanoutPumpError
                 .invalidSegmentIndex(index: 0)
         }
+        guard videoPacketSink == nil || hybridVideoDecodeSink == nil else {
+            throw BlackCarrierMediaFanoutPumpError.videoPacketSinkFailed(
+                reason: "Multiple real-video packet sinks were supplied"
+            )
+        }
+        let resolvedVideoPacketSink: VideoPacketSink? = videoPacketSink
+            ?? hybridVideoDecodeSink.map { sink in
+                { packet in try sink.consume(packet) }
+            }
         let resolvedVideoStreamIndex = videoStreamIndex
             ?? demuxer.videoStreamIndex
-        guard videoPacketSink == nil || resolvedVideoStreamIndex >= 0 else {
+        guard resolvedVideoPacketSink == nil || resolvedVideoStreamIndex >= 0 else {
             throw BlackCarrierMediaFanoutPumpError.videoStreamMissing
+        }
+        if let hybridVideoDecodeSink {
+            guard let stream = demuxer.stream(
+                at: resolvedVideoStreamIndex
+            ) else {
+                throw BlackCarrierMediaFanoutPumpError.videoStreamMissing
+            }
+            do {
+                guard try hybridVideoDecodeSink.validate(stream: stream) else {
+                    throw HybridVideoDecodeSinkError.streamContractMismatch
+                }
+            } catch {
+                throw BlackCarrierMediaFanoutPumpError.videoPacketSinkFailed(
+                    reason: String(describing: error)
+                )
+            }
         }
         let tracks = demuxer.audioTrackInfos()
         guard !tracks.isEmpty else {
@@ -238,10 +265,11 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         self.sourceFactory = sourceFactory
         self.timeline = timeline
         self.bridgeMode = bridgeMode
-        self.videoStreamIndex = videoPacketSink == nil
+        self.videoStreamIndex = resolvedVideoPacketSink == nil
             ? -1
             : resolvedVideoStreamIndex
-        self.videoPacketSink = videoPacketSink
+        self.videoPacketSink = resolvedVideoPacketSink
+        self.hybridVideoDecodeSink = hybridVideoDecodeSink
         sourceContract = BlackCarrierDemuxContract(demuxer: demuxer)
         renditionMetadata = metadata
         renditions = prepared
@@ -269,6 +297,8 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         timeline: BlackCarrierTimeline,
         bridgeMode: AudioBridgeMode = .surroundCompat,
         videoPacketSink: VideoPacketSink? = nil,
+        decodedFrameHandler: HybridVideoDecodeSink.FrameHandler? = nil,
+        videoFailureHandler: HybridVideoDecodeSink.FailureHandler? = nil,
         initialGeneration: UInt64 = 0,
         selectTitleID: Int? = nil
     ) throws -> BlackCarrierMediaFanoutPump {
@@ -283,6 +313,8 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             timeline: timeline,
             bridgeMode: bridgeMode,
             videoPacketSink: videoPacketSink,
+            decodedFrameHandler: decodedFrameHandler,
+            videoFailureHandler: videoFailureHandler,
             initialGeneration: initialGeneration
         )
     }
@@ -293,10 +325,20 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         timeline: BlackCarrierTimeline,
         bridgeMode: AudioBridgeMode = .surroundCompat,
         videoPacketSink: VideoPacketSink? = nil,
+        decodedFrameHandler: HybridVideoDecodeSink.FrameHandler? = nil,
+        videoFailureHandler: HybridVideoDecodeSink.FailureHandler? = nil,
         initialGeneration: UInt64 = 0
     ) throws -> BlackCarrierMediaFanoutPump {
         do {
             let demuxer = try sourceFactory.openDemuxer()
+            let decodeSink = try decodedFrameHandler.map { handler in
+                try HybridVideoDecodeSink(
+                    demuxer: demuxer,
+                    initialGeneration: initialGeneration,
+                    onFrame: handler,
+                    onFailure: videoFailureHandler
+                )
+            }
             do {
                 return try BlackCarrierMediaFanoutPump(
                     demuxer: demuxer,
@@ -304,6 +346,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                     bridgeMode: bridgeMode,
                     videoStreamIndex: demuxer.videoStreamIndex,
                     videoPacketSink: videoPacketSink,
+                    hybridVideoDecodeSink: decodeSink,
                     initialGeneration: initialGeneration,
                     freshDemuxerFactory: {
                         try sourceFactory.openDemuxer()
@@ -312,6 +355,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                     sourceFactory: ownsSourceFactory ? sourceFactory : nil
                 )
             } catch {
+                decodeSink?.close()
                 demuxer.close()
                 throw error
             }
@@ -496,6 +540,25 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                 throw BlackCarrierMediaFanoutPumpError
                     .restartTrackContractMismatch
             }
+            if let hybridVideoDecodeSink {
+                guard let freshVideoStream = freshDemuxer.stream(
+                    at: freshVideoStreamIndex
+                ) else {
+                    throw BlackCarrierMediaFanoutPumpError.videoStreamMissing
+                }
+                do {
+                    try hybridVideoDecodeSink.beginGeneration(
+                        requestedGeneration,
+                        targetTime: target,
+                        stream: freshVideoStream
+                    )
+                } catch {
+                    throw BlackCarrierMediaFanoutPumpError
+                        .videoPacketSinkFailed(
+                            reason: String(describing: error)
+                        )
+                }
+            }
             for (rendition, replacement) in zip(
                 renditions,
                 replacementWriters
@@ -568,6 +631,14 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         if let terminalError {
             throw terminalError
         }
+        if let videoError = hybridVideoDecodeSink?.failure {
+            let typed = BlackCarrierMediaFanoutPumpError
+                .videoPacketSinkFailed(
+                    reason: videoError.localizedDescription
+                )
+            fail(typed)
+            throw typed
+        }
         guard timeline.segments.indices.contains(index) else {
             throw BlackCarrierMediaFanoutPumpError.invalidSegmentIndex(
                 index: index
@@ -586,6 +657,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
 
         do {
             while !hasSegment(index), !isFinished {
+                try throwIfVideoDecoderFailed()
                 guard let packet = try demuxer.readPacket() else {
                     if isGenerationSuperseded(operationGeneration) {
                         throw BlackCarrierMediaFanoutPumpError
@@ -626,6 +698,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                     }
                 }
             }
+            try throwIfVideoDecoderFailed()
             guard hasSegment(index) else {
                 throw BlackCarrierMediaFanoutPumpError
                     .requestedSegmentUnavailable(index: index)
@@ -707,6 +780,20 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         return summaries[ordinal]
     }
 
+    func advanceVideoDecodeDemand(to time: CMTime) throws {
+        guard let hybridVideoDecodeSink else { return }
+        do {
+            try hybridVideoDecodeSink.advanceDecodeDemand(to: time)
+        } catch {
+            let typed = BlackCarrierMediaFanoutPumpError
+                .videoPacketSinkFailed(
+                    reason: String(describing: error)
+                )
+            failAfterUnlock(typed)
+            throw typed
+        }
+    }
+
     func finishStores() throws -> [BlackCarrierAudioRenditionStore] {
         guard let lastIndex = timeline.segments.indices.last else {
             throw BlackCarrierMediaFanoutPumpError.invalidSegmentIndex(
@@ -742,6 +829,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             sourceFactory = nil
             lock.unlock()
             demuxerToClose?.close()
+            hybridVideoDecodeSink?.close()
             sourceFactoryToClose?.close()
             return stores
         } catch let error as BlackCarrierMediaFanoutPumpError {
@@ -802,11 +890,21 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         lock.unlock()
         caches.forEach { $0.close() }
         demuxerToClose?.close()
+        hybridVideoDecodeSink?.close()
         sourceFactoryToClose?.close()
     }
 
     private func finishWriters() throws {
         guard !isFinished else { return }
+        if let hybridVideoDecodeSink {
+            do {
+                try hybridVideoDecodeSink.markEndOfStream()
+            } catch {
+                throw BlackCarrierMediaFanoutPumpError.videoPacketSinkFailed(
+                    reason: String(describing: error)
+                )
+            }
+        }
         for rendition in renditions {
             do {
                 summaries[rendition.metadata.ordinal] =
@@ -826,10 +924,21 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     }
 
     private func hasSegment(_ index: Int) -> Bool {
-        renditions.allSatisfy {
+        let audioReady = renditions.allSatisfy {
             $0.writer.highestFinalizedSegmentIndex >= index
                 && $0.cache.peekURL(index: index) != nil
         }
+        guard audioReady else { return false }
+        return hybridVideoDecodeSink?.isTargetFrameReady ?? true
+    }
+
+    private func throwIfVideoDecoderFailed() throws {
+        guard let error = hybridVideoDecodeSink?.failure else {
+            return
+        }
+        throw BlackCarrierMediaFanoutPumpError.videoPacketSinkFailed(
+            reason: error.localizedDescription
+        )
     }
 
     private func cachedSegmentExists(_ index: Int) -> Bool {

@@ -1,3 +1,4 @@
+import CoreMedia
 import Foundation
 
 enum BlackCarrierAudioBandwidthEvidence: Sendable, Equatable {
@@ -256,6 +257,8 @@ final class BlackCarrierLazyCompositeProvider:
         timeline: BlackCarrierTimeline,
         bridgeMode: AudioBridgeMode = .surroundCompat,
         videoPacketSink: BlackCarrierMediaFanoutPump.VideoPacketSink? = nil,
+        decodedFrameHandler: HybridVideoDecodeSink.FrameHandler? = nil,
+        videoFailureHandler: HybridVideoDecodeSink.FailureHandler? = nil,
         initialGeneration: UInt64 = 0,
         selectTitleID: Int? = nil
     ) throws -> BlackCarrierLazyCompositeProvider {
@@ -292,6 +295,8 @@ final class BlackCarrierLazyCompositeProvider:
                 timeline: timeline,
                 bridgeMode: bridgeMode,
                 videoPacketSink: videoPacketSink,
+                decodedFrameHandler: decodedFrameHandler,
+                videoFailureHandler: videoFailureHandler,
                 initialGeneration: initialGeneration
             )
         } catch {
@@ -349,6 +354,21 @@ final class BlackCarrierLazyCompositeProvider:
     ) throws -> BlackCarrierMediaFanoutRestartResult {
         do {
             return try pump.restart(for: intent)
+        } catch let error as BlackCarrierMediaFanoutPumpError {
+            record(.pump(error))
+            throw error
+        } catch {
+            let typed = BlackCarrierMediaFanoutPumpError.demuxFailed(
+                reason: String(describing: error)
+            )
+            record(.pump(typed))
+            throw typed
+        }
+    }
+
+    func advanceVideoDecodeDemand(to time: CMTime) throws {
+        do {
+            try pump.advanceVideoDecodeDemand(to: time)
         } catch let error as BlackCarrierMediaFanoutPumpError {
             record(.pump(error))
             throw error

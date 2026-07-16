@@ -6,15 +6,28 @@ import Libavcodec
 import Libavutil
 import Libswscale
 
+enum SoftwareVideoDecoderThreadingMode: Sendable {
+    case throughput
+    case boundedLatency
+}
+
 /// libavcodec software video decoder for codecs without VideoToolbox support (e.g. AV1/dav1d on Apple TV).
 /// Uses sws_scale (SIMD/NEON-optimized) for YUV→NV12/P010 conversion; required to hit 24fps at 1080p for AV1.
 final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
+    static func boundedLatencyThreadCount(
+        activeProcessorCount: Int
+    ) -> Int {
+        max(1, min(16, activeProcessorCount))
+    }
+
+    private let threadingMode: SoftwareVideoDecoderThreadingMode
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
     // FFmpeg 8.x exposes SwsContext as a real struct (7.x was OpaquePointer); pointer type must match or call sites miscompile.
     private var swsContext: UnsafeMutablePointer<SwsContext>?
     private var timeBase: AVRational = AVRational(num: 1, den: 90000)
     var onFrame: DecodedFrameHandler?
+    var onFailure: VideoDecoderFailureHandler?
 
     /// Fires once (demux thread) on first HDR10+ side data; engine flips videoFormat to .hdr10Plus.
     private var seenHDR10Plus = false
@@ -57,6 +70,12 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Engaged lazily on first interlaced frame; every subsequent frame routes through it. Guarded by `lock`.
     private let deinterlacer = DeinterlaceFilter()
 
+    init(
+        threadingMode: SoftwareVideoDecoderThreadingMode = .throughput
+    ) {
+        self.threadingMode = threadingMode
+    }
+
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
         self.onFrame = onFrame
 
@@ -95,8 +114,23 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             return AV_PIX_FMT_YUV420P
         }
 
-        ctx.pointee.thread_count = Int32(ProcessInfo.processInfo.activeProcessorCount)
-        ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
+        let activeProcessorCount =
+            ProcessInfo.processInfo.activeProcessorCount
+        switch threadingMode {
+        case .throughput:
+            ctx.pointee.thread_count = Int32(activeProcessorCount)
+            ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
+        case .boundedLatency:
+            // FF_THREAD_FRAME buffers one future frame per thread. The hybrid
+            // route is clock-demand-driven and intentionally does not decode an
+            // unbounded future window, so only within-frame parallelism is valid.
+            ctx.pointee.thread_count = Int32(
+                Self.boundedLatencyThreadCount(
+                    activeProcessorCount: activeProcessorCount
+                )
+            )
+            ctx.pointee.thread_type = FF_THREAD_SLICE
+        }
 
         // Belt-and-suspenders hwaccel=none: some decoders ignore get_format.
         var opts: OpaquePointer?
@@ -113,7 +147,15 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         use10Bit = bitsPerSample > 8 || isHDRTransfer
 
         // Release-visible log (no #if DEBUG): needed for TestFlight users and DrHurt #4 black-screen reports.
-        EngineLog.emit("[SWDecoder] Opened: \(codecpar.pointee.width)x\(codecpar.pointee.height), codec=\(String(cString: codec.pointee.name)), threads=\(ctx.pointee.thread_count), \(use10Bit ? "10-bit" : "8-bit")", category: .swPlayback)
+        EngineLog.emit(
+            "[SWDecoder] Opened: \(codecpar.pointee.width)x\(codecpar.pointee.height), "
+                + "codec=\(String(cString: codec.pointee.name)), "
+                + "threads=\(ctx.pointee.thread_count), "
+                + "requestedThreadType=\(ctx.pointee.thread_type), "
+                + "activeThreadType=\(ctx.pointee.active_thread_type), "
+                + "\(use10Bit ? "10-bit" : "8-bit")",
+            category: .swPlayback
+        )
     }
 
     func decode(packet: UnsafeMutablePointer<AVPacket>) {
@@ -121,10 +163,20 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         guard let ctx = codecContext else { lock.unlock(); return }
 
         let sendRet = avcodec_send_packet(ctx, packet)
-        guard sendRet >= 0 else { lock.unlock(); return }
+        guard sendRet >= 0 else {
+            let failure = onFailure
+            lock.unlock()
+            failure?(.softwareSendPacketFailed(code: sendRet))
+            return
+        }
 
         var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
-        guard let f = frame else { lock.unlock(); return }
+        guard let f = frame else {
+            let failure = onFailure
+            lock.unlock()
+            failure?(.frameAllocationFailed)
+            return
+        }
         lock.unlock()
 
         var filtered: UnsafeMutablePointer<AVFrame>? = nil
@@ -133,7 +185,14 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             lock.lock()
             guard codecContext != nil else { lock.unlock(); break }
             let ret = avcodec_receive_frame(ctx, f)
-            guard ret >= 0 else { lock.unlock(); break }
+            guard ret >= 0 else {
+                let failure = ret == FFmpegErr.eagain || ret == FFmpegErr.eof
+                    ? nil
+                    : onFailure
+                lock.unlock()
+                failure?(.softwareReceiveFrameFailed(code: ret))
+                break
+            }
 
             let isInterlaced = (f.pointee.flags & (1 << 3)) != 0  // AV_FRAME_FLAG_INTERLACED
             if isInterlaced || deinterlacer.isActive {
@@ -176,7 +235,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             clearSkip(ifStillAt: threshold)
         }
 
-        guard let pixelBuffer = convertFrameToPixelBuffer(f) else { return }
+        guard let pixelBuffer = convertFrameToPixelBuffer(f) else {
+            onFailure?(.pixelBufferConversionFailed)
+            return
+        }
 
         let pts = f.pointee.pts
         let cmPTS: CMTime
@@ -197,7 +259,13 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             onFirstHDR10PlusDetected?()
         }
 
-        onFrame?(pixelBuffer, cmPTS, hdr10PlusData)
+        let duration = f.pointee.duration > 0
+            ? CMTimeMake(
+                value: f.pointee.duration * Int64(timeBase.num),
+                timescale: Int32(timeBase.den)
+            )
+            : .invalid
+        onFrame?(pixelBuffer, cmPTS, duration, hdr10PlusData)
     }
 
     func flush() {
@@ -207,6 +275,50 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         deinterlacer.teardown()
         guard let ctx = codecContext else { return }
         avcodec_flush_buffers(ctx)
+    }
+
+    func synchronize() {
+        // Software decode and frame delivery are synchronous in decode(packet:).
+    }
+
+    func finish() {
+        lock.lock()
+        guard let ctx = codecContext else {
+            lock.unlock()
+            return
+        }
+        let sendResult = avcodec_send_packet(ctx, nil)
+        guard sendResult >= 0 else {
+            let failure = onFailure
+            lock.unlock()
+            failure?(.softwareSendPacketFailed(code: sendResult))
+            return
+        }
+        var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
+        guard frame != nil else {
+            let failure = onFailure
+            lock.unlock()
+            failure?(.frameAllocationFailed)
+            return
+        }
+        while true {
+            let receiveResult = avcodec_receive_frame(ctx, frame)
+            if receiveResult == FFmpegErr.eagain
+                || receiveResult == FFmpegErr.eof {
+                break
+            }
+            guard receiveResult >= 0 else {
+                let failure = onFailure
+                lock.unlock()
+                av_frame_free(&frame)
+                failure?(.softwareReceiveFrameFailed(code: receiveResult))
+                return
+            }
+            emit(frame!)
+            av_frame_unref(frame!)
+        }
+        av_frame_free(&frame)
+        lock.unlock()
     }
 
     /// Serialise HDR10+ dynamic metadata from AVFrame side data to T.35 SEI bytes (kCMSampleAttachmentKey_HDR10PlusPerFrameData).
@@ -254,6 +366,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         poolHeight = 0
         // Nil onFrame inside the lock: emit() reads it under the same lock; unsynchronized write is a data race.
         onFrame = nil
+        onFailure = nil
         lock.unlock()
     }
 

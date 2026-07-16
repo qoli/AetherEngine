@@ -21,6 +21,11 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         set { skipLock.lock(); _onFrame = newValue; skipLock.unlock() }
     }
     private var _onFrame: DecodedFrameHandler?
+    var onFailure: VideoDecoderFailureHandler? {
+        get { skipLock.lock(); defer { skipLock.unlock() }; return _onFailure }
+        set { skipLock.lock(); _onFailure = newValue; skipLock.unlock() }
+    }
+    private var _onFailure: VideoDecoderFailureHandler?
     /// Not yet wired on the VT side (follow-up: read AV_PKT_DATA_DYNAMIC_HDR10_PLUS before decode,
     /// mirror SoftwareVideoDecoder.extractHDR10PlusBytes). Flag kept so host wiring stays identical to SW path.
     var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
@@ -197,7 +202,10 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // Wrap the packet (HEVC length-prefix framing from FFmpeg's matroska demuxer, already the VT-expected format)
         // in a CMBlockBuffer+CMSampleBuffer. Copy once: VT may retain the buffer past the call (async decode),
         // and AVPacket storage is reused for the next packet.
-        guard let data = packet.pointee.data, packet.pointee.size > 0 else { return }
+        guard let data = packet.pointee.data, packet.pointee.size > 0 else {
+            onFailure?(.packetDataMissing)
+            return
+        }
         let size = Int(packet.pointee.size)
         let copied = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 1)
         copied.copyMemory(from: data, byteCount: size)
@@ -217,6 +225,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         guard blockStatus == kCMBlockBufferNoErr, let bb = blockBuffer else {
             // CMBlockBuffer takes ownership only on success; we own the allocation on failure.
             copied.deallocate()
+            onFailure?(.blockBufferCreationFailed(status: blockStatus))
             return
         }
         let ptsRaw = packet.pointee.pts
@@ -252,7 +261,10 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             sampleSizeArray: &sampleSize,
             sampleBufferOut: &sampleBuffer
         )
-        guard sbStatus == noErr, let sb = sampleBuffer else { return }
+        guard sbStatus == noErr, let sb = sampleBuffer else {
+            onFailure?(.sampleBufferCreationFailed(status: sbStatus))
+            return
+        }
 
         // Tag non-keyframes as DependsOnOthers so VT can drop pre-seek RASL frames after a flush.
         if (packet.pointee.flags & AV_PKT_FLAG_KEY) == 0 {
@@ -280,6 +292,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             infoFlagsOut: &infoFlags
         )
         if decodeStatus != noErr {
+            onFailure?(.decodeFrameFailed(status: decodeStatus))
             EngineLog.emit(
                 "[HardwareVideoDecoder] decode error \(decodeStatus) at pts=\(ptsRaw)",
                 category: .swPlayback
@@ -297,6 +310,18 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         VTDecompressionSessionFinishDelayedFrames(session)
     }
 
+    func synchronize() {
+        lock.lock()
+        let session = self.session
+        lock.unlock()
+        guard let session else { return }
+        VTDecompressionSessionWaitForAsynchronousFrames(session)
+    }
+
+    func finish() {
+        flush()
+    }
+
     func close() {
         lock.lock()
         if let session = session {
@@ -312,6 +337,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             refConBox = nil
         }
         onFrame = nil
+        onFailure = nil
     }
 
     deinit {
@@ -323,7 +349,8 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Invoked by `hwDecoderOutputCallback`; delivers CVPixelBuffer+PTS, honouring `skipUntilPTS` for seek-pre-roll.
     fileprivate func handleDecodedFrame(
         imageBuffer: CVImageBuffer,
-        pts: CMTime
+        pts: CMTime,
+        duration: CMTime
     ) {
         if let threshold = skipUntilPTS {
             if CMTimeCompare(pts, threshold) < 0 {
@@ -344,7 +371,18 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             CVBufferSetAttachment(imageBuffer, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate)
         }
 
-        onFrame?(imageBuffer, pts, nil)
+        onFrame?(imageBuffer, pts, duration, nil)
+    }
+
+    fileprivate func handleDecodeFailure(
+        status: OSStatus,
+        imageBufferMissing: Bool
+    ) {
+        if status != noErr {
+            onFailure?(.asynchronousDecodeFailed(status: status))
+        } else if imageBufferMissing {
+            onFailure?(.asynchronousFrameMissing)
+        }
     }
 }
 
@@ -359,12 +397,19 @@ private func hwDecoderOutputCallback(
     presentationTimeStamp: CMTime,
     presentationDuration: CMTime
 ) {
-    guard status == noErr, let imageBuffer = imageBuffer else { return }
     guard let refCon = decompressionOutputRefCon else { return }
     let box = Unmanaged<HardwareVideoDecoder.RefConBox>
         .fromOpaque(refCon).takeUnretainedValue()
+    guard status == noErr, let imageBuffer else {
+        box.decoder?.handleDecodeFailure(
+            status: status,
+            imageBufferMissing: imageBuffer == nil
+        )
+        return
+    }
     box.decoder?.handleDecodedFrame(
         imageBuffer: imageBuffer,
-        pts: presentationTimeStamp
+        pts: presentationTimeStamp,
+        duration: presentationDuration
     )
 }

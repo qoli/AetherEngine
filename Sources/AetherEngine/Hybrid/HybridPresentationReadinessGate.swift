@@ -212,7 +212,7 @@ struct HybridPresentationReadinessGate {
             && CMTimeCompare(value, .zero) >= 0
     }
 
-    private static func frameIntersectsTargetWindow(
+    static func frameIntersectsTargetWindow(
         frame: DecodedVideoFrame,
         targetTime: CMTime,
         toleranceBefore: CMTime,

@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Added
+
+- **Hybrid carrier real-video decode generations.** The shared VOD demux fanout can now feed a generation-aware video sink alongside the real-audio/black-video AVPlayer carrier, emitting `DecodedVideoFrame` values with PTS, duration, HDR classification, geometry, SAR, rotation, and seek generation. Compressed packets remain in a bounded queue until the host advances AVPlayer-clock demand; startup and explicit seeks require a target-intersecting decoded frame before the requested carrier segment becomes ready. HEVC decode stays on VideoToolbox, software codecs use an explicit bounded-latency threading mode, asynchronous decoder work is synchronized at the first-frame gate, and invalid timestamps, stream drift, queue overflow, decode failures, or invalid clock demand terminate with typed errors instead of dropping packets or selecting another playback route.
+
 ## [5.0.7] - 2026-07-15
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.0.7))

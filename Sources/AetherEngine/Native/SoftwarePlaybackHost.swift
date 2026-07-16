@@ -319,7 +319,11 @@ final class SoftwarePlaybackHost {
             }
         }
 
-        try videoDecoder.open(stream: vStream) { [weak self] pixelBuffer, pts, hdr10PlusData in
+        try videoDecoder.open(stream: vStream) {
+            [weak self] pixelBuffer,
+            pts,
+            _,
+            hdr10PlusData in
             // Decoder callback is off-main; SampleBufferRenderer is internally locked.
             self?.renderer.enqueue(pixelBuffer: pixelBuffer, pts: pts, hdr10PlusData: hdr10PlusData)
             // First-frame milestone: demux reached a video packet + decoder produced a pixel buffer.
