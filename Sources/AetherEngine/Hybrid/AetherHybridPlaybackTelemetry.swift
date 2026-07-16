@@ -190,6 +190,8 @@ public struct AetherHybridPlaybackTelemetrySnapshot:
         HybridAudioAnalysisPlaybackPressure
     public let audioAnalysisTrackIDs: [Int]
     public let activeAudioAnalysisRequestCount: Int
+    public let carrierBandwidth:
+        AetherHybridCarrierBandwidthTelemetry
     public let renderer: AetherMetalPlayerView.Diagnostics
     public let systemFeaturePolicy:
         HybridPlaybackSystemFeaturePolicy
@@ -210,6 +212,8 @@ public struct AetherHybridPlaybackTelemetrySnapshot:
             HybridAudioAnalysisPlaybackPressure,
         audioAnalysisTrackIDs: [Int],
         activeAudioAnalysisRequestCount: Int,
+        carrierBandwidth:
+            AetherHybridCarrierBandwidthTelemetry,
         renderer: AetherMetalPlayerView.Diagnostics,
         systemFeaturePolicy:
             HybridPlaybackSystemFeaturePolicy
@@ -232,6 +236,7 @@ public struct AetherHybridPlaybackTelemetrySnapshot:
         self.audioAnalysisTrackIDs = audioAnalysisTrackIDs
         self.activeAudioAnalysisRequestCount =
             activeAudioAnalysisRequestCount
+        self.carrierBandwidth = carrierBandwidth
         self.renderer = renderer
         self.systemFeaturePolicy = systemFeaturePolicy
     }

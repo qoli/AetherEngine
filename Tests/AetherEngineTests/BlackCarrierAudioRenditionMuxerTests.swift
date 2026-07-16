@@ -173,6 +173,38 @@ struct BlackCarrierAudioRenditionMuxerTests {
         }
     }
 
+    @Test("EAC3 JOC metadata preserves Atmos stream-copy and 16/JOC signaling")
+    func jocMetadataKeepsAtmosStreamCopy() throws {
+        let sourceData = try makeEAC3FragmentedMP4(
+            seconds: 1
+        )
+        let demuxer = Demuxer()
+        try demuxer.open(
+            reader: DataIOReader(data: sourceData)
+        )
+        defer { demuxer.close() }
+        let stream = try #require(
+            demuxer.stream(
+                at: demuxer.audioStreamIndex
+            )
+        )
+        stream.pointee.codecpar.pointee.profile = 30
+
+        let descriptor = try BlackCarrierAudioRenditionMuxer
+            .admissionDescriptor(
+                demuxer: demuxer,
+                audioStreamIndex:
+                    demuxer.audioStreamIndex
+            )
+
+        #expect(
+            descriptor.pipeline
+                == .streamCopy(codecString: "ec-3")
+        )
+        #expect(descriptor.codecString == "ec-3")
+        #expect(descriptor.channelsAttribute == "16/JOC")
+    }
+
     @Test("Two rendition writers consume one interleaved demux pass")
     func sharedDemuxFanout() throws {
         let sourceData = try makeDualEAC3Container(seconds: 1)

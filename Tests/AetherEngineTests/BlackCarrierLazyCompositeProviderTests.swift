@@ -25,24 +25,9 @@ struct BlackCarrierLazyCompositeProviderTests {
                 return fresh
             }
         )
-        let evidence = BlackCarrierAudioBandwidthEvidence
-            .verifiedConstantRate(
-                payloadBandwidth: 256_000,
-                maximumContainerOverhead: 64_000,
-                averageContainerOverhead: 32_000
-            )
-        let expectedBandwidth =
-            try #require(videoProvider.masterBandwidth)
-            + evidence.peakBandwidth
         let provider = try BlackCarrierLazyCompositeProvider(
             videoProvider: videoProvider,
-            pump: pump,
-            bandwidthAdmissions: [
-                BlackCarrierAudioBandwidthAdmission(
-                    ordinal: 0,
-                    evidence: evidence
-                ),
-            ]
+            pump: pump
         )
 
         try provider.prepareForTransportStart()
@@ -53,8 +38,21 @@ struct BlackCarrierLazyCompositeProviderTests {
         #expect(!pump.finished)
         #expect(pump.peekMediaSegmentURL(ordinal: 0, index: 1) == nil)
         #expect(provider.masterCodecs == "avc1.42C01E,ec-3")
-        #expect(provider.masterBandwidth == expectedBandwidth)
+        #expect(
+            provider.masterBandwidth
+                == AetherHybridCarrierBandwidthPolicy
+                    .loopbackTransportBudget
+        )
+        #expect(provider.masterAverageBandwidth == nil)
         #expect(provider.terminalError == nil)
+        #expect(
+            provider.carrierBandwidthTelemetry.state
+                == .partial
+        )
+        #expect(
+            provider.carrierBandwidthTelemetry
+                .observedPeakBandwidth != nil
+        )
 
         let server = HLSLocalServer(provider: provider)
         try server.start()
@@ -66,7 +64,8 @@ struct BlackCarrierLazyCompositeProviderTests {
         let baseURL = masterURL.deletingLastPathComponent()
 
         let master = try await fetchText(masterURL)
-        #expect(master.contains("BANDWIDTH=\(expectedBandwidth)"))
+        #expect(master.contains("BANDWIDTH=2000000"))
+        #expect(!master.contains("AVERAGE-BANDWIDTH"))
         #expect(master.contains("AUDIO=\"audio\""))
         let audioPlaylist = try await fetchText(
             baseURL.appendingPathComponent("audio_0.m3u8")
@@ -111,51 +110,6 @@ struct BlackCarrierLazyCompositeProviderTests {
         #expect(!FileManager.default.fileExists(atPath: audioDirectory.path))
     }
 
-    @Test("Invalid bandwidth evidence closes adopted provider resources")
-    func invalidBandwidthEvidence() throws {
-        let timeline = try BlackCarrierTimeline.fileVOD(
-            duration: CMTime(seconds: 1, preferredTimescale: 90_000)
-        )
-        let videoProvider = try BlackCarrierVideoProvider(timeline: timeline)
-        let videoDirectory = videoProvider.sessionDirectory
-        let sourceData = makeWAV(seconds: 1)
-        let demuxer = Demuxer()
-        try demuxer.open(reader: DataIOReader(data: sourceData))
-        defer { demuxer.close() }
-        let pump = try BlackCarrierMediaFanoutPump(
-            demuxer: demuxer,
-            timeline: timeline,
-            freshDemuxerFactory: {
-                let fresh = Demuxer()
-                try fresh.open(reader: DataIOReader(data: sourceData))
-                return fresh
-            }
-        )
-        let evidence = BlackCarrierAudioBandwidthEvidence
-            .measuredFullAsset(
-                peakBandwidth: 100,
-                averageBandwidth: 200
-            )
-
-        #expect(throws: BlackCarrierLazyCompositeProviderError
-            .invalidBandwidthEvidence(ordinal: 0)) {
-            _ = try BlackCarrierLazyCompositeProvider(
-                videoProvider: videoProvider,
-                pump: pump,
-                bandwidthAdmissions: [
-                    BlackCarrierAudioBandwidthAdmission(
-                        ordinal: 0,
-                        evidence: evidence
-                    ),
-                ]
-            )
-        }
-        #expect(!FileManager.default.fileExists(atPath: videoDirectory.path))
-        #expect(throws: BlackCarrierMediaFanoutPumpError.closed) {
-            try pump.produce(throughSegment: 0)
-        }
-    }
-
     @Test("Lazy provider rejects a pump without a fresh-demux restart factory")
     func missingFreshDemuxFactory() throws {
         let timeline = try BlackCarrierTimeline.fileVOD(
@@ -176,17 +130,7 @@ struct BlackCarrierLazyCompositeProviderTests {
         )) {
             _ = try BlackCarrierLazyCompositeProvider(
                 videoProvider: videoProvider,
-                pump: pump,
-                bandwidthAdmissions: [
-                    BlackCarrierAudioBandwidthAdmission(
-                        ordinal: 0,
-                        evidence: .verifiedConstantRate(
-                            payloadBandwidth: 256_000,
-                            maximumContainerOverhead: 64_000,
-                            averageContainerOverhead: 32_000
-                        )
-                    ),
-                ]
+                pump: pump
             )
         }
         #expect(!FileManager.default.fileExists(atPath: videoDirectory.path))

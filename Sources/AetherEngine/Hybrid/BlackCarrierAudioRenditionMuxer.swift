@@ -83,18 +83,6 @@ struct BlackCarrierAudioRenditionDescriptor: Sendable, Equatable {
     let codecString: String
     let channelsAttribute: String
     let declaredCodecInitialPaddingSamples: Int64
-    let constantRateBridgeProfile:
-        BlackCarrierConstantRateBridgeProfile?
-}
-
-struct BlackCarrierConstantRateBridgeProfile:
-    Sendable,
-    Equatable
-{
-    let sampleRate: Int
-    let channelCount: Int
-    let payloadBandwidth: Int
-    let sourceDurationSeconds: Double
 }
 
 enum BlackCarrierAudioRenditionMuxer {
@@ -119,8 +107,6 @@ enum BlackCarrierAudioRenditionMuxer {
         let sourceCodecID: AVCodecID
         let sampleRate: Int32
         let declaredCodecInitialPaddingSamples: Int64
-        let constantRateBridgeProfile:
-            BlackCarrierConstantRateBridgeProfile?
         let ownedCodecParameters: HLSVideoEngine.OwnedCodecParameters?
         let bridge: AudioBridge?
     }
@@ -147,6 +133,8 @@ enum BlackCarrierAudioRenditionMuxer {
         private var wroteCurrentSegment = false
         private var peakBandwidth = 0
         private var totalMediaBytes = 0
+        private var bandwidthSegmentSamples:
+            [BlackCarrierBandwidthSegmentSample] = []
         private(set) var presentationTimelineOffset: Int64?
         private var sourceTimestampRebase: Int64?
         private var isFinished = false
@@ -227,10 +215,14 @@ enum BlackCarrierAudioRenditionMuxer {
                 codecString: route.codecString,
                 channelsAttribute: route.channelsAttribute,
                 declaredCodecInitialPaddingSamples:
-                    route.declaredCodecInitialPaddingSamples,
-                constantRateBridgeProfile:
-                    route.constantRateBridgeProfile
+                    route.declaredCodecInitialPaddingSamples
             )
+        }
+
+        var observedBandwidthSegmentSamples:
+            [BlackCarrierBandwidthSegmentSample]
+        {
+            bandwidthSegmentSamples
         }
 
         func restartDecodeTimestampOffset(
@@ -375,6 +367,12 @@ enum BlackCarrierAudioRenditionMuxer {
                 Int(ceil(Double(finalized.bytesWritten) * 8 / duration))
             )
             totalMediaBytes += finalized.bytesWritten
+            bandwidthSegmentSamples.append(
+                BlackCarrierBandwidthSegmentSample(
+                    segmentIndex: timing.index,
+                    byteCount: finalized.bytesWritten
+                )
+            )
         }
 
         private func writeOutputPacket(
@@ -631,9 +629,7 @@ enum BlackCarrierAudioRenditionMuxer {
             codecString: route.codecString,
             channelsAttribute: route.channelsAttribute,
             declaredCodecInitialPaddingSamples:
-                route.declaredCodecInitialPaddingSamples,
-            constantRateBridgeProfile:
-                route.constantRateBridgeProfile
+                route.declaredCodecInitialPaddingSamples
         )
     }
 
@@ -755,7 +751,6 @@ enum BlackCarrierAudioRenditionMuxer {
                     declaredCodecInitialPaddingSamples: Int64(
                         sourceCodecParameters.pointee.initial_padding
                     ),
-                    constantRateBridgeProfile: nil,
                     ownedCodecParameters: owned,
                     bridge: nil
                 )
@@ -841,15 +836,6 @@ enum BlackCarrierAudioRenditionMuxer {
             declaredCodecInitialPaddingSamples: Int64(
                 encoderCodecParameters.pointee.initial_padding
             ),
-            constantRateBridgeProfile:
-                constantRateBridgeProfile(
-                    sourceStream: sourceStream,
-                    sourceStartPTS: sourceStartPTS,
-                    sourceCodecID: codecID,
-                    bridgeMode: bridgeMode,
-                    encoderCodecParameters:
-                        encoderCodecParameters
-                ),
             ownedCodecParameters: nil,
             bridge: bridge
         )
@@ -920,68 +906,6 @@ enum BlackCarrierAudioRenditionMuxer {
             AVRational(num: 1, den: parameters.sample_rate),
             packetTimeBase
         )
-    }
-
-    private static func constantRateBridgeProfile(
-        sourceStream: UnsafeMutablePointer<AVStream>,
-        sourceStartPTS: Int64,
-        sourceCodecID: AVCodecID,
-        bridgeMode: AudioBridgeMode,
-        encoderCodecParameters:
-            UnsafeMutablePointer<AVCodecParameters>
-    ) -> BlackCarrierConstantRateBridgeProfile? {
-        let stream = sourceStream.pointee
-        let encoder = encoderCodecParameters.pointee
-        guard bridgeMode == .surroundCompat,
-              encoder.codec_id == AV_CODEC_ID_EAC3,
-              encoder.sample_rate == 48_000,
-              encoder.ch_layout.nb_channels > 0,
-              encoder.ch_layout.nb_channels <= 6,
-              encoder.bit_rate > 0,
-              isLinearPCM(sourceCodecID),
-              stream.start_time == sourceStartPTS
-                || (
-                    stream.start_time == Int64.min
-                        && sourceStartPTS == 0
-                ),
-              stream.duration > 0,
-              stream.time_base.num > 0,
-              stream.time_base.den > 0 else {
-            return nil
-        }
-        let duration =
-            Double(stream.duration)
-            * Double(stream.time_base.num)
-            / Double(stream.time_base.den)
-        guard duration.isFinite, duration > 0 else { return nil }
-        return BlackCarrierConstantRateBridgeProfile(
-            sampleRate: Int(encoder.sample_rate),
-            channelCount: Int(
-                encoder.ch_layout.nb_channels
-            ),
-            payloadBandwidth: Int(encoder.bit_rate),
-            sourceDurationSeconds: duration
-        )
-    }
-
-    private static func isLinearPCM(_ codecID: AVCodecID) -> Bool {
-        switch codecID {
-        case AV_CODEC_ID_PCM_S16LE,
-             AV_CODEC_ID_PCM_S16BE,
-             AV_CODEC_ID_PCM_S24LE,
-             AV_CODEC_ID_PCM_S24BE,
-             AV_CODEC_ID_PCM_S32LE,
-             AV_CODEC_ID_PCM_S32BE,
-             AV_CODEC_ID_PCM_F32LE,
-             AV_CODEC_ID_PCM_F32BE,
-             AV_CODEC_ID_PCM_F64LE,
-             AV_CODEC_ID_PCM_F64BE,
-             AV_CODEC_ID_PCM_U8,
-             AV_CODEC_ID_PCM_S8:
-            true
-        default:
-            false
-        }
     }
 
     private static func normalizeFixedAudioFrameSize(

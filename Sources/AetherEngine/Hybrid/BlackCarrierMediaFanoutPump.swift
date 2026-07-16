@@ -818,6 +818,33 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         return summaries[ordinal]
     }
 
+    func observedAudioBandwidthSegmentSamples()
+        -> [[BlackCarrierBandwidthSegmentSample]]
+    {
+        lock.lock()
+        defer { lock.unlock() }
+        return renditions.map {
+            $0.writer.observedBandwidthSegmentSamples
+        }
+    }
+
+    func carrierBandwidthTelemetry(
+        videoSamples:
+            [BlackCarrierBandwidthSegmentSample]
+    ) -> AetherHybridCarrierBandwidthTelemetry {
+        lock.lock()
+        defer { lock.unlock() }
+        return BlackCarrierBandwidthTelemetryCalculator
+            .calculate(
+                timeline: timeline,
+                videoSamples: videoSamples,
+                audioSamples: renditions.map {
+                    $0.writer
+                        .observedBandwidthSegmentSamples
+                }
+            )
+    }
+
     func advanceVideoDecodeDemand(to time: CMTime) throws {
         guard let hybridVideoDecodeSink else { return }
         do {

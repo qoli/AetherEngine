@@ -27,7 +27,7 @@ enum HLSVODMediaPumpError:
         trackID: UInt32,
         segmentIndex: Int
     )
-    case fullAssetSummaryUnavailableAfterRestart(
+    case finalFixtureSummaryUnavailableAfterRestart(
         generation: UInt64
     )
     case origin(HLSVODOriginResourceError)
@@ -114,10 +114,10 @@ enum HLSVODMediaPumpError:
             let segmentIndex
         ):
             "HLS VOD fMP4 segment \(segmentIndex) has no unique tfdt evidence for track \(trackID)"
-        case .fullAssetSummaryUnavailableAfterRestart(
+        case .finalFixtureSummaryUnavailableAfterRestart(
             let generation
         ):
-            "HLS VOD generation \(generation) cannot produce full-asset bandwidth evidence after seek restart"
+            "HLS VOD generation \(generation) cannot produce a final fixture summary after seek restart"
         case .origin(let error):
             error.localizedDescription
         case .demuxOpenFailed:
@@ -183,7 +183,7 @@ struct HLSVODMediaPumpSnapshot: Sendable, Equatable {
 ///
 /// This remains an engine-private source pump. Transport, seek-generation replacement and an independent
 /// graph-bound analysis cursor own the same bounded origin loader; public HLS session admission stays
-/// disabled until exact startup master-bandwidth admission and the remaining public-session gates land.
+/// disabled until the remaining public-session and real-device gates land.
 /// Audio production may read one upstream segment ahead because an audio access unit from
 /// the next carrier interval is the evidence that lets the long-lived fMP4 writer finalize the requested
 /// fragment; the following carrier fragment is not finalized until a later demand.
@@ -646,12 +646,15 @@ actor HLSVODMediaPump {
         )
     }
 
-    func finishProduction() async throws
+    /// Exhausts the graph for deterministic mux-fixture verification.
+    ///
+    /// Production provider construction and startup never call this test-only assembly boundary.
+    func finishFixtureProduction() async throws
         -> [BlackCarrierAudioRenditionSummary]
     {
         guard !didRestart else {
             throw HLSVODMediaPumpError
-                .fullAssetSummaryUnavailableAfterRestart(
+                .finalFixtureSummaryUnavailableAfterRestart(
                     generation:
                         currentGeneration
                 )
@@ -733,6 +736,12 @@ actor HLSVODMediaPump {
                 workerSnapshot.audioPacketCounts,
             isClosed: isClosed
         )
+    }
+
+    func observedAudioBandwidthSegmentSamples()
+        -> [[BlackCarrierBandwidthSegmentSample]]
+    {
+        worker.observedAudioBandwidthSegmentSamples()
     }
 
     func originLoaderSnapshot() async
@@ -2132,6 +2141,15 @@ private extension HLSVODMediaPump {
                         \.packetCount
                     )
             )
+        }
+
+        func observedAudioBandwidthSegmentSamples()
+            -> [[BlackCarrierBandwidthSegmentSample]]
+        {
+            audioRenditions.map {
+                $0.writer
+                    .observedBandwidthSegmentSamples
+            }
         }
 
         func close() {

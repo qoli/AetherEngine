@@ -7,15 +7,6 @@ enum HLSVODCarrierProviderError:
     Sendable,
     Equatable
 {
-    case admissionCountMismatch(
-        expected: Int,
-        actual: Int
-    )
-    case admissionOrdinalMismatch(
-        expected: Int,
-        actual: Int
-    )
-    case invalidBandwidthEvidence(ordinal: Int)
     case startupResourceMissing(ordinal: Int)
     case pump(HLSVODMediaPumpError)
     case closed
@@ -23,18 +14,6 @@ enum HLSVODCarrierProviderError:
 
     var errorDescription: String? {
         switch self {
-        case .admissionCountMismatch(
-            let expected,
-            let actual
-        ):
-            "HLS VOD carrier requires \(expected) audio bandwidth admissions, found \(actual)"
-        case .admissionOrdinalMismatch(
-            let expected,
-            let actual
-        ):
-            "HLS VOD carrier audio bandwidth ordinal \(actual) is invalid; expected \(expected)"
-        case .invalidBandwidthEvidence(let ordinal):
-            "HLS VOD carrier audio rendition \(ordinal) has invalid bandwidth evidence"
         case .startupResourceMissing(let ordinal):
             "HLS VOD carrier audio rendition \(ordinal) did not produce startup init and segment 0"
         case .pump(let error):
@@ -50,15 +29,15 @@ enum HLSVODCarrierProviderError:
 /// Loopback-HLS transport adapter for the engine-private graph-bound HLS media pump.
 ///
 /// The existing server/provider surface is synchronous because each request owns a dedicated connection
-/// worker. This adapter blocks only that worker while an unstructured task awaits the pump actor. It never
-/// invents master bandwidth: the caller must supply explicit, valid evidence for every rendition before
-/// the provider can exist. Playback and independent analysis share the same graph-bound loader while
-/// retaining separate demux/decoder cursors. Public HLS session admission remains disabled until a
-/// source-specific startup bandwidth strategy and the remaining public-session gates own this provider.
+/// worker. This adapter blocks only that worker while an unstructured task awaits the pump actor. It
+/// advertises Aether's fixed 2 Mbps AVPlayer loopback transport budget. The budget is the primary policy;
+/// it is never replaced by source bitrate, full-asset measurement or an audio transcode. Playback and
+/// independent analysis share the same graph-bound loader while retaining separate demux/decoder cursors.
 final class HLSVODCarrierProvider:
     BlackCarrierTransportProvider,
     HybridAudioAnalysisSource,
     HybridAudioAnalysisPlaybackPressureSink,
+    HybridCarrierBandwidthTelemetrySource,
     @unchecked Sendable
 {
     private let videoProvider: BlackCarrierVideoProvider
@@ -69,8 +48,6 @@ final class HLSVODCarrierProvider:
         [BlackCarrierAudioRenditionDescriptor]
     private let timeline: BlackCarrierTimeline
     private let codecs: String
-    private let bandwidth: Int
-    private let averageBandwidth: Int
     private let resolvedHybridVideoFormat: VideoFormat?
     private let analysisInput: AudioAnalysisInput
 
@@ -87,8 +64,6 @@ final class HLSVODCarrierProvider:
 
     static func make(
         preflight: AetherHLSPlaybackPreflight,
-        bandwidthAdmissions:
-            [BlackCarrierAudioBandwidthAdmission],
         bridgeMode: AudioBridgeMode = .surroundCompat,
         videoPacketSink:
             HLSVODMediaPump.VideoPacketSink? = nil,
@@ -158,9 +133,7 @@ final class HLSVODCarrierProvider:
             return try await HLSVODCarrierProvider(
                 videoProvider: videoProvider,
                 pump: pump,
-                timeline: timeline,
-                bandwidthAdmissions:
-                    bandwidthAdmissions
+                timeline: timeline
             )
         } catch {
             videoProvider.close()
@@ -180,40 +153,11 @@ final class HLSVODCarrierProvider:
     private init(
         videoProvider: BlackCarrierVideoProvider,
         pump: HLSVODMediaPump,
-        timeline: BlackCarrierTimeline,
-        bandwidthAdmissions:
-            [BlackCarrierAudioBandwidthAdmission]
+        timeline: BlackCarrierTimeline
     ) async throws {
         let metadata = pump.renditionMetadata
         let descriptors =
             pump.renditionDescriptors
-        guard bandwidthAdmissions.count
-                == metadata.count else {
-            throw HLSVODCarrierProviderError
-                .admissionCountMismatch(
-                    expected: metadata.count,
-                    actual:
-                        bandwidthAdmissions.count
-                )
-        }
-        for (expectedOrdinal, admission) in
-                bandwidthAdmissions.enumerated() {
-            guard admission.ordinal
-                    == expectedOrdinal else {
-                throw HLSVODCarrierProviderError
-                    .admissionOrdinalMismatch(
-                        expected: expectedOrdinal,
-                        actual: admission.ordinal
-                    )
-            }
-            guard admission.evidence.isValid else {
-                throw HLSVODCarrierProviderError
-                    .invalidBandwidthEvidence(
-                        ordinal: admission.ordinal
-                    )
-            }
-        }
-
         self.videoProvider = videoProvider
         self.pump = pump
         self.metadata = metadata
@@ -237,25 +181,6 @@ final class HLSVODCarrierProvider:
         }
         codecs = uniqueCodecs.joined(
             separator: ","
-        )
-        bandwidth = max(
-            1,
-            (videoProvider.masterBandwidth ?? 0)
-                + (
-                    bandwidthAdmissions.map {
-                        $0.evidence.peakBandwidth
-                    }.max() ?? 0
-                )
-        )
-        averageBandwidth = max(
-            1,
-            (videoProvider.masterAverageBandwidth
-                ?? 0)
-                + (
-                    bandwidthAdmissions.map {
-                        $0.evidence.averageBandwidth
-                    }.max() ?? 0
-                )
         )
     }
 
@@ -504,15 +429,41 @@ final class HLSVODCarrierProvider:
     var masterVideoRange: HLSVideoRange? {
         videoProvider.masterVideoRange
     }
-    var masterBandwidth: Int? { bandwidth }
-    var masterAverageBandwidth: Int? {
-        averageBandwidth
+    var masterBandwidth: Int? {
+        AetherHybridCarrierBandwidthPolicy
+            .loopbackTransportBudget
     }
+    var masterAverageBandwidth: Int? { nil }
     var masterFrameRate: Double? {
         videoProvider.masterFrameRate
     }
     var masterClosedCaptions: String? {
         videoProvider.masterClosedCaptions
+    }
+
+    var carrierBandwidthTelemetry:
+        AetherHybridCarrierBandwidthTelemetry
+    {
+        do {
+            let videoSamples = try videoProvider
+                .observedBandwidthSegmentSamples()
+            let audioSamples = try BlockingAsyncBridge
+                .wait {
+                    await self.pump
+                        .observedAudioBandwidthSegmentSamples()
+                }
+            return BlackCarrierBandwidthTelemetryCalculator
+                .calculate(
+                    timeline: timeline,
+                    videoSamples: videoSamples,
+                    audioSamples: audioSamples
+                )
+        } catch {
+            return .unavailable(
+                audioRenditionCount:
+                    metadata.count
+            )
+        }
     }
 
     var alternateAudioRenditions:

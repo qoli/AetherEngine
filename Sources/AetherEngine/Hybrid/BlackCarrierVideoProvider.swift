@@ -21,19 +21,19 @@ enum BlackCarrierVideoProviderError: Error, LocalizedError, Sendable, Equatable 
 /// Disk-backed video-only carrier provider for the existing loopback HLS server.
 ///
 /// The provider owns only the fixed black video representation. The eventual hybrid carrier
-/// provider composes this with separately muxed real-audio renditions and raises master bandwidth
-/// by the highest-cost selectable audio rendition.
-final class BlackCarrierVideoProvider: HLSSegmentProvider, @unchecked Sendable {
+/// provider composes this with separately muxed real-audio renditions. The master playlist advertises
+/// the fixed Hybrid loopback transport budget; measured black-video bytes are diagnostics only.
+final class BlackCarrierVideoProvider:
+    HLSSegmentProvider,
+    HybridCarrierBandwidthTelemetrySource,
+    @unchecked Sendable
+{
     private struct Storage {
         let cache: SegmentCache
-        let peakBandwidth: Int
-        let averageBandwidth: Int
     }
 
     private let cache: SegmentCache
     private let timeline: BlackCarrierTimeline
-    private let peakBandwidth: Int
-    private let averageBandwidth: Int
     private let closeLock = NSLock()
     private var isClosed = false
 
@@ -41,8 +41,6 @@ final class BlackCarrierVideoProvider: HLSSegmentProvider, @unchecked Sendable {
         let storage = try Self.makeStorage(timeline: timeline)
         cache = storage.cache
         self.timeline = timeline
-        peakBandwidth = storage.peakBandwidth
-        averageBandwidth = storage.averageBandwidth
     }
 
     deinit {
@@ -89,8 +87,11 @@ final class BlackCarrierVideoProvider: HLSSegmentProvider, @unchecked Sendable {
         (BlackCarrierProfile.approved.width, BlackCarrierProfile.approved.height)
     }
     var masterVideoRange: HLSVideoRange? { .sdr }
-    var masterBandwidth: Int? { peakBandwidth }
-    var masterAverageBandwidth: Int? { averageBandwidth }
+    var masterBandwidth: Int? {
+        AetherHybridCarrierBandwidthPolicy
+            .loopbackTransportBudget
+    }
+    var masterAverageBandwidth: Int? { nil }
     var masterFrameRate: Double? {
         Double(BlackCarrierProfile.approved.nominalFramesPerSecond)
     }
@@ -98,6 +99,44 @@ final class BlackCarrierVideoProvider: HLSSegmentProvider, @unchecked Sendable {
 
     var sessionDirectory: URL {
         cache.sessionDir
+    }
+
+    var carrierTimeline: BlackCarrierTimeline {
+        timeline
+    }
+
+    func observedBandwidthSegmentSamples() throws
+        -> [BlackCarrierBandwidthSegmentSample]
+    {
+        let urls = timeline.segments.compactMap {
+            segment -> (segmentIndex: Int, url: URL)? in
+            guard let url = cache.peekURL(
+                index: segment.index
+            ) else {
+                return nil
+            }
+            return (segment.index, url)
+        }
+        return try BlackCarrierBandwidthTelemetryCalculator
+            .fileSamples(urls: urls)
+    }
+
+    var carrierBandwidthTelemetry:
+        AetherHybridCarrierBandwidthTelemetry
+    {
+        do {
+            return BlackCarrierBandwidthTelemetryCalculator
+                .calculate(
+                    timeline: timeline,
+                    videoSamples:
+                        try observedBandwidthSegmentSamples(),
+                    audioSamples: []
+                )
+        } catch {
+            return .unavailable(
+                audioRenditionCount: 0
+            )
+        }
     }
 
     private static func makeStorage(
@@ -108,9 +147,6 @@ final class BlackCarrierVideoProvider: HLSSegmentProvider, @unchecked Sendable {
             forwardWindow: segmentWindow,
             backwardWindow: segmentWindow
         )
-        var peakBandwidth = 0
-        var totalMediaBytes = 0
-
         do {
             try BlackCarrierVideoMuxer.mux(
                 timeline: timeline,
@@ -127,12 +163,6 @@ final class BlackCarrierVideoProvider: HLSSegmentProvider, @unchecked Sendable {
                             index: timing.index
                         )
                     }
-                    let duration = CMTimeGetSeconds(timing.duration)
-                    let segmentBandwidth = Int(
-                        ceil(Double(bytesWritten) * 8 / duration)
-                    )
-                    peakBandwidth = max(peakBandwidth, segmentBandwidth)
-                    totalMediaBytes += bytesWritten
                 }
             )
         } catch let error as BlackCarrierVideoProviderError {
@@ -148,14 +178,6 @@ final class BlackCarrierVideoProvider: HLSSegmentProvider, @unchecked Sendable {
             )
         }
 
-        let duration = CMTimeGetSeconds(timeline.duration)
-        let averageBandwidth = Int(
-            ceil(Double(totalMediaBytes) * 8 / duration)
-        )
-        return Storage(
-            cache: cache,
-            peakBandwidth: max(1, peakBandwidth),
-            averageBandwidth: max(1, averageBandwidth)
-        )
+        return Storage(cache: cache)
     }
 }

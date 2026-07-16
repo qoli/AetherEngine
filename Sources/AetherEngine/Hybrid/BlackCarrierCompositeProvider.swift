@@ -177,6 +177,22 @@ final class BlackCarrierAudioRenditionStore: @unchecked Sendable {
         return cache.peekURL(index: index)
     }
 
+    func observedBandwidthSegmentSamples() throws
+        -> [BlackCarrierBandwidthSegmentSample]
+    {
+        let urls = segmentDurations.indices.compactMap {
+            index -> (segmentIndex: Int, url: URL)? in
+            guard let url = cache.peekURL(
+                index: index
+            ) else {
+                return nil
+            }
+            return (index, url)
+        }
+        return try BlackCarrierBandwidthTelemetryCalculator
+            .fileSamples(urls: urls)
+    }
+
     func close() {
         closeLock.lock()
         guard !isClosed else {
@@ -244,14 +260,13 @@ enum BlackCarrierCompositeProviderError:
 /// or AVPlayer session can be created.
 final class BlackCarrierCompositeProvider:
     BlackCarrierTransportProvider,
+    HybridCarrierBandwidthTelemetrySource,
     @unchecked Sendable
 {
     private let videoProvider: BlackCarrierVideoProvider
     private let audioStores: [BlackCarrierAudioRenditionStore]
     private let audioStoresByOrdinal: [Int: BlackCarrierAudioRenditionStore]
     private let codecs: String
-    private let bandwidth: Int
-    private let averageBandwidth: Int
     private let closeLock = NSLock()
     private var isClosed = false
 
@@ -287,16 +302,6 @@ final class BlackCarrierCompositeProvider:
         }
         codecs = uniqueCodecs.joined(separator: ",")
 
-        bandwidth = max(
-            1,
-            (videoProvider.masterBandwidth ?? 0)
-                + (audioStores.map(\.peakBandwidth).max() ?? 0)
-        )
-        averageBandwidth = max(
-            1,
-            (videoProvider.masterAverageBandwidth ?? 0)
-                + (audioStores.map(\.averageBandwidth).max() ?? 0)
-        )
     }
 
     deinit {
@@ -415,13 +420,41 @@ final class BlackCarrierCompositeProvider:
     var masterVideoRange: HLSVideoRange? {
         videoProvider.masterVideoRange
     }
-    var masterBandwidth: Int? { bandwidth }
-    var masterAverageBandwidth: Int? { averageBandwidth }
+    var masterBandwidth: Int? {
+        AetherHybridCarrierBandwidthPolicy
+            .loopbackTransportBudget
+    }
+    var masterAverageBandwidth: Int? { nil }
     var masterFrameRate: Double? {
         videoProvider.masterFrameRate
     }
     var masterClosedCaptions: String? {
         videoProvider.masterClosedCaptions
+    }
+
+    var carrierBandwidthTelemetry:
+        AetherHybridCarrierBandwidthTelemetry
+    {
+        do {
+            return BlackCarrierBandwidthTelemetryCalculator
+                .calculate(
+                    timeline:
+                        videoProvider.carrierTimeline,
+                    videoSamples:
+                        try videoProvider
+                            .observedBandwidthSegmentSamples(),
+                    audioSamples:
+                        try audioStores.map {
+                            try $0
+                                .observedBandwidthSegmentSamples()
+                        }
+                )
+        } catch {
+            return .unavailable(
+                audioRenditionCount:
+                    audioStores.count
+            )
+        }
     }
 
     var alternateAudioRenditions: [HLSAudioRenditionInfo] {

@@ -124,6 +124,9 @@ struct HybridPlaybackTelemetryTests {
             audioAnalysisPlaybackPressure: .none,
             audioAnalysisTrackIDs: [0, 1],
             activeAudioAnalysisRequestCount: 0,
+            carrierBandwidth: .awaiting(
+                audioRenditionCount: 2
+            ),
             renderer: AetherMetalPlayerView.Diagnostics(
                 generation: 0,
                 queuedFrames: 0,

@@ -5,7 +5,7 @@ import Testing
 
 @Suite("Black carrier video HLS provider", .serialized)
 struct BlackCarrierVideoProviderTests {
-    @Test("Disk-backed provider publishes an exact finite VOD")
+    @Test("Disk-backed provider publishes a finite VOD with the fixed loopback budget")
     func exactVODPlaylist() throws {
         let timeline = try BlackCarrierTimeline.fileVOD(
             duration: CMTime(seconds: 9.25, preferredTimescale: 90_000)
@@ -23,13 +23,22 @@ struct BlackCarrierVideoProviderTests {
         }
         #expect(provider.mediaSegment(at: -1) == nil)
         #expect(provider.mediaSegment(at: provider.segmentCount) == nil)
+        #expect(provider.carrierBandwidthTelemetry.state == .complete)
+        #expect(
+            provider.carrierBandwidthTelemetry
+                .observedSegmentCount == 3
+        )
+        #expect(
+            provider.carrierBandwidthTelemetry
+                .observedPeakBandwidth != nil
+        )
 
         let master = try HLSLocalServer.buildMasterPlaylistText(
             provider: provider
         )
         #expect(master.contains("#EXT-X-INDEPENDENT-SEGMENTS"))
-        #expect(master.contains("BANDWIDTH=\(provider.masterBandwidth!)"))
-        #expect(master.contains("AVERAGE-BANDWIDTH=\(provider.masterAverageBandwidth!)"))
+        #expect(master.contains("BANDWIDTH=2000000"))
+        #expect(!master.contains("AVERAGE-BANDWIDTH"))
         #expect(master.contains("CODECS=\"avc1.42C01E\""))
         #expect(master.contains("RESOLUTION=640x360"))
         #expect(master.contains("FRAME-RATE=1.000"))

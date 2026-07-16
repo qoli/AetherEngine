@@ -2,6 +2,13 @@
 
 Checks that need a running engine + a real media file, so they cannot run under `swift test`.
 
+## Hybrid Atmos tvOS device gate
+
+[`hybrid-atmos-device-acceptance.md`](hybrid-atmos-device-acceptance.md) defines the physical-tvOS
+E-AC-3 JOC / Atmos fixture, start/seek/track-switch/stall matrix, privacy-safe telemetry evidence,
+and the rule for reopening the fixed 2 Mbps policy. This gate is currently pending; source-level
+profile-30 routing tests do not count as device evidence.
+
 ## `avplayer-open-check.swift` (#15, E8)
 
 Proves AVPlayer can OPEN the loopback HLS master that carries the native WebVTT `SUBTITLES`

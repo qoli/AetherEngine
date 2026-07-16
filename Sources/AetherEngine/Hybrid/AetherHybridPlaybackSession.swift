@@ -96,6 +96,8 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
         Double
     public let audioAnalysisTrackIDs: [Int]
     public let activeAudioAnalysisRequestCount: Int
+    public let carrierBandwidth:
+        AetherHybridCarrierBandwidthTelemetry
     public let renderer: AetherMetalPlayerView.Diagnostics
     public let systemFeaturePolicy: HybridPlaybackSystemFeaturePolicy
 
@@ -115,6 +117,8 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
             Double,
         audioAnalysisTrackIDs: [Int],
         activeAudioAnalysisRequestCount: Int,
+        carrierBandwidth:
+            AetherHybridCarrierBandwidthTelemetry,
         renderer: AetherMetalPlayerView.Diagnostics,
         systemFeaturePolicy: HybridPlaybackSystemFeaturePolicy
     ) {
@@ -134,6 +138,7 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
             audioAnalysisForwardBufferPressureThresholdSeconds
         self.audioAnalysisTrackIDs = audioAnalysisTrackIDs
         self.activeAudioAnalysisRequestCount = activeAudioAnalysisRequestCount
+        self.carrierBandwidth = carrierBandwidth
         self.renderer = renderer
         self.systemFeaturePolicy = systemFeaturePolicy
     }
@@ -148,8 +153,8 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
 public final class AetherHybridPlaybackSession: ObservableObject {
     /// Capabilities that the current public session can actually admit.
     ///
-    /// HLS is deliberately absent until its internal graph-bound composition gains an engine-owned startup
-    /// bandwidth admission policy and the remaining public/device gates. The verified renderer remains
+    /// HLS is deliberately absent until the remaining public and real-device acceptance gates land. Its
+    /// fixed loopback transport budget is already engine-owned. The verified renderer remains
     /// SDR-only; unsupported color formats are rejected by preflight rather than tone-mapped.
     public nonisolated static var capabilities: HybridPlaybackCapabilities {
         HybridPlaybackCapabilities(
@@ -333,6 +338,8 @@ public final class AetherHybridPlaybackSession: ObservableObject {
             audioAnalysisTrackIDs: core.audioAnalysisTrackIDs,
             activeAudioAnalysisRequestCount:
                 core.activeAudioAnalysisRequestCount,
+            carrierBandwidth:
+                core.carrierBandwidthTelemetry,
             renderer: metalPlayerView.diagnostics,
             systemFeaturePolicy: Self.systemFeaturePolicy
         )
@@ -413,6 +420,8 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                 current.audioAnalysisTrackIDs,
             activeAudioAnalysisRequestCount:
                 current.activeAudioAnalysisRequestCount,
+            carrierBandwidth:
+                current.carrierBandwidth,
             renderer: current.renderer,
             systemFeaturePolicy:
                 current.systemFeaturePolicy

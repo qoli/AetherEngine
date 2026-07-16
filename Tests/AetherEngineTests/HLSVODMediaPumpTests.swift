@@ -238,7 +238,7 @@ final class HLSVODMediaPumpTests: XCTestCase {
             throughSegment: 1
         )
         let summaries =
-            try await pump.finishProduction()
+            try await pump.finishFixtureProduction()
         XCTAssertEqual(summaries.count, 1)
         XCTAssertEqual(
             summaries[0].pipeline,
@@ -894,15 +894,15 @@ final class HLSVODMediaPumpTests: XCTestCase {
         )
         do {
             _ = try await pump
-                .finishProduction()
+                .finishFixtureProduction()
             XCTFail(
-                "seek generation unexpectedly produced full-asset bandwidth evidence"
+                "seek generation unexpectedly produced a final fixture summary"
             )
         } catch let error
                 as HLSVODMediaPumpError {
             XCTAssertEqual(
                 error,
-                .fullAssetSummaryUnavailableAfterRestart(
+                .finalFixtureSummaryUnavailableAfterRestart(
                     generation: 1
                 )
             )
@@ -1169,36 +1169,9 @@ final class HLSVODMediaPumpTests: XCTestCase {
         async throws
     {
         let fixture = try makeFixture()
-        let measurementPump =
-            try await HLSVODMediaPump.make(
-                preflight: fixture.preflight,
-                fetchOverride: { request, _ in
-                    try fixture.fetchStore.response(
-                        for: request
-                    )
-                }
-            )
-        let summaries =
-            try await measurementPump
-                .finishProduction()
-        try await measurementPump.close()
-        let admissions = summaries.enumerated().map {
-            ordinal,
-            summary in
-            BlackCarrierAudioBandwidthAdmission(
-                ordinal: ordinal,
-                evidence: .measuredFullAsset(
-                    peakBandwidth:
-                        summary.peakBandwidth,
-                    averageBandwidth:
-                        summary.averageBandwidth
-                )
-            )
-        }
         let provider =
             try await HLSVODCarrierProvider.make(
                 preflight: fixture.preflight,
-                bandwidthAdmissions: admissions,
                 fetchOverride: { request, _ in
                     try fixture.fetchStore.response(
                         for: request
@@ -1221,6 +1194,12 @@ final class HLSVODMediaPumpTests: XCTestCase {
 
         let master = try await fetchText(
             masterURL
+        )
+        XCTAssertTrue(
+            master.contains("BANDWIDTH=2000000")
+        )
+        XCTAssertFalse(
+            master.contains("AVERAGE-BANDWIDTH")
         )
         XCTAssertTrue(
             master.contains(
@@ -1304,37 +1283,10 @@ final class HLSVODMediaPumpTests: XCTestCase {
         async throws
     {
         let fixture = try makeFixture()
-        let measurementPump =
-            try await HLSVODMediaPump.make(
-                preflight: fixture.preflight,
-                fetchOverride: { request, _ in
-                    try fixture.fetchStore.response(
-                        for: request
-                    )
-                }
-            )
-        let summaries =
-            try await measurementPump
-                .finishProduction()
-        try await measurementPump.close()
-        let admissions = summaries.enumerated().map {
-            ordinal,
-            summary in
-            BlackCarrierAudioBandwidthAdmission(
-                ordinal: ordinal,
-                evidence: .measuredFullAsset(
-                    peakBandwidth:
-                        summary.peakBandwidth,
-                    averageBandwidth:
-                        summary.averageBandwidth
-                )
-            )
-        }
         let session =
             try await HybridPlaybackSession
                 .makeHLSVOD(
                     preflight: fixture.preflight,
-                    bandwidthAdmissions: admissions,
                     fetchOverride: {
                         request,
                         _ in
@@ -1398,7 +1350,6 @@ final class HLSVODMediaPumpTests: XCTestCase {
             _ = try await HybridPlaybackSession
                 .makeHLSVOD(
                     preflight: preflight,
-                    bandwidthAdmissions: [],
                     fetchOverride: {
                         request,
                         _ in
@@ -1456,15 +1407,6 @@ final class HLSVODMediaPumpTests: XCTestCase {
             _ = try await HybridPlaybackSession
                 .makeHLSVOD(
                     preflight: fixture.preflight,
-                    bandwidthAdmissions: [
-                        BlackCarrierAudioBandwidthAdmission(
-                            ordinal: 0,
-                            evidence: .measuredFullAsset(
-                                peakBandwidth: 512_000,
-                                averageBandwidth: 384_000
-                            )
-                        ),
-                    ],
                     fetchOverride: {
                         request,
                         _ in
@@ -1511,15 +1453,6 @@ final class HLSVODMediaPumpTests: XCTestCase {
         let provider =
             try await HLSVODCarrierProvider.make(
                 preflight: fixture.preflight,
-                bandwidthAdmissions: [
-                    BlackCarrierAudioBandwidthAdmission(
-                        ordinal: 0,
-                        evidence: .measuredFullAsset(
-                            peakBandwidth: 512_000,
-                            averageBandwidth: 384_000
-                        )
-                    ),
-                ],
                 fetchOverride: {
                     request,
                     _ in
@@ -1586,33 +1519,53 @@ final class HLSVODMediaPumpTests: XCTestCase {
         )
     }
 
-    func testCarrierProviderRejectsMissingBandwidthEvidence()
+    func testCarrierProviderUsesPrimaryFixedLoopbackBudgetWithoutMeasurement()
         async throws
     {
         let fixture = try makeFixture()
-        do {
-            _ = try await HLSVODCarrierProvider.make(
+        let provider =
+            try await HLSVODCarrierProvider.make(
                 preflight: fixture.preflight,
-                bandwidthAdmissions: [],
                 fetchOverride: { request, _ in
                     try fixture.fetchStore.response(
                         for: request
                     )
                 }
             )
-            XCTFail(
-                "provider unexpectedly invented audio bandwidth"
-            )
-        } catch let error
-                as HLSVODCarrierProviderError {
-            XCTAssertEqual(
-                error,
-                .admissionCountMismatch(
-                    expected: 1,
-                    actual: 0
-                )
-            )
-        }
+        defer { provider.close() }
+
+        XCTAssertEqual(
+            provider.masterBandwidth,
+            AetherHybridCarrierBandwidthPolicy
+                .loopbackTransportBudget
+        )
+        XCTAssertNil(provider.masterAverageBandwidth)
+        XCTAssertEqual(
+            provider.carrierBandwidthTelemetry.state,
+            .awaitingCarrierSegments
+        )
+        XCTAssertEqual(
+            fixture.fetchStore.count(
+                for: fixture.videoSegmentURLs[1]
+            ),
+            0,
+            "provider construction must not measure the full video asset"
+        )
+        XCTAssertEqual(
+            fixture.fetchStore.count(
+                for: fixture.audioSegmentURLs[1]
+            ),
+            0,
+            "provider construction must not measure the full audio asset"
+        )
+
+        try provider.prepareForTransportStart()
+        let telemetry = provider.carrierBandwidthTelemetry
+        XCTAssertEqual(telemetry.state, .partial)
+        XCTAssertEqual(telemetry.audioRenditionCount, 1)
+        XCTAssertEqual(telemetry.observedSegmentCount, 1)
+        XCTAssertNotNil(telemetry.observedPeakBandwidth)
+        XCTAssertNotNil(telemetry.observedAverageBandwidth)
     }
 
     func testCarrierProviderForwardsAVPlayerPressureToTheOriginLoader()
@@ -1622,8 +1575,6 @@ final class HLSVODMediaPumpTests: XCTestCase {
         let provider =
             try await HLSVODCarrierProvider.make(
                 preflight: fixture.preflight,
-                bandwidthAdmissions:
-                    validBandwidthAdmissions(),
                 fetchOverride: { request, _ in
                     try fixture.fetchStore.response(
                         for: request
@@ -1661,8 +1612,6 @@ final class HLSVODMediaPumpTests: XCTestCase {
         let provider =
             try await HLSVODCarrierProvider.make(
                 preflight: fixture.preflight,
-                bandwidthAdmissions:
-                    validBandwidthAdmissions(),
                 fetchOverride: { request, _ in
                     try fixture.fetchStore.response(
                         for: request
@@ -1782,8 +1731,6 @@ final class HLSVODMediaPumpTests: XCTestCase {
         let provider =
             try await HLSVODCarrierProvider.make(
                 preflight: fixture.preflight,
-                bandwidthAdmissions:
-                    validBandwidthAdmissions(),
                 fetchOverride: { request, _ in
                     try await blocker.response(
                         for: request
@@ -1883,8 +1830,6 @@ final class HLSVODMediaPumpTests: XCTestCase {
         let provider =
             try await HLSVODCarrierProvider.make(
                 preflight: fixture.preflight,
-                bandwidthAdmissions:
-                    validBandwidthAdmissions(),
                 fetchOverride: { request, _ in
                     try fixture.fetchStore.response(
                         for: request
@@ -2291,20 +2236,6 @@ final class HLSVODMediaPumpTests: XCTestCase {
             ),
             videoSegmentURLs: segmentURLs
         )
-    }
-
-    private func validBandwidthAdmissions()
-        -> [BlackCarrierAudioBandwidthAdmission]
-    {
-        [
-            BlackCarrierAudioBandwidthAdmission(
-                ordinal: 0,
-                evidence: .measuredFullAsset(
-                    peakBandwidth: 512_000,
-                    averageBandwidth: 384_000
-                )
-            ),
-        ]
     }
 
     private func response(

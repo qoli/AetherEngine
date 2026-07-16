@@ -380,6 +380,8 @@ final class HybridPlaybackSession {
     private let relay: HybridPlaybackFrameRelay
     private let audioAnalysisSource:
         (any HybridAudioAnalysisSource)?
+    private let carrierBandwidthTelemetrySource:
+        (any HybridCarrierBandwidthTelemetrySource)?
 
     private var classifier: HybridSeekIntentClassifier
     private var readinessGate = HybridPresentationReadinessGate()
@@ -448,6 +450,17 @@ final class HybridPlaybackSession {
         audioAnalysisSessions.count
     }
 
+    var carrierBandwidthTelemetry:
+        AetherHybridCarrierBandwidthTelemetry
+    {
+        carrierBandwidthTelemetrySource?
+            .carrierBandwidthTelemetry
+            ?? .unavailable(
+                audioRenditionCount:
+                    audioAnalysisTrackIDs.count
+            )
+    }
+
     var generation: UInt64 {
         classifier.generation
     }
@@ -472,6 +485,9 @@ final class HybridPlaybackSession {
         self.relay = relay
         audioAnalysisSource =
             provider as? any HybridAudioAnalysisSource
+        carrierBandwidthTelemetrySource =
+            provider as?
+                any HybridCarrierBandwidthTelemetrySource
         classifier = HybridSeekIntentClassifier(
             timeline: timeline,
             initialGeneration: initialGeneration
@@ -539,8 +555,6 @@ final class HybridPlaybackSession {
 
     static func makeHLSVOD(
         preflight: AetherHLSPlaybackPreflight,
-        bandwidthAdmissions:
-            [BlackCarrierAudioBandwidthAdmission],
         bridgeMode: AudioBridgeMode = .surroundCompat,
         initialGeneration: UInt64 = 0,
         fetchOverride:
@@ -561,8 +575,6 @@ final class HybridPlaybackSession {
         do {
             provider = try await HLSVODCarrierProvider.make(
                 preflight: preflight,
-                bandwidthAdmissions:
-                    bandwidthAdmissions,
                 bridgeMode: bridgeMode,
                 decodedFrameHandler: {
                     relay.emit($0)

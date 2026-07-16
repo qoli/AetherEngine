@@ -74,13 +74,6 @@ struct BlackCarrierCompositeProviderTests {
             english.sessionDirectory,
             japanese.sessionDirectory,
         ]
-        let expectedBandwidth =
-            try #require(videoProvider.masterBandwidth)
-            + max(english.peakBandwidth, japanese.peakBandwidth)
-        let expectedAverageBandwidth =
-            try #require(videoProvider.masterAverageBandwidth)
-            + max(english.averageBandwidth, japanese.averageBandwidth)
-
         let provider = try BlackCarrierCompositeProvider(
             videoProvider: videoProvider,
             audioStores: [english, japanese]
@@ -88,8 +81,17 @@ struct BlackCarrierCompositeProviderTests {
 
         #expect(provider.segmentCount == 2)
         #expect(provider.masterCodecs == "avc1.42C01E,ec-3")
-        #expect(provider.masterBandwidth == expectedBandwidth)
-        #expect(provider.masterAverageBandwidth == expectedAverageBandwidth)
+        #expect(provider.masterBandwidth == 2_000_000)
+        #expect(provider.masterAverageBandwidth == nil)
+        #expect(provider.carrierBandwidthTelemetry.state == .complete)
+        #expect(
+            provider.carrierBandwidthTelemetry
+                .observedSegmentCount == 2
+        )
+        #expect(
+            provider.carrierBandwidthTelemetry
+                .audioRenditionCount == 2
+        )
         #expect(provider.alternateAudioRenditions.map(\.name) == [
             "English",
             "日本語",
@@ -103,8 +105,8 @@ struct BlackCarrierCompositeProviderTests {
         )
         #expect(master.contains("CODECS=\"avc1.42C01E,ec-3\""))
         #expect(master.contains("AUDIO=\"audio\""))
-        #expect(master.contains("BANDWIDTH=\(expectedBandwidth)"))
-        #expect(master.contains("AVERAGE-BANDWIDTH=\(expectedAverageBandwidth)"))
+        #expect(master.contains("BANDWIDTH=2000000"))
+        #expect(!master.contains("AVERAGE-BANDWIDTH"))
 
         guard case .master(let parsedMaster) = try HLSPlaylistParser.parse(master) else {
             Issue.record("Expected a carrier master playlist")

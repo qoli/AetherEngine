@@ -225,8 +225,8 @@ struct SourceByteStoreAVIOTests {
         )
     }
 
-    @Test("Black-carrier measurement and playback share one validated origin generation")
-    func blackCarrierMeasurementPlaybackReuse() throws {
+    @Test("Black-carrier startup reuses its original demux without a measurement pass")
+    func blackCarrierStartupUsesOneDemuxPass() throws {
         let source = makeWAV(seconds: 5.25)
         let server = try RangeFixtureServer(
             body: source,
@@ -253,7 +253,7 @@ struct SourceByteStoreAVIOTests {
 
         try provider.prepareForTransportStart()
         let snapshot = server.snapshot
-        #expect(snapshot.conditionalRequestCount == 1)
+        #expect(snapshot.conditionalRequestCount == 0)
         #expect(snapshot.bodyBytesSent <= source.count + 1)
         #expect(provider.alternateAudioRenditions.count == 1)
         #expect(
