@@ -1299,6 +1299,130 @@ final class HLSVODMediaPumpTests: XCTestCase {
         XCTAssertNil(provider.terminalError)
     }
 
+    @MainActor
+    func testHybridSessionComposesHLSProviderIntoAVPlayerAndMetal()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let measurementPump =
+            try await HLSVODMediaPump.make(
+                preflight: fixture.preflight,
+                fetchOverride: { request, _ in
+                    try fixture.fetchStore.response(
+                        for: request
+                    )
+                }
+            )
+        let summaries =
+            try await measurementPump
+                .finishProduction()
+        try await measurementPump.close()
+        let admissions = summaries.enumerated().map {
+            ordinal,
+            summary in
+            BlackCarrierAudioBandwidthAdmission(
+                ordinal: ordinal,
+                evidence: .measuredFullAsset(
+                    peakBandwidth:
+                        summary.peakBandwidth,
+                    averageBandwidth:
+                        summary.averageBandwidth
+                )
+            )
+        }
+        let session =
+            try await HybridPlaybackSession
+                .makeHLSVOD(
+                    preflight: fixture.preflight,
+                    bandwidthAdmissions: admissions,
+                    fetchOverride: {
+                        request,
+                        _ in
+                        try fixture.fetchStore
+                            .response(for: request)
+                    }
+                )
+        defer { session.stop() }
+
+        try await session.prepare(timeout: 10)
+
+        XCTAssertEqual(
+            session.state,
+            .ready(generation: 0)
+        )
+        XCTAssertNotNil(session.avPlayer.currentItem)
+        let metalView = try XCTUnwrap(
+            session.metalPlayerView
+        )
+        XCTAssertEqual(
+            metalView.diagnostics.generation,
+            0
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(
+                metalView.diagnostics
+                    .lastPresentedTimeSeconds
+            ),
+            0,
+            accuracy: 0.000_001
+        )
+    }
+
+    @MainActor
+    func testHybridSessionRejectsNonHybridHLSBeforeOriginFetch()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let result = PlaybackPreflightResult(
+            sourceProfile:
+                fixture.preflight.result
+                    .sourceProfile,
+            hlsPackaging:
+                fixture.preflight.result
+                    .hlsPackaging,
+            route: .nativeAVPlayer,
+            reason: .nativeHLSContractVerified
+        )
+        let preflight = AetherHLSPlaybackPreflight(
+            result: result,
+            resourceGraph: nil,
+            httpHeaders: [:]
+        )
+        let expected = HybridPlaybackSessionError
+            .preflightRequiresHybrid(
+                route: .nativeAVPlayer,
+                reason: .nativeHLSContractVerified
+            )
+
+        do {
+            _ = try await HybridPlaybackSession
+                .makeHLSVOD(
+                    preflight: preflight,
+                    bandwidthAdmissions: [],
+                    fetchOverride: {
+                        request,
+                        _ in
+                        try fixture.fetchStore
+                            .response(for: request)
+                    }
+                )
+            XCTFail(
+                "non-hybrid HLS unexpectedly created a hybrid session"
+            )
+        } catch let error
+                as HybridPlaybackSessionError {
+            XCTAssertEqual(error, expected)
+        }
+        for url in
+            fixture.videoSegmentURLs
+                + fixture.audioSegmentURLs {
+            XCTAssertEqual(
+                fixture.fetchStore.count(for: url),
+                0
+            )
+        }
+    }
+
     func testCarrierProviderRejectsMissingBandwidthEvidence()
         async throws
     {

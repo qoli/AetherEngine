@@ -458,6 +458,85 @@ final class HybridPlaybackSession {
         }
     }
 
+    static func makeHLSVOD(
+        preflight: AetherHLSPlaybackPreflight,
+        bandwidthAdmissions:
+            [BlackCarrierAudioBandwidthAdmission],
+        bridgeMode: AudioBridgeMode = .surroundCompat,
+        initialGeneration: UInt64 = 0,
+        fetchOverride:
+            HLSVODOriginResourceLoader.Fetch? = nil
+    ) async throws -> HybridPlaybackSession {
+        guard preflight.result.route
+                == .hybridCarrierMetal,
+              preflight.resourceGraph != nil else {
+            throw HybridPlaybackSessionError
+                .preflightRequiresHybrid(
+                    route: preflight.result.route,
+                    reason: preflight.result.reason
+                )
+        }
+
+        let relay = HybridPlaybackFrameRelay()
+        let provider: HLSVODCarrierProvider
+        do {
+            provider = try await HLSVODCarrierProvider.make(
+                preflight: preflight,
+                bandwidthAdmissions:
+                    bandwidthAdmissions,
+                bridgeMode: bridgeMode,
+                decodedFrameHandler: {
+                    relay.emit($0)
+                },
+                videoFailureHandler: {
+                    relay.fail($0)
+                },
+                initialGeneration:
+                    initialGeneration,
+                fetchOverride: fetchOverride
+            )
+        } catch {
+            relay.detach()
+            throw error
+        }
+
+        do {
+            let renderView = try AetherMetalPlayerView()
+            let transport = BlackCarrierAVPlayerSession(
+                provider: provider
+            )
+            return try HybridPlaybackSession(
+                provider: provider,
+                transport: transport,
+                renderSurface: renderView,
+                timeline:
+                    try requireHLSHybridTimeline(
+                        preflight
+                    ),
+                initialGeneration: initialGeneration,
+                relay: relay
+            )
+        } catch {
+            provider.close()
+            relay.detach()
+            throw error
+        }
+    }
+
+    private static func requireHLSHybridTimeline(
+        _ preflight: AetherHLSPlaybackPreflight
+    ) throws -> BlackCarrierTimeline {
+        guard let timeline =
+                preflight.hybridTimeline else {
+            throw HybridPlaybackSessionError
+                .providerFailed(
+                    reason:
+                        "HLS preflight did not retain a hybrid timeline"
+                )
+        }
+        return timeline
+    }
+
     func prepare(timeout: TimeInterval = 15) async throws {
         guard timeout.isFinite, timeout > 0 else {
             throw HybridPlaybackSessionError.invalidReadinessTimeout
