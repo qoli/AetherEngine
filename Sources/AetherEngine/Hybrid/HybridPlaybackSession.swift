@@ -2,13 +2,33 @@ import AVFoundation
 import CoreMedia
 import Foundation
 
-enum HybridPlaybackSessionError:
+public enum HybridPlaybackSessionError:
     Error,
     LocalizedError,
     Sendable,
     Equatable
 {
     case videoPipelineMissing
+    case renderSurfaceMissing
+    case invalidSeekableVODOptions
+    case sourceIndependentReaderUnavailable
+    case sourceKindMismatch(expected: AetherMediaSourceKind)
+    case timelineSourceMismatch(
+        sourceKind: AetherMediaSourceKind,
+        timelineSource: BlackCarrierTimelineSource
+    )
+    case preflightRequiresHybrid(
+        route: PlaybackRenderRoute,
+        reason: PlaybackRouteReason
+    )
+    case preflightContractChanged(
+        route: PlaybackRenderRoute,
+        reason: PlaybackRouteReason
+    )
+    case sourceVideoFormatDiverged(
+        preflight: VideoFormat,
+        decoded: VideoFormat
+    )
     case invalidReadinessTimeout
     case invalidSeekTarget
     case invalidRate
@@ -31,10 +51,33 @@ enum HybridPlaybackSessionError:
     )
     case cancelled
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .videoPipelineMissing:
             return "Hybrid playback requires a generation-aware real-video decoder"
+        case .renderSurfaceMissing:
+            return "Hybrid playback did not create its engine-owned Metal render surface"
+        case .invalidSeekableVODOptions:
+            return "Hybrid playback requires non-live, video-bearing, seekable VOD load options"
+        case .sourceIndependentReaderUnavailable:
+            return "Hybrid playback source cannot create the independent readers required by its session"
+        case .sourceKindMismatch(let expected):
+            return "Hybrid playback source does not match preflight source kind \(expected.rawValue)"
+        case .timelineSourceMismatch(
+            let sourceKind,
+            let timelineSource
+        ):
+            return "Hybrid playback \(sourceKind.rawValue) source cannot use "
+                + "\(String(describing: timelineSource)) carrier timing"
+        case .preflightRequiresHybrid(let route, let reason):
+            return "Hybrid session creation requires .hybridCarrierMetal, received "
+                + "\(route.rawValue) (\(reason.rawValue))"
+        case .preflightContractChanged(let route, let reason):
+            return "Hybrid session capabilities now resolve the source as "
+                + "\(route.rawValue) (\(reason.rawValue))"
+        case .sourceVideoFormatDiverged(let preflight, let decoded):
+            return "Hybrid decoded video format \(String(describing: decoded)) diverged from "
+                + "preflight \(String(describing: preflight))"
         case .invalidReadinessTimeout:
             return "Hybrid playback readiness timeout must be positive and finite"
         case .invalidSeekTarget:
@@ -79,7 +122,7 @@ enum HybridPlaybackSessionError:
     }
 }
 
-enum HybridPlaybackSessionState: Sendable, Equatable {
+public enum HybridPlaybackSessionState: Sendable, Equatable {
     case idle
     case preparing(generation: UInt64, target: CMTime)
     case ready(generation: UInt64)
@@ -88,7 +131,7 @@ enum HybridPlaybackSessionState: Sendable, Equatable {
     case stopped
 }
 
-enum HybridPlaybackSeekResult: Sendable, Equatable {
+public enum HybridPlaybackSeekResult: Sendable, Equatable {
     case applied(generation: UInt64, target: CMTime)
     case superseded(currentGeneration: UInt64)
 }
@@ -237,7 +280,11 @@ final class HybridPlaybackSession {
     nonisolated private static let observedJumpThresholdSeconds = 0.5
 
     let avPlayer: AVPlayer
-    private(set) var state: HybridPlaybackSessionState = .idle
+    private(set) var state: HybridPlaybackSessionState = .idle {
+        didSet {
+            stateDidChange?(state)
+        }
+    }
 
     var metalPlayerView: AetherMetalPlayerView? {
         renderSurface as? AetherMetalPlayerView
@@ -270,6 +317,24 @@ final class HybridPlaybackSession {
     private var audioAnalysisSessions: [
         UUID: AudioAnalysisSession
     ] = [:]
+    var stateDidChange:
+        (@MainActor @Sendable (HybridPlaybackSessionState) -> Void)?
+
+    var sourceVideoFormat: VideoFormat {
+        videoFormat
+    }
+
+    var audioAnalysisTrackIDs: [Int] {
+        audioAnalysisSource?.audioAnalysisTrackIDs ?? []
+    }
+
+    var activeAudioAnalysisRequestCount: Int {
+        audioAnalysisSessions.count
+    }
+
+    var generation: UInt64 {
+        classifier.generation
+    }
 
     init(
         provider: any HybridCarrierTransportProvider,

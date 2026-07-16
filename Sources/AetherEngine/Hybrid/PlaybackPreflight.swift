@@ -14,7 +14,7 @@ public enum PlaybackRenderRoute: String, Sendable, Equatable {
 ///
 /// The caller must state this fact rather than relying on a URL suffix: HLS endpoints commonly have no
 /// `.m3u8` path extension.
-public enum AetherMediaSourceKind: String, Sendable, Equatable {
+public enum AetherMediaSourceKind: String, Sendable, Equatable, Hashable {
     case hls
     case progressive
     case custom
@@ -162,15 +162,22 @@ public struct HybridPlaybackCapabilities: Sendable, Equatable {
     public let hasDirectVideoDecoder: Bool
     public let hasMetalRenderer: Bool
     public let supportedVideoFormats: Set<VideoFormat>
+    public let supportedSourceKinds: Set<AetherMediaSourceKind>
 
     public init(
         hasDirectVideoDecoder: Bool,
         hasMetalRenderer: Bool,
-        supportedVideoFormats: Set<VideoFormat>
+        supportedVideoFormats: Set<VideoFormat>,
+        supportedSourceKinds: Set<AetherMediaSourceKind> = [
+            .hls,
+            .progressive,
+            .custom,
+        ]
     ) {
         self.hasDirectVideoDecoder = hasDirectVideoDecoder
         self.hasMetalRenderer = hasMetalRenderer
         self.supportedVideoFormats = supportedVideoFormats
+        self.supportedSourceKinds = supportedSourceKinds
     }
 }
 
@@ -188,6 +195,7 @@ public enum PlaybackRouteReason: String, Sendable, Equatable {
     case unsupportedHLSContentProtection
     case unsupportedHLSVideoPackaging
     case unsupportedHybridRequiresSeekableVOD
+    case unsupportedHybridSourceKind
     case unsupportedHybridDecoderUnavailable
     case unsupportedHybridMetalRendererUnavailable
     case unsupportedHybridVideoFormat
@@ -339,6 +347,9 @@ public enum PlaybackPreflight {
     ) -> PlaybackPreflightResult {
         guard sourceProfile.isSeekableVOD else {
             return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHybridRequiresSeekableVOD)
+        }
+        guard capabilities.supportedSourceKinds.contains(sourceProfile.sourceKind) else {
+            return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHybridSourceKind)
         }
         guard capabilities.hasDirectVideoDecoder else {
             return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHybridDecoderUnavailable)

@@ -165,6 +165,23 @@ final class PlaybackPreflightTests: XCTestCase {
         XCTAssertEqual(result.reason, .hybridNonAVPlayerCodec)
     }
 
+    func testHybridSourceKindMustBePubliclyAdmitted() {
+        let progressiveOnly = HybridPlaybackCapabilities(
+            hasDirectVideoDecoder: true,
+            hasMetalRenderer: true,
+            supportedVideoFormats: [.sdr],
+            supportedSourceKinds: [.progressive, .custom]
+        )
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(),
+            hlsPackaging: hls(sampleEntry: .hev1),
+            hybridCapabilities: progressiveOnly
+        )
+
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(result.reason, .unsupportedHybridSourceKind)
+    }
+
     func testUnknownCodecFailsInsteadOfAssumingNative() {
         let result = PlaybackPreflight.resolve(
             sourceProfile: source(codec: .unknown),

@@ -49,7 +49,7 @@ public final class AetherMetalPlayerView: PlatformBaseView {
 
     /// This is deliberately the only color format currently advertised by the production renderer.
     /// Adding another format requires an end-to-end Metal/display-criteria device acceptance test first.
-    public static let verifiedVideoFormats: Set<VideoFormat> = [.sdr]
+    public nonisolated static let verifiedVideoFormats: Set<VideoFormat> = [.sdr]
 
     public let metalView: MTKView
     private let renderer: AetherMetalFrameRenderer

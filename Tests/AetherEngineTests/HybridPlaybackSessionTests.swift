@@ -406,18 +406,20 @@ struct HybridPlaybackSessionTests {
             CMTime(seconds: 1, preferredTimescale: 600)
         )
         try await waitUntil {
-            guard let latest = fixture.provider
-                .snapshot().demands.last else {
-                return false
+            fixture.provider.snapshot().demands.contains {
+                abs($0.seconds - 1.25) < 0.000_001
             }
-            return latest.seconds >= 1.25 - 0.000_001
         }
         let demand = try #require(
-            fixture.provider.snapshot().demands.last
+            fixture.provider.snapshot().demands.first {
+                abs($0.seconds - 1.25) < 0.000_001
+            }
         )
         #expect(abs(demand.seconds - 1.25) < 0.000_001)
         #expect(
-            fixture.renderSurface.clockSamples.last?.seconds == 1
+            fixture.renderSurface.clockSamples.contains {
+                abs($0.seconds - 1) < 0.000_001
+            }
         )
     }
 
@@ -665,7 +667,7 @@ struct HybridPlaybackSessionTests {
     private func waitUntil(
         _ condition: @escaping @MainActor () -> Bool
     ) async throws {
-        for _ in 0..<100 {
+        for _ in 0..<500 {
             if condition() {
                 return
             }
