@@ -23,7 +23,8 @@ struct HybridVideoStreamContract: Sendable, Equatable {
 
     init(
         demuxer: Demuxer,
-        stream: UnsafeMutablePointer<AVStream>
+        stream: UnsafeMutablePointer<AVStream>,
+        sourceStartPTSOverride: Int64? = nil
     ) throws {
         let codecParameters = stream.pointee.codecpar.pointee
         codecID = codecParameters.codec_id.rawValue
@@ -59,10 +60,11 @@ struct HybridVideoStreamContract: Sendable, Equatable {
             throw HybridVideoDecodeSinkError.invalidPacketTimeBase
         }
         let resolvedSourceStartPTS =
-            BlackCarrierSourceAxis.sourceStartPTS(
-            demuxer: demuxer,
-            streamIndex: stream.pointee.index
-        )
+            sourceStartPTSOverride
+            ?? BlackCarrierSourceAxis.sourceStartPTS(
+                demuxer: demuxer,
+                streamIndex: stream.pointee.index
+            )
         let sourceStartValue =
             resolvedSourceStartPTS.multipliedReportingOverflow(
                 by: Int64(stream.pointee.time_base.num)
@@ -257,6 +259,7 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         demuxer: Demuxer,
         initialGeneration: UInt64,
         initialTargetTime: CMTime = .zero,
+        sourceStartPTSOverride: Int64? = nil,
         maximumQueuedBytes: Int = 96 * 1_024 * 1_024,
         maximumQueuedPackets: Int = 8_192,
         onFrame: @escaping FrameHandler,
@@ -279,7 +282,9 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         }
         streamContract = try HybridVideoStreamContract(
             demuxer: demuxer,
-            stream: stream
+            stream: stream,
+            sourceStartPTSOverride:
+                sourceStartPTSOverride
         )
         generation = initialGeneration
         targetTime = initialTargetTime
@@ -342,11 +347,14 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
 
     func validate(
         demuxer: Demuxer,
-        stream: UnsafeMutablePointer<AVStream>
+        stream: UnsafeMutablePointer<AVStream>,
+        sourceStartPTSOverride: Int64? = nil
     ) throws -> Bool {
         try HybridVideoStreamContract(
             demuxer: demuxer,
-            stream: stream
+            stream: stream,
+            sourceStartPTSOverride:
+                sourceStartPTSOverride
         ) == streamContract
     }
 
