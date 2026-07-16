@@ -4,7 +4,7 @@ import Libavformat
 import Testing
 @testable import AetherEngine
 
-@Suite("Black carrier encoded sample")
+@Suite("Black carrier encoded sample", .serialized)
 struct BlackCarrierEncodedSampleTests {
     @Test("Bundled asset and manifest match the approved SHA-256")
     func approvedHash() throws {
