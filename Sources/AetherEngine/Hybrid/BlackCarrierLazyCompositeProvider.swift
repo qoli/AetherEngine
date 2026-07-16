@@ -328,6 +328,10 @@ final class BlackCarrierLazyCompositeProvider:
         return _terminalError
     }
 
+    var hybridVideoFormat: VideoFormat? {
+        pump.hybridVideoFormat
+    }
+
     func prepareForTransportStart() throws {
         do {
             for ordinal in pump.renditionMetadata.indices {
@@ -373,6 +377,22 @@ final class BlackCarrierLazyCompositeProvider:
         } catch let error as BlackCarrierMediaFanoutPumpError {
             record(.pump(error))
             throw error
+        } catch {
+            let typed = BlackCarrierMediaFanoutPumpError.demuxFailed(
+                reason: String(describing: error)
+            )
+            record(.pump(typed))
+            throw typed
+        }
+    }
+
+    func prepareHybridGeneration(segmentIndex: Int) throws {
+        do {
+            try pump.produce(throughSegment: segmentIndex)
+        } catch let error as BlackCarrierMediaFanoutPumpError {
+            let typed = BlackCarrierLazyCompositeProviderError.pump(error)
+            record(typed)
+            throw typed
         } catch {
             let typed = BlackCarrierMediaFanoutPumpError.demuxFailed(
                 reason: String(describing: error)

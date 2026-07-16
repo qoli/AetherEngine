@@ -397,6 +397,10 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         freshDemuxerFactory != nil
     }
 
+    var hybridVideoFormat: VideoFormat? {
+        hybridVideoDecodeSink?.streamContract.videoFormat
+    }
+
     func restart(
         for intent: HybridSeekIntent
     ) throws -> BlackCarrierMediaFanoutRestartResult {

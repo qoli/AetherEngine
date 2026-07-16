@@ -97,6 +97,14 @@ final class BlackCarrierAVPlayerSession {
     }
 
     func start() throws {
+        try start(prepareProvider: true)
+    }
+
+    func startPrepared() throws {
+        try start(prepareProvider: false)
+    }
+
+    private func start(prepareProvider: Bool) throws {
         switch lifecycle {
         case .idle:
             break
@@ -106,13 +114,15 @@ final class BlackCarrierAVPlayerSession {
             throw BlackCarrierAVPlayerSessionError.alreadyStopped
         }
 
-        do {
-            try provider.prepareForTransportStart()
-        } catch {
-            failAndClose()
-            throw BlackCarrierAVPlayerSessionError.providerPreparationFailed(
-                reason: String(describing: error)
-            )
+        if prepareProvider {
+            do {
+                try provider.prepareForTransportStart()
+            } catch {
+                failAndClose()
+                throw BlackCarrierAVPlayerSessionError.providerPreparationFailed(
+                    reason: String(describing: error)
+                )
+            }
         }
 
         do {
@@ -142,6 +152,18 @@ final class BlackCarrierAVPlayerSession {
         transportState = .started
     }
 
+    func seek(to time: CMTime) async -> Bool {
+        await withCheckedContinuation { continuation in
+            avPlayer.seek(
+                to: time,
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            ) { finished in
+                continuation.resume(returning: finished)
+            }
+        }
+    }
+
     /// Resolves only the AVPlayer carrier transport boundary.
     ///
     /// A `.ready` result means the loopback asset is playable and the item reached
@@ -168,7 +190,7 @@ final class BlackCarrierAVPlayerSession {
         case .stopped:
             throw BlackCarrierAVPlayerSessionError.alreadyStopped
         }
-        guard timeout > 0 else {
+        guard timeout.isFinite, timeout > 0 else {
             let error = BlackCarrierAVPlayerSessionError.readinessTimedOut(
                 seconds: timeout
             )
