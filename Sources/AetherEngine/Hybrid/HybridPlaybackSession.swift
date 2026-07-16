@@ -158,6 +158,16 @@ public enum HybridAudioAnalysisPlaybackPressure:
     case carrierNotLikelyToKeepUp
 }
 
+enum HybridPlaybackTelemetryTrigger:
+    Sendable,
+    Equatable
+{
+    case transportChanged
+    case periodicSample
+    case playbackPressureChanged
+    case audioAnalysisChanged
+}
+
 protocol HybridCarrierTransportProvider:
     BlackCarrierTransportProvider,
     Sendable
@@ -347,6 +357,7 @@ final class HybridPlaybackSession {
         preferredTimescale: 600
     )
     static let analysisForwardBufferPressureThresholdSeconds = 2.0
+    nonisolated static let telemetrySampleIntervalSeconds = 1.0
     nonisolated private static let observedJumpThresholdSeconds = 0.5
 
     let avPlayer: AVPlayer
@@ -386,6 +397,7 @@ final class HybridPlaybackSession {
     private(set) var carrierForwardBufferSeconds: Double?
     private var playbackStallLatched = false
     private var analysisPlaybackPressureSequence: UInt64 = 0
+    private var lastTelemetryClockSampleSeconds: Double?
 
     private var latestDecodeDemand: CMTime?
     private var decodeDemandWorker: Task<Void, Never>?
@@ -396,6 +408,8 @@ final class HybridPlaybackSession {
     ] = [:]
     var stateDidChange:
         (@MainActor @Sendable (HybridPlaybackSessionState) -> Void)?
+    var telemetryDidChange:
+        (@MainActor @Sendable (HybridPlaybackTelemetryTrigger) -> Void)?
 
     var sourceVideoFormat: VideoFormat {
         videoFormat
@@ -687,6 +701,7 @@ final class HybridPlaybackSession {
             throw currentAvailabilityError()
         }
         avPlayer.play()
+        telemetryDidChange?(.transportChanged)
         reevaluateAudioAnalysisPlaybackPressure()
     }
 
@@ -709,6 +724,7 @@ final class HybridPlaybackSession {
         default:
             throw currentAvailabilityError()
         }
+        telemetryDidChange?(.transportChanged)
         reevaluateAudioAnalysisPlaybackPressure()
     }
 
@@ -720,6 +736,7 @@ final class HybridPlaybackSession {
             throw currentAvailabilityError()
         }
         avPlayer.rate = rate
+        telemetryDidChange?(.transportChanged)
         reevaluateAudioAnalysisPlaybackPressure()
     }
 
@@ -769,6 +786,7 @@ final class HybridPlaybackSession {
             cancel: { session.cancel() }
         )
         audioAnalysisSessions[session.id] = session
+        telemetryDidChange?(.audioAnalysisChanged)
         let sessionID = session.id
         let task = Task.detached(priority: .utility) {
             [weak self] in
@@ -786,10 +804,14 @@ final class HybridPlaybackSession {
     }
 
     func cancelAudioAnalysisStreams() {
+        let hadSessions = !audioAnalysisSessions.isEmpty
         let sessions = Array(audioAnalysisSessions.values)
         audioAnalysisSessions.removeAll()
         for session in sessions {
             session.cancel()
+        }
+        if hadSessions {
+            telemetryDidChange?(.audioAnalysisChanged)
         }
     }
 
@@ -816,7 +838,12 @@ final class HybridPlaybackSession {
     }
 
     private func removeAudioAnalysisSession(id: UUID) {
-        audioAnalysisSessions.removeValue(forKey: id)
+        guard audioAnalysisSessions.removeValue(
+            forKey: id
+        ) != nil else {
+            return
+        }
+        telemetryDidChange?(.audioAnalysisChanged)
     }
 
     func receiveDecodedFrame(_ frame: DecodedVideoFrame) {
@@ -872,6 +899,7 @@ final class HybridPlaybackSession {
             CMTimeAdd(time, Self.decodeLookahead)
         )
         submitDecodeDemand(requested)
+        publishPeriodicTelemetryIfNeeded(time)
     }
 
     private func performSeek(
@@ -1165,6 +1193,7 @@ final class HybridPlaybackSession {
         }
         audioAnalysisPlaybackPressure = pressure
         analysisPlaybackPressureSequence &+= 1
+        telemetryDidChange?(.playbackPressureChanged)
         let sequence = analysisPlaybackPressureSequence
         let coordinator = coordinator
         Task {
@@ -1235,6 +1264,21 @@ final class HybridPlaybackSession {
             pressure,
             forwardBufferSeconds: forwardBufferSeconds
         )
+    }
+
+    private func publishPeriodicTelemetryIfNeeded(
+        _ time: CMTime
+    ) {
+        guard Self.isValidTimelineTime(time) else { return }
+        let seconds = time.seconds
+        if let last = lastTelemetryClockSampleSeconds,
+           seconds >= last,
+           seconds - last
+                < Self.telemetrySampleIntervalSeconds {
+            return
+        }
+        lastTelemetryClockSampleSeconds = seconds
+        telemetryDidChange?(.periodicSample)
     }
 
     static func resolveAudioAnalysisPlaybackPressure(

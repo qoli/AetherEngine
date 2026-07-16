@@ -168,11 +168,14 @@ public final class AetherHybridPlaybackSession: ObservableObject {
     public let avPlayer: AVPlayer
     public let metalPlayerView: AetherMetalPlayerView
     public let timeline: BlackCarrierTimeline
+    public let telemetrySessionID: UUID
 
     @Published public private(set) var state:
         HybridPlaybackSessionState
 
     private let core: HybridPlaybackSession
+    private let telemetryHub:
+        AetherHybridPlaybackTelemetryHub
 
     private init(
         core: HybridPlaybackSession,
@@ -180,15 +183,26 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         timeline: BlackCarrierTimeline,
         metalPlayerView: AetherMetalPlayerView
     ) {
+        let telemetryHub =
+            AetherHybridPlaybackTelemetryHub()
         self.core = core
         self.preflightResult = preflightResult
         self.timeline = timeline
         self.metalPlayerView = metalPlayerView
+        self.telemetryHub = telemetryHub
+        telemetrySessionID = telemetryHub.sessionID
         avPlayer = core.avPlayer
         state = core.state
         core.stateDidChange = { [weak self] state in
             self?.state = state
+            self?.publishTelemetry(.stateChanged)
         }
+        core.telemetryDidChange = { [weak self] trigger in
+            self?.publishTelemetry(
+                Self.telemetryEventKind(for: trigger)
+            )
+        }
+        publishTelemetry(.sessionCreated)
     }
 
     /// Construct a session only from the exact preflight result used by the host route decision.
@@ -278,6 +292,16 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         core.audioAnalysisTrackIDs
     }
 
+    /// Bounded, sequence-ordered telemetry for the complete public hybrid session lifecycle.
+    ///
+    /// Each subscriber receives up to the latest 64 events before live delivery. The stream finishes after
+    /// `stop()`. Events never expose source URLs, request headers, credentials or arbitrary error strings.
+    public func telemetryEvents()
+        -> AsyncStream<AetherHybridPlaybackTelemetryEvent>
+    {
+        telemetryHub.stream()
+    }
+
     public func audioAnalysisAvailability(
         for audioTrackID: Int
     ) -> AudioAnalysisTrackAvailability {
@@ -349,6 +373,65 @@ public final class AetherHybridPlaybackSession: ObservableObject {
 
     public func stop() {
         core.stop()
+        telemetryHub.finish()
+    }
+
+    private func publishTelemetry(
+        _ kind: AetherHybridPlaybackTelemetryEventKind
+    ) {
+        telemetryHub.emit(
+            kind: kind,
+            snapshot: telemetrySnapshot()
+        )
+    }
+
+    private func telemetrySnapshot()
+        -> AetherHybridPlaybackTelemetrySnapshot
+    {
+        let current = diagnostics
+        return AetherHybridPlaybackTelemetrySnapshot(
+            route: preflightResult.route,
+            routeReason: preflightResult.reason,
+            state:
+                AetherHybridPlaybackTelemetryState(
+                    current.state
+                ),
+            generation: current.generation,
+            videoFormat: current.videoFormat,
+            timelineDurationSeconds:
+                current.timelineDurationSeconds,
+            carrierTimeSeconds:
+                current.carrierTimeSeconds,
+            carrierRate: current.carrierRate,
+            carrierTimeControlStatus:
+                current.carrierTimeControlStatus,
+            carrierForwardBufferSeconds:
+                current.carrierForwardBufferSeconds,
+            audioAnalysisPlaybackPressure:
+                current.audioAnalysisPlaybackPressure,
+            audioAnalysisTrackIDs:
+                current.audioAnalysisTrackIDs,
+            activeAudioAnalysisRequestCount:
+                current.activeAudioAnalysisRequestCount,
+            renderer: current.renderer,
+            systemFeaturePolicy:
+                current.systemFeaturePolicy
+        )
+    }
+
+    private static func telemetryEventKind(
+        for trigger: HybridPlaybackTelemetryTrigger
+    ) -> AetherHybridPlaybackTelemetryEventKind {
+        switch trigger {
+        case .transportChanged:
+            .transportChanged
+        case .periodicSample:
+            .periodicSample
+        case .playbackPressureChanged:
+            .playbackPressureChanged
+        case .audioAnalysisChanged:
+            .audioAnalysisChanged
+        }
     }
 
     private static func validate(

@@ -9,6 +9,20 @@ private enum HybridPlaybackSessionFixtureError: Error {
     case pixelBufferCreationFailed
 }
 
+@MainActor
+private final class HybridTelemetryTriggerRecorder {
+    private(set) var values:
+        [HybridPlaybackTelemetryTrigger] = []
+
+    func record(_ value: HybridPlaybackTelemetryTrigger) {
+        values.append(value)
+    }
+
+    func removeAll() {
+        values.removeAll()
+    }
+}
+
 private func makeHybridPlaybackSessionFrame(
     time: Double,
     duration: Double = 1,
@@ -410,6 +424,10 @@ struct HybridPlaybackSessionTests {
             relay: relay
         )
         defer { session.stop() }
+        let telemetry = HybridTelemetryTriggerRecorder()
+        session.telemetryDidChange = {
+            telemetry.record($0)
+        }
         let request = try AudioAnalysisRequest(
             audioTrackID: 0,
             range: 0.25..<0.75
@@ -428,6 +446,9 @@ struct HybridPlaybackSessionTests {
         )
         let stream = try session.audioAnalysisStream(
             request: request
+        )
+        #expect(
+            telemetry.values == [.audioAnalysisChanged]
         )
 
         var totalFrames: Int64 = 0
@@ -454,6 +475,13 @@ struct HybridPlaybackSessionTests {
         #expect(abs(totalFrames - 24_000) <= 1_200)
         #expect(abs(resolvedFirstPosition - 12_000) <= 120)
         #expect(abs(resolvedFinalPosition - 36_000) <= 120)
+        try await waitUntil {
+            telemetry.values
+                == [
+                    .audioAnalysisChanged,
+                    .audioAnalysisChanged,
+                ]
+        }
     }
 
     @MainActor
@@ -728,6 +756,50 @@ struct HybridPlaybackSessionTests {
             fixture.renderSurface.clockSamples.contains {
                 abs($0.seconds - 1) < 0.000_001
             }
+        )
+    }
+
+    @Test("Hybrid telemetry emits immediate transport changes and at most one clock sample per second")
+    @MainActor
+    func structuredTelemetryTriggerCadence() async throws {
+        let fixture = try makeSession()
+        defer { fixture.session.stop() }
+        let telemetry = HybridTelemetryTriggerRecorder()
+        fixture.session.telemetryDidChange = {
+            telemetry.record($0)
+        }
+
+        try await fixture.session.prepare(timeout: 1)
+        #expect(
+            telemetry.values.contains(.periodicSample)
+        )
+        telemetry.removeAll()
+
+        fixture.session.handleClockTick(
+            CMTime(
+                seconds: 0.5,
+                preferredTimescale: 600
+            )
+        )
+        #expect(
+            !telemetry.values.contains(.periodicSample)
+        )
+
+        fixture.session.handleClockTick(
+            CMTime(
+                seconds: 1,
+                preferredTimescale: 600
+            )
+        )
+        #expect(
+            telemetry.values.filter {
+                $0 == .periodicSample
+            }.count == 1
+        )
+
+        try fixture.session.play()
+        #expect(
+            telemetry.values.contains(.transportChanged)
         )
     }
 
