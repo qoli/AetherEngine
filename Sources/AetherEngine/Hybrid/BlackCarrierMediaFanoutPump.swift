@@ -13,6 +13,10 @@ enum BlackCarrierMediaFanoutPumpError:
     case videoStreamMissing
     case invalidRenditionOrdinal(ordinal: Int)
     case invalidSegmentIndex(index: Int)
+    case restartRequiresUserSeek
+    case seekIntentSegmentMismatch(expected: Int, actual: Int)
+    case demuxSeekFailed(segmentIndex: Int)
+    case restartTimelineOffsetUnavailable(trackID: Int)
     case closed
     case demuxFailed(reason: String)
     case videoPacketSinkFailed(reason: String)
@@ -33,6 +37,14 @@ enum BlackCarrierMediaFanoutPumpError:
             return "Black carrier audio rendition ordinal \(ordinal) is unavailable"
         case .invalidSegmentIndex(let index):
             return "Black carrier media fanout segment \(index) is out of range"
+        case .restartRequiresUserSeek:
+            return "Black carrier media fanout restart requires an explicit user-seek intent"
+        case .seekIntentSegmentMismatch(let expected, let actual):
+            return "Black carrier seek intent segment \(actual) does not match target segment \(expected)"
+        case .demuxSeekFailed(let segmentIndex):
+            return "Black carrier demux could not seek to segment \(segmentIndex)"
+        case .restartTimelineOffsetUnavailable(let trackID):
+            return "Black carrier audio track \(trackID) has no startup timeline offset for restart"
         case .closed:
             return "Black carrier media fanout pump is closed"
         case .demuxFailed(let reason):
@@ -49,6 +61,11 @@ enum BlackCarrierMediaFanoutPumpError:
     }
 }
 
+enum BlackCarrierMediaFanoutRestartResult: Sendable, Equatable {
+    case applied(generation: UInt64, segmentIndex: Int)
+    case stale(currentGeneration: UInt64)
+}
+
 /// Incremental single-demux packet fanout for carrier audio and the future real-video decoder.
 ///
 /// `produce(throughSegment:)` advances only until every audio rendition has finalized the requested
@@ -60,10 +77,20 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         _ packet: UnsafeMutablePointer<AVPacket>
     ) throws -> Void
 
-    private struct Rendition {
+    private final class Rendition {
         let metadata: BlackCarrierAudioRenditionMetadata
         let cache: SegmentCache
-        let writer: BlackCarrierAudioRenditionMuxer.Writer
+        var writer: BlackCarrierAudioRenditionMuxer.Writer
+
+        init(
+            metadata: BlackCarrierAudioRenditionMetadata,
+            cache: SegmentCache,
+            writer: BlackCarrierAudioRenditionMuxer.Writer
+        ) {
+            self.metadata = metadata
+            self.cache = cache
+            self.writer = writer
+        }
     }
 
     let renditionMetadata: [BlackCarrierAudioRenditionMetadata]
@@ -71,6 +98,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
 
     private let demuxer: Demuxer
     private let timeline: BlackCarrierTimeline
+    private let bridgeMode: AudioBridgeMode
     private let videoStreamIndex: Int32
     private let videoPacketSink: VideoPacketSink?
     private let renditions: [Rendition]
@@ -85,14 +113,21 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     private var terminalError: BlackCarrierMediaFanoutPumpError?
     private var isFinished = false
     private var isClosed = false
+    private var generationStartSegmentIndex: Int
+    private var currentGeneration: UInt64
 
     init(
         demuxer: Demuxer,
         timeline: BlackCarrierTimeline,
         bridgeMode: AudioBridgeMode = .surroundCompat,
         videoStreamIndex: Int32? = nil,
-        videoPacketSink: VideoPacketSink? = nil
+        videoPacketSink: VideoPacketSink? = nil,
+        initialGeneration: UInt64 = 0
     ) throws {
+        guard let firstSegmentIndex = timeline.segments.first?.index else {
+            throw BlackCarrierMediaFanoutPumpError
+                .invalidSegmentIndex(index: 0)
+        }
         let resolvedVideoStreamIndex = videoStreamIndex
             ?? demuxer.videoStreamIndex
         guard videoPacketSink == nil || resolvedVideoStreamIndex >= 0 else {
@@ -114,32 +149,15 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                 )
                 do {
                     let streamIndex = Int32(track.id)
-                    let writer = try BlackCarrierAudioRenditionMuxer.makeWriter(
+                    let writer = try Self.makeWriter(
                         demuxer: demuxer,
-                        audioStreamIndex: streamIndex,
-                        sourceStartPTS: Self.sourceStartPTS(
-                            demuxer: demuxer,
-                            streamIndex: streamIndex
-                        ),
+                        streamIndex: streamIndex,
+                        metadata: renditionMetadata,
+                        cache: cache,
                         timeline: timeline,
                         bridgeMode: bridgeMode,
-                        sessionDirectory: cache.sessionDir,
-                        onInit: { cache.setInit($0) },
-                        onSegment: { timing, stagingPath, bytesWritten in
-                            cache.adopt(
-                                index: timing.index,
-                                stagingPath: stagingPath,
-                                byteCount: bytesWritten
-                            )
-                            guard cache.peekURL(index: timing.index) != nil else {
-                                throw BlackCarrierAudioRenditionStoreError
-                                    .segmentStoreFailed(
-                                        trackID:
-                                            renditionMetadata.sourceTrackID,
-                                        index: timing.index
-                                    )
-                            }
-                        }
+                        startingSegmentIndex: firstSegmentIndex,
+                        preserveEncoderPriming: true
                     )
                     prepared.append(Rendition(
                         metadata: renditionMetadata,
@@ -174,6 +192,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
 
         self.demuxer = demuxer
         self.timeline = timeline
+        self.bridgeMode = bridgeMode
         self.videoStreamIndex = videoPacketSink == nil
             ? -1
             : resolvedVideoStreamIndex
@@ -181,6 +200,8 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         renditionMetadata = metadata
         renditions = prepared
         renditionDescriptors = prepared.map(\.writer.descriptor)
+        generationStartSegmentIndex = firstSegmentIndex
+        currentGeneration = initialGeneration
         renditionsByStream = Dictionary(
             uniqueKeysWithValues: prepared.map {
                 ($0.writer.sourceStreamIndex, $0)
@@ -204,6 +225,125 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         return isFinished
     }
 
+    var generation: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return currentGeneration
+    }
+
+    func restart(
+        for intent: HybridSeekIntent
+    ) throws -> BlackCarrierMediaFanoutRestartResult {
+        guard case .userSeek(
+            let target,
+            let requestedSegmentIndex,
+            let requestedGeneration
+        ) = intent else {
+            throw BlackCarrierMediaFanoutPumpError.restartRequiresUserSeek
+        }
+
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !isClosed else {
+            throw BlackCarrierMediaFanoutPumpError.closed
+        }
+        if let terminalError {
+            throw terminalError
+        }
+        guard requestedGeneration > currentGeneration else {
+            return .stale(currentGeneration: currentGeneration)
+        }
+        guard let expectedSegmentIndex = timeline.segmentIndex(
+            containing: target
+        ) else {
+            throw BlackCarrierMediaFanoutPumpError
+                .invalidSegmentIndex(index: requestedSegmentIndex)
+        }
+        guard requestedSegmentIndex == expectedSegmentIndex else {
+            throw BlackCarrierMediaFanoutPumpError
+                .seekIntentSegmentMismatch(
+                    expected: expectedSegmentIndex,
+                    actual: requestedSegmentIndex
+                )
+        }
+        let segment = timeline.segments[expectedSegmentIndex]
+        guard demuxer.seek(to: CMTimeGetSeconds(segment.startTime)) else {
+            let error = BlackCarrierMediaFanoutPumpError
+                .demuxSeekFailed(segmentIndex: expectedSegmentIndex)
+            failWhileLocked(error)
+            throw error
+        }
+
+        do {
+            let timelineOffsets = try renditions.map { rendition in
+                guard let offset =
+                        rendition.writer.presentationTimelineOffset else {
+                    throw BlackCarrierMediaFanoutPumpError
+                        .restartTimelineOffsetUnavailable(
+                            trackID: rendition.metadata.sourceTrackID
+                        )
+                }
+                return offset
+            }
+            let replacementWriters = try zip(
+                renditions,
+                timelineOffsets
+            ).map { rendition, timelineOffset in
+                try Self.makeWriter(
+                    demuxer: demuxer,
+                    streamIndex: rendition.writer.sourceStreamIndex,
+                    metadata: rendition.metadata,
+                    cache: rendition.cache,
+                    timeline: timeline,
+                    bridgeMode: bridgeMode,
+                    startingSegmentIndex: expectedSegmentIndex,
+                    preserveEncoderPriming: false,
+                    presentationTimelineOffset: timelineOffset,
+                    decodeTimestampOffset: timelineOffset,
+                    restartTimestampRebaseEnabled: true
+                )
+            }
+            for (rendition, replacement) in zip(
+                renditions,
+                replacementWriters
+            ) {
+                rendition.writer = replacement
+            }
+            summaries.removeAll(keepingCapacity: true)
+            isFinished = false
+            generationStartSegmentIndex = expectedSegmentIndex
+            currentGeneration = requestedGeneration
+            return .applied(
+                generation: requestedGeneration,
+                segmentIndex: expectedSegmentIndex
+            )
+        } catch let error as BlackCarrierMediaFanoutPumpError {
+            failWhileLocked(error)
+            throw error
+        } catch let error as BlackCarrierAudioRenditionMuxerError {
+            let trackID = renditions.first?.metadata.sourceTrackID ?? -1
+            let typed = BlackCarrierMediaFanoutPumpError.audioMuxerFailed(
+                trackID: trackID,
+                error: error
+            )
+            failWhileLocked(typed)
+            throw typed
+        } catch let error as BlackCarrierAudioRenditionStoreError {
+            let typed = BlackCarrierMediaFanoutPumpError.audioStoreFailed(
+                error: error
+            )
+            failWhileLocked(typed)
+            throw typed
+        } catch {
+            let typed = BlackCarrierMediaFanoutPumpError.demuxFailed(
+                reason: String(describing: error)
+            )
+            failWhileLocked(typed)
+            throw typed
+        }
+    }
+
     func produce(throughSegment index: Int) throws {
         lock.lock()
         defer { lock.unlock() }
@@ -218,6 +358,13 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             throw BlackCarrierMediaFanoutPumpError.invalidSegmentIndex(
                 index: index
             )
+        }
+        if index < generationStartSegmentIndex {
+            guard cachedSegmentExists(index) else {
+                throw BlackCarrierMediaFanoutPumpError
+                    .requestedSegmentUnavailable(index: index)
+            }
+            return
         }
         if hasSegment(index) {
             return
@@ -280,6 +427,9 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             throw BlackCarrierMediaFanoutPumpError.invalidRenditionOrdinal(
                 ordinal: ordinal
             )
+        }
+        if let cached = peekInitSegment(ordinal: ordinal) {
+            return cached
         }
         try produce(throughSegment: 0)
         lock.lock()
@@ -426,6 +576,13 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
 
     private func hasSegment(_ index: Int) -> Bool {
         renditions.allSatisfy {
+            $0.writer.highestFinalizedSegmentIndex >= index
+                && $0.cache.peekURL(index: index) != nil
+        }
+    }
+
+    private func cachedSegmentExists(_ index: Int) -> Bool {
+        renditions.allSatisfy {
             $0.cache.peekURL(index: index) != nil
         }
     }
@@ -437,6 +594,14 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
 
     private func fail(_ error: BlackCarrierMediaFanoutPumpError) {
         terminalError = error
+        renditions.forEach { $0.cache.close() }
+    }
+
+    private func failWhileLocked(
+        _ error: BlackCarrierMediaFanoutPumpError
+    ) {
+        terminalError = error
+        isClosed = true
         renditions.forEach { $0.cache.close() }
     }
 
@@ -477,5 +642,56 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         return stream.pointee.start_time == Int64.min
             ? 0
             : stream.pointee.start_time
+    }
+
+    private static func makeWriter(
+        demuxer: Demuxer,
+        streamIndex: Int32,
+        metadata: BlackCarrierAudioRenditionMetadata,
+        cache: SegmentCache,
+        timeline: BlackCarrierTimeline,
+        bridgeMode: AudioBridgeMode,
+        startingSegmentIndex: Int,
+        preserveEncoderPriming: Bool,
+        presentationTimelineOffset: Int64? = nil,
+        decodeTimestampOffset: Int64 = 0,
+        restartTimestampRebaseEnabled: Bool = false
+    ) throws -> BlackCarrierAudioRenditionMuxer.Writer {
+        try BlackCarrierAudioRenditionMuxer.makeWriter(
+            demuxer: demuxer,
+            audioStreamIndex: streamIndex,
+            sourceStartPTS: sourceStartPTS(
+                demuxer: demuxer,
+                streamIndex: streamIndex
+            ),
+            timeline: timeline,
+            bridgeMode: bridgeMode,
+            startingSegmentIndex: startingSegmentIndex,
+            preserveEncoderPriming: preserveEncoderPriming,
+            presentationTimelineOffset: presentationTimelineOffset,
+            decodeTimestampOffset: decodeTimestampOffset,
+            restartTimestampRebaseEnabled:
+                restartTimestampRebaseEnabled,
+            sessionDirectory: cache.sessionDir,
+            onInit: {
+                if cache.fetchInit(timeout: 0) == nil {
+                    cache.setInit($0)
+                }
+            },
+            onSegment: { timing, stagingPath, bytesWritten in
+                cache.adopt(
+                    index: timing.index,
+                    stagingPath: stagingPath,
+                    byteCount: bytesWritten
+                )
+                guard cache.peekURL(index: timing.index) != nil else {
+                    throw BlackCarrierAudioRenditionStoreError
+                        .segmentStoreFailed(
+                            trackID: metadata.sourceTrackID,
+                            index: timing.index
+                        )
+                }
+            }
+        )
     }
 }

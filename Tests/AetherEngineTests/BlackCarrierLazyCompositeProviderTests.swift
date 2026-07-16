@@ -78,6 +78,20 @@ struct BlackCarrierLazyCompositeProviderTests {
         #expect(!pump.finished)
         #expect(pump.peekMediaSegmentURL(ordinal: 0, index: 1) == nil)
 
+        var classifier = HybridSeekIntentClassifier(timeline: timeline)
+        let seekIntent = try classifier.registerExplicitHostSeek(
+            to: CMTime(seconds: 4.5, preferredTimescale: 90_000)
+        )
+        #expect(try provider.restartMedia(
+            for: seekIntent
+        ) == .applied(
+            generation: 1,
+            segmentIndex: 1
+        ))
+        #expect(pump.generation == 1)
+        #expect(!pump.finished)
+        #expect(pump.peekMediaSegmentURL(ordinal: 0, index: 1) == nil)
+
         let secondSegment = try await fetchData(
             baseURL.appendingPathComponent("audio_0_seg_1.mp4")
         )

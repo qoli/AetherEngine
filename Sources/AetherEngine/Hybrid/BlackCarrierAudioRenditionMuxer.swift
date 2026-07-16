@@ -14,6 +14,7 @@ enum BlackCarrierAudioRenditionMuxerError: Error, LocalizedError, Sendable, Equa
     case bridgeHeaderRejected(code: Int32)
     case muxerSetupFailed(reason: String)
     case bridgeFeedFailed(reason: String)
+    case invalidStartingSegment(index: Int)
     case nonMonotonicSegment(previous: Int, next: Int)
     case emptySegment(index: Int)
     case packetWriteFailed(segmentIndex: Int, code: Int32)
@@ -41,6 +42,8 @@ enum BlackCarrierAudioRenditionMuxerError: Error, LocalizedError, Sendable, Equa
             return "Black carrier audio-only muxer could not be created: \(reason)"
         case .bridgeFeedFailed(let reason):
             return "Black carrier audio bridge failed while decoding: \(reason)"
+        case .invalidStartingSegment(let index):
+            return "Black carrier audio restart segment \(index) is out of range"
         case .nonMonotonicSegment(let previous, let next):
             return "Black carrier audio segment order regressed from \(previous) to \(next)"
         case .emptySegment(let index):
@@ -91,6 +94,9 @@ enum BlackCarrierAudioRenditionMuxer {
         let codecString: String
         let channelsAttribute: String
         let audioConfig: MP4SegmentMuxer.AudioConfig
+        let sourceTimeBase: AVRational
+        let sourceStartPTS: Int64
+        let sourceTimestampTolerance: Int64
         let packetTimeBase: AVRational
         let packetStartOffset: Int64
         let minimumRelativePacketTimestamp: Int64
@@ -116,12 +122,16 @@ enum BlackCarrierAudioRenditionMuxer {
         private let initCapture: InitCapture
         private let onInit: (Data) -> Void
         private let onSegment: SegmentSink
+        private let startingOffset: Int
+        private let decodeTimestampOffset: Int64
+        private let restartTimestampRebaseEnabled: Bool
 
         private var currentOffset = 0
         private var wroteCurrentSegment = false
         private var peakBandwidth = 0
         private var totalMediaBytes = 0
-        private var presentationTimelineOffset: Int64?
+        private(set) var presentationTimelineOffset: Int64?
+        private var sourceTimestampRebase: Int64?
         private var isFinished = false
         private var didPublishInit = false
         private(set) var highestFinalizedSegmentIndex: Int
@@ -132,20 +142,36 @@ enum BlackCarrierAudioRenditionMuxer {
             sourceStartPTS: Int64,
             timeline: BlackCarrierTimeline,
             bridgeMode: AudioBridgeMode,
+            startingSegmentIndex: Int,
+            preserveEncoderPriming: Bool,
+            presentationTimelineOffset: Int64?,
+            decodeTimestampOffset: Int64,
+            restartTimestampRebaseEnabled: Bool,
             sessionDirectory: URL,
             onInit: @escaping (Data) -> Void,
             onSegment: @escaping SegmentSink
         ) throws {
-            guard let firstTiming = timeline.segments.first,
-                  let lastTiming = timeline.segments.last else {
+            guard let lastTiming = timeline.segments.last else {
                 throw BlackCarrierAudioRenditionMuxerError.emptyTimeline
+            }
+            guard let startingOffset = timeline.segments.firstIndex(
+                where: { $0.index == startingSegmentIndex }
+            ) else {
+                throw BlackCarrierAudioRenditionMuxerError
+                    .invalidStartingSegment(index: startingSegmentIndex)
             }
             self.sourceStreamIndex = sourceStreamIndex
             self.timeline = timeline
             self.lastTiming = lastTiming
             self.onInit = onInit
             self.onSegment = onSegment
-            highestFinalizedSegmentIndex = firstTiming.index - 1
+            self.startingOffset = startingOffset
+            self.presentationTimelineOffset = presentationTimelineOffset
+            self.decodeTimestampOffset = decodeTimestampOffset
+            self.restartTimestampRebaseEnabled =
+                restartTimestampRebaseEnabled
+            currentOffset = startingOffset
+            highestFinalizedSegmentIndex = startingSegmentIndex - 1
             route = try prepareRoute(
                 sourceStream: sourceStream,
                 sourceStartPTS: sourceStartPTS,
@@ -157,10 +183,10 @@ enum BlackCarrierAudioRenditionMuxer {
             initCapture = capture
             do {
                 muxer = try MP4SegmentMuxer(
-                    initialSegmentIndex: firstTiming.index,
+                    initialSegmentIndex: startingSegmentIndex,
                     sessionDir: sessionDirectory,
                     audioOnly: route.audioConfig,
-                    preserveEncoderPriming: true,
+                    preserveEncoderPriming: preserveEncoderPriming,
                     maxBufferedFragmentSeconds: maxBufferedFragmentSeconds(
                         for: timeline
                     ),
@@ -197,6 +223,7 @@ enum BlackCarrierAudioRenditionMuxer {
             guard sourcePacket.pointee.stream_index == sourceStreamIndex else {
                 return
             }
+            applySourceTimestampRebaseIfNeeded(sourcePacket)
 
             if let bridge = route.bridge {
                 let outputs: [UnsafeMutablePointer<AVPacket>]
@@ -249,7 +276,10 @@ enum BlackCarrierAudioRenditionMuxer {
                 throw BlackCarrierAudioRenditionMuxerError.initSegmentMissing
             }
 
-            let duration = CMTimeGetSeconds(timeline.duration)
+            let duration = CMTimeGetSeconds(
+                timeline.duration
+                    - timeline.segments[startingOffset].startTime
+            )
             let presentationTrimSamples = samples(
                 forTicks: presentationTimelineOffset ?? 0,
                 packetTimeBase: route.packetTimeBase,
@@ -337,6 +367,9 @@ enum BlackCarrierAudioRenditionMuxer {
                 forTimelinePTS: timelinePTS,
                 timeline: timeline
             )
+            if nextOffset < startingOffset {
+                return
+            }
             guard nextOffset >= currentOffset else {
                 throw BlackCarrierAudioRenditionMuxerError.nonMonotonicSegment(
                     previous: timeline.segments[currentOffset].index,
@@ -347,6 +380,17 @@ enum BlackCarrierAudioRenditionMuxer {
             while currentOffset < nextOffset {
                 let timing = timeline.segments[currentOffset]
                 guard wroteCurrentSegment else {
+                    EngineLog.emit(
+                        "[BlackCarrierAudioRenditionMuxer] empty segment before advance "
+                            + "current=\(timing.index) next="
+                            + "\(timeline.segments[nextOffset].index) "
+                            + "packetPTS=\(packet.pointee.pts) "
+                            + "packetDTS=\(packet.pointee.dts) "
+                            + "presentationOffset="
+                            + "\(presentationTimelineOffset ?? 0) "
+                            + "decodeOffset=\(decodeTimestampOffset)",
+                        category: .session
+                    )
                     throw BlackCarrierAudioRenditionMuxerError.emptySegment(
                         index: timing.index
                     )
@@ -361,6 +405,7 @@ enum BlackCarrierAudioRenditionMuxer {
                 wroteCurrentSegment = false
             }
 
+            packet.pointee.dts += decodeTimestampOffset
             packet.pointee.stream_index = muxer.audioOutputStreamIndex
             packet.pointee.pos = -1
             av_packet_rescale_ts(
@@ -386,6 +431,69 @@ enum BlackCarrierAudioRenditionMuxer {
             didPublishInit = true
             onInit(initSegment)
         }
+
+        private func applySourceTimestampRebaseIfNeeded(
+            _ packet: UnsafeMutablePointer<AVPacket>
+        ) {
+            guard restartTimestampRebaseEnabled else { return }
+            if let rebase = sourceTimestampRebase {
+                applySourceTimestampRebase(rebase, to: packet)
+                return
+            }
+            let timestamp = packet.pointee.pts != Int64.min
+                ? packet.pointee.pts
+                : packet.pointee.dts
+            guard timestamp != Int64.min else { return }
+
+            let restartTiming = timeline.segments[startingOffset]
+            let restartPTS = route.sourceStartPTS + av_rescale_q(
+                restartTiming.startTime.value,
+                approvedTimelineTimeBase,
+                route.sourceTimeBase
+            )
+            let originDelta = timestamp.subtractingReportingOverflow(
+                route.sourceStartPTS
+            )
+            guard !originDelta.overflow,
+                  originDelta.partialValue != Int64.min else {
+                sourceTimestampRebase = 0
+                return
+            }
+            let distanceFromSourceOrigin = abs(originDelta.partialValue)
+            let shouldRebase =
+                restartPTS > route.sourceStartPTS
+                && distanceFromSourceOrigin
+                    <= route.sourceTimestampTolerance
+            let rebaseDelta = restartPTS.subtractingReportingOverflow(
+                timestamp
+            )
+            let rebase = shouldRebase && !rebaseDelta.overflow
+                ? rebaseDelta.partialValue
+                : 0
+            sourceTimestampRebase = rebase
+            guard rebase != 0 else { return }
+
+            applySourceTimestampRebase(rebase, to: packet)
+            EngineLog.emit(
+                "[BlackCarrierAudioRenditionMuxer] restart source timestamp rebase "
+                    + "segment=\(restartTiming.index) raw=\(timestamp) "
+                    + "anchor=\(restartPTS) delta=\(rebase)",
+                category: .session
+            )
+        }
+
+        private func applySourceTimestampRebase(
+            _ rebase: Int64,
+            to packet: UnsafeMutablePointer<AVPacket>
+        ) {
+            guard rebase != 0 else { return }
+            if packet.pointee.pts != Int64.min {
+                packet.pointee.pts += rebase
+            }
+            if packet.pointee.dts != Int64.min {
+                packet.pointee.dts += rebase
+            }
+        }
     }
 
     static func makeWriter(
@@ -394,6 +502,11 @@ enum BlackCarrierAudioRenditionMuxer {
         sourceStartPTS: Int64,
         timeline: BlackCarrierTimeline,
         bridgeMode: AudioBridgeMode = .surroundCompat,
+        startingSegmentIndex: Int? = nil,
+        preserveEncoderPriming: Bool = true,
+        presentationTimelineOffset: Int64? = nil,
+        decodeTimestampOffset: Int64 = 0,
+        restartTimestampRebaseEnabled: Bool = false,
         sessionDirectory: URL,
         onInit: @escaping (Data) -> Void,
         onSegment: @escaping SegmentSink
@@ -405,12 +518,22 @@ enum BlackCarrierAudioRenditionMuxer {
                 index: audioStreamIndex
             )
         }
+        guard let resolvedStartingSegmentIndex = startingSegmentIndex
+            ?? timeline.segments.first?.index else {
+            throw BlackCarrierAudioRenditionMuxerError.emptyTimeline
+        }
         return try Writer(
             sourceStreamIndex: audioStreamIndex,
             sourceStream: sourceStream,
             sourceStartPTS: sourceStartPTS,
             timeline: timeline,
             bridgeMode: bridgeMode,
+            startingSegmentIndex: resolvedStartingSegmentIndex,
+            preserveEncoderPriming: preserveEncoderPriming,
+            presentationTimelineOffset: presentationTimelineOffset,
+            decodeTimestampOffset: decodeTimestampOffset,
+            restartTimestampRebaseEnabled:
+                restartTimestampRebaseEnabled,
             sessionDirectory: sessionDirectory,
             onInit: onInit,
             onSegment: onSegment
@@ -517,6 +640,12 @@ enum BlackCarrierAudioRenditionMuxer {
                     codecString: compatibility.hlsCodecsString,
                     channelsAttribute: channels,
                     audioConfig: config,
+                    sourceTimeBase: sourceTimeBase,
+                    sourceStartPTS: sourceStartPTS,
+                    sourceTimestampTolerance: max(
+                        declaredPaddingTicks,
+                        fallbackPacketDuration * 2
+                    ),
                     packetTimeBase: sourceTimeBase,
                     packetStartOffset: sourceStartPTS,
                     minimumRelativePacketTimestamp: -max(
@@ -577,6 +706,14 @@ enum BlackCarrierAudioRenditionMuxer {
         case .lossless:
             codecString = "fLaC"
         }
+        let sourceFallbackDuration = fallbackDuration(
+            codecParameters: sourceCodecParameters,
+            timeBase: sourceTimeBase
+        )
+        let sourcePaddingTicks = initialPaddingTicks(
+            codecParameters: sourceCodecParameters,
+            packetTimeBase: sourceTimeBase
+        )
         return PreparedRoute(
             pipeline: .bridge(mode: bridgeMode, codecString: codecString),
             codecString: codecString,
@@ -584,6 +721,12 @@ enum BlackCarrierAudioRenditionMuxer {
                 max(1, encoderCodecParameters.pointee.ch_layout.nb_channels)
             ),
             audioConfig: config,
+            sourceTimeBase: sourceTimeBase,
+            sourceStartPTS: sourceStartPTS,
+            sourceTimestampTolerance: max(
+                sourcePaddingTicks,
+                sourceFallbackDuration * 2
+            ),
             packetTimeBase: bridge.encoderTimeBase,
             packetStartOffset: av_rescale_q(
                 sourceStartPTS,

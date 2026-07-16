@@ -196,6 +196,23 @@ final class BlackCarrierLazyCompositeProvider:
         }
     }
 
+    func restartMedia(
+        for intent: HybridSeekIntent
+    ) throws -> BlackCarrierMediaFanoutRestartResult {
+        do {
+            return try pump.restart(for: intent)
+        } catch let error as BlackCarrierMediaFanoutPumpError {
+            record(.pump(error))
+            throw error
+        } catch {
+            let typed = BlackCarrierMediaFanoutPumpError.demuxFailed(
+                reason: String(describing: error)
+            )
+            record(.pump(typed))
+            throw typed
+        }
+    }
+
     func close() {
         closeLock.lock()
         guard !isClosed else {

@@ -334,6 +334,129 @@ struct BlackCarrierAudioRenditionMuxerTests {
         }
     }
 
+    @Test("Explicit seek generation restarts the demux without inferring gaps from requests")
+    func explicitSeekGenerationRestart() throws {
+        let sourceData = try makeDualEAC3Container(seconds: 12.25)
+        let demuxer = Demuxer()
+        try demuxer.open(reader: DataIOReader(data: sourceData))
+        defer { demuxer.close() }
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(seconds: 12.25, preferredTimescale: 90_000)
+        )
+        let pump = try BlackCarrierMediaFanoutPump(
+            demuxer: demuxer,
+            timeline: timeline,
+            initialGeneration: 10
+        )
+        defer { pump.close() }
+
+        let initialInit = try #require(
+            try pump.initSegment(ordinal: 0)
+        )
+        #expect(pump.peekMediaSegmentURL(
+            ordinal: 0,
+            index: 0
+        ) != nil)
+        #expect(pump.peekMediaSegmentURL(
+            ordinal: 0,
+            index: 1
+        ) == nil)
+
+        var classifier = HybridSeekIntentClassifier(
+            timeline: timeline,
+            initialGeneration: 10
+        )
+        let intent = try classifier.registerExplicitHostSeek(
+            to: CMTime(seconds: 8.25, preferredTimescale: 90_000)
+        )
+        #expect(try pump.restart(for: intent) == .applied(
+            generation: 11,
+            segmentIndex: 2
+        ))
+        #expect(pump.generation == 11)
+
+        try pump.produce(throughSegment: 2)
+        #expect(pump.peekMediaSegmentURL(
+            ordinal: 0,
+            index: 1
+        ) == nil)
+        let restartedSegment = try #require(
+            try pump.mediaSegment(ordinal: 0, index: 2)
+        )
+        #expect(fragmentBaseMediaDecodeTime(restartedSegment) == 384_000)
+        #expect(try pump.initSegment(ordinal: 0) == initialInit)
+
+        let backwardIntent = try classifier.registerPlayerTimeJump(
+            to: CMTime(seconds: 0.25, preferredTimescale: 90_000)
+        )
+        #expect(try pump.restart(for: backwardIntent) == .applied(
+            generation: 12,
+            segmentIndex: 0
+        ))
+        let restartedHead = try #require(
+            try pump.mediaSegment(ordinal: 0, index: 0)
+        )
+        #expect(fragmentBaseMediaDecodeTime(restartedHead) == 0)
+        #expect(try pump.initSegment(ordinal: 0) == initialInit)
+
+        #expect(try pump.restart(for: intent) == .stale(
+            currentGeneration: 12
+        ))
+        #expect(throws: BlackCarrierMediaFanoutPumpError
+            .restartRequiresUserSeek) {
+            _ = try pump.restart(for: .prefetch(
+                segmentIndex: 3,
+                generation: 11
+            ))
+        }
+    }
+
+    @Test("Bridged audio restart preserves the admitted startup init and absolute timeline")
+    func bridgedRestartTimeline() throws {
+        let sourceData = makeWAV(
+            sampleRate: 48_000,
+            channels: 2,
+            seconds: 12.25
+        )
+        let seekProbe = Demuxer()
+        try seekProbe.open(reader: DataIOReader(data: sourceData))
+        #expect(seekProbe.seek(to: 8))
+        let seekPacket = try #require(try seekProbe.readPacket())
+        #expect(seekPacket.pointee.pts == 0)
+        var seekPacketToFree: UnsafeMutablePointer<AVPacket>? = seekPacket
+        trackedPacketFree(&seekPacketToFree)
+        seekProbe.close()
+        let demuxer = Demuxer()
+        try demuxer.open(reader: DataIOReader(data: sourceData))
+        defer { demuxer.close() }
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(seconds: 12.25, preferredTimescale: 90_000)
+        )
+        let pump = try BlackCarrierMediaFanoutPump(
+            demuxer: demuxer,
+            timeline: timeline
+        )
+        defer { pump.close() }
+
+        let initialInit = try #require(
+            try pump.initSegment(ordinal: 0)
+        )
+        var classifier = HybridSeekIntentClassifier(timeline: timeline)
+        let intent = try classifier.registerExplicitHostSeek(
+            to: CMTime(seconds: 8.5, preferredTimescale: 90_000)
+        )
+
+        #expect(try pump.restart(for: intent) == .applied(
+            generation: 1,
+            segmentIndex: 2
+        ))
+        let restartedSegment = try #require(
+            try pump.mediaSegment(ordinal: 0, index: 2)
+        )
+        #expect(fragmentBaseMediaDecodeTime(restartedSegment) == 384_000)
+        #expect(try pump.initSegment(ordinal: 0) == initialInit)
+    }
+
     private struct EditListEntry: Equatable {
         let segmentDuration: UInt64
         let mediaTime: Int64
