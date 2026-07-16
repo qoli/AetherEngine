@@ -148,8 +148,8 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
 public final class AetherHybridPlaybackSession: ObservableObject {
     /// Capabilities that the current public session can actually admit.
     ///
-    /// HLS is deliberately absent until its playlist/segment resource graph has the same validated
-    /// byte-identity and cancellation guarantees as progressive/custom VOD. The verified renderer remains
+    /// HLS is deliberately absent until its internal graph-bound composition gains an engine-owned startup
+    /// bandwidth admission policy and the remaining public/device gates. The verified renderer remains
     /// SDR-only; unsupported color formats are rejected by preflight rather than tone-mapped.
     public nonisolated static var capabilities: HybridPlaybackCapabilities {
         HybridPlaybackCapabilities(

@@ -48,6 +48,270 @@ final class HLSPreflightInspectorTests: XCTestCase {
         )
     }
 
+    func testProtectedNativeHLSUsesManifestContractWithoutFetchingMedia()
+        async throws
+    {
+        let rootURL = URL(
+            string: "https://example.com/master.m3u8"
+        )!
+        let mediaURL = URL(
+            string: "https://example.com/video.m3u8"
+        )!
+        let fetchedURLs = LockedURLs()
+        let responses: [URL: HLSPreflightFetchResponse] = [
+            rootURL: HLSPreflightFetchResponse(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS="hvc1.2.4.L150",VIDEO-RANGE=PQ
+                    video.m3u8
+                    """.utf8
+                ),
+                effectiveURL: rootURL
+            ),
+            mediaURL: HLSPreflightFetchResponse(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-TARGETDURATION:4
+                    #EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT="com.apple.streamingkeydelivery",URI="skd://license"
+                    #EXT-X-MAP:URI="init.mp4"
+                    #EXTINF:4,
+                    seg0.m4s
+                    #EXT-X-ENDLIST
+                    """.utf8
+                ),
+                effectiveURL: mediaURL
+            ),
+        ]
+        let inspected = try await HLSPreflightInspector(
+            httpHeaders: [:],
+            fetchOverride: { url, _ in
+                fetchedURLs.append(url)
+                guard let response = responses[url] else {
+                    throw HLSPreflightError.httpStatus(599)
+                }
+                return response
+            }
+        ).inspect(
+            rootURL: rootURL,
+            sourceIsSeekableVOD: true,
+            variantSelection: .highestBandwidth,
+            hybridCapabilities: HybridPlaybackCapabilities(
+                hasDirectVideoDecoder: true,
+                hasMetalRenderer: true,
+                supportedVideoFormats: [.sdr]
+            )
+        )
+
+        XCTAssertEqual(inspected.result.route, .nativeAVPlayer)
+        XCTAssertEqual(
+            inspected.result.reason,
+            .nativeProtectedHLSContractVerified
+        )
+        XCTAssertEqual(
+            inspected.result.sourceProfile.videoFormat,
+            .hdr10
+        )
+        XCTAssertEqual(
+            inspected.result.hlsPackaging?.contentProtection,
+            .fairPlay
+        )
+        XCTAssertEqual(
+            inspected.result.hlsPackaging?.codecVerification,
+            .protectedManifestVerified
+        )
+        XCTAssertNil(inspected.resourceGraph)
+        XCTAssertEqual(
+            fetchedURLs.snapshot(),
+            [rootURL, mediaURL]
+        )
+    }
+
+    func testProtectedHEV1HLSIsTypedUnsupportedWithoutFetchingMedia()
+        async throws
+    {
+        let rootURL = URL(
+            string: "https://example.com/master.m3u8"
+        )!
+        let mediaURL = URL(
+            string: "https://example.com/video.m3u8"
+        )!
+        let fetchedURLs = LockedURLs()
+        let responses: [URL: HLSPreflightFetchResponse] = [
+            rootURL: HLSPreflightFetchResponse(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS="hev1.2.4.L150"
+                    video.m3u8
+                    """.utf8
+                ),
+                effectiveURL: rootURL
+            ),
+            mediaURL: HLSPreflightFetchResponse(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-TARGETDURATION:4
+                    #EXT-X-KEY:METHOD=SAMPLE-AES,URI="key.bin"
+                    #EXT-X-MAP:URI="init.mp4"
+                    #EXTINF:4,
+                    seg0.m4s
+                    #EXT-X-ENDLIST
+                    """.utf8
+                ),
+                effectiveURL: mediaURL
+            ),
+        ]
+        let inspected = try await HLSPreflightInspector(
+            httpHeaders: [:],
+            fetchOverride: { url, _ in
+                fetchedURLs.append(url)
+                guard let response = responses[url] else {
+                    throw HLSPreflightError.httpStatus(599)
+                }
+                return response
+            }
+        ).inspect(
+            rootURL: rootURL,
+            sourceIsSeekableVOD: true,
+            variantSelection: .highestBandwidth,
+            hybridCapabilities: HybridPlaybackCapabilities(
+                hasDirectVideoDecoder: true,
+                hasMetalRenderer: true,
+                supportedVideoFormats: [.sdr]
+            )
+        )
+
+        XCTAssertEqual(inspected.result.route, .unsupported)
+        XCTAssertEqual(
+            inspected.result.reason,
+            .unsupportedHLSContentProtection
+        )
+        XCTAssertEqual(
+            inspected.result.hlsPackaging?.contentProtection,
+            .sampleAES
+        )
+        XCTAssertNil(inspected.resourceGraph)
+        XCTAssertEqual(
+            fetchedURLs.snapshot(),
+            [rootURL, mediaURL]
+        )
+    }
+
+    func testProtectedAlternateAudioTurnsHybridCandidateIntoTypedUnsupported()
+        async throws
+    {
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(
+                seconds: 1,
+                preferredTimescale: 90_000
+            )
+        )
+        let provider = try BlackCarrierVideoProvider(
+            timeline: timeline
+        )
+        defer { provider.close() }
+        let initData = try XCTUnwrap(provider.initSegment())
+        let segmentData = try XCTUnwrap(
+            provider.mediaSegment(at: 0)
+        )
+        let rootURL = URL(
+            string: "https://example.com/master.m3u8"
+        )!
+        let mediaURL = URL(
+            string: "https://example.com/video.m3u8"
+        )!
+        let initURL = URL(
+            string: "https://example.com/init.mp4"
+        )!
+        let segmentURL = URL(
+            string: "https://example.com/seg0.m4s"
+        )!
+        let audioURL = URL(
+            string: "https://example.com/audio.m3u8"
+        )!
+        let responses: [URL: HLSPreflightFetchResponse] = [
+            rootURL: HLSPreflightFetchResponse(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="audio.m3u8"
+                    #EXT-X-STREAM-INF:BANDWIDTH=1200000,CODECS="hvc1.2.4.L150",AUDIO="audio"
+                    video.m3u8
+                    """.utf8
+                ),
+                effectiveURL: rootURL
+            ),
+            mediaURL: HLSPreflightFetchResponse(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-TARGETDURATION:1
+                    #EXT-X-MAP:URI="init.mp4"
+                    #EXTINF:1,
+                    seg0.m4s
+                    #EXT-X-ENDLIST
+                    """.utf8
+                ),
+                effectiveURL: mediaURL
+            ),
+            initURL: HLSPreflightFetchResponse(
+                data: initData,
+                effectiveURL: initURL
+            ),
+            segmentURL: HLSPreflightFetchResponse(
+                data: segmentData,
+                effectiveURL: segmentURL
+            ),
+            audioURL: HLSPreflightFetchResponse(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-TARGETDURATION:1
+                    #EXT-X-KEY:METHOD=SAMPLE-AES,URI="key.bin"
+                    #EXTINF:1,
+                    audio0.aac
+                    #EXT-X-ENDLIST
+                    """.utf8
+                ),
+                effectiveURL: audioURL
+            ),
+        ]
+        let inspected = try await HLSPreflightInspector(
+            httpHeaders: [:],
+            fetchOverride: { url, _ in
+                guard let response = responses[url] else {
+                    throw HLSPreflightError.httpStatus(599)
+                }
+                return response
+            }
+        ).inspect(
+            rootURL: rootURL,
+            sourceIsSeekableVOD: true,
+            variantSelection: .highestBandwidth,
+            hybridCapabilities: HybridPlaybackCapabilities(
+                hasDirectVideoDecoder: true,
+                hasMetalRenderer: true,
+                supportedVideoFormats: [.sdr]
+            )
+        )
+
+        XCTAssertEqual(inspected.result.route, .unsupported)
+        XCTAssertEqual(
+            inspected.result.reason,
+            .unsupportedHLSContentProtection
+        )
+        XCTAssertEqual(
+            inspected.result.hlsPackaging?.contentProtection,
+            .sampleAES
+        )
+        XCTAssertNil(inspected.resourceGraph)
+        XCTAssertNil(inspected.resourceIdentity)
+        XCTAssertNil(inspected.hybridTimeline)
+    }
+
     func testSelectedVODResourcesAreBoundWithoutExposingSignedURLs() async throws {
         let timeline = try BlackCarrierTimeline.fileVOD(
             duration: CMTime(

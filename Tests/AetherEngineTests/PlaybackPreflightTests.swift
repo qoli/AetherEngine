@@ -127,15 +127,100 @@ final class PlaybackPreflightTests: XCTestCase {
         XCTAssertEqual(result.reason, .unsupportedHLSSegmentNotInspected)
     }
 
-    func testProtectedHLSFailsExplicitly() {
+    func testProtectedHVC1FMP4StaysOnNativeAVPlayer() {
         let result = PlaybackPreflight.resolve(
             sourceProfile: source(),
-            hlsPackaging: hls(protection: .sampleAES),
+            hlsPackaging: hls(
+                verification: .protectedManifestVerified,
+                protection: .fairPlay
+            ),
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .nativeAVPlayer)
+        XCTAssertEqual(
+            result.reason,
+            .nativeProtectedHLSContractVerified
+        )
+    }
+
+    func testProtectedH264StaysOnNativeAVPlayer() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(codec: .h264),
+            hlsPackaging: hls(
+                container: .mpegTransport,
+                sampleEntry: .avc1,
+                codec: .h264,
+                verification: .protectedManifestVerified,
+                protection: .sampleAES
+            ),
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .nativeAVPlayer)
+        XCTAssertEqual(
+            result.reason,
+            .nativeProtectedHLSContractVerified
+        )
+    }
+
+    func testAES128H264StaysOnNativeAVPlayer() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(codec: .h264),
+            hlsPackaging: hls(
+                container: .mpegTransport,
+                sampleEntry: .avc1,
+                codec: .h264,
+                verification: .protectedManifestVerified,
+                protection: .aes128
+            ),
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .nativeAVPlayer)
+        XCTAssertEqual(
+            result.reason,
+            .nativeProtectedHLSContractVerified
+        )
+    }
+
+    func testProtectedHEV1FailsInsteadOfEnteringHybrid() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(),
+            hlsPackaging: hls(
+                sampleEntry: .hev1,
+                verification: .protectedManifestVerified,
+                protection: .sampleAES
+            ),
             hybridCapabilities: fullHybridCapabilities
         )
 
         XCTAssertEqual(result.route, .unsupported)
         XCTAssertEqual(result.reason, .unsupportedHLSContentProtection)
+    }
+
+    func testUnknownContentProtectionFailsEvenForNativePackaging() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(),
+            hlsPackaging: hls(protection: .unknown),
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(result.reason, .unsupportedHLSContentProtection)
+    }
+
+    func testClearManifestOnlyPackagingCannotClaimNative() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(),
+            hlsPackaging: hls(
+                verification: .protectedManifestVerified
+            ),
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(result.reason, .unsupportedHLSSegmentNotInspected)
     }
 
     func testHybridRequiresAnExplicitRendererColorContract() {

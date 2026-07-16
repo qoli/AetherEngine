@@ -92,9 +92,11 @@ public enum HLSVideoContainer: String, Sendable, Equatable {
     case unknown
 }
 
-/// BMFF sample entry observed in the selected HLS variant's init segment.
+/// BMFF sample entry established for the selected HLS variant.
 ///
-/// MPEG-TS has no BMFF sample entry, therefore uses `.notApplicable` rather than an invented value.
+/// Clear fMP4 uses init-segment evidence. Protected fMP4 may use the selected variant's normalized codec
+/// declaration only alongside `.protectedManifestVerified`. MPEG-TS has no BMFF sample entry, therefore
+/// uses `.notApplicable` rather than an invented value.
 public enum HLSVideoSampleEntry: String, Sendable, Equatable {
     case avc1
     case hvc1
@@ -104,20 +106,24 @@ public enum HLSVideoSampleEntry: String, Sendable, Equatable {
     case unknown
 }
 
-/// Result of comparing the selected variant's `CODECS` declaration with the inspected init/first segment.
+/// Evidence used to compare the selected variant's `CODECS` declaration with its media packaging.
 ///
-/// `.segmentNotInspected` is an explicit stop condition. It must never be converted into a native route.
+/// Clear media requires segment inspection. Protected media can use `.protectedManifestVerified` only for
+/// an AVPlayer-native contract; that state never admits hybrid direct decode because AetherEngine has no
+/// clear compressed-sample contract.
 public enum HLSManifestCodecVerification: String, Sendable, Equatable {
     case verified
     case manifestMissingButSegmentVerified
     case mismatch
+    case protectedManifestVerified
     case segmentNotInspected
 }
 
-/// Content protection observed on the selected HLS variant.
+/// Content protection observed on the selected HLS presentation.
 ///
-/// Hybrid direct decode requires clear packets and samples. The policy refuses every protected form until a
-/// specific end-to-end decryption and license contract is implemented and verified.
+/// For a hybrid candidate, this includes protection on any required alternate-audio rendition. Hybrid
+/// direct decode requires clear packets and samples, while an AVPlayer-native protected presentation can
+/// remain on the native route without exposing keys or clear samples to AetherEngine.
 public enum HLSContentProtection: String, Sendable, Equatable {
     case none
     case aes128
@@ -126,7 +132,11 @@ public enum HLSContentProtection: String, Sendable, Equatable {
     case unknown
 }
 
-/// Verified selected-variant packaging facts. This is evidence, not a manifest-only guess.
+/// Selected-presentation packaging facts plus their explicit verification state.
+///
+/// Clear media is segment-backed. Protected media can be manifest-backed only when
+/// `codecVerification == .protectedManifestVerified`, which is sufficient solely for the native AVPlayer
+/// route and never for hybrid direct decode.
 public struct HLSVideoPackaging: Sendable, Equatable {
     public let container: HLSVideoContainer
     public let sampleEntry: HLSVideoSampleEntry
@@ -184,6 +194,7 @@ public struct HybridPlaybackCapabilities: Sendable, Equatable {
 /// Stable diagnostic reason accompanying every preflight route.
 public enum PlaybackRouteReason: String, Sendable, Equatable {
     case nativeHLSContractVerified
+    case nativeProtectedHLSContractVerified
     case nativeContainerRepackaging
     case hybridHEV1SampleEntry
     case hybridHEVCInMPEGTransport
@@ -270,14 +281,72 @@ public enum PlaybackPreflight {
         guard let hlsPackaging else {
             return result(sourceProfile, nil, .unsupported, .unsupportedHLSPreflightMissing)
         }
-        guard hlsPackaging.contentProtection == .none else {
-            return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHLSContentProtection)
+        if hlsPackaging.contentProtection == .unknown {
+            return result(
+                sourceProfile,
+                hlsPackaging,
+                .unsupported,
+                .unsupportedHLSContentProtection
+            )
         }
-        guard hlsPackaging.codecVerification != .segmentNotInspected else {
-            return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHLSSegmentNotInspected)
+        if hlsPackaging.codecVerification == .segmentNotInspected {
+            return result(
+                sourceProfile,
+                hlsPackaging,
+                .unsupported,
+                hlsPackaging.contentProtection == .none
+                    ? .unsupportedHLSSegmentNotInspected
+                    : .unsupportedHLSContentProtection
+            )
+        }
+        if hlsPackaging.codecVerification
+                == .protectedManifestVerified,
+           hlsPackaging.contentProtection == .none {
+            return result(
+                sourceProfile,
+                hlsPackaging,
+                .unsupported,
+                .unsupportedHLSSegmentNotInspected
+            )
         }
         guard hlsPackaging.actualVideoCodec == sourceProfile.videoCodec else {
             return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHLSVideoPackaging)
+        }
+
+        let nativeContractVerified: Bool
+        switch sourceProfile.videoCodec {
+        case .h264:
+            nativeContractVerified =
+                hlsPackaging.codecVerification == .verified
+                || hlsPackaging.codecVerification
+                    == .protectedManifestVerified
+        case .hevc:
+            nativeContractVerified =
+                hlsPackaging.container == .fragmentedMP4
+                && (
+                    hlsPackaging.sampleEntry == .hvc1
+                    || hlsPackaging.sampleEntry == .dvh1
+                )
+                && (
+                    hlsPackaging.codecVerification == .verified
+                    || hlsPackaging.codecVerification
+                        == .protectedManifestVerified
+                )
+        case .av1, .vp9, .vp8, .mpeg2, .mpeg4Part2, .vc1,
+             .unknown:
+            nativeContractVerified = false
+        }
+        if hlsPackaging.contentProtection != .none {
+            return result(
+                sourceProfile,
+                hlsPackaging,
+                nativeContractVerified
+                    ? .nativeAVPlayer
+                    : .unsupported,
+                nativeContractVerified
+                    ? .nativeProtectedHLSContractVerified
+                    : .unsupportedHLSContentProtection
+            )
         }
 
         switch sourceProfile.videoCodec {
@@ -327,7 +396,8 @@ public enum PlaybackPreflight {
             return .hybridHLSManifestMissingCodecs
         case .mismatch:
             return .hybridHLSManifestSegmentMismatch
-        case .verified, .segmentNotInspected:
+        case .verified, .protectedManifestVerified,
+             .segmentNotInspected:
             break
         }
         if packaging.container == .mpegTransport, packaging.actualVideoCodec == .hevc {

@@ -78,10 +78,11 @@ extension AetherEngine {
     /// Inspect HLS packaging and retain an opaque binding to the exact selected VOD video resources.
     ///
     /// Raw signed URLs and HTTP headers remain engine-private. The returned resource digest and mirrored
-    /// timeline are safe for host diagnostics, while a future HLS hybrid session must consume the opaque
+    /// timeline are safe for host diagnostics, while every HLS hybrid session must consume the opaque
     /// binding instead of reopening the root master and selecting a potentially different variant. Every
-    /// separate alternate-audio playlist in the selected group is bound too; segment fetch/demux and carrier
-    /// mux integration remain pending, so the public hybrid session must continue to exclude HLS.
+    /// separate alternate-audio playlist in the selected group is bound too. Internal graph-bound
+    /// fetch/demux/carrier composition exists, but the public hybrid session must continue to exclude HLS
+    /// until startup bandwidth ownership and the remaining public/device gates are complete.
     public nonisolated static func preflightHLSPlayback(
         url: URL,
         sourceIsSeekableVOD: Bool,
@@ -120,6 +121,13 @@ private struct HLSInspectedVideo: Sendable {
     let sampleEntry: HLSVideoSampleEntry
 }
 
+private struct HLSProtectedManifestVideo: Sendable {
+    let codec: AetherVideoCodec
+    let format: VideoFormat
+    let container: HLSVideoContainer
+    let sampleEntry: HLSVideoSampleEntry
+}
+
 /// Stateful only through its immutable HTTP header set. Tests exercise parsing and verification helpers
 /// directly; runtime I/O is isolated here so it cannot fall back to the AudioTap retry path.
 struct HLSPreflightInspector {
@@ -152,16 +160,18 @@ struct HLSPreflightInspector {
         let manifestCodecs = (resolved.variant?.codecs ?? [])
             + (resolved.variant?.supplementalCodecs ?? [])
 
-        // Protected media has no clear-packet hybrid contract. Return a normal typed route result rather
-        // than fetching keys, asking AVPlayer to try it, or silently changing to a legacy path.
+        // Protected media never enters hybrid direct decode. A manifest contract that is already
+        // AVPlayer-native stays native without fetching a key, init segment or media body. Every contract
+        // that would require AetherEngine clear samples becomes a normal typed unsupported route.
         guard resolved.media.contentProtection == .none else {
+            let protectedResult = protectedManifestResult(
+                resolved: resolved,
+                isSeekableVOD: sourceIsSeekableVOD,
+                manifestCodecs: manifestCodecs,
+                hybridCapabilities: hybridCapabilities
+            )
             return AetherHLSPlaybackPreflight(
-                result: unresolvedResult(
-                    isSeekableVOD: sourceIsSeekableVOD,
-                    manifestCodecs: manifestCodecs,
-                    contentProtection: resolved.media.contentProtection,
-                    hybridCapabilities: hybridCapabilities
-                ),
+                result: protectedResult,
                 resourceGraph: nil,
                 httpHeaders: httpHeaders
             )
@@ -255,23 +265,37 @@ struct HLSPreflightInspector {
         )
         let resourceGraph: HLSVODResourceGraph?
         if result.route == .hybridCarrierMetal {
-            let audioRenditions = try await resolveAudioRenditions(
+            let audioResolution = try await resolveAudioRenditions(
                 resolved.audioRenditions,
                 rootEffectiveURL: resolved.rootEffectiveURL
             )
-            resourceGraph = try HLSVODResourceGraph.make(
-                requestedRootURL: rootURL,
-                effectiveRootURL: resolved.rootEffectiveURL,
-                selectedMediaPlaylistURL: resolved.mediaURL,
-                selectedVariant: resolved.variant,
-                separateAudioGroupID: resolved.separateAudioGroupID,
-                mediaPlaylistData: resolved.mediaData,
-                media: resolved.media,
-                audioRenditions: audioRenditions,
-                inspectedInitSegmentData: initSegment,
-                inspectedFirstMediaSegmentData: segment.data,
-                httpHeaders: httpHeaders
-            )
+            switch audioResolution {
+            case .clear(let audioRenditions):
+                resourceGraph = try HLSVODResourceGraph.make(
+                    requestedRootURL: rootURL,
+                    effectiveRootURL: resolved.rootEffectiveURL,
+                    selectedMediaPlaylistURL: resolved.mediaURL,
+                    selectedVariant: resolved.variant,
+                    separateAudioGroupID: resolved.separateAudioGroupID,
+                    mediaPlaylistData: resolved.mediaData,
+                    media: resolved.media,
+                    audioRenditions: audioRenditions,
+                    inspectedInitSegmentData: initSegment,
+                    inspectedFirstMediaSegmentData: segment.data,
+                    httpHeaders: httpHeaders
+                )
+            case .protected(let protection):
+                return AetherHLSPlaybackPreflight(
+                    result: unsupportedProtectedHybridResult(
+                        result,
+                        protection: protection,
+                        hybridCapabilities:
+                            hybridCapabilities
+                    ),
+                    resourceGraph: nil,
+                    httpHeaders: httpHeaders
+                )
+            }
         } else {
             resourceGraph = nil
         }
@@ -342,10 +366,15 @@ struct HLSPreflightInspector {
         }
     }
 
+    private enum AudioRenditionResolution {
+        case clear([HLSVODAudioRenditionResource])
+        case protected(HLSContentProtection)
+    }
+
     private func resolveAudioRenditions(
         _ renditions: [HLSAudioRendition],
         rootEffectiveURL: URL
-    ) async throws -> [HLSVODAudioRenditionResource] {
+    ) async throws -> AudioRenditionResolution {
         var resources: [HLSVODAudioRenditionResource] = []
         resources.reserveCapacity(renditions.count)
         for (ordinal, rendition) in renditions.enumerated() {
@@ -364,6 +393,9 @@ struct HLSPreflightInspector {
                     "alternate-audio rendition was not a media playlist"
                 )
             }
+            guard media.contentProtection == .none else {
+                return .protected(media.contentProtection)
+            }
             resources.append(
                 try HLSVODResourceGraph.makeAudioRendition(
                     ordinal: ordinal,
@@ -374,7 +406,7 @@ struct HLSPreflightInspector {
                 )
             )
         }
-        return resources
+        return .clear(resources)
     }
 
     private func fetch(_ url: URL) async throws -> HLSPreflightFetchResponse {
@@ -482,6 +514,166 @@ struct HLSPreflightInspector {
             hlsPackaging: packaging,
             hybridCapabilities: hybridCapabilities
         )
+    }
+
+    private func protectedManifestResult(
+        resolved: HLSPreflightResolvedMedia,
+        isSeekableVOD: Bool,
+        manifestCodecs: [String],
+        hybridCapabilities: HybridPlaybackCapabilities
+    ) -> PlaybackPreflightResult {
+        guard let inspected = Self.inspectProtectedManifestVideo(
+            manifestCodecs: manifestCodecs,
+            videoRange: resolved.variant?.videoRange,
+            hasMap: resolved.media.hasMap
+        ) else {
+            return unresolvedResult(
+                isSeekableVOD: isSeekableVOD,
+                manifestCodecs: manifestCodecs,
+                contentProtection:
+                    resolved.media.contentProtection,
+                hybridCapabilities: hybridCapabilities
+            )
+        }
+        let source = AetherSourceProfile(
+            sourceKind: .hls,
+            isSeekableVOD: isSeekableVOD,
+            videoCodec: inspected.codec,
+            videoFormat: inspected.format
+        )
+        let packaging = HLSVideoPackaging(
+            container: inspected.container,
+            sampleEntry: inspected.sampleEntry,
+            manifestCodecs: manifestCodecs,
+            actualVideoCodec: inspected.codec,
+            codecVerification: .protectedManifestVerified,
+            contentProtection:
+                resolved.media.contentProtection
+        )
+        return PlaybackPreflight.resolve(
+            sourceProfile: source,
+            hlsPackaging: packaging,
+            hybridCapabilities: hybridCapabilities
+        )
+    }
+
+    private func unsupportedProtectedHybridResult(
+        _ result: PlaybackPreflightResult,
+        protection: HLSContentProtection,
+        hybridCapabilities: HybridPlaybackCapabilities
+    ) -> PlaybackPreflightResult {
+        guard let packaging = result.hlsPackaging else {
+            return PlaybackPreflightResult(
+                sourceProfile: result.sourceProfile,
+                hlsPackaging: nil,
+                route: .unsupported,
+                reason: .unsupportedHLSContentProtection
+            )
+        }
+        let protectedPackaging = HLSVideoPackaging(
+            container: packaging.container,
+            sampleEntry: packaging.sampleEntry,
+            manifestCodecs: packaging.manifestCodecs,
+            actualVideoCodec: packaging.actualVideoCodec,
+            codecVerification: packaging.codecVerification,
+            contentProtection: protection
+        )
+        return PlaybackPreflight.resolve(
+            sourceProfile: result.sourceProfile,
+            hlsPackaging: protectedPackaging,
+            hybridCapabilities: hybridCapabilities
+        )
+    }
+
+    private static func inspectProtectedManifestVideo(
+        manifestCodecs: [String],
+        videoRange: String?,
+        hasMap: Bool
+    ) -> HLSProtectedManifestVideo? {
+        let tokens = manifestCodecs.filter(isVideoCodecToken)
+        let codecs = Set(tokens.compactMap(codec(forManifestToken:)))
+        guard codecs.count == 1,
+              let codec = codecs.first else {
+            return nil
+        }
+        let sampleEntry: HLSVideoSampleEntry
+        if tokens.contains(where: { $0.hasPrefix("dvh1") }) {
+            sampleEntry = .dvh1
+        } else if tokens.contains(where: { $0.hasPrefix("hvc1") }) {
+            sampleEntry = .hvc1
+        } else if tokens.contains(where: { $0.hasPrefix("hev1") }) {
+            sampleEntry = .hev1
+        } else if tokens.contains(where: {
+            $0.hasPrefix("avc1") || $0.hasPrefix("avc3")
+        }) {
+            sampleEntry = .avc1
+        } else {
+            sampleEntry = .unknown
+        }
+        return HLSProtectedManifestVideo(
+            codec: codec,
+            format: manifestVideoFormat(
+                tokens: tokens,
+                videoRange: videoRange
+            ),
+            container: hasMap
+                ? .fragmentedMP4
+                : .mpegTransport,
+            sampleEntry: sampleEntry
+        )
+    }
+
+    private static func codec(
+        forManifestToken token: String
+    ) -> AetherVideoCodec? {
+        if token.hasPrefix("avc1")
+            || token.hasPrefix("avc3") {
+            return .h264
+        }
+        if token.hasPrefix("hvc1")
+            || token.hasPrefix("hev1")
+            || token.hasPrefix("dvh1")
+            || token.hasPrefix("dvhe") {
+            return .hevc
+        }
+        if token.hasPrefix("av01") {
+            return .av1
+        }
+        if token.hasPrefix("vp09") {
+            return .vp9
+        }
+        if token.hasPrefix("vp08") {
+            return .vp8
+        }
+        if token.hasPrefix("mp4v") {
+            return .mpeg4Part2
+        }
+        if token.hasPrefix("mpeg2") {
+            return .mpeg2
+        }
+        if token.hasPrefix("vc-1") {
+            return .vc1
+        }
+        return nil
+    }
+
+    private static func manifestVideoFormat(
+        tokens: [String],
+        videoRange: String?
+    ) -> VideoFormat {
+        if tokens.contains(where: {
+            $0.hasPrefix("dvh1") || $0.hasPrefix("dvhe")
+        }) {
+            return .dolbyVision
+        }
+        switch videoRange?.uppercased() {
+        case "PQ":
+            return .hdr10
+        case "HLG":
+            return .hlg
+        default:
+            return .sdr
+        }
     }
 
     private static func inspectVideo(

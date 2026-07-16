@@ -73,8 +73,9 @@ enum HLSVODResourceDigest {
 /// Engine-private immutable snapshot of the exact clear, finite HLS VOD video resources inspected before
 /// route selection. Future hybrid demux generations must consume these resolved URLs; reopening the root
 /// master and choosing a different adaptive variant would violate the preflight contract. Every separate
-/// audio rendition in the selected variant's group is bound to the same identity, but segment fetch/demux
-/// and carrier mux integration remain pending and therefore still block public HLS session admission.
+/// audio rendition in the selected variant's group is bound to the same identity. The graph now feeds the
+/// incremental media pump and internal carrier session; public HLS admission remains blocked by startup
+/// bandwidth ownership and the remaining public/device gates.
 struct HLSVODResourceGraph: Sendable, Equatable {
     let requestedRootURL: URL
     let effectiveRootURL: URL
