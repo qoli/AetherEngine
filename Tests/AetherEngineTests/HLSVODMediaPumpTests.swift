@@ -353,6 +353,137 @@ final class HLSVODMediaPumpTests: XCTestCase {
         }
     }
 
+    func testCarrierProviderServesPumpOutputThroughLoopbackHLS()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let measurementPump =
+            try await HLSVODMediaPump.make(
+                preflight: fixture.preflight,
+                fetchOverride: { request, _ in
+                    try fixture.fetchStore.response(
+                        for: request
+                    )
+                }
+            )
+        let summaries =
+            try await measurementPump
+                .finishProduction()
+        try await measurementPump.close()
+        let admissions = summaries.enumerated().map {
+            ordinal,
+            summary in
+            BlackCarrierAudioBandwidthAdmission(
+                ordinal: ordinal,
+                evidence: .measuredFullAsset(
+                    peakBandwidth:
+                        summary.peakBandwidth,
+                    averageBandwidth:
+                        summary.averageBandwidth
+                )
+            )
+        }
+        let provider =
+            try await HLSVODCarrierProvider.make(
+                preflight: fixture.preflight,
+                bandwidthAdmissions: admissions,
+                fetchOverride: { request, _ in
+                    try fixture.fetchStore.response(
+                        for: request
+                    )
+                }
+            )
+        let server = HLSLocalServer(
+            provider: provider
+        )
+        try server.start()
+        addTeardownBlock {
+            server.stop()
+            provider.close()
+        }
+        let masterURL = try XCTUnwrap(
+            server.playlistURL
+        )
+        let baseURL =
+            masterURL.deletingLastPathComponent()
+
+        let master = try await fetchText(
+            masterURL
+        )
+        XCTAssertTrue(
+            master.contains(
+                "CODECS=\"avc1.42C01E,ec-3\""
+            )
+        )
+        XCTAssertTrue(
+            master.contains("AUDIO=\"audio\"")
+        )
+        let audioPlaylist = try await fetchText(
+            baseURL.appendingPathComponent(
+                "audio_0.m3u8"
+            )
+        )
+        XCTAssertTrue(
+            audioPlaylist.contains(
+                "audio_0_seg_1.mp4"
+            )
+        )
+        let audioInit = try await fetchData(
+            baseURL.appendingPathComponent(
+                "audio_0_init.mp4"
+            )
+        )
+        let firstAudio = try await fetchData(
+            baseURL.appendingPathComponent(
+                "audio_0_seg_0.mp4"
+            )
+        )
+        let secondVideo = try await fetchData(
+            baseURL.appendingPathComponent(
+                "seg1.mp4"
+            )
+        )
+        let secondAudio = try await fetchData(
+            baseURL.appendingPathComponent(
+                "audio_0_seg_1.mp4"
+            )
+        )
+        XCTAssertFalse(audioInit.isEmpty)
+        XCTAssertFalse(firstAudio.isEmpty)
+        XCTAssertFalse(secondVideo.isEmpty)
+        XCTAssertFalse(secondAudio.isEmpty)
+        XCTAssertNil(provider.terminalError)
+    }
+
+    func testCarrierProviderRejectsMissingBandwidthEvidence()
+        async throws
+    {
+        let fixture = try makeFixture()
+        do {
+            _ = try await HLSVODCarrierProvider.make(
+                preflight: fixture.preflight,
+                bandwidthAdmissions: [],
+                fetchOverride: { request, _ in
+                    try fixture.fetchStore.response(
+                        for: request
+                    )
+                }
+            )
+            XCTFail(
+                "provider unexpectedly invented audio bandwidth"
+            )
+        } catch let error
+                as HLSVODCarrierProviderError {
+            XCTAssertEqual(
+                error,
+                .admissionCountMismatch(
+                    expected: 1,
+                    actual: 0
+                )
+            )
+        }
+    }
+
     private func makeFixture(
         declaredAudioChannels: String = "2"
     ) throws -> Fixture {
@@ -581,6 +712,34 @@ final class HLSVODMediaPumpTests: XCTestCase {
             statusCode: 200,
             contentLength: Int64(data.count),
             contentEncoding: nil
+        )
+    }
+
+    private func fetchData(
+        _ url: URL
+    ) async throws -> Data {
+        let (
+            data,
+            response
+        ) = try await URLSession.shared.data(
+            from: url
+        )
+        let http = try XCTUnwrap(
+            response as? HTTPURLResponse
+        )
+        XCTAssertEqual(http.statusCode, 200)
+        return data
+    }
+
+    private func fetchText(
+        _ url: URL
+    ) async throws -> String {
+        let data = try await fetchData(url)
+        return try XCTUnwrap(
+            String(
+                data: data,
+                encoding: .utf8
+            )
         )
     }
 
