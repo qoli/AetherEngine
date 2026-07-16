@@ -1063,15 +1063,26 @@ final class HybridPlaybackSession {
            recoveredForwardBuffer {
             playbackStallLatched = false
         }
+        let isPlaybackBufferEmpty: Bool
+        let isPlaybackLikelyToKeepUp: Bool
+        if let item {
+            isPlaybackBufferEmpty =
+                item.isPlaybackBufferEmpty
+            isPlaybackLikelyToKeepUp =
+                item.isPlaybackLikelyToKeepUp
+        } else {
+            isPlaybackBufferEmpty = true
+            isPlaybackLikelyToKeepUp = false
+        }
         let pressure = Self.resolveAudioAnalysisPlaybackPressure(
             state: state,
             timeControlStatus: avPlayer.timeControlStatus,
             rate: avPlayer.rate,
             playbackStalled: playbackStallLatched,
             isPlaybackBufferEmpty:
-                item?.isPlaybackBufferEmpty ?? false,
+                isPlaybackBufferEmpty,
             isPlaybackLikelyToKeepUp:
-                item?.isPlaybackLikelyToKeepUp ?? true,
+                isPlaybackLikelyToKeepUp,
             forwardBufferSeconds: forwardBufferSeconds
         )
         applyAudioAnalysisPlaybackPressure(
