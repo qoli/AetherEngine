@@ -238,6 +238,57 @@ struct HybridVideoDecodeSinkTests {
         }
     }
 
+    @Test("Real-video frame rate is snapped for display criteria without inventing unusual rates")
+    func displayFrameRateContract() throws {
+        let data = try BlackCarrierEncodedSample.verifiedMP4Data()
+        let standardDemuxer = try openDemuxer(data: data)
+        defer { standardDemuxer.close() }
+        let standardStream = try #require(
+            standardDemuxer.stream(
+                at: standardDemuxer.videoStreamIndex
+            )
+        )
+        standardStream.pointee.avg_frame_rate = AVRational(
+            num: 30_000,
+            den: 1_001
+        )
+        let standardSink = try HybridVideoDecodeSink(
+            demuxer: standardDemuxer,
+            initialGeneration: 0,
+            onFrame: { _ in }
+        )
+        defer { standardSink.close() }
+        #expect(
+            standardSink.streamContract.displayFrameRate
+                == 29.97
+        )
+
+        let unusualDemuxer = try openDemuxer(data: data)
+        defer { unusualDemuxer.close() }
+        let unusualStream = try #require(
+            unusualDemuxer.stream(
+                at: unusualDemuxer.videoStreamIndex
+            )
+        )
+        unusualStream.pointee.avg_frame_rate = AVRational(
+            num: 1,
+            den: 1
+        )
+        unusualStream.pointee.r_frame_rate = AVRational(
+            num: 1,
+            den: 1
+        )
+        let unusualSink = try HybridVideoDecodeSink(
+            demuxer: unusualDemuxer,
+            initialGeneration: 0,
+            onFrame: { _ in }
+        )
+        defer { unusualSink.close() }
+        #expect(
+            unusualSink.streamContract.displayFrameRate == nil
+        )
+    }
+
     @Test("Non-zero source origin is normalized before decode demand and frame delivery")
     func nonZeroSourceOriginNormalization() throws {
         let data = try makeVideoOnlySource(

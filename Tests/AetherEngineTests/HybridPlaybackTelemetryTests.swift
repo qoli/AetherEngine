@@ -134,6 +134,7 @@ struct HybridPlaybackTelemetryTests {
             state: state,
             generation: 0,
             videoFormat: .sdr,
+            realVideoFrameRate: 23.976,
             timelineDurationSeconds: 10,
             carrierTimeSeconds: 0,
             carrierRate: 0,

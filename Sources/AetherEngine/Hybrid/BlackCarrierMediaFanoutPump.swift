@@ -414,6 +414,11 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         hybridVideoDecodeSink?.streamContract.videoFormat
     }
 
+    var hybridVideoFrameRate: Double? {
+        hybridVideoDecodeSink?
+            .streamContract.displayFrameRate
+    }
+
     func restart(
         for intent: HybridSeekIntent
     ) throws -> BlackCarrierMediaFanoutRestartResult {

@@ -2,6 +2,13 @@
 
 Checks that need a running engine + a real media file, so they cannot run under `swift test`.
 
+## Hybrid geometry / display-criteria tvOS device gate
+
+[`hybrid-display-device-acceptance.md`](hybrid-display-device-acceptance.md) locks the physical-tvOS
+geometry, AVPlayerViewController writer, Match Frame Rate, HDR/HLG/Dolby Vision and teardown evidence.
+The source-level SDR geometry contract is implemented, but the physical gate remains pending and no
+unverified color format may be added to `AetherMetalPlayerView.verifiedVideoFormats`.
+
 ## Hybrid Atmos tvOS device gate
 
 [`hybrid-atmos-device-acceptance.md`](hybrid-atmos-device-acceptance.md) defines the physical-tvOS

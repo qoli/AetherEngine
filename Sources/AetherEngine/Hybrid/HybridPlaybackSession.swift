@@ -39,6 +39,8 @@ public enum HybridPlaybackSessionError:
     case alreadyStopped
     case carrierItemMissing
     case carrierClockUnavailable
+    case carrierPresentationNotConfigured
+    case carrierPresentationContractChanged
     case resumeIntentMissing
     case hlsPreflightGenerationInvalidated(
         AetherHLSPreflightInvalidationReason
@@ -103,6 +105,10 @@ public enum HybridPlaybackSessionError:
             return "Hybrid carrier transport did not create an AVPlayerItem"
         case .carrierClockUnavailable:
             return "Hybrid carrier AVPlayer did not publish a valid timeline clock"
+        case .carrierPresentationNotConfigured:
+            return "Hybrid tvOS playback requires configureCarrierPlayerViewController before prepare"
+        case .carrierPresentationContractChanged:
+            return "Hybrid tvOS carrier presentation no longer matches the engine-owned AVKit/display-criteria contract"
         case .resumeIntentMissing:
             return "Hybrid seek lost its required transport resume intent"
         case .hlsPreflightGenerationInvalidated:
@@ -179,6 +185,7 @@ protocol HybridCarrierTransportProvider:
     Sendable
 {
     var hybridVideoFormat: VideoFormat? { get }
+    var hybridVideoFrameRate: Double? { get }
 
     func restartMedia(
         for intent: HybridSeekIntent
@@ -383,6 +390,9 @@ final class HybridPlaybackSession {
     private let coordinator: HybridPlaybackProviderCoordinator
     private let timeline: BlackCarrierTimeline
     private let videoFormat: VideoFormat
+    private let videoFrameRate: Double?
+    private let displayCriteriaController =
+        DisplayCriteriaController()
     private let relay: HybridPlaybackFrameRelay
     private let audioAnalysisSource:
         (any HybridAudioAnalysisSource)?
@@ -421,6 +431,10 @@ final class HybridPlaybackSession {
 
     var sourceVideoFormat: VideoFormat {
         videoFormat
+    }
+
+    var sourceVideoFrameRate: Double? {
+        videoFrameRate
     }
 
     var audioAnalysisTrackIDs: [Int] {
@@ -488,6 +502,7 @@ final class HybridPlaybackSession {
         coordinator = HybridPlaybackProviderCoordinator(provider: provider)
         self.timeline = timeline
         self.videoFormat = videoFormat
+        videoFrameRate = provider.hybridVideoFrameRate
         self.relay = relay
         audioAnalysisSource =
             provider as? any HybridAudioAnalysisSource
@@ -669,6 +684,21 @@ final class HybridPlaybackSession {
         state = .preparing(generation: generation, target: target)
 
         do {
+            if let videoFrameRate {
+                _ = displayCriteriaController.apply(
+                    format: videoFormat,
+                    frameRate: videoFrameRate,
+                    codecTag: nil,
+                    omitColorExtensions: false
+                )
+                await displayCriteriaController.waitForSwitch()
+                try ensureActiveGeneration(generation)
+            } else {
+                EngineLog.emit(
+                    "[HybridPlaybackSession] display criteria skipped: real-video refresh rate unavailable",
+                    category: .session
+                )
+            }
             try renderSurface.beginGeneration(
                 generation,
                 videoFormat: videoFormat
@@ -852,10 +882,17 @@ final class HybridPlaybackSession {
         avPlayer.pause()
         renderSurface.flush()
         transport.stop()
+        displayCriteriaController.reset()
         EngineLog.emit(
             "[HybridPlaybackSession] stopped",
             category: .session
         )
+    }
+
+    func rejectPreparation(
+        with error: HybridPlaybackSessionError
+    ) {
+        terminate(with: error)
     }
 
     private func removeAudioAnalysisSession(id: UUID) {
@@ -1579,6 +1616,7 @@ final class HybridPlaybackSession {
         avPlayer.pause()
         renderSurface.flush()
         transport.stop()
+        displayCriteriaController.reset()
         EngineLog.emit(
             "[HybridPlaybackSession] terminal error: "
                 + error.localizedDescription,

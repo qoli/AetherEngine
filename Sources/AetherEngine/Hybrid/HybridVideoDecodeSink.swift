@@ -15,6 +15,7 @@ struct HybridVideoStreamContract: Sendable, Equatable {
     let pixelAspectRatioDenominator: Int
     let rotationDegrees: Int
     let nominalFrameDuration: CMTime
+    let displayFrameRate: Double?
     let packetTimeBaseNumerator: Int32
     let packetTimeBaseDenominator: Int32
     let sourceStartPTS: Int64
@@ -87,8 +88,13 @@ struct HybridVideoStreamContract: Sendable, Equatable {
                 value: Int64(frameRate.den),
                 timescale: frameRate.num
             )
+            displayFrameRate = FrameRateSnap.snap(
+                Double(frameRate.num)
+                    / Double(frameRate.den)
+            )
         } else {
             nominalFrameDuration = .invalid
+            displayFrameRate = nil
         }
         let timeBase = AVRational(
             num: packetTimeBaseNumerator,

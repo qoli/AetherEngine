@@ -130,6 +130,10 @@ final class BlackCarrierLazyCompositeProvider:
         pump.hybridVideoFormat
     }
 
+    var hybridVideoFrameRate: Double? {
+        pump.hybridVideoFrameRate
+    }
+
     var audioAnalysisTrackIDs: [Int] {
         pump.renditionMetadata.map(\.sourceTrackID)
     }

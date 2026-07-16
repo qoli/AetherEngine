@@ -115,6 +115,7 @@ struct HybridPlaybackSessionTests {
         }
 
         var hybridVideoFormat: VideoFormat? { .sdr }
+        var hybridVideoFrameRate: Double? { 24 }
         var terminalHybridPlaybackError:
             HybridPlaybackSessionError?
         {

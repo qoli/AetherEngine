@@ -29,6 +29,8 @@ public enum AetherHybridPlaybackTelemetryFailure:
     case alreadyStopped
     case carrierItemMissing
     case carrierClockUnavailable
+    case carrierPresentationNotConfigured
+    case carrierPresentationContractChanged
     case resumeIntentMissing
     case hlsPreflightGenerationInvalidated(
         AetherHLSPreflightInvalidationReason
@@ -83,6 +85,10 @@ public enum AetherHybridPlaybackTelemetryFailure:
             .carrierItemMissing
         case .carrierClockUnavailable:
             .carrierClockUnavailable
+        case .carrierPresentationNotConfigured:
+            .carrierPresentationNotConfigured
+        case .carrierPresentationContractChanged:
+            .carrierPresentationContractChanged
         case .resumeIntentMissing:
             .resumeIntentMissing
         case .hlsPreflightGenerationInvalidated(let reason):
@@ -186,6 +192,7 @@ public struct AetherHybridPlaybackTelemetrySnapshot:
     public let state: AetherHybridPlaybackTelemetryState
     public let generation: UInt64
     public let videoFormat: VideoFormat
+    public let realVideoFrameRate: Double?
     public let timelineDurationSeconds: Double
     public let carrierTimeSeconds: Double?
     public let carrierRate: Float
@@ -208,6 +215,7 @@ public struct AetherHybridPlaybackTelemetrySnapshot:
         state: AetherHybridPlaybackTelemetryState,
         generation: UInt64,
         videoFormat: VideoFormat,
+        realVideoFrameRate: Double?,
         timelineDurationSeconds: Double,
         carrierTimeSeconds: Double?,
         carrierRate: Float,
@@ -229,6 +237,7 @@ public struct AetherHybridPlaybackTelemetrySnapshot:
         self.state = state
         self.generation = generation
         self.videoFormat = videoFormat
+        self.realVideoFrameRate = realVideoFrameRate
         self.timelineDurationSeconds =
             timelineDurationSeconds
         self.carrierTimeSeconds = carrierTimeSeconds

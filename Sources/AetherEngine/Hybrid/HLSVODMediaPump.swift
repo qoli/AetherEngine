@@ -710,6 +710,10 @@ actor HLSVODMediaPump {
         worker.hybridVideoFormat
     }
 
+    var hybridVideoFrameRate: Double? {
+        worker.hybridVideoFrameRate
+    }
+
     var isTargetFrameReady: Bool {
         worker.isTargetFrameReady
     }
@@ -1298,6 +1302,11 @@ private extension HLSVODMediaPump {
         var hybridVideoFormat: VideoFormat? {
             videoDecodeSink?
                 .streamContract.videoFormat
+        }
+
+        var hybridVideoFrameRate: Double? {
+            videoDecodeSink?
+                .streamContract.displayFrameRate
         }
 
         var audioAnalysisContracts:

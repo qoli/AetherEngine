@@ -49,6 +49,7 @@ final class HLSVODCarrierProvider:
     private let timeline: BlackCarrierTimeline
     private let codecs: String
     private let resolvedHybridVideoFormat: VideoFormat?
+    private let resolvedHybridVideoFrameRate: Double?
     private let analysisInput: AudioAnalysisInput
 
     private let closeLock = NSLock()
@@ -165,6 +166,8 @@ final class HLSVODCarrierProvider:
         self.timeline = timeline
         resolvedHybridVideoFormat =
             await pump.hybridVideoFormat
+        resolvedHybridVideoFrameRate =
+            await pump.hybridVideoFrameRate
         analysisInput =
             try await pump.makeAudioAnalysisInput()
 
@@ -228,6 +231,10 @@ final class HLSVODCarrierProvider:
 
     var hybridVideoFormat: VideoFormat? {
         resolvedHybridVideoFormat
+    }
+
+    var hybridVideoFrameRate: Double? {
+        resolvedHybridVideoFrameRate
     }
 
     var audioAnalysisTrackIDs: [Int] {

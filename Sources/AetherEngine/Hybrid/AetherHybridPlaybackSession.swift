@@ -4,6 +4,31 @@ import CoreMedia
 import Foundation
 import Metal
 
+#if os(tvOS)
+import AVKit
+#endif
+
+enum HybridCarrierPresentationContract {
+    static func failure(
+        wasConfigured: Bool,
+        playerControllerAvailable: Bool,
+        playerMatchesSession: Bool,
+        carrierUsesAspectFit: Bool,
+        automaticallyAppliesDisplayCriteria: Bool
+    ) -> HybridPlaybackSessionError? {
+        guard wasConfigured else {
+            return .carrierPresentationNotConfigured
+        }
+        guard playerControllerAvailable,
+              playerMatchesSession,
+              carrierUsesAspectFit,
+              !automaticallyAppliesDisplayCriteria else {
+            return .carrierPresentationContractChanged
+        }
+        return nil
+    }
+}
+
 /// System video-output features whose presentation surface is outside the inline AVKit hierarchy.
 ///
 /// The first production hybrid contract does not move the engine-owned Metal surface into any of these
@@ -85,6 +110,7 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
     public let state: HybridPlaybackSessionState
     public let generation: UInt64
     public let videoFormat: VideoFormat
+    public let realVideoFrameRate: Double?
     public let timelineDurationSeconds: Double
     public let carrierTimeSeconds: Double?
     public let carrierRate: Float
@@ -106,6 +132,7 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
         state: HybridPlaybackSessionState,
         generation: UInt64,
         videoFormat: VideoFormat,
+        realVideoFrameRate: Double?,
         timelineDurationSeconds: Double,
         carrierTimeSeconds: Double?,
         carrierRate: Float,
@@ -126,6 +153,7 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
         self.state = state
         self.generation = generation
         self.videoFormat = videoFormat
+        self.realVideoFrameRate = realVideoFrameRate
         self.timelineDurationSeconds = timelineDurationSeconds
         self.carrierTimeSeconds = carrierTimeSeconds
         self.carrierRate = carrierRate
@@ -185,6 +213,11 @@ public final class AetherHybridPlaybackSession: ObservableObject {
     private let core: HybridPlaybackSession
     private let telemetryHub:
         AetherHybridPlaybackTelemetryHub
+    #if os(tvOS)
+    private weak var configuredCarrierPlayerViewController:
+        AVPlayerViewController?
+    private var didConfigureCarrierPlayerViewController = false
+    #endif
 
     private init(
         core: HybridPlaybackSession,
@@ -416,6 +449,27 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         core.audioAnalysisTrackIDs
     }
 
+    #if os(tvOS)
+    /// Applies the non-negotiable tvOS carrier-host contract before presentation.
+    ///
+    /// AVKit remains the controller and audio/system-integration owner. Its fixed black carrier stays
+    /// aspect-fit and cannot write display criteria from the SDR carrier; Aether's Metal view owns the real
+    /// video's fit/fill policy while `HybridPlaybackSession` writes criteria from real-video metadata.
+    public func configureCarrierPlayerViewController(
+        _ playerViewController: AVPlayerViewController,
+        realVideoGravity: AetherHybridVideoGravity = .resizeAspect
+    ) {
+        playerViewController.player = avPlayer
+        playerViewController.videoGravity = .resizeAspect
+        playerViewController
+            .appliesPreferredDisplayCriteriaAutomatically = false
+        metalPlayerView.videoGravity = realVideoGravity
+        configuredCarrierPlayerViewController =
+            playerViewController
+        didConfigureCarrierPlayerViewController = true
+    }
+    #endif
+
     /// Bounded, sequence-ordered telemetry for the complete public hybrid session lifecycle.
     ///
     /// Each subscriber receives up to the latest 64 events before live delivery. The stream finishes after
@@ -441,6 +495,8 @@ public final class AetherHybridPlaybackSession: ObservableObject {
             state: state,
             generation: core.generation,
             videoFormat: core.sourceVideoFormat,
+            realVideoFrameRate:
+                core.sourceVideoFrameRate,
             timelineDurationSeconds: timeline.duration.seconds,
             carrierTimeSeconds: Self.validSeconds(time),
             carrierRate: avPlayer.rate,
@@ -465,6 +521,28 @@ public final class AetherHybridPlaybackSession: ObservableObject {
     }
 
     public func prepare(timeout: TimeInterval = 15) async throws {
+        #if os(tvOS)
+        let playerViewController =
+            configuredCarrierPlayerViewController
+        if let error = HybridCarrierPresentationContract.failure(
+                wasConfigured:
+                    didConfigureCarrierPlayerViewController,
+                playerControllerAvailable:
+                    playerViewController != nil,
+                playerMatchesSession:
+                    playerViewController?.player === avPlayer,
+                carrierUsesAspectFit:
+                    playerViewController?.videoGravity
+                        == .resizeAspect,
+                automaticallyAppliesDisplayCriteria:
+                    playerViewController?
+                        .appliesPreferredDisplayCriteriaAutomatically
+                        ?? true
+        ) {
+            core.rejectPreparation(with: error)
+            throw error
+        }
+        #endif
         try await core.prepare(timeout: timeout)
     }
 
@@ -524,6 +602,8 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                 ),
             generation: current.generation,
             videoFormat: current.videoFormat,
+            realVideoFrameRate:
+                current.realVideoFrameRate,
             timelineDurationSeconds:
                 current.timelineDurationSeconds,
             carrierTimeSeconds:
