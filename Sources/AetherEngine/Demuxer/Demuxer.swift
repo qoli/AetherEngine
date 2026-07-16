@@ -268,12 +268,25 @@ public final class Demuxer: @unchecked Sendable {
     /// - Parameters:
     ///   - extraHeaders: Attached to every HTTP request (ignored for file:// URLs).
     ///   - isLive: Suppresses EOF synthesis and surfaces terminal error on reconnect cap.
-    func open(url: URL, extraHeaders: [String: String] = [:], profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil) throws {
+    func open(
+        url: URL,
+        extraHeaders: [String: String] = [:],
+        profile: DemuxerOpenProfile = .playback,
+        isLive: Bool = false,
+        selectTitleID: Int? = nil,
+        sourceByteStore: SourceByteStore? = nil
+    ) throws {
         self.openProfile = profile
         let isHTTP = url.scheme == "http" || url.scheme == "https"
 
         if isHTTP {
-            try openHTTP(url: url, extraHeaders: extraHeaders, isLive: isLive, selectTitleID: selectTitleID)
+            try openHTTP(
+                url: url,
+                extraHeaders: extraHeaders,
+                isLive: isLive,
+                selectTitleID: selectTitleID,
+                sourceByteStore: sourceByteStore
+            )
         } else {
             // Route a local DVD ISO through the disc adapter (FileIOReader keeps it
             // out of RAM). Falls back to the normal local open when not a disc.
@@ -346,7 +359,13 @@ public final class Demuxer: @unchecked Sendable {
         ["iso", "img", "udf"].contains(url.pathExtension.lowercased())
     }
 
-    private func openHTTP(url: URL, extraHeaders: [String: String], isLive: Bool = false, selectTitleID: Int? = nil) throws {
+    private func openHTTP(
+        url: URL,
+        extraHeaders: [String: String],
+        isLive: Bool = false,
+        selectTitleID: Int? = nil,
+        sourceByteStore: SourceByteStore? = nil
+    ) throws {
         // A remote disc image goes through the same disc adapter as a local ISO (a raw .iso handed
         // straight to libavformat fails to probe; it is a filesystem, not a media container, #64).
         // Gated on the disc-image extension so normal media URLs skip the range-probe entirely; if
@@ -370,7 +389,8 @@ public final class Demuxer: @unchecked Sendable {
             isLive: isLive,
             chunkRequestTimeout: openProfile.avioRequestTimeout,
             chunkMaxRetries: openProfile.avioMaxRetries,
-            boundedInitialFetch: openProfile.boundedInitialFetch
+            boundedInitialFetch: openProfile.boundedInitialFetch,
+            sourceByteStore: sourceByteStore
         )
         reader.onNetworkPhaseChanged = onNetworkPhaseChanged
         try openWithProvider(reader, isLive: isLive)

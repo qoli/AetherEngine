@@ -5,6 +5,7 @@ final class AudioAnalysisRunnerTests: XCTestCase {
     private final class CountingReader: IOReader, @unchecked Sendable {
         private let lock = NSLock()
         private var accesses = 0
+        private var closes = 0
 
         func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {
             lock.lock(); accesses += 1; lock.unlock()
@@ -16,12 +17,19 @@ final class AudioAnalysisRunnerTests: XCTestCase {
             return 0
         }
 
-        func close() {}
+        func close() {
+            lock.lock(); closes += 1; lock.unlock()
+        }
         func cancel() {}
 
         func accessCount() -> Int {
             lock.lock(); defer { lock.unlock() }
             return accesses
+        }
+
+        func closeCount() -> Int {
+            lock.lock(); defer { lock.unlock() }
+            return closes
         }
     }
 
@@ -99,5 +107,7 @@ final class AudioAnalysisRunnerTests: XCTestCase {
         XCTAssertEqual(reader.accessCount(), 0)
         stream.cancel()
         await task.value
+        XCTAssertEqual(reader.accessCount(), 0)
+        XCTAssertEqual(reader.closeCount(), 1)
     }
 }

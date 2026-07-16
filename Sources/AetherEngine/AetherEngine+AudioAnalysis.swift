@@ -35,7 +35,11 @@ extension AetherEngine {
             }
             input = .reader(reader, formatHint: customFormatHint)
         } else {
-            input = .url(loadedURL, httpHeaders: loadedOptions.httpHeaders)
+            input = .url(
+                loadedURL,
+                httpHeaders: loadedOptions.httpHeaders,
+                sourceByteStore: nil
+            )
         }
 
         let session = AudioAnalysisSession()

@@ -18,6 +18,7 @@ enum BlackCarrierMediaFanoutPumpError:
     case demuxSeekFailed(segmentIndex: Int)
     case restartTimelineOffsetUnavailable(trackID: Int)
     case freshDemuxerFactoryMissing
+    case analysisSourceFactoryMissing
     case freshDemuxerOpenFailed(reason: String)
     case restartSourceContractMismatch
     case restartTrackContractMismatch
@@ -50,6 +51,8 @@ enum BlackCarrierMediaFanoutPumpError:
             return "Black carrier audio track \(trackID) has no startup timeline offset for restart"
         case .freshDemuxerFactoryMissing:
             return "Black carrier lazy restart requires a fresh-demux factory"
+        case .analysisSourceFactoryMissing:
+            return "Black carrier audio analysis requires the session-owned source factory"
         case .freshDemuxerOpenFailed(let reason):
             return "Black carrier fresh demux generation could not open: \(reason)"
         case .restartSourceContractMismatch:
@@ -901,6 +904,23 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return rendition(at: ordinal)?.cache.peekURL(index: index)
+    }
+
+    func makeAudioAnalysisInput() throws -> AudioAnalysisInput {
+        let factory: BlackCarrierDemuxSourceFactory
+        lock.lock()
+        guard !isClosed else {
+            lock.unlock()
+            throw BlackCarrierMediaFanoutPumpError.closed
+        }
+        guard let sourceFactory else {
+            lock.unlock()
+            throw BlackCarrierMediaFanoutPumpError
+                .analysisSourceFactoryMissing
+        }
+        factory = sourceFactory
+        lock.unlock()
+        return try factory.makeAudioAnalysisInput()
     }
 
     func close() {

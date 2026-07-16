@@ -5,7 +5,11 @@ import Libavcodec
 /// A fresh source owned by one analysis session. URL analysis intentionally opens its own demuxer; it never
 /// observes or moves the playback demuxer's cursor. A custom source must already be an independent clone.
 enum AudioAnalysisInput: Sendable {
-    case url(URL, httpHeaders: [String: String])
+    case url(
+        URL,
+        httpHeaders: [String: String],
+        sourceByteStore: SourceByteStore?
+    )
     case reader(IOReader, formatHint: String?)
 }
 
@@ -85,6 +89,11 @@ enum AudioAnalysisRunner {
 
     static func run(session: AudioAnalysisSession, input: AudioAnalysisInput,
                     request: AudioAnalysisRequest) async {
+        if case .reader(let reader, _) = input {
+            // Ownership is attached before the first demand wait. This does not read or open the source,
+            // but guarantees cancel-before-first-next closes an already-created independent clone.
+            session.attachOwnedReader(reader)
+        }
         defer { session.closeResources() }
         do {
             // Opening/probing a URL reader consumes source bytes. Do not do it merely because a host created a
@@ -92,10 +101,18 @@ enum AudioAnalysisRunner {
             try await session.gate.waitForDemand()
             try session.throwIfCancelled()
             switch input {
-            case .url(let url, let httpHeaders):
-                try session.demuxer.open(url: url, extraHeaders: httpHeaders, isLive: false)
+            case .url(
+                let url,
+                let httpHeaders,
+                let sourceByteStore
+            ):
+                try session.demuxer.open(
+                    url: url,
+                    extraHeaders: httpHeaders,
+                    isLive: false,
+                    sourceByteStore: sourceByteStore
+                )
             case .reader(let reader, let formatHint):
-                session.attachOwnedReader(reader)
                 try session.demuxer.open(reader: reader, formatHint: formatHint, isLive: false)
             }
             try session.throwIfCancelled()

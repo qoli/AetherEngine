@@ -110,6 +110,15 @@ extension BlackCarrierLazyCompositeProvider:
     HybridCarrierTransportProvider
 {}
 
+protocol HybridAudioAnalysisSource: Sendable {
+    var audioAnalysisTrackIDs: [Int] { get }
+    func makeAudioAnalysisInput() throws -> AudioAnalysisInput
+}
+
+extension BlackCarrierLazyCompositeProvider:
+    HybridAudioAnalysisSource
+{}
+
 @MainActor
 protocol HybridCarrierPlayerTransport: AnyObject {
     var avPlayer: AVPlayer { get }
@@ -240,6 +249,8 @@ final class HybridPlaybackSession {
     private let timeline: BlackCarrierTimeline
     private let videoFormat: VideoFormat
     private let relay: HybridPlaybackFrameRelay
+    private let audioAnalysisSource:
+        (any HybridAudioAnalysisSource)?
 
     private var classifier: HybridSeekIntentClassifier
     private var readinessGate = HybridPresentationReadinessGate()
@@ -256,6 +267,9 @@ final class HybridPlaybackSession {
     private var decodeDemandWorker: Task<Void, Never>?
     private var decodeDemandWorkerID: UInt64 = 0
     private var decodeDemandSuspended = false
+    private var audioAnalysisSessions: [
+        UUID: AudioAnalysisSession
+    ] = [:]
 
     init(
         provider: any HybridCarrierTransportProvider,
@@ -275,6 +289,8 @@ final class HybridPlaybackSession {
         self.timeline = timeline
         self.videoFormat = videoFormat
         self.relay = relay
+        audioAnalysisSource =
+            provider as? any HybridAudioAnalysisSource
         classifier = HybridSeekIntentClassifier(
             timeline: timeline,
             initialGeneration: initialGeneration
@@ -451,6 +467,70 @@ final class HybridPlaybackSession {
         )
     }
 
+    func audioAnalysisStream(
+        request: AudioAnalysisRequest
+    ) throws -> AudioAnalysisStream {
+        switch state {
+        case .failed, .stopped:
+            throw AudioAnalysisError.noActiveSession
+        case .idle, .preparing, .ready, .seeking:
+            break
+        }
+        guard let audioAnalysisSource else {
+            throw AudioAnalysisError.analysisFailed(
+                "hybrid session has no independent analysis source"
+            )
+        }
+        guard audioAnalysisSource.audioAnalysisTrackIDs.contains(
+            request.audioTrackID
+        ) else {
+            throw AudioAnalysisError.audioTrackUnavailable(
+                request.audioTrackID
+            )
+        }
+        let input: AudioAnalysisInput
+        do {
+            input = try audioAnalysisSource.makeAudioAnalysisInput()
+        } catch BlackCarrierDemuxSourceFactoryError
+                    .independentReaderUnavailable {
+            throw AudioAnalysisError
+                .sourceCannotCreateIndependentReader
+        } catch {
+            throw AudioAnalysisError.analysisFailed(
+                String(describing: error)
+            )
+        }
+
+        let session = AudioAnalysisSession()
+        let stream = AudioAnalysisStream(
+            gate: session.gate,
+            cancel: { session.cancel() }
+        )
+        audioAnalysisSessions[session.id] = session
+        let sessionID = session.id
+        let task = Task.detached(priority: .utility) {
+            [weak self] in
+            await AudioAnalysisRunner.run(
+                session: session,
+                input: input,
+                request: request
+            )
+            await self?.removeAudioAnalysisSession(
+                id: sessionID
+            )
+        }
+        session.install(task: task)
+        return stream
+    }
+
+    func cancelAudioAnalysisStreams() {
+        let sessions = Array(audioAnalysisSessions.values)
+        audioAnalysisSessions.removeAll()
+        for session in sessions {
+            session.cancel()
+        }
+    }
+
     func stop() {
         guard state != .stopped else { return }
         state = .stopped
@@ -462,6 +542,7 @@ final class HybridPlaybackSession {
         managedTimeJumpSuppressionTarget = nil
         managedTimeJumpSuppressionDeadline = nil
         pendingResumeIntent = nil
+        cancelAudioAnalysisStreams()
         relay.detach()
         avPlayer.pause()
         renderSurface.flush()
@@ -470,6 +551,10 @@ final class HybridPlaybackSession {
             "[HybridPlaybackSession] stopped",
             category: .session
         )
+    }
+
+    private func removeAudioAnalysisSession(id: UUID) {
+        audioAnalysisSessions.removeValue(forKey: id)
     }
 
     func receiveDecodedFrame(_ frame: DecodedVideoFrame) {
@@ -922,6 +1007,7 @@ final class HybridPlaybackSession {
         managedTimeJumpSuppressionDeadline = nil
         pendingResumeIntent = nil
         decodeDemandSuspended = true
+        cancelAudioAnalysisStreams()
         relay.detach()
         avPlayer.pause()
         renderSurface.flush()

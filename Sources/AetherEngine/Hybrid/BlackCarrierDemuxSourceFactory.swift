@@ -49,6 +49,7 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
     }
 
     private let backing: Backing
+    private let sourceByteStore: SourceByteStore?
     private let lock = NSLock()
     private var isClosed = false
 
@@ -66,6 +67,7 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
         )
         switch source {
         case .url(let url):
+            sourceByteStore = try SourceByteStore()
             backing = .url(
                 url,
                 headers: options.httpHeaders,
@@ -73,6 +75,7 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
                 selectTitleID: selectTitleID
             )
         case .custom(let reader, let formatHint):
+            sourceByteStore = nil
             backing = .custom(
                 reader,
                 formatHint: formatHint,
@@ -130,7 +133,8 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
                     extraHeaders: headers,
                     profile: profile,
                     isLive: false,
-                    selectTitleID: selectTitleID
+                    selectTitleID: selectTitleID,
+                    sourceByteStore: sourceByteStore
                 )
             case .custom(
                 let prototype,
@@ -170,6 +174,32 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
         }
     }
 
+    func makeAudioAnalysisInput() throws -> AudioAnalysisInput {
+        let source: Backing
+        lock.lock()
+        guard !isClosed else {
+            lock.unlock()
+            throw BlackCarrierDemuxSourceFactoryError.closed
+        }
+        source = backing
+        lock.unlock()
+
+        switch source {
+        case .url(let url, let headers, _, _):
+            return .url(
+                url,
+                httpHeaders: headers,
+                sourceByteStore: sourceByteStore
+            )
+        case .custom(let prototype, let formatHint, _, _, _):
+            guard let reader = prototype.makeIndependentReader() else {
+                throw BlackCarrierDemuxSourceFactoryError
+                    .independentReaderUnavailable
+            }
+            return .reader(reader, formatHint: formatHint)
+        }
+    }
+
     func close() {
         let customReader: IOReader?
         lock.lock()
@@ -185,5 +215,6 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
         }
         lock.unlock()
         customReader?.close()
+        sourceByteStore?.close()
     }
 }

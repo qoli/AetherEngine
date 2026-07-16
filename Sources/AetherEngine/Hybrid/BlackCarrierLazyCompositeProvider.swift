@@ -332,6 +332,14 @@ final class BlackCarrierLazyCompositeProvider:
         pump.hybridVideoFormat
     }
 
+    var audioAnalysisTrackIDs: [Int] {
+        pump.renditionMetadata.map(\.sourceTrackID)
+    }
+
+    func makeAudioAnalysisInput() throws -> AudioAnalysisInput {
+        try pump.makeAudioAnalysisInput()
+    }
+
     func prepareForTransportStart() throws {
         do {
             for ordinal in pump.renditionMetadata.indices {

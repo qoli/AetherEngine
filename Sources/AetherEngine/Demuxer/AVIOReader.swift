@@ -29,6 +29,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     private let url: URL
     private let extraHeaders: [String: String]
+    private let sourceByteStore: SourceByteStore?
     /// Session config factory. Short-lived probes/chunks get a 60s resource timeout;
     /// long-lived persistent/streaming connections omit it (fires mid-stream, NSURLError
     /// -1001; stall detection is handled by `connStallTimeout`). `urlCache = nil` avoids
@@ -47,6 +48,36 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     }
     private var position: Int64 = 0
     private var fileSize: Int64 = -1
+    private var sourceStoreReadEnabled = false
+    private var usesValidatedCompleteSourceStore = false
+
+    private let sourceStoreFailureLock = NSLock()
+    private var _sourceStoreFailure: SourceByteStoreError?
+    private var sourceStoreFailure: SourceByteStoreError? {
+        sourceStoreFailureLock.lock()
+        defer { sourceStoreFailureLock.unlock() }
+        return _sourceStoreFailure
+    }
+    private func recordSourceStoreFailure(_ error: SourceByteStoreError) {
+        sourceStoreFailureLock.lock()
+        if _sourceStoreFailure == nil {
+            _sourceStoreFailure = error
+        }
+        sourceStoreFailureLock.unlock()
+    }
+
+    private let sourceStoreCounterLock = NSLock()
+    private var _sourceStoreBytesServed: Int64 = 0
+    var sourceStoreBytesServed: Int64 {
+        sourceStoreCounterLock.lock()
+        defer { sourceStoreCounterLock.unlock() }
+        return _sourceStoreBytesServed
+    }
+    private func addSourceStoreBytesServed(_ count: Int) {
+        sourceStoreCounterLock.lock()
+        _sourceStoreBytesServed &+= Int64(count)
+        sourceStoreCounterLock.unlock()
+    }
 
     /// Typed source-fetch network phase, pushed on every stall/reconnect/recovery transition (#85).
     /// Mirrors `HLSVideoEngine.onSeekStateChanged`. `@Sendable`: invoked from the demux thread, the
@@ -299,9 +330,20 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var throttleVClockNs: UInt64 = 0
     private let throttleLock = NSLock()
 
-    init(url: URL, extraHeaders: [String: String] = [:], chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil) {
+    init(
+        url: URL,
+        extraHeaders: [String: String] = [:],
+        chunkSize: Int = 4 * 1024 * 1024,
+        prefetchEnabled: Bool = true,
+        isLive: Bool = false,
+        chunkRequestTimeout: TimeInterval = 35,
+        chunkMaxRetries: Int = 3,
+        boundedInitialFetch: Int64? = nil,
+        sourceByteStore: SourceByteStore? = nil
+    ) {
         self.url = url
         self.extraHeaders = extraHeaders
+        self.sourceByteStore = sourceByteStore
         self.chunkSize = chunkSize
         self.prefetchEnabled = prefetchEnabled
         self.isLive = isLive
@@ -333,6 +375,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
     }
 
+    private func applySourceByteStoreHeaders(
+        _ request: inout URLRequest
+    ) {
+        guard sourceByteStore != nil else { return }
+        request.setValue(
+            "identity",
+            forHTTPHeaderField: "Accept-Encoding"
+        )
+    }
+
     func open() throws {
         guard let buf = av_malloc(Int(Self.avioBufferSize)) else {
             throw AVIOReaderError.allocationFailed
@@ -355,6 +407,56 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
 
         context = ctx
+
+        if !isLive, let sourceByteStore,
+           let snapshot = sourceByteStore.snapshot,
+           snapshot.residentBytes > 0 {
+            if let candidate = sourceByteStore.validationCandidate {
+                switch validateSourceStore(candidate.generation) {
+                case .valid:
+                    fileSize = candidate.generation.contentLength
+                    sourceStoreReadEnabled = true
+                    usesValidatedCompleteSourceStore =
+                        candidate.isComplete
+                    EngineLog.emit(
+                        "[AVIOReader] validated session source-byte store "
+                            + "length=\(candidate.generation.contentLength) "
+                            + "complete=\(candidate.isComplete)",
+                        category: .demux
+                    )
+                case .changed:
+                    do {
+                        try sourceByteStore.reset()
+                    } catch let error as SourceByteStoreError {
+                        close()
+                        throw AVIOReaderError.sourceByteStore(error)
+                    }
+                case .failed(let reason):
+                    close()
+                    throw AVIOReaderError.sourceByteStoreValidationFailed(
+                        reason: reason
+                    )
+                }
+            } else {
+                do {
+                    try sourceByteStore.reset()
+                    EngineLog.emit(
+                        "[AVIOReader] discarded unvalidated resident source bytes",
+                        category: .demux
+                    )
+                } catch let error as SourceByteStoreError {
+                    close()
+                    throw AVIOReaderError.sourceByteStore(error)
+                }
+            }
+        }
+
+        if usesValidatedCompleteSourceStore {
+            if let ctx = context {
+                ctx.pointee.seekable = AVIO_SEEKABLE_NORMAL
+            }
+            return
+        }
 
         if prefetchEnabled {
             // Playback path. The persistent connection's `Range: bytes=0-` request is itself
@@ -611,6 +713,29 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     fileprivate func read(into buf: UnsafeMutablePointer<UInt8>, size: Int32) -> Int32 {
         guard !isClosed else { return -1 }
         if readDeadlinePassedOrAborted { readDeadlineFired = true; return -1 }
+        if sourceStoreFailure != nil { return -1 }
+        if sourceStoreReadEnabled,
+           let cached = readFromSourceStore(
+               maximumLength: Int(size)
+           ) {
+            cached.withUnsafeBytes { raw in
+                if let base = raw.baseAddress {
+                    buf.update(
+                        from: base.assumingMemoryBound(to: UInt8.self),
+                        count: cached.count
+                    )
+                }
+            }
+            advancePositionAfterSourceStoreRead(cached.count)
+            addSourceStoreBytesServed(cached.count)
+            applyThrottle(deliveredBytes: cached.count)
+            return Int32(cached.count)
+        }
+        if sourceStoreFailure != nil { return -1 }
+        if usesValidatedCompleteSourceStore {
+            let currentPosition = sourceStoreReadPosition()
+            return currentPosition >= fileSize ? FFmpegErr.eof : -1
+        }
         // Check usePersistentReader before isStreaming: live feeds without
         // Content-Length must use the reconnect-capable persistent path.
         let n: Int32
@@ -619,6 +744,45 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         else { n = readSeekable(into: buf, size: size) }
         if n > 0 { applyThrottle(deliveredBytes: Int(n)) }
         return n
+    }
+
+    private func sourceStoreReadPosition() -> Int64 {
+        if usePersistentReader || usesValidatedCompleteSourceStore {
+            winCond.lock()
+            let current = position
+            winCond.unlock()
+            return current
+        }
+        return position
+    }
+
+    private func readFromSourceStore(
+        maximumLength: Int
+    ) -> Data? {
+        guard let sourceByteStore, maximumLength > 0 else { return nil }
+        do {
+            return try sourceByteStore.read(
+                at: sourceStoreReadPosition(),
+                maximumLength: maximumLength
+            )
+        } catch let error as SourceByteStoreError {
+            recordSourceStoreFailure(error)
+            return nil
+        } catch {
+            recordSourceStoreFailure(.blockReadFailed(errno: EIO))
+            return nil
+        }
+    }
+
+    private func advancePositionAfterSourceStoreRead(_ count: Int) {
+        if usePersistentReader || usesValidatedCompleteSourceStore {
+            winCond.lock()
+            position += Int64(count)
+            winCond.broadcast()
+            winCond.unlock()
+        } else {
+            position += Int64(count)
+        }
     }
 
     // MARK: - Seekable Read (Range-based)
@@ -1163,6 +1327,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let budget = Self.effectiveDetourBudget(chunkRequestTimeout: chunkRequestTimeout)
         request.timeoutInterval = budget
         applyExtraHeaders(&request)
+        applySourceByteStoreHeaders(&request)
         do {
             let (data, response) = try syncRequest(request, budget: budget)
             if let http = response as? HTTPURLResponse {
@@ -1179,8 +1344,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     EngineLog.emit("[AVIOReader] detour: server ignored Range (200 for offset \(offset)); rejecting", category: .demux, level: .verbose)
                     return .failed
                 }
+                guard admitSourceStoreResponse(
+                    http,
+                    requestedOffset: offset
+                ) else {
+                    return .failed
+                }
             }
             addBytesFetched(data.count)
+            storeSourceBytes(data, at: offset)
+            if sourceStoreFailure != nil { return .failed }
             return .ok(data)
         } catch {
             return .failed
@@ -1242,6 +1415,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         request.timeoutInterval = 0  // long-lived; stalls handled by the reader
         applyExtraHeaders(&request)
+        applySourceByteStoreHeaders(&request)
 
         let delegate = PersistentReadDelegate(
             reader: self,
@@ -1284,6 +1458,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             winCond.unlock()
             return
         }
+        let sourceOffset = winStart + Int64(window.count)
         var firstDataMs: Double? = nil
         if !connFirstDataSeen {
             connFirstDataSeen = true
@@ -1308,6 +1483,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             _ = winCond.wait(until: Date(timeIntervalSinceNow: 0.2))
         }
         winCond.unlock()
+        storeSourceBytes(data, at: sourceOffset)
         if let firstDataMs {
             // #93/#96 residual: a slow first-data gap is release-visible so a device trace can pair it
             // with the response-header timing above. Small header gap + large first-data gap = the body
@@ -1338,7 +1514,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         var headerMs: Double? = nil
         winCond.lock()
-        if generation == connGeneration {
+        let isCurrentGeneration = generation == connGeneration
+        if isCurrentGeneration {
             connStatus = status
             connRetryAfter = retryAfter
             // #93/#96 residual: time-to-first-response-header for this generation. A large value here
@@ -1350,14 +1527,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // VOD: 200 at offset > 0 means server ignored Range and sent the full body
         // from byte 0 (silent corruption). Reject it. Live is exempt: transcode
         // reconnect legitimately answers 200 with "from now".
-        let requestedOffset = (generation == connGeneration) ? winStart : 0
+        let requestedOffset = isCurrentGeneration ? winStart : 0
         // Issue #70: the first from-0 data connection doubles as the size probe, so the
         // playback open skips probeFileSize() entirely. Derive the total from this
         // response (206 Content-Range, or Content-Length on a from-0 2xx). Write-once
         // (fileSize <= 0), current-gen only, and never for live (whose length is
         // non-authoritative). The response precedes any body and no read() reads fileSize
         // until open() returns, so this write is ordered behind winCond just like the data.
-        if generation == connGeneration, !isLive, fileSize <= 0,
+        if isCurrentGeneration, !isLive, fileSize <= 0,
            let total = Self.sizeFromResponse(http, requestedOffset: requestedOffset) {
             fileSize = total
             // #112: share this resolved length so a later side demuxer on the same origin can skip a probe that
@@ -1368,6 +1545,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             #endif
         }
         winCond.unlock()
+        if isOK, isCurrentGeneration,
+           !admitSourceStoreResponse(
+               http,
+               requestedOffset: requestedOffset
+           ) {
+            isOK = false
+        }
         if let headerMs, headerMs > 2000 {
             EngineLog.emit(
                 "[AVIOReader] gen=\(generation) response headers after \(Int(headerMs))ms status=\(status)",
@@ -1418,6 +1602,80 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return min(max(seconds, 0), 15)
     }
 
+    private func admitSourceStoreResponse(
+        _ response: HTTPURLResponse,
+        requestedOffset: Int64
+    ) -> Bool {
+        guard let sourceByteStore else { return true }
+        if let contentEncoding = response.value(
+            forHTTPHeaderField: "Content-Encoding"
+        )?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !contentEncoding.isEmpty,
+           contentEncoding.lowercased() != "identity" {
+            recordSourceStoreFailure(
+                .unsupportedContentEncoding(contentEncoding)
+            )
+            return false
+        }
+        guard let generation = Self.sourceStoreGeneration(
+            response: response,
+            requestedOffset: requestedOffset
+        ) else {
+            return true
+        }
+        do {
+            try sourceByteStore.admit(generation)
+            return true
+        } catch let error as SourceByteStoreError {
+            recordSourceStoreFailure(error)
+            return false
+        } catch {
+            recordSourceStoreFailure(.generationMismatch)
+            return false
+        }
+    }
+
+    private func storeSourceBytes(_ data: Data, at offset: Int64) {
+        guard let sourceByteStore, !data.isEmpty else { return }
+        do {
+            try sourceByteStore.store(data, at: offset)
+        } catch let error as SourceByteStoreError {
+            recordSourceStoreFailure(error)
+        } catch {
+            recordSourceStoreFailure(.blockWriteFailed(errno: EIO))
+        }
+    }
+
+    private static func sourceStoreGeneration(
+        response: HTTPURLResponse,
+        requestedOffset: Int64
+    ) -> SourceByteStoreGeneration? {
+        guard let contentLength = sizeFromResponse(
+            response,
+            requestedOffset: requestedOffset
+        ), contentLength > 0 else {
+            return nil
+        }
+        let validator: SourceByteStoreValidator?
+        if let rawETag = response.value(forHTTPHeaderField: "ETag")?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !rawETag.isEmpty,
+           !rawETag.lowercased().hasPrefix("w/") {
+            validator = .strongETag(rawETag)
+        } else if let lastModified = response.value(
+            forHTTPHeaderField: "Last-Modified"
+        )?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !lastModified.isEmpty {
+            validator = .lastModified(lastModified)
+        } else {
+            validator = nil
+        }
+        return try? SourceByteStoreGeneration(
+            contentLength: contentLength,
+            validator: validator
+        )
+    }
+
     // MARK: - Streaming Download (background)
 
     private func startStreamingDownload() {
@@ -1430,6 +1688,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var request = URLRequest(url: url)
         request.timeoutInterval = 0  // No timeout for live streams
         applyExtraHeaders(&request)
+        applySourceByteStoreHeaders(&request)
 
         let semaphore = DispatchSemaphore(value: 0)
 
@@ -1603,6 +1862,79 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return URLSession(configuration: config, delegate: nil, delegateQueue: nil)
     }()
 
+    private enum SourceStoreValidationResult {
+        case valid
+        case changed
+        case failed(reason: String)
+    }
+
+    private func validateSourceStore(
+        _ candidate: SourceByteStoreGeneration
+    ) -> SourceStoreValidationResult {
+        guard let validator = candidate.validator else {
+            return .failed(reason: "complete store has no response validator")
+        }
+        var request = URLRequest(url: url)
+        request.setValue("bytes=0-0", forHTTPHeaderField: "Range")
+        switch validator {
+        case .strongETag(let value), .lastModified(let value):
+            request.setValue(value, forHTTPHeaderField: "If-Range")
+        }
+        request.timeoutInterval = min(20, chunkRequestTimeout)
+        applyExtraHeaders(&request)
+        applySourceByteStoreHeaders(&request)
+
+        let delegate = SourceByteStoreValidationDelegate(
+            extraHeaders: extraHeaders
+        )
+        let task = Self.probeSession.dataTask(with: request)
+        task.delegate = delegate
+        let semaphore = DispatchSemaphore(value: 0)
+        delegate.onCompletion = { semaphore.signal() }
+        task.resume()
+
+        let outcome = Self.awaitSignal(
+            semaphore,
+            budget: min(25, chunkRequestTimeout),
+            pollInterval: 0.1,
+            shouldAbort: { [weak self] in self?.isClosed == true }
+        )
+        guard outcome == .signaled else {
+            task.cancel()
+            return .failed(reason: "conditional range validation timed out")
+        }
+        guard let response = delegate.response else {
+            return .failed(reason: "conditional range validation returned no response")
+        }
+        switch response.statusCode {
+        case 206:
+            if let contentEncoding = response.value(
+                forHTTPHeaderField: "Content-Encoding"
+            )?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !contentEncoding.isEmpty,
+               contentEncoding.lowercased() != "identity" {
+                return .failed(
+                    reason: "conditional range validation used "
+                        + "Content-Encoding \(contentEncoding)"
+                )
+            }
+            guard Self.sizeFromResponse(
+                response,
+                requestedOffset: 0
+            ) == candidate.contentLength else {
+                return .changed
+            }
+            return .valid
+        case 200, 412, 416:
+            return .changed
+        default:
+            return .failed(
+                reason: "conditional range validation returned HTTP "
+                    + "\(response.statusCode)"
+            )
+        }
+    }
+
     /// Total size from a data-connection response: `Content-Range` total on a 206, or
     /// `Content-Length` on a from-0 2xx (origins that answer 200 ignoring Range). Nil when
     /// the origin gave no usable length (chunked, or an unknown `*` total). Issue #70.
@@ -1679,6 +2011,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         request.setValue(range, forHTTPHeaderField: "Range")
         request.timeoutInterval = 20
         applyExtraHeaders(&request)
+        applySourceByteStoreHeaders(&request)
 
         let delegate = ProbeDelegate(extraHeaders: extraHeaders)
         let task = Self.probeSession.dataTask(with: request)
@@ -1716,6 +2049,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         request.httpMethod = "HEAD"
         request.timeoutInterval = 5
         applyExtraHeaders(&request)
+        applySourceByteStoreHeaders(&request)
 
         do {
             // Honour the still budget here too so the open-time HEAD fallback can't
@@ -1757,6 +2091,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         request.setValue("bytes=\(offset)-\(rangeEnd)", forHTTPHeaderField: "Range")
         request.timeoutInterval = min(15, chunkRequestTimeout)
         applyExtraHeaders(&request)
+        applySourceByteStoreHeaders(&request)
 
         var lastError: Error?
         for attempt in 0..<chunkMaxRetries {
@@ -1779,8 +2114,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         )
                         return nil
                     }
+                    guard admitSourceStoreResponse(
+                        http,
+                        requestedOffset: offset
+                    ) else {
+                        return nil
+                    }
                 }
                 addBytesFetched(data.count)
+                storeSourceBytes(data, at: offset)
+                if sourceStoreFailure != nil { return nil }
                 return data
             } catch {
                 // Superseded / closed / past the read deadline: this read is disposable,
@@ -1946,11 +2289,22 @@ private func redirectPreservingHeaders(
     extraHeaders: [String: String]
 ) -> URLRequest {
     var updated = request
+    for (name, value) in extraHeaders {
+        updated.setValue(value, forHTTPHeaderField: name)
+    }
     if let originalRange = task.originalRequest?.value(forHTTPHeaderField: "Range") {
         updated.setValue(originalRange, forHTTPHeaderField: "Range")
     }
-    for (name, value) in extraHeaders {
-        updated.setValue(value, forHTTPHeaderField: name)
+    if let originalIfRange = task.originalRequest?
+        .value(forHTTPHeaderField: "If-Range") {
+        updated.setValue(originalIfRange, forHTTPHeaderField: "If-Range")
+    }
+    if let originalEncoding = task.originalRequest?
+        .value(forHTTPHeaderField: "Accept-Encoding") {
+        updated.setValue(
+            originalEncoding,
+            forHTTPHeaderField: "Accept-Encoding"
+        )
     }
     return updated
 }
@@ -2119,6 +2473,57 @@ private final class StreamingDelegate: NSObject, URLSessionDataDelegate {
     }
 }
 
+// MARK: - Source Byte Store Validation Delegate
+
+/// Captures only response headers for a conditional one-byte Range request, then cancels before
+/// the response body can redownload cached media. `If-Range` is preserved across redirects by the
+/// shared redirect helper.
+private final class SourceByteStoreValidationDelegate:
+    NSObject,
+    URLSessionDataDelegate,
+    @unchecked Sendable
+{
+    let extraHeaders: [String: String]
+    var response: HTTPURLResponse?
+    var onCompletion: (() -> Void)?
+
+    init(extraHeaders: [String: String]) {
+        self.extraHeaders = extraHeaders
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(redirectPreservingHeaders(
+            task: task,
+            newRequest: request,
+            extraHeaders: extraHeaders
+        ))
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        self.response = response as? HTTPURLResponse
+        completionHandler(.cancel)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        onCompletion?()
+    }
+}
+
 // MARK: - Probe Delegate
 
 /// File-size Range probe delegate. Preserves Range across cross-host redirects,
@@ -2200,12 +2605,18 @@ enum AVIOReaderError: Error, CustomStringConvertible {
     case allocationFailed
     case noResponse
     case requestTimeout
+    case sourceByteStore(SourceByteStoreError)
+    case sourceByteStoreValidationFailed(reason: String)
 
     var description: String {
         switch self {
         case .allocationFailed: return "Failed to allocate AVIO buffer"
         case .noResponse: return "No response from server"
         case .requestTimeout: return "Request timed out"
+        case .sourceByteStore(let error):
+            return error.localizedDescription
+        case .sourceByteStoreValidationFailed(let reason):
+            return "Source byte store validation failed: \(reason)"
         }
     }
 }

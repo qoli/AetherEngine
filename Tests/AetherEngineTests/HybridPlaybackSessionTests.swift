@@ -62,10 +62,12 @@ private func makeHybridPlaybackSessionFrame(
 struct HybridPlaybackSessionTests {
     private final class Provider:
         HybridCarrierTransportProvider,
+        HybridAudioAnalysisSource,
         @unchecked Sendable
     {
         private let relay: HybridPlaybackFrameRelay
         private let timeline: BlackCarrierTimeline
+        private let analysisData: Data?
         private let lock = NSLock()
 
         private(set) var didPrepareInitial = false
@@ -80,13 +82,30 @@ struct HybridPlaybackSessionTests {
 
         init(
             relay: HybridPlaybackFrameRelay,
-            timeline: BlackCarrierTimeline
+            timeline: BlackCarrierTimeline,
+            analysisData: Data? = nil
         ) {
             self.relay = relay
             self.timeline = timeline
+            self.analysisData = analysisData
         }
 
         var hybridVideoFormat: VideoFormat? { .sdr }
+        var audioAnalysisTrackIDs: [Int] {
+            analysisData == nil ? [] : [0]
+        }
+
+        func makeAudioAnalysisInput() throws
+            -> AudioAnalysisInput
+        {
+            guard let analysisData else {
+                throw AudioAnalysisError.audioTrackUnavailable(0)
+            }
+            return .reader(
+                DataIOReader(data: analysisData),
+                formatHint: "wav"
+            )
+        }
 
         func prepareForTransportStart() throws {
             lock.lock()
@@ -259,6 +278,113 @@ struct HybridPlaybackSessionTests {
         }
     }
 
+    private func makeAnalysisWAV(seconds: Double) -> Data {
+        let sampleRate = 48_000
+        let channels = 2
+        let frames = Int(Double(sampleRate) * seconds)
+        var pcm = Data(capacity: frames * channels * 2)
+        for frame in 0..<frames {
+            let value = Int16(
+                9_000 * sin(
+                    2 * .pi * 440 * Double(frame) / Double(sampleRate)
+                )
+            )
+            for _ in 0..<channels {
+                withUnsafeBytes(of: value.littleEndian) {
+                    pcm.append(contentsOf: $0)
+                }
+            }
+        }
+        var data = Data()
+        func appendString(_ value: String) {
+            data.append(value.data(using: .ascii)!)
+        }
+        func appendUInt32(_ value: UInt32) {
+            withUnsafeBytes(of: value.littleEndian) {
+                data.append(contentsOf: $0)
+            }
+        }
+        func appendUInt16(_ value: UInt16) {
+            withUnsafeBytes(of: value.littleEndian) {
+                data.append(contentsOf: $0)
+            }
+        }
+        appendString("RIFF")
+        appendUInt32(UInt32(36 + pcm.count))
+        appendString("WAVE")
+        appendString("fmt ")
+        appendUInt32(16)
+        appendUInt16(1)
+        appendUInt16(UInt16(channels))
+        appendUInt32(UInt32(sampleRate))
+        appendUInt32(UInt32(sampleRate * channels * 2))
+        appendUInt16(UInt16(channels * 2))
+        appendUInt16(16)
+        appendString("data")
+        appendUInt32(UInt32(pcm.count))
+        data.append(pcm)
+        return data
+    }
+
+    @MainActor
+    @Test("Hybrid session owns independent demand-driven audio analysis")
+    func hybridAudioAnalysisStream() async throws {
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(
+                seconds: 2,
+                preferredTimescale: 90_000
+            )
+        )
+        let relay = HybridPlaybackFrameRelay()
+        let provider = Provider(
+            relay: relay,
+            timeline: timeline,
+            analysisData: makeAnalysisWAV(seconds: 2)
+        )
+        let transport = Transport()
+        let renderSurface = RenderSurface()
+        let session = try HybridPlaybackSession(
+            provider: provider,
+            transport: transport,
+            renderSurface: renderSurface,
+            timeline: timeline,
+            relay: relay
+        )
+        defer { session.stop() }
+        let request = try AudioAnalysisRequest(
+            audioTrackID: 0,
+            range: 0.25..<0.75
+        )
+        let stream = try session.audioAnalysisStream(
+            request: request
+        )
+
+        var totalFrames: Int64 = 0
+        var firstPosition: Int64?
+        var finalPosition: Int64?
+        var bufferIndex = 0
+        var iterator = stream.makeAsyncIterator()
+        while let buffer = try await iterator.next() {
+            firstPosition = firstPosition
+                ?? buffer.sourceSamplePosition
+            totalFrames += Int64(buffer.pcm.frameLength)
+            finalPosition = buffer.sourceSamplePosition
+                + Int64(buffer.pcm.frameLength)
+            #expect(buffer.pcm.format.sampleRate == 48_000)
+            #expect(buffer.pcm.format.channelCount == 1)
+            if bufferIndex > 0 {
+                #expect(!buffer.isDiscontinuous)
+            }
+            bufferIndex += 1
+        }
+
+        let resolvedFirstPosition = try #require(firstPosition)
+        let resolvedFinalPosition = try #require(finalPosition)
+        #expect(abs(totalFrames - 24_000) <= 1_200)
+        #expect(abs(resolvedFirstPosition - 12_000) <= 120)
+        #expect(abs(resolvedFinalPosition - 36_000) <= 120)
+    }
+
     @Test("Initial carrier and decoded frame must both become ready")
     @MainActor
     func initialReadinessAndClockDemand() async throws {
@@ -280,7 +406,11 @@ struct HybridPlaybackSessionTests {
             CMTime(seconds: 1, preferredTimescale: 600)
         )
         try await waitUntil {
-            !fixture.provider.snapshot().demands.isEmpty
+            guard let latest = fixture.provider
+                .snapshot().demands.last else {
+                return false
+            }
+            return latest.seconds >= 1.25 - 0.000_001
         }
         let demand = try #require(
             fixture.provider.snapshot().demands.last
