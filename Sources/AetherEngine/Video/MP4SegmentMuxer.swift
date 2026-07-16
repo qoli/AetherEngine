@@ -84,6 +84,7 @@ final class MP4SegmentMuxer {
         case avioAllocFailed
         case writeHeaderFailed(code: Int32)
         case openStagingFileFailed(errno: Int32)
+        case noStreams
 
         var description: String {
             switch self {
@@ -93,6 +94,7 @@ final class MP4SegmentMuxer {
             case .avioAllocFailed: return "MP4SegmentMuxer: avio_alloc_context failed"
             case .writeHeaderFailed(let c): return "MP4SegmentMuxer: avformat_write_header failed (\(c))"
             case .openStagingFileFailed(let e): return "MP4SegmentMuxer: open() staging file failed errno=\(e)"
+            case .noStreams: return "MP4SegmentMuxer: at least one media stream is required"
             }
         }
     }
@@ -130,7 +132,9 @@ final class MP4SegmentMuxer {
     /// (typically 1/16000 for 24 fps video, 1/<sample rate> for audio).
     private(set) var muxerVideoTimeBase: AVRational = AVRational(num: 1, den: 1)
     private(set) var muxerAudioTimeBase: AVRational = AVRational(num: 1, den: 1)
+    private let haveVideo: Bool
     private let haveAudio: Bool
+    private let fragmentBoundOutputStreamIndex: Int32
 
     /// Mid-segment fragment-flush bound (#64). With movflags +frag_custom a moof+mdat is emitted only at
     /// an explicit segment cut; a degenerate plan (sparse-keyframe TS index) or any very long segment
@@ -143,10 +147,10 @@ final class MP4SegmentMuxer {
     /// (which runs before the latch) sees a fully-initialized stored property.
     private var maxBufferedFragmentTicks: Int64 = 0
     /// Output-TB DTS of the first video packet since the last flush; Int64.min = no window open yet.
-    private var fragmentWindowFirstVideoDts: Int64 = Int64.min
+    private var fragmentWindowFirstDts: Int64 = Int64.min
 
-    let videoOutputStreamIndex: Int32 = 0
-    let audioOutputStreamIndex: Int32 = 1
+    let videoOutputStreamIndex: Int32
+    let audioOutputStreamIndex: Int32
 
     private let splitter: FragmentSplitter
 
@@ -155,7 +159,7 @@ final class MP4SegmentMuxer {
     /// Build the session-long muxer, opening its first segment file.
     /// `onInitCaptured` fires once when ftyp+moov bytes finish streaming (= init.mp4 content).
     /// Throws on any libavformat init failure or staging-file open failure.
-    init(
+    convenience init(
         initialSegmentIndex: Int,
         sessionDir: URL,
         video: VideoConfig,
@@ -163,12 +167,58 @@ final class MP4SegmentMuxer {
         maxBufferedFragmentSeconds: Double = 8.0,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
+        try self.init(
+            initialSegmentIndex: initialSegmentIndex,
+            sessionDir: sessionDir,
+            videoConfig: video,
+            audioConfig: audio,
+            maxBufferedFragmentSeconds: maxBufferedFragmentSeconds,
+            onInitCaptured: onInitCaptured
+        )
+    }
+
+    /// Audio-only fMP4 rendition muxer. Stream index is 0 and all fragment-bound math follows
+    /// the audio DTS axis. Existing A/V and video-only initializers keep video=0/audio=1.
+    convenience init(
+        initialSegmentIndex: Int,
+        sessionDir: URL,
+        audioOnly audio: AudioConfig,
+        maxBufferedFragmentSeconds: Double = 8.0,
+        onInitCaptured: @escaping (Data) -> Void
+    ) throws {
+        try self.init(
+            initialSegmentIndex: initialSegmentIndex,
+            sessionDir: sessionDir,
+            videoConfig: nil,
+            audioConfig: audio,
+            maxBufferedFragmentSeconds: maxBufferedFragmentSeconds,
+            onInitCaptured: onInitCaptured
+        )
+    }
+
+    private init(
+        initialSegmentIndex: Int,
+        sessionDir: URL,
+        videoConfig: VideoConfig?,
+        audioConfig: AudioConfig?,
+        maxBufferedFragmentSeconds: Double,
+        onInitCaptured: @escaping (Data) -> Void
+    ) throws {
+        guard videoConfig != nil || audioConfig != nil else {
+            throw MuxerError.noStreams
+        }
         self.currentSegmentIndex = initialSegmentIndex
         self.sessionDir = sessionDir
-        self.haveAudio = audio != nil
+        self.haveVideo = videoConfig != nil
+        self.haveAudio = audioConfig != nil
+        self.videoOutputStreamIndex = videoConfig == nil ? -1 : 0
+        self.audioOutputStreamIndex = audioConfig == nil ? -1 : (videoConfig == nil ? 0 : 1)
+        self.fragmentBoundOutputStreamIndex = videoConfig == nil
+            ? self.audioOutputStreamIndex
+            : self.videoOutputStreamIndex
         // Only AC-3 / E-AC-3 / TrueHD build their mp4 sample entry from a parsed packet (dac3/dec3/dmlp),
         // so only they can hit the "moov before audio parsed" wedge and need the #64-flush guard.
-        if let audioCodecID = audio?.codecpar.pointee.codec_id {
+        if let audioCodecID = audioConfig?.codecpar.pointee.codec_id {
             self.audioNeedsParsedPacketForMoov =
                 audioCodecID == AV_CODEC_ID_AC3 ||
                 audioCodecID == AV_CODEC_ID_EAC3 ||
@@ -237,8 +287,8 @@ final class MP4SegmentMuxer {
         do {
             try Self.configureStreamsAndWriteHeader(
                 ctx: ctx,
-                video: video,
-                audio: audio
+                video: videoConfig,
+                audio: audioConfig
             )
         } catch {
             cleanup()
@@ -246,16 +296,21 @@ final class MP4SegmentMuxer {
         }
         self.headerWritten = true
 
-        muxerVideoTimeBase = ctx.pointee.streams.advanced(by: 0).pointee!.pointee.time_base
-        if haveAudio {
-            muxerAudioTimeBase = ctx.pointee.streams.advanced(by: 1).pointee!.pointee.time_base
+        if haveVideo {
+            muxerVideoTimeBase = ctx.pointee.streams[
+                Int(videoOutputStreamIndex)
+            ]!.pointee.time_base
         }
-        // Bound is in the muxer's rewritten output video TB: packets reach writePacket already rescaled
-        // to muxerVideoTimeBase, so the window math must use it (not the source TB). Latched here, after
-        // write_header has rewritten the stream time_base (#64).
+        if haveAudio {
+            muxerAudioTimeBase = ctx.pointee.streams[
+                Int(audioOutputStreamIndex)
+            ]!.pointee.time_base
+        }
+        // Bound follows the primary output axis: video for A/V/video-only, audio for audio-only.
+        // Packets reach writePacket already rescaled to the matching muxer time base.
         maxBufferedFragmentTicks = Self.bufferedFragmentTicks(
             seconds: maxBufferedFragmentSeconds,
-            timeBase: muxerVideoTimeBase
+            timeBase: haveVideo ? muxerVideoTimeBase : muxerAudioTimeBase
         )
     }
 
@@ -319,7 +374,45 @@ final class MP4SegmentMuxer {
         do {
             try Self.configureStreamsAndWriteHeader(
                 ctx: ctx,
-                video: video,
+                video: Optional(video),
+                audio: audio
+            )
+            return 0
+        } catch MuxerError.copyParametersFailed(let code) {
+            return code
+        } catch MuxerError.writeHeaderFailed(let code) {
+            return code
+        } catch {
+            return -1
+        }
+    }
+
+    static func probeAudioWriteHeader(audio: AudioConfig) -> Int32 {
+        var ctxOut: UnsafeMutablePointer<AVFormatContext>?
+        let allocRet = avformat_alloc_output_context2(&ctxOut, nil, "mp4", "probe.m4s")
+        guard allocRet == 0, let ctx = ctxOut else {
+            return allocRet
+        }
+        defer { avformat_free_context(ctx) }
+
+        var pb: UnsafeMutablePointer<AVIOContext>?
+        let avioRet = avio_open_dyn_buf(&pb)
+        guard avioRet >= 0, let pbContext = pb else {
+            return avioRet
+        }
+        ctx.pointee.pb = pbContext
+        defer {
+            var buffer: UnsafeMutablePointer<UInt8>?
+            _ = avio_close_dyn_buf(pbContext, &buffer)
+            if buffer != nil {
+                av_free(buffer)
+            }
+        }
+
+        do {
+            try Self.configureStreamsAndWriteHeader(
+                ctx: ctx,
+                video: nil,
                 audio: audio
             )
             return 0
@@ -336,41 +429,45 @@ final class MP4SegmentMuxer {
     /// Single source of truth: drift between the two would let the probe pass while the real muxer fails.
     private static func configureStreamsAndWriteHeader(
         ctx: UnsafeMutablePointer<AVFormatContext>,
-        video: VideoConfig,
+        video: VideoConfig?,
         audio: AudioConfig?
     ) throws {
+        guard video != nil || audio != nil else {
+            throw MuxerError.noStreams
+        }
         // strict=-2 lets the mp4 muxer write Dolby Vision atoms (dvcC,
         // dvvC) and other non-strict-ISOBMFF extensions when the source
         // codecpar carries DV side data. Matches the prior hls-path
         // setting; mp4 muxer respects the same compliance level.
         ctx.pointee.strict_std_compliance = -2
 
-        // Video stream.
-        guard let videoStream = avformat_new_stream(ctx, nil) else {
-            throw MuxerError.streamCreationFailed
-        }
-        let vCopy = avcodec_parameters_copy(videoStream.pointee.codecpar, video.codecpar)
-        guard vCopy >= 0 else {
-            throw MuxerError.copyParametersFailed(code: vCopy)
-        }
-        videoStream.pointee.time_base = video.timeBase
-        if let override = video.codecTagOverride,
-           let tag = Self.mkTag(fromFourCC: override) {
-            videoStream.pointee.codecpar.pointee.codec_tag = tag
-        }
-        if video.rewriteDoviConfigTo81 {
-            Self.rewriteDoviConfigToProfile81(videoStream.pointee.codecpar)
-        } else if video.stripDolbyVisionMetadata {
-            Self.stripDolbyVisionSideData(videoStream.pointee.codecpar)
-        }
-        if let co = video.colorOverride {
-            videoStream.pointee.codecpar.pointee.color_primaries = co.primaries
-            videoStream.pointee.codecpar.pointee.color_trc = co.trc
-            videoStream.pointee.codecpar.pointee.color_space = co.space
-            videoStream.pointee.codecpar.pointee.color_range = co.range
-        }
-        if let extradata = video.extradataOverride {
-            Self.replaceExtradata(videoStream.pointee.codecpar, with: extradata)
+        if let video {
+            guard let videoStream = avformat_new_stream(ctx, nil) else {
+                throw MuxerError.streamCreationFailed
+            }
+            let vCopy = avcodec_parameters_copy(videoStream.pointee.codecpar, video.codecpar)
+            guard vCopy >= 0 else {
+                throw MuxerError.copyParametersFailed(code: vCopy)
+            }
+            videoStream.pointee.time_base = video.timeBase
+            if let override = video.codecTagOverride,
+               let tag = Self.mkTag(fromFourCC: override) {
+                videoStream.pointee.codecpar.pointee.codec_tag = tag
+            }
+            if video.rewriteDoviConfigTo81 {
+                Self.rewriteDoviConfigToProfile81(videoStream.pointee.codecpar)
+            } else if video.stripDolbyVisionMetadata {
+                Self.stripDolbyVisionSideData(videoStream.pointee.codecpar)
+            }
+            if let colorOverride = video.colorOverride {
+                videoStream.pointee.codecpar.pointee.color_primaries = colorOverride.primaries
+                videoStream.pointee.codecpar.pointee.color_trc = colorOverride.trc
+                videoStream.pointee.codecpar.pointee.color_space = colorOverride.space
+                videoStream.pointee.codecpar.pointee.color_range = colorOverride.range
+            }
+            if let extradata = video.extradataOverride {
+                Self.replaceExtradata(videoStream.pointee.codecpar, with: extradata)
+            }
         }
         if let audio = audio {
             guard let audioStream = avformat_new_stream(ctx, nil) else {
@@ -409,7 +506,8 @@ final class MP4SegmentMuxer {
 
     // MARK: - Pump-side API
 
-    /// Write one packet via av_interleaved_write_frame (caller must rescale pts/dts to muxerVideoTimeBase / muxerAudioTimeBase).
+    /// Write one packet via av_interleaved_write_frame. Caller must rescale pts/dts to the
+    /// matching output stream's muxer time base.
     @discardableResult
     func writePacket(_ packet: UnsafeMutablePointer<AVPacket>) -> Int32 {
         guard let ctx = formatContext else { return -1 }
@@ -428,17 +526,18 @@ final class MP4SegmentMuxer {
         // moof+mdat into the current staging file before the buffered span grows without bound. Tracked
         // on the video output stream only; audio/subtitle packets ride along and are force-drained by the
         // flush. Flush BEFORE writing the triggering packet so it opens a fresh window.
-        if streamIndex == videoOutputStreamIndex, packet.pointee.dts != Int64.min {
+        if streamIndex == fragmentBoundOutputStreamIndex,
+           packet.pointee.dts != Int64.min {
             let dts = packet.pointee.dts
-            if fragmentWindowFirstVideoDts == Int64.min {
-                fragmentWindowFirstVideoDts = dts
+            if fragmentWindowFirstDts == Int64.min {
+                fragmentWindowFirstDts = dts
             } else if Self.bufferedTicksExceedsBound(
-                firstDts: fragmentWindowFirstVideoDts,
+                firstDts: fragmentWindowFirstDts,
                 currentDts: dts,
                 boundTicks: maxBufferedFragmentTicks
             ) {
                 flushPendingFragment()
-                fragmentWindowFirstVideoDts = dts
+                fragmentWindowFirstDts = dts
             }
         }
 
@@ -458,7 +557,7 @@ final class MP4SegmentMuxer {
         // (2) in the video-leads-audio case, the first audio packet arrives after a video packet is already
         // in the fragment window, proactively flush so moov is emitted WITH a parsed audio packet present
         // rather than waiting for the first cut. In the common backward-seek path the #74 pregate buffer
-        // replays captured audio BEFORE the first video look-behind packet, so fragmentWindowFirstVideoDts
+        // replays captured audio BEFORE the first video look-behind packet, so fragmentWindowFirstDts
         // is still unset here and this proactive arm is skipped, moov is instead primed correctly at the
         // first cut, which already holds the audio in the interleaver. Idempotent once moovFlushed. Audio
         // routing/placement is untouched, so no audio dropouts. The proactive flush is scoped to
@@ -466,7 +565,10 @@ final class MP4SegmentMuxer {
         // must keep the exact stock code path, no extra early fragment flush, so nothing perturbs its audio.
         if streamIndex == audioOutputStreamIndex {
             audioPacketWritten = true
-            if audioNeedsParsedPacketForMoov, !moovFlushed, fragmentWindowFirstVideoDts != Int64.min {
+            if haveVideo,
+               audioNeedsParsedPacketForMoov,
+               !moovFlushed,
+               fragmentWindowFirstDts != Int64.min {
                 flushPendingFragment()
             }
         }
@@ -513,7 +615,7 @@ final class MP4SegmentMuxer {
             _ = av_write_frame(ctx, nil)
         }
         // New segment starts a fresh buffered-fragment window (#64).
-        fragmentWindowFirstVideoDts = Int64.min
+        fragmentWindowFirstDts = Int64.min
 
         // 2. Snapshot the completed segment + reset counters.
         let completedPath = currentStagingPath
@@ -765,4 +867,3 @@ private func mp4SegmentMuxerSinkWrite(
     muxer.receive(buf, count: Int(size))
     return size
 }
-
