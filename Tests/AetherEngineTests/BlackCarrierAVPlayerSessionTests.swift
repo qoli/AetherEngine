@@ -6,6 +6,33 @@ import Testing
 
 @Suite("Black carrier AVPlayer transport session", .serialized)
 struct BlackCarrierAVPlayerSessionTests {
+    private enum FixtureError: Error {
+        case preparationRejected
+    }
+
+    private final class FailingProvider:
+        BlackCarrierTransportProvider,
+        @unchecked Sendable
+    {
+        private(set) var didPrepare = false
+        private(set) var didClose = false
+
+        func prepareForTransportStart() throws {
+            didPrepare = true
+            throw FixtureError.preparationRejected
+        }
+
+        func close() {
+            didClose = true
+        }
+
+        func initSegment() -> Data? { nil }
+        func mediaSegment(at index: Int) -> Data? { nil }
+        var segmentCount: Int { 1 }
+        func segmentDuration(at index: Int) -> Double { 1 }
+        var playlistType: HLSPlaylistType { .vod }
+    }
+
     @Test("Session serves the composite carrier and creates a restricted AVPlayer item")
     @MainActor
     func sessionLifecycle() async throws {
@@ -137,6 +164,24 @@ struct BlackCarrierAVPlayerSessionTests {
         #expect(session.transportState == .failed(error))
 
         session.stop()
+        #expect(session.transportState == .stopped)
+    }
+
+    @Test("Provider startup preparation fails before the loopback server starts")
+    @MainActor
+    func providerPreparationFailure() {
+        let provider = FailingProvider()
+        let session = BlackCarrierAVPlayerSession(provider: provider)
+
+        #expect(throws: BlackCarrierAVPlayerSessionError
+            .providerPreparationFailed(
+                reason: String(describing: FixtureError.preparationRejected)
+            )) {
+            try session.start()
+        }
+        #expect(provider.didPrepare)
+        #expect(provider.didClose)
+        #expect(session.playlistURL == nil)
         #expect(session.transportState == .stopped)
     }
 

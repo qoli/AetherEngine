@@ -11,6 +11,7 @@ enum BlackCarrierAVPlayerSessionError:
     case alreadyStopped
     case notStarted
     case preparationInProgress
+    case providerPreparationFailed(reason: String)
     case serverStartFailed(reason: String)
     case playlistURLUnavailable
     case assetLoadFailed(reason: String)
@@ -29,6 +30,8 @@ enum BlackCarrierAVPlayerSessionError:
             return "Black carrier AVPlayer session has not started"
         case .preparationInProgress:
             return "Black carrier AVPlayer session preparation is already in progress"
+        case .providerPreparationFailed(let reason):
+            return "Black carrier provider startup preparation failed: \(reason)"
         case .serverStartFailed(let reason):
             return "Black carrier HLS server could not start: \(reason)"
         case .playlistURLUnavailable:
@@ -74,14 +77,14 @@ final class BlackCarrierAVPlayerSession {
     private(set) var playlistURL: URL?
     private(set) var transportState: BlackCarrierTransportState = .idle
 
-    private let provider: BlackCarrierCompositeProvider
+    private let provider: any BlackCarrierTransportProvider
     private let server: HLSLocalServer
     private var lifecycle: Lifecycle = .idle
     private var statusObservation: NSKeyValueObservation?
     private var readinessContinuation: CheckedContinuation<Void, Error>?
     private var preparationTimedOut = false
 
-    init(provider: BlackCarrierCompositeProvider) {
+    init(provider: any BlackCarrierTransportProvider) {
         self.provider = provider
         server = HLSLocalServer(provider: provider)
 
@@ -101,6 +104,15 @@ final class BlackCarrierAVPlayerSession {
             throw BlackCarrierAVPlayerSessionError.alreadyStarted
         case .stopped:
             throw BlackCarrierAVPlayerSessionError.alreadyStopped
+        }
+
+        do {
+            try provider.prepareForTransportStart()
+        } catch {
+            failAndClose()
+            throw BlackCarrierAVPlayerSessionError.providerPreparationFailed(
+                reason: String(describing: error)
+            )
         }
 
         do {

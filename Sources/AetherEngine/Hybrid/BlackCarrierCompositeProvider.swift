@@ -245,7 +245,10 @@ enum BlackCarrierCompositeProviderError:
 /// It adopts ownership of the supplied video/audio stores. Validation is all-or-nothing: one
 /// malformed or missing audio rendition closes every store and fails the carrier before a server
 /// or AVPlayer session can be created.
-final class BlackCarrierCompositeProvider: HLSSegmentProvider, @unchecked Sendable {
+final class BlackCarrierCompositeProvider:
+    BlackCarrierTransportProvider,
+    @unchecked Sendable
+{
     private let videoProvider: BlackCarrierVideoProvider
     private let audioStores: [BlackCarrierAudioRenditionStore]
     private let audioStoresByOrdinal: [Int: BlackCarrierAudioRenditionStore]
