@@ -7,6 +7,74 @@ import Testing
 
 @Suite("Source byte store AVIO integration", .serialized)
 struct SourceByteStoreAVIOTests {
+    @Test("Concurrent AVIO readers fetch one exact origin range")
+    func concurrentReaderRangeSingleFlight() async throws {
+        let source = makeWAV(seconds: 1)
+        let firstRequestObserved =
+            DispatchSemaphore(value: 0)
+        let releaseFirstResponse =
+            DispatchSemaphore(value: 0)
+        let server = try RangeFixtureServer(
+            body: source,
+            eTag: "\"single-flight-generation\"",
+            firstRequestObserved: firstRequestObserved,
+            releaseFirstResponse: releaseFirstResponse
+        )
+        defer { server.close() }
+        let store = try SourceByteStore(
+            blockSize: 64 * 1024,
+            capacityBytes: 2 * 1024 * 1024
+        )
+        defer { store.close() }
+        let firstReader = AVIOReader(
+            url: server.url,
+            chunkSize: source.count,
+            prefetchEnabled: false,
+            sourceByteStore: store
+        )
+        let secondReader = AVIOReader(
+            url: server.url,
+            chunkSize: source.count,
+            prefetchEnabled: false,
+            sourceByteStore: store
+        )
+        defer {
+            firstReader.close()
+            secondReader.close()
+        }
+
+        let first = Task.detached {
+            firstReader.fetchChunkForTesting(
+                from: 0,
+                size: source.count
+            )
+        }
+        #expect(
+            await waitForRangeServer(
+                firstRequestObserved
+            )
+        )
+
+        let secondStarted = DispatchSemaphore(value: 0)
+        let second = Task.detached {
+            secondStarted.signal()
+            return secondReader.fetchChunkForTesting(
+                from: 0,
+                size: source.count
+            )
+        }
+        #expect(
+            await waitForRangeServer(secondStarted)
+        )
+        try await Task.sleep(for: .milliseconds(100))
+        releaseFirstResponse.signal()
+
+        #expect(await first.value == source)
+        #expect(await second.value == source)
+        #expect(server.snapshot.requestCount == 1)
+        #expect(server.snapshot.bodyBytesSent == source.count)
+    }
+
     @Test("A validated complete generation reopens without redownloading media body")
     func validatedCacheOnlyReopen() throws {
         let source = makeWAV(seconds: 2)
@@ -329,12 +397,28 @@ private final class RangeFixtureServer: @unchecked Sendable {
     private var conditionalRequestCount = 0
     private var bodyBytesSent = 0
     private var isClosed = false
+    private let firstRequestObserved:
+        DispatchSemaphore?
+    private let releaseFirstResponse:
+        DispatchSemaphore?
+    private var didGateFirstRequest = false
 
     let url: URL
 
-    init(body: Data, eTag: String?) throws {
+    init(
+        body: Data,
+        eTag: String?,
+        firstRequestObserved:
+            DispatchSemaphore? = nil,
+        releaseFirstResponse:
+            DispatchSemaphore? = nil
+    ) throws {
         self.body = body
         self.eTag = eTag
+        self.firstRequestObserved =
+            firstRequestObserved
+        self.releaseFirstResponse =
+            releaseFirstResponse
         let bound = try Self.makeListener()
         listener = bound.descriptor
         url = URL(
@@ -485,7 +569,17 @@ private final class RangeFixtureServer: @unchecked Sendable {
         if ifRange != nil {
             conditionalRequestCount += 1
         }
+        let shouldGate = !didGateFirstRequest
+            && releaseFirstResponse != nil
+        if shouldGate {
+            didGateFirstRequest = true
+        }
         lock.unlock()
+
+        if shouldGate {
+            firstRequestObserved?.signal()
+            releaseFirstResponse?.wait()
+        }
 
         let requestedRange = headers["range"]
         let validatorMatches = ifRange == nil || ifRange == currentETag
@@ -576,6 +670,21 @@ private final class RangeFixtureServer: @unchecked Sendable {
                 total += sent
             }
             return total
+        }
+    }
+}
+
+private func waitForRangeServer(
+    _ semaphore: DispatchSemaphore
+) async -> Bool {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global().async {
+            continuation.resume(
+                returning:
+                    semaphore.wait(
+                        timeout: .now() + 2
+                    ) == .success
+            )
         }
     }
 }

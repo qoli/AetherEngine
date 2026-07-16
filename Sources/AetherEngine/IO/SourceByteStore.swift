@@ -7,6 +7,9 @@ enum SourceByteStoreError: Error, LocalizedError, Sendable, Equatable {
     case generationMismatch
     case unsupportedContentEncoding(String)
     case invalidRange
+    case cancelled
+    case rangeFetchFailed
+    case rangeFetchRateLimited(TimeInterval)
     case closed
     case directoryCreationFailed
     case blockOpenFailed(errno: Int32)
@@ -25,6 +28,12 @@ enum SourceByteStoreError: Error, LocalizedError, Sendable, Equatable {
             return "Source byte store requires identity content encoding, found \(value)"
         case .invalidRange:
             return "Source byte store byte range is invalid"
+        case .cancelled:
+            return "Source byte store range request was cancelled"
+        case .rangeFetchFailed:
+            return "Source byte store range request failed"
+        case .rangeFetchRateLimited(let retryAfter):
+            return "Source byte store range request was rate limited for \(retryAfter) seconds"
         case .closed:
             return "Source byte store is closed"
         case .directoryCreationFailed:
@@ -71,6 +80,11 @@ struct SourceByteStoreValidationCandidate: Sendable, Equatable {
     let isComplete: Bool
 }
 
+struct SourceByteStoreFetchedRange: Sendable, Equatable {
+    let generation: SourceByteStoreGeneration
+    let data: Data
+}
+
 /// Session-scoped immutable origin-byte store.
 ///
 /// Blocks are stored under a UUID-only temporary directory; URL, Authorization, Cookie and
@@ -78,6 +92,21 @@ struct SourceByteStoreValidationCandidate: Sendable, Equatable {
 /// own cursor and only asks this store for immutable byte ranges. A generation mismatch fails
 /// explicitly so bytes from two source revisions can never be combined into valid-looking media.
 final class SourceByteStore: @unchecked Sendable {
+    private struct RangeKey: Hashable {
+        let offset: Int64
+        let length: Int
+    }
+
+    private final class RangeFlight {
+        let id = UUID()
+        let epoch: UInt64
+        var result: Result<Data, SourceByteStoreError>?
+
+        init(epoch: UInt64) {
+            self.epoch = epoch
+        }
+    }
+
     private struct Block {
         var coveredRanges: [Range<Int>] = []
         var coveredBytes = 0
@@ -91,12 +120,14 @@ final class SourceByteStore: @unchecked Sendable {
     let blockSize: Int
     let capacityBytes: Int64
 
-    private let lock = NSLock()
+    private let lock = NSCondition()
     private var generation: SourceByteStoreGeneration?
     private var blocks: [Int64: Block] = [:]
     private var residentBytes: Int64 = 0
     private var accessCounter: UInt64 = 0
     private var isClosed = false
+    private var rangeFlightEpoch: UInt64 = 0
+    private var rangeFlights: [RangeKey: RangeFlight] = [:]
 
     init(
         blockSize: Int = SourceByteStore.defaultBlockSize,
@@ -131,13 +162,7 @@ final class SourceByteStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         try requireOpen()
-        if let generation {
-            guard generation == proposed else {
-                throw SourceByteStoreError.generationMismatch
-            }
-        } else {
-            generation = proposed
-        }
+        try admitLocked(proposed)
     }
 
     /// Clears all resident blocks and starts a newly validated content generation.
@@ -147,6 +172,9 @@ final class SourceByteStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         try requireOpen()
+        invalidateRangeFlightsLocked(
+            with: .generationMismatch
+        )
         removeAllBlocksLocked()
         generation = proposed
     }
@@ -156,6 +184,9 @@ final class SourceByteStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         try requireOpen()
+        invalidateRangeFlightsLocked(
+            with: .generationMismatch
+        )
         removeAllBlocksLocked()
         generation = nil
     }
@@ -169,30 +200,146 @@ final class SourceByteStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         try requireOpen()
-        guard let generation else {
-            throw SourceByteStoreError.invalidGeneration
-        }
-        guard offset <= generation.contentLength,
-              Int64(data.count) <= generation.contentLength - offset else {
+        try storeLocked(data, at: offset)
+    }
+
+    /// Coalesces concurrent misses for one exact requested range.
+    ///
+    /// The first caller performs `originFetch`; followers wait for its immutable result. A follower
+    /// cancellation never mutates the shared flight. If the leader is cancelled, a surviving follower
+    /// becomes the next leader instead of inheriting that cancellation. Generation replacement and close
+    /// terminate every waiter with their typed store error.
+    func fetchExactRange(
+        at offset: Int64,
+        length: Int,
+        shouldAbort: () -> Bool,
+        originFetch: () throws -> SourceByteStoreFetchedRange
+    ) throws -> Data {
+        guard offset >= 0, length > 0 else {
             throw SourceByteStoreError.invalidRange
         }
+        let key = RangeKey(offset: offset, length: length)
 
-        var sourceOffset = 0
-        while sourceOffset < data.count {
-            let absoluteOffset = offset + Int64(sourceOffset)
-            let blockIndex = absoluteOffset / Int64(blockSize)
-            let offsetInBlock = Int(absoluteOffset % Int64(blockSize))
-            let count = min(
-                blockSize - offsetInBlock,
-                data.count - sourceOffset
+        while true {
+            lock.lock()
+            guard !isClosed else {
+                lock.unlock()
+                throw SourceByteStoreError.closed
+            }
+            do {
+                if let resident = try readExactRangeLocked(
+                    at: offset,
+                    requestedLength: length
+                ) {
+                    lock.unlock()
+                    return resident
+                }
+            } catch {
+                lock.unlock()
+                throw error
+            }
+
+            if let flight = rangeFlights[key] {
+                while flight.result == nil {
+                    if shouldAbort() {
+                        lock.unlock()
+                        throw SourceByteStoreError.cancelled
+                    }
+                    guard !isClosed else {
+                        lock.unlock()
+                        throw SourceByteStoreError.closed
+                    }
+                    guard flight.epoch == rangeFlightEpoch else {
+                        lock.unlock()
+                        throw SourceByteStoreError
+                            .generationMismatch
+                    }
+                    _ = lock.wait(
+                        until: Date(
+                            timeIntervalSinceNow: 0.05
+                        )
+                    )
+                }
+                guard !isClosed else {
+                    lock.unlock()
+                    throw SourceByteStoreError.closed
+                }
+                guard flight.epoch == rangeFlightEpoch else {
+                    lock.unlock()
+                    throw SourceByteStoreError
+                        .generationMismatch
+                }
+                let result = flight.result!
+                lock.unlock()
+                switch result {
+                case .success(let data):
+                    return data
+                case .failure(.cancelled):
+                    if shouldAbort() {
+                        throw SourceByteStoreError.cancelled
+                    }
+                    continue
+                case .failure(let error):
+                    throw error
+                }
+            }
+
+            let flight = RangeFlight(
+                epoch: rangeFlightEpoch
             )
-            try writeLocked(
-                data,
-                sourceRange: sourceOffset..<(sourceOffset + count),
-                blockIndex: blockIndex,
-                offsetInBlock: offsetInBlock
-            )
-            sourceOffset += count
+            rangeFlights[key] = flight
+            lock.unlock()
+
+            let fetched: SourceByteStoreFetchedRange
+            do {
+                fetched = try originFetch()
+            } catch let error as SourceByteStoreError {
+                finishRangeFlight(
+                    key: key,
+                    flight: flight,
+                    result: .failure(error)
+                )
+                throw error
+            } catch {
+                finishRangeFlight(
+                    key: key,
+                    flight: flight,
+                    result: .failure(.rangeFetchFailed)
+                )
+                throw SourceByteStoreError.rangeFetchFailed
+            }
+
+            lock.lock()
+            do {
+                try requireOpen()
+                guard flight.epoch == rangeFlightEpoch,
+                      rangeFlights[key]?.id == flight.id else {
+                    throw SourceByteStoreError
+                        .generationMismatch
+                }
+                guard !fetched.data.isEmpty,
+                      fetched.data.count <= length else {
+                    throw SourceByteStoreError.invalidRange
+                }
+                try admitLocked(fetched.generation)
+                try storeLocked(
+                    fetched.data,
+                    at: offset
+                )
+                flight.result = .success(fetched.data)
+                rangeFlights.removeValue(forKey: key)
+                lock.broadcast()
+                lock.unlock()
+                return fetched.data
+            } catch let error as SourceByteStoreError {
+                if rangeFlights[key]?.id == flight.id {
+                    flight.result = .failure(error)
+                    rangeFlights.removeValue(forKey: key)
+                    lock.broadcast()
+                }
+                lock.unlock()
+                throw error
+            }
         }
     }
 
@@ -271,6 +418,7 @@ final class SourceByteStore: @unchecked Sendable {
             return
         }
         isClosed = true
+        invalidateRangeFlightsLocked(with: .closed)
         blocks.removeAll()
         generation = nil
         residentBytes = 0
@@ -280,6 +428,133 @@ final class SourceByteStore: @unchecked Sendable {
 
     private func requireOpen() throws {
         guard !isClosed else { throw SourceByteStoreError.closed }
+    }
+
+    private func admitLocked(
+        _ proposed: SourceByteStoreGeneration
+    ) throws {
+        if let generation {
+            guard generation == proposed else {
+                throw SourceByteStoreError.generationMismatch
+            }
+        } else {
+            generation = proposed
+        }
+    }
+
+    private func storeLocked(
+        _ data: Data,
+        at offset: Int64
+    ) throws {
+        guard let generation else {
+            throw SourceByteStoreError.invalidGeneration
+        }
+        guard offset >= 0,
+              offset <= generation.contentLength,
+              Int64(data.count)
+                <= generation.contentLength - offset else {
+            throw SourceByteStoreError.invalidRange
+        }
+
+        var sourceOffset = 0
+        while sourceOffset < data.count {
+            let absoluteOffset = offset + Int64(sourceOffset)
+            let blockIndex =
+                absoluteOffset / Int64(blockSize)
+            let offsetInBlock = Int(
+                absoluteOffset % Int64(blockSize)
+            )
+            let count = min(
+                blockSize - offsetInBlock,
+                data.count - sourceOffset
+            )
+            try writeLocked(
+                data,
+                sourceRange:
+                    sourceOffset..<(sourceOffset + count),
+                blockIndex: blockIndex,
+                offsetInBlock: offsetInBlock
+            )
+            sourceOffset += count
+        }
+    }
+
+    private func readExactRangeLocked(
+        at offset: Int64,
+        requestedLength: Int
+    ) throws -> Data? {
+        guard let generation,
+              offset < generation.contentLength else {
+            return nil
+        }
+        let exactLength = min(
+            requestedLength,
+            Int(generation.contentLength - offset)
+        )
+        guard exactLength > 0 else { return nil }
+
+        var result = Data()
+        result.reserveCapacity(exactLength)
+        var copied = 0
+        while copied < exactLength {
+            let absoluteOffset = offset + Int64(copied)
+            let blockIndex =
+                absoluteOffset / Int64(blockSize)
+            let offsetInBlock = Int(
+                absoluteOffset % Int64(blockSize)
+            )
+            let required = min(
+                blockSize - offsetInBlock,
+                exactLength - copied
+            )
+            guard var block = blocks[blockIndex],
+                  block.coveredRanges.contains(
+                      where: {
+                          $0.lowerBound <= offsetInBlock
+                              && $0.upperBound
+                                  >= offsetInBlock + required
+                      }
+                  ) else {
+                return nil
+            }
+            result.append(
+                try readBlockLocked(
+                    blockIndex: blockIndex,
+                    offset: offsetInBlock,
+                    count: required
+                )
+            )
+            accessCounter &+= 1
+            block.lastAccess = accessCounter
+            blocks[blockIndex] = block
+            copied += required
+        }
+        return result
+    }
+
+    private func finishRangeFlight(
+        key: RangeKey,
+        flight: RangeFlight,
+        result: Result<Data, SourceByteStoreError>
+    ) {
+        lock.lock()
+        if rangeFlights[key]?.id == flight.id {
+            flight.result = result
+            rangeFlights.removeValue(forKey: key)
+            lock.broadcast()
+        }
+        lock.unlock()
+    }
+
+    private func invalidateRangeFlightsLocked(
+        with error: SourceByteStoreError
+    ) {
+        rangeFlightEpoch &+= 1
+        for flight in rangeFlights.values {
+            flight.result = .failure(error)
+        }
+        rangeFlights.removeAll()
+        lock.broadcast()
     }
 
     private func blockURL(_ index: Int64) -> URL {

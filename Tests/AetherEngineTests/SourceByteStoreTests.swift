@@ -124,4 +124,422 @@ struct SourceByteStoreTests {
         #expect(store.snapshot?.isComplete == true)
         #expect(store.validationCandidate == nil)
     }
+
+    @Test("Concurrent exact-range misses use one origin producer")
+    func exactRangeSingleFlight() async throws {
+        let store = try SourceByteStore(
+            blockSize: 4,
+            capacityBytes: 16
+        )
+        defer { store.close() }
+        let generation = try SourceByteStoreGeneration(
+            contentLength: 8,
+            validator: .strongETag("\"generation-a\"")
+        )
+        let data = Data(0...7)
+        let leaderStarted = DispatchSemaphore(value: 0)
+        let releaseLeader = DispatchSemaphore(value: 0)
+        let followerWaiting = DispatchSemaphore(value: 0)
+        let producer = LockedRangeProducer()
+
+        let leader = Task.detached {
+            try store.fetchExactRange(
+                at: 0,
+                length: 8,
+                shouldAbort: { false },
+                originFetch: {
+                    producer.begin()
+                    leaderStarted.signal()
+                    releaseLeader.wait()
+                    producer.end()
+                    return SourceByteStoreFetchedRange(
+                        generation: generation,
+                        data: data
+                    )
+                }
+            )
+        }
+        #expect(
+            await waitForSemaphore(leaderStarted)
+        )
+
+        let follower = Task.detached {
+            try store.fetchExactRange(
+                at: 0,
+                length: 8,
+                shouldAbort: {
+                    followerWaiting.signal()
+                    return false
+                },
+                originFetch: {
+                    producer.begin()
+                    defer { producer.end() }
+                    return SourceByteStoreFetchedRange(
+                        generation: generation,
+                        data: data
+                    )
+                }
+            )
+        }
+        #expect(
+            await waitForSemaphore(followerWaiting)
+        )
+        releaseLeader.signal()
+
+        #expect(try await leader.value == data)
+        #expect(try await follower.value == data)
+        let resident = try store.fetchExactRange(
+            at: 0,
+            length: 8,
+            shouldAbort: { false },
+            originFetch: {
+                Issue.record(
+                    "resident exact range must not refetch"
+                )
+                return SourceByteStoreFetchedRange(
+                    generation: generation,
+                    data: data
+                )
+            }
+        )
+        #expect(resident == data)
+        #expect(producer.snapshot.count == 1)
+        #expect(producer.snapshot.maximumConcurrent == 1)
+    }
+
+    @Test("Cancelling one follower does not cancel the shared leader")
+    func followerCancellationIsIsolated() async throws {
+        let store = try SourceByteStore(
+            blockSize: 4,
+            capacityBytes: 16
+        )
+        defer { store.close() }
+        let generation = try SourceByteStoreGeneration(
+            contentLength: 8,
+            validator: .strongETag("\"generation-a\"")
+        )
+        let data = Data(0...7)
+        let leaderStarted = DispatchSemaphore(value: 0)
+        let releaseLeader = DispatchSemaphore(value: 0)
+        let producer = LockedRangeProducer()
+
+        let leader = Task.detached {
+            try store.fetchExactRange(
+                at: 0,
+                length: 8,
+                shouldAbort: { false },
+                originFetch: {
+                    producer.begin()
+                    leaderStarted.signal()
+                    releaseLeader.wait()
+                    producer.end()
+                    return SourceByteStoreFetchedRange(
+                        generation: generation,
+                        data: data
+                    )
+                }
+            )
+        }
+        #expect(
+            await waitForSemaphore(leaderStarted)
+        )
+
+        let cancelledFollower = Task.detached {
+            try store.fetchExactRange(
+                at: 0,
+                length: 8,
+                shouldAbort: { true },
+                originFetch: {
+                    producer.begin()
+                    defer { producer.end() }
+                    return SourceByteStoreFetchedRange(
+                        generation: generation,
+                        data: data
+                    )
+                }
+            )
+        }
+        do {
+            _ = try await cancelledFollower.value
+            Issue.record("expected follower cancellation")
+        } catch let error as SourceByteStoreError {
+            #expect(error == .cancelled)
+        }
+
+        releaseLeader.signal()
+        #expect(try await leader.value == data)
+        #expect(producer.snapshot.count == 1)
+    }
+
+    @Test("A surviving follower replaces a cancelled leader without overlapping origin work")
+    func cancelledLeaderPromotesFollower() async throws {
+        let store = try SourceByteStore(
+            blockSize: 4,
+            capacityBytes: 16
+        )
+        defer { store.close() }
+        let generation = try SourceByteStoreGeneration(
+            contentLength: 8,
+            validator: .strongETag("\"generation-a\"")
+        )
+        let data = Data(0...7)
+        let leaderStarted = DispatchSemaphore(value: 0)
+        let releaseLeader = DispatchSemaphore(value: 0)
+        let followerWaiting = DispatchSemaphore(value: 0)
+        let producer = LockedRangeProducer()
+
+        let leader = Task.detached {
+            try store.fetchExactRange(
+                at: 0,
+                length: 8,
+                shouldAbort: { false },
+                originFetch: {
+                    producer.begin()
+                    leaderStarted.signal()
+                    releaseLeader.wait()
+                    producer.end()
+                    throw SourceByteStoreError.cancelled
+                }
+            )
+        }
+        #expect(
+            await waitForSemaphore(leaderStarted)
+        )
+
+        let follower = Task.detached {
+            try store.fetchExactRange(
+                at: 0,
+                length: 8,
+                shouldAbort: {
+                    followerWaiting.signal()
+                    return false
+                },
+                originFetch: {
+                    producer.begin()
+                    defer { producer.end() }
+                    return SourceByteStoreFetchedRange(
+                        generation: generation,
+                        data: data
+                    )
+                }
+            )
+        }
+        #expect(
+            await waitForSemaphore(followerWaiting)
+        )
+        releaseLeader.signal()
+
+        do {
+            _ = try await leader.value
+            Issue.record("expected leader cancellation")
+        } catch let error as SourceByteStoreError {
+            #expect(error == .cancelled)
+        }
+        #expect(try await follower.value == data)
+        #expect(producer.snapshot.count == 2)
+        #expect(producer.snapshot.maximumConcurrent == 1)
+    }
+
+    @Test("Generation reset terminates every exact-range waiter")
+    func resetTerminatesRangeFlight() async throws {
+        let store = try SourceByteStore(
+            blockSize: 4,
+            capacityBytes: 16
+        )
+        defer { store.close() }
+        let generation = try SourceByteStoreGeneration(
+            contentLength: 8,
+            validator: .strongETag("\"generation-a\"")
+        )
+        let data = Data(0...7)
+        let leaderStarted = DispatchSemaphore(value: 0)
+        let releaseLeader = DispatchSemaphore(value: 0)
+        let followerWaiting = DispatchSemaphore(value: 0)
+
+        let leader = Task.detached {
+            try store.fetchExactRange(
+                at: 0,
+                length: 8,
+                shouldAbort: { false },
+                originFetch: {
+                    leaderStarted.signal()
+                    releaseLeader.wait()
+                    return SourceByteStoreFetchedRange(
+                        generation: generation,
+                        data: data
+                    )
+                }
+            )
+        }
+        #expect(
+            await waitForSemaphore(leaderStarted)
+        )
+
+        let follower = Task.detached {
+            try store.fetchExactRange(
+                at: 0,
+                length: 8,
+                shouldAbort: {
+                    followerWaiting.signal()
+                    return false
+                },
+                originFetch: {
+                    Issue.record(
+                        "invalidated follower must not fetch"
+                    )
+                    return SourceByteStoreFetchedRange(
+                        generation: generation,
+                        data: data
+                    )
+                }
+            )
+        }
+        #expect(
+            await waitForSemaphore(followerWaiting)
+        )
+        try store.reset()
+        releaseLeader.signal()
+
+        for task in [leader, follower] {
+            do {
+                _ = try await task.value
+                Issue.record(
+                    "expected generation mismatch"
+                )
+            } catch let error as SourceByteStoreError {
+                #expect(error == .generationMismatch)
+            }
+        }
+        #expect(store.snapshot == nil)
+    }
+
+    @Test("Close terminates every exact-range waiter and removes session bytes")
+    func closeTerminatesRangeFlight() async throws {
+        let store = try SourceByteStore(
+            blockSize: 4,
+            capacityBytes: 16
+        )
+        let directory = store.sessionDirectory
+        let generation = try SourceByteStoreGeneration(
+            contentLength: 8,
+            validator: .strongETag("\"generation-a\"")
+        )
+        let data = Data(0...7)
+        let leaderStarted = DispatchSemaphore(value: 0)
+        let releaseLeader = DispatchSemaphore(value: 0)
+        let followerWaiting = DispatchSemaphore(value: 0)
+
+        let leader = Task.detached {
+            try store.fetchExactRange(
+                at: 0,
+                length: 8,
+                shouldAbort: { false },
+                originFetch: {
+                    leaderStarted.signal()
+                    releaseLeader.wait()
+                    return SourceByteStoreFetchedRange(
+                        generation: generation,
+                        data: data
+                    )
+                }
+            )
+        }
+        #expect(
+            await waitForSemaphore(leaderStarted)
+        )
+
+        let follower = Task.detached {
+            try store.fetchExactRange(
+                at: 0,
+                length: 8,
+                shouldAbort: {
+                    followerWaiting.signal()
+                    return false
+                },
+                originFetch: {
+                    Issue.record(
+                        "closed follower must not fetch"
+                    )
+                    return SourceByteStoreFetchedRange(
+                        generation: generation,
+                        data: data
+                    )
+                }
+            )
+        }
+        #expect(
+            await waitForSemaphore(followerWaiting)
+        )
+        store.close()
+        releaseLeader.signal()
+
+        for task in [leader, follower] {
+            do {
+                _ = try await task.value
+                Issue.record("expected closed")
+            } catch let error as SourceByteStoreError {
+                #expect(error == .closed)
+            }
+        }
+        #expect(
+            !FileManager.default.fileExists(
+                atPath: directory.path
+            )
+        )
+    }
+}
+
+private func waitForSemaphore(
+    _ semaphore: DispatchSemaphore
+) async -> Bool {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global().async {
+            continuation.resume(
+                returning:
+                    semaphore.wait(
+                        timeout: .now() + 2
+                    ) == .success
+            )
+        }
+    }
+}
+
+private final class LockedRangeProducer:
+    @unchecked Sendable
+{
+    struct Snapshot {
+        let count: Int
+        let maximumConcurrent: Int
+    }
+
+    private let lock = NSLock()
+    private var count = 0
+    private var concurrent = 0
+    private var maximumConcurrent = 0
+
+    func begin() {
+        lock.lock()
+        count += 1
+        concurrent += 1
+        maximumConcurrent = max(
+            maximumConcurrent,
+            concurrent
+        )
+        lock.unlock()
+    }
+
+    func end() {
+        lock.lock()
+        concurrent -= 1
+        lock.unlock()
+    }
+
+    var snapshot: Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return Snapshot(
+            count: count,
+            maximumConcurrent: maximumConcurrent
+        )
+    }
 }

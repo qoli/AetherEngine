@@ -1319,6 +1319,81 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// Single Range fetch for a detour block over the pooled chunkSession. Surfaces 429/503 with
     /// its Retry-After so the caller can back off in place rather than churn the connection (#71).
     private func detourFetchBlock(from offset: Int64, size: Int) -> DetourFetch {
+        guard let sourceByteStore else {
+            do {
+                return .ok(
+                    try detourOriginRange(
+                        from: offset,
+                        size: size
+                    ).data
+                )
+            } catch SourceByteStoreError
+                    .rangeFetchRateLimited(
+                        let retryAfter
+                    ) {
+                return .rateLimited(retryAfter)
+            } catch {
+                return .failed
+            }
+        }
+        let budget = Self.effectiveDetourBudget(
+            chunkRequestTimeout: chunkRequestTimeout
+        )
+        let deadline = Date(
+            timeIntervalSinceNow: budget
+        )
+        do {
+            return .ok(
+                try sourceByteStore.fetchExactRange(
+                    at: offset,
+                    length: size,
+                    shouldAbort: { [weak self] in
+                        guard let self else { return true }
+                        return self.isClosed
+                            || self.readDeadlinePassedOrAborted
+                            || Date() >= deadline
+                    },
+                    originFetch: { [weak self] in
+                        guard let self else {
+                            throw SourceByteStoreError.cancelled
+                        }
+                        let origin = try self.detourOriginRange(
+                            from: offset,
+                            size: size
+                        )
+                        guard let generation =
+                                origin.generation else {
+                            throw SourceByteStoreError
+                                .invalidGeneration
+                        }
+                        return SourceByteStoreFetchedRange(
+                            generation: generation,
+                            data: origin.data
+                        )
+                    }
+                )
+            )
+        } catch SourceByteStoreError
+                .rangeFetchRateLimited(
+                    let retryAfter
+                ) {
+            return .rateLimited(retryAfter)
+        } catch let error as SourceByteStoreError
+                where error == .cancelled
+                    || error == .rangeFetchFailed {
+            return .failed
+        } catch let error as SourceByteStoreError {
+            recordSourceStoreFailure(error)
+            return .failed
+        } catch {
+            return .failed
+        }
+    }
+
+    private func detourOriginRange(
+        from offset: Int64,
+        size: Int
+    ) throws -> OriginChunk {
         let rangeEnd = offset + Int64(size) - 1
         var request = URLRequest(url: requestURL())
         request.setValue("bytes=\(offset)-\(rangeEnd)", forHTTPHeaderField: "Range")
@@ -1330,33 +1405,62 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         applySourceByteStoreHeaders(&request)
         do {
             let (data, response) = try syncRequest(request, budget: budget)
+            var sourceGeneration:
+                SourceByteStoreGeneration?
             if let http = response as? HTTPURLResponse {
                 let status = http.statusCode
                 if status == 429 || status == 503 {
-                    return .rateLimited(Self.parseRetryAfter(http))
+                    throw SourceByteStoreError
+                        .rangeFetchRateLimited(
+                            Self.parseRetryAfter(http)
+                        )
                 }
                 if status != 200 && status != 206 {
                     if Self.isResolvedExpiryStatus(status) { invalidateResolvedURL() }
-                    return .failed
+                    throw SourceByteStoreError
+                        .rangeFetchFailed
                 }
                 // VOD: 200 at offset > 0 = server ignored Range; silent corruption. Reject.
                 if status == 200 && offset > 0 && !isLive {
                     EngineLog.emit("[AVIOReader] detour: server ignored Range (200 for offset \(offset)); rejecting", category: .demux, level: .verbose)
-                    return .failed
+                    throw SourceByteStoreError
+                        .rangeFetchFailed
                 }
-                guard admitSourceStoreResponse(
-                    http,
-                    requestedOffset: offset
-                ) else {
-                    return .failed
+                if sourceByteStore != nil {
+                    guard let generation =
+                            sourceStoreFetchGeneration(
+                                response: http,
+                                requestedOffset: offset
+                            ) else {
+                        throw sourceStoreFailure
+                            ?? SourceByteStoreError
+                                .invalidGeneration
+                    }
+                    sourceGeneration = generation
                 }
             }
             addBytesFetched(data.count)
-            storeSourceBytes(data, at: offset)
-            if sourceStoreFailure != nil { return .failed }
-            return .ok(data)
+            if sourceByteStore != nil {
+                guard let sourceGeneration else {
+                    throw SourceByteStoreError
+                        .invalidGeneration
+                }
+                return OriginChunk(
+                    data: data,
+                    generation: sourceGeneration
+                )
+            }
+            return OriginChunk(
+                data: data,
+                generation: nil
+            )
+        } catch let error as SourceByteStoreError {
+            throw error
         } catch {
-            return .failed
+            if isClosed || readDeadlinePassedOrAborted {
+                throw SourceByteStoreError.cancelled
+            }
+            throw SourceByteStoreError.rangeFetchFailed
         }
     }
 
@@ -1633,6 +1737,30 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             recordSourceStoreFailure(.generationMismatch)
             return false
         }
+    }
+
+    private func sourceStoreFetchGeneration(
+        response: HTTPURLResponse,
+        requestedOffset: Int64
+    ) -> SourceByteStoreGeneration? {
+        if let contentEncoding = response.value(
+            forHTTPHeaderField: "Content-Encoding"
+        )?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !contentEncoding.isEmpty,
+           contentEncoding.lowercased() != "identity" {
+            recordSourceStoreFailure(
+                .unsupportedContentEncoding(contentEncoding)
+            )
+            return nil
+        }
+        guard let generation = Self.sourceStoreGeneration(
+            response: response,
+            requestedOffset: requestedOffset
+        ) else {
+            recordSourceStoreFailure(.invalidGeneration)
+            return nil
+        }
+        return generation
     }
 
     private func storeSourceBytes(_ data: Data, at offset: Int64) {
@@ -2071,19 +2199,111 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
     }
 
+    private struct OriginChunk {
+        let data: Data
+        let generation: SourceByteStoreGeneration?
+    }
+
     private func fetchChunk(from offset: Int64, size: Int) -> Data? {
-        if let data = fetchChunkAttempt(from: offset, size: size, forceSource: false) {
-            return data
+        guard let sourceByteStore else {
+            return fetchOriginChunk(
+                from: offset,
+                size: size
+            )?.data
+        }
+        do {
+            return try sourceByteStore.fetchExactRange(
+                at: offset,
+                length: size,
+                shouldAbort: { [weak self] in
+                    guard let self else { return true }
+                    return self.isClosed
+                        || self.readDeadlinePassedOrAborted
+                },
+                originFetch: { [weak self] in
+                    guard let self else {
+                        throw SourceByteStoreError.cancelled
+                    }
+                    guard let origin = self.fetchOriginChunk(
+                        from: offset,
+                        size: size
+                    ) else {
+                        if let failure =
+                                self.sourceStoreFailure {
+                            throw failure
+                        }
+                        if self.isClosed
+                            || self.readDeadlinePassedOrAborted {
+                            throw SourceByteStoreError.cancelled
+                        }
+                        throw SourceByteStoreError.rangeFetchFailed
+                    }
+                    guard let generation = origin.generation else {
+                        throw SourceByteStoreError
+                            .invalidGeneration
+                    }
+                    return SourceByteStoreFetchedRange(
+                        generation: generation,
+                        data: origin.data
+                    )
+                }
+            )
+        } catch let error as SourceByteStoreError
+                where error == .cancelled
+                    || error == .rangeFetchFailed {
+            return nil
+        } catch SourceByteStoreError
+                .rangeFetchRateLimited(_) {
+            return nil
+        } catch let error as SourceByteStoreError {
+            recordSourceStoreFailure(error)
+            return nil
+        } catch {
+            recordSourceStoreFailure(
+                .rangeFetchFailed
+            )
+            return nil
+        }
+    }
+
+    #if DEBUG
+    func fetchChunkForTesting(
+        from offset: Int64,
+        size: Int
+    ) -> Data? {
+        fetchChunk(from: offset, size: size)
+    }
+    #endif
+
+    private func fetchOriginChunk(
+        from offset: Int64,
+        size: Int
+    ) -> OriginChunk? {
+        if let chunk = fetchChunkAttempt(
+            from: offset,
+            size: size,
+            forceSource: false
+        ) {
+            return chunk
         }
         // Retry against source URL only if a cached resolved URL was used
         // (so the proxy can re-issue a fresh signed redirect).
-        if cachedResolvedURL() != nil {
-            return fetchChunkAttempt(from: offset, size: size, forceSource: true)
+        if cachedResolvedURL() != nil,
+           sourceStoreFailure == nil {
+            return fetchChunkAttempt(
+                from: offset,
+                size: size,
+                forceSource: true
+            )
         }
         return nil
     }
 
-    private func fetchChunkAttempt(from offset: Int64, size: Int, forceSource: Bool) -> Data? {
+    private func fetchChunkAttempt(
+        from offset: Int64,
+        size: Int,
+        forceSource: Bool
+    ) -> OriginChunk? {
         let usingCachedURL = !forceSource && cachedResolvedURL() != nil
         let target = forceSource ? url : requestURL()
         let rangeEnd = offset + Int64(size) - 1
@@ -2097,6 +2317,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         for attempt in 0..<chunkMaxRetries {
             do {
                 let (data, response) = try syncRequest(request, budget: chunkRequestTimeout)
+                var sourceGeneration:
+                    SourceByteStoreGeneration?
                 if let http = response as? HTTPURLResponse {
                     let status = http.statusCode
                     if status != 200 && status != 206 {
@@ -2114,17 +2336,22 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         )
                         return nil
                     }
-                    guard admitSourceStoreResponse(
-                        http,
-                        requestedOffset: offset
-                    ) else {
-                        return nil
+                    if sourceByteStore != nil {
+                        guard let generation =
+                                sourceStoreFetchGeneration(
+                                    response: http,
+                                    requestedOffset: offset
+                                ) else {
+                            return nil
+                        }
+                        sourceGeneration = generation
                     }
                 }
                 addBytesFetched(data.count)
-                storeSourceBytes(data, at: offset)
-                if sourceStoreFailure != nil { return nil }
-                return data
+                return OriginChunk(
+                    data: data,
+                    generation: sourceGeneration
+                )
             } catch {
                 // Superseded / closed / past the read deadline: this read is disposable,
                 // bail at once instead of retrying into the abort (issue #27).
