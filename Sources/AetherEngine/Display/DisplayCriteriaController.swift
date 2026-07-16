@@ -148,9 +148,10 @@ final class DisplayCriteriaController {
     /// Block until the panel settles its HDR mode negotiation, bounded so an
     /// unobservable switch can't stall the first frame.
     ///
-    /// Callers: the engine pre-flight gates this on `apply()`'s isHDR return; the
-    /// play-gate call after the host loads runs unconditionally, so SDR rate-only
-    /// switches still settle here via the in-progress flag as before.
+    /// Callers: the native engine gates its HDR pre-flight on
+    /// `requiresDynamicRangeSwitch`; Hybrid waits after any applied source-rate
+    /// criteria. The native play-gate call after the host loads runs
+    /// unconditionally, so AVKit-owned switches still settle here.
     ///
     /// `preferredDisplayCriteria` is a *hint*: when Match Content is enabled the TV
     /// performs the switch over HDMI and reports progress via the AVDisplayManager
