@@ -57,6 +57,13 @@ protocol HLSSegmentProvider: AnyObject {
     var masterHDCPLevel: String? { get }
     var masterClosedCaptions: String? { get }
 
+    /// Alternate real-audio renditions exposed through AVKit's native media-selection UI.
+    /// Every rendition mirrors the video segment timeline and owns separate fMP4 init/media bytes.
+    var alternateAudioRenditions: [HLSAudioRenditionInfo] { get }
+    func alternateAudioInitSegment(ordinal: Int) -> Data?
+    func alternateAudioMediaSegment(ordinal: Int, index: Int) -> Data?
+    func alternateAudioMediaSegmentURL(ordinal: Int, index: Int) -> URL?
+
     /// Native subtitle renditions (#15): one per text track, for the master EXT-X-MEDIA:TYPE=SUBTITLES tags
     /// and the /subs_{N} endpoints. Empty unless prepareNativeSubtitles is on and the cue stores are threaded.
     /// NAMEs must be unique within the group (duplicates collapse AVFoundation's legible options).
@@ -100,6 +107,10 @@ extension HLSSegmentProvider {
     var masterAverageBandwidth: Int? { nil }
     var masterHDCPLevel: String? { nil }
     var masterClosedCaptions: String? { nil }
+    var alternateAudioRenditions: [HLSAudioRenditionInfo] { [] }
+    func alternateAudioInitSegment(ordinal: Int) -> Data? { nil }
+    func alternateAudioMediaSegment(ordinal: Int, index: Int) -> Data? { nil }
+    func alternateAudioMediaSegmentURL(ordinal: Int, index: Int) -> URL? { nil }
     var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { [] }
     var nativeSubtitleDefaultOrdinal: Int { 0 }
     var nativeSubtitleWholeProgram: Bool { false }
@@ -127,6 +138,22 @@ enum HLSVideoRange: String {
     case sdr = "SDR"
     case pq = "PQ"
     case hlg = "HLG"
+}
+
+struct HLSAudioRenditionInfo: Sendable, Equatable {
+    let ordinal: Int
+    let language: String?
+    let name: String
+    let isDefault: Bool
+    let isAutoselect: Bool
+    /// RFC 8216 CHANNELS attribute, for example "2", "6", or "16/JOC".
+    let channels: String?
+}
+
+enum HLSAudioResourcePath: Equatable {
+    case playlist(ordinal: Int)
+    case initSegment(ordinal: Int)
+    case mediaSegment(ordinal: Int, index: Int)
 }
 
 /// A served master's DV form (#98). `.primary` is the DV/HDR master start() chose. `.reducedHDR` drops
@@ -642,6 +669,93 @@ final class HLSLocalServer: @unchecked Sendable {
                            data: Data(body.utf8),
                            contentType: "application/vnd.apple.mpegurl")
 
+        case let p where p.hasPrefix("/audio_") && p.hasSuffix(".m3u8"):
+            guard let resource = Self.parseAudioResourcePath(p),
+                  case .playlist(let ordinal) = resource,
+                  let provider else {
+                return send404(
+                    fd: fd,
+                    path: normalizedPath,
+                    reason: "unparseable alternate-audio playlist path"
+                )
+            }
+            guard let body = Self.buildAlternateAudioMediaPlaylistText(
+                ordinal: ordinal,
+                provider: provider
+            ) else {
+                return send404(
+                    fd: fd,
+                    path: normalizedPath,
+                    reason: "alternate-audio rendition \(ordinal) is unavailable"
+                )
+            }
+            return send200(
+                fd: fd,
+                path: normalizedPath,
+                data: Data(body.utf8),
+                contentType: "application/vnd.apple.mpegurl"
+            )
+
+        case let p where p.hasPrefix("/audio_") && p.hasSuffix(".mp4"):
+            guard let resource = Self.parseAudioResourcePath(p), let provider else {
+                return send404(
+                    fd: fd,
+                    path: normalizedPath,
+                    reason: "unparseable alternate-audio media path"
+                )
+            }
+            switch resource {
+            case .playlist:
+                return send404(
+                    fd: fd,
+                    path: normalizedPath,
+                    reason: "alternate-audio playlist requested as media"
+                )
+            case .initSegment(let ordinal):
+                guard let data = provider.alternateAudioInitSegment(ordinal: ordinal),
+                      !data.isEmpty else {
+                    return send404(
+                        fd: fd,
+                        path: normalizedPath,
+                        reason: "alternate-audio init \(ordinal) is unavailable"
+                    )
+                }
+                return send200(
+                    fd: fd,
+                    path: normalizedPath,
+                    data: data,
+                    contentType: "audio/mp4"
+                )
+            case .mediaSegment(let ordinal, let index):
+                if let url = provider.alternateAudioMediaSegmentURL(
+                    ordinal: ordinal,
+                    index: index
+                ) {
+                    return send200File(
+                        fd: fd,
+                        path: normalizedPath,
+                        fileURL: url,
+                        contentType: "audio/mp4"
+                    )
+                }
+                guard let data = provider.alternateAudioMediaSegment(
+                    ordinal: ordinal,
+                    index: index
+                ), !data.isEmpty else {
+                    return send404(
+                        fd: fd,
+                        path: normalizedPath,
+                        reason: "alternate-audio segment \(ordinal)/\(index) is unavailable"
+                    )
+                }
+                return send200(
+                    fd: fd,
+                    path: normalizedPath,
+                    data: data,
+                    contentType: "audio/mp4"
+                )
+            }
+
         case let p where p.hasPrefix("/subs_") && p.hasSuffix(".m3u8"):
             // #15: windowed subtitle media playlist, one WebVTT segment per video segment.
             guard let parsed = Self.parseSubsPath(p), let prov = provider else {
@@ -1055,6 +1169,29 @@ final class HLSLocalServer: @unchecked Sendable {
         if let cc = provider.masterClosedCaptions {
             streamInfAttrs.append("CLOSED-CAPTIONS=\(cc)")
         }
+        let audioRenditions = provider.alternateAudioRenditions
+        for rendition in audioRenditions {
+            var mediaAttrs = [
+                "TYPE=AUDIO",
+                "GROUP-ID=\"audio\"",
+                "NAME=\"\(rendition.name)\"",
+            ]
+            if let language = rendition.language {
+                mediaAttrs.append("LANGUAGE=\"\(language)\"")
+            }
+            mediaAttrs.append("DEFAULT=\(rendition.isDefault ? "YES" : "NO")")
+            mediaAttrs.append(
+                "AUTOSELECT=\((rendition.isDefault || rendition.isAutoselect) ? "YES" : "NO")"
+            )
+            if let channels = rendition.channels {
+                mediaAttrs.append("CHANNELS=\"\(channels)\"")
+            }
+            mediaAttrs.append("URI=\"audio_\(rendition.ordinal).m3u8\"")
+            lines.append("#EXT-X-MEDIA:\(mediaAttrs.joined(separator: ","))")
+        }
+        if !audioRenditions.isEmpty {
+            streamInfAttrs.append("AUDIO=\"audio\"")
+        }
         // #15: native WebVTT subtitle renditions (separate from the A/V variant; in-band timed text is
         // non-conformant for HLS). Orthogonal to the video VIDEO-RANGE/CODECS attributes.
         // Sodalite#32: DEFAULT=NO,AUTOSELECT=NO so AVKit never auto-selects a subtitle rendition in fullscreen
@@ -1081,6 +1218,99 @@ final class HLSLocalServer: @unchecked Sendable {
         lines.append("#EXT-X-STREAM-INF:\(streamInfAttrs.joined(separator: ","))")
         lines.append("media.m3u8")
         return lines.joined(separator: "\n") + "\n"
+    }
+
+    static func buildAlternateAudioMediaPlaylistText(
+        ordinal: Int,
+        provider: HLSSegmentProvider,
+        subResourceBaseURL: URL? = nil
+    ) -> String? {
+        guard provider.alternateAudioRenditions.contains(where: { $0.ordinal == ordinal }) else {
+            return nil
+        }
+        let snapshot = provider.notePlaylistBuild()
+        let count = snapshot.visibleCount
+        let firstVisible = min(snapshot.firstVisible, count)
+        let typeIsEvent = provider.playlistType == .event && !snapshot.endlistAdded
+        let typeIsLive = provider.playlistType == .live && !snapshot.endlistAdded
+
+        var maximumDuration = 0.0
+        for index in firstVisible..<count {
+            maximumDuration = max(maximumDuration, provider.segmentDuration(at: index))
+        }
+        var targetDuration = Int(ceil(max(1, maximumDuration)))
+        if typeIsLive, let liveTarget = provider.liveTargetSegmentDuration {
+            targetDuration = max(targetDuration, Int(ceil(liveTarget * 1.5)))
+        }
+        if typeIsLive, let cadenceFloor = provider.liveTargetDurationFloorSeconds {
+            targetDuration = max(targetDuration, Int(ceil(cadenceFloor)))
+        }
+
+        let resourcePrefix: String
+        if let base = subResourceBaseURL {
+            let absolute = base.absoluteString
+            resourcePrefix = absolute.hasSuffix("/") ? absolute : absolute + "/"
+        } else {
+            resourcePrefix = ""
+        }
+
+        var lines = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:7",
+            "#EXT-X-TARGETDURATION:\(targetDuration)",
+            "#EXT-X-MEDIA-SEQUENCE:\(firstVisible)",
+        ]
+        if typeIsLive {
+            lines.append("#EXT-X-DISCONTINUITY-SEQUENCE:\(snapshot.discontinuitySequence)")
+        } else if typeIsEvent {
+            lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
+        } else {
+            lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
+        }
+        lines.append("#EXT-X-MAP:URI=\"\(resourcePrefix)audio_\(ordinal)_init.mp4\"")
+        for index in firstVisible..<count {
+            if provider.segmentIsDiscontinuous(at: index) {
+                lines.append("#EXT-X-DISCONTINUITY")
+            }
+            let duration = provider.segmentDuration(at: index)
+            lines.append("#EXTINF:\(String(format: "%.3f", duration)),")
+            lines.append("\(resourcePrefix)audio_\(ordinal)_seg_\(index).mp4")
+        }
+        if !typeIsLive && (snapshot.endlistAdded || !typeIsEvent) {
+            lines.append("#EXT-X-ENDLIST")
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    static func parseAudioResourcePath(_ path: String) -> HLSAudioResourcePath? {
+        let name = path.hasPrefix("/") ? String(path.dropFirst()) : path
+        guard name.hasPrefix("audio_") else { return nil }
+        if name.hasSuffix(".m3u8") {
+            let ordinalText = name
+                .dropFirst("audio_".count)
+                .dropLast(".m3u8".count)
+            guard let ordinal = Int(ordinalText), ordinal >= 0 else { return nil }
+            return .playlist(ordinal: ordinal)
+        }
+        guard name.hasSuffix(".mp4") else { return nil }
+        let body = String(name.dropLast(".mp4".count))
+        if body.hasSuffix("_init") {
+            let ordinalText = body
+                .dropFirst("audio_".count)
+                .dropLast("_init".count)
+            guard let ordinal = Int(ordinalText), ordinal >= 0 else { return nil }
+            return .initSegment(ordinal: ordinal)
+        }
+        guard let marker = body.range(of: "_seg_") else { return nil }
+        let ordinalText = body[
+            body.index(body.startIndex, offsetBy: "audio_".count)..<marker.lowerBound
+        ]
+        let indexText = body[marker.upperBound...]
+        guard let ordinal = Int(ordinalText), ordinal >= 0,
+              let index = Int(indexText), index >= 0 else {
+            return nil
+        }
+        return .mediaSegment(ordinal: ordinal, index: index)
     }
 
     /// Windowed WebVTT subtitle media playlist (#15): MIRRORS the video media playlist one-for-one.
@@ -1279,4 +1509,3 @@ enum HLSLocalServerError: Error, CustomStringConvertible {
         }
     }
 }
-
