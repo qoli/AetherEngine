@@ -9,12 +9,21 @@ import AVKit
 #endif
 
 enum HybridCarrierPresentationContract {
+    static func configurationFailure(
+        sessionIsIdle: Bool
+    ) -> HybridPlaybackSessionError? {
+        sessionIsIdle
+            ? nil
+            : .carrierPresentationConfigurationTooLate
+    }
+
     static func failure(
         wasConfigured: Bool,
         playerControllerAvailable: Bool,
         playerMatchesSession: Bool,
         carrierUsesAspectFit: Bool,
-        automaticallyAppliesDisplayCriteria: Bool
+        automaticallyAppliesDisplayCriteria: Bool,
+        metalOverlayAttached: Bool
     ) -> HybridPlaybackSessionError? {
         guard wasConfigured else {
             return .carrierPresentationNotConfigured
@@ -22,7 +31,8 @@ enum HybridCarrierPresentationContract {
         guard playerControllerAvailable,
               playerMatchesSession,
               carrierUsesAspectFit,
-              !automaticallyAppliesDisplayCriteria else {
+              !automaticallyAppliesDisplayCriteria,
+              metalOverlayAttached else {
             return .carrierPresentationContractChanged
         }
         return nil
@@ -236,8 +246,17 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         avPlayer = core.avPlayer
         state = core.state
         core.stateDidChange = { [weak self] state in
-            self?.state = state
-            self?.publishTelemetry(.stateChanged)
+            guard let self else { return }
+            self.state = state
+            #if os(tvOS)
+            switch state {
+            case .failed, .stopped:
+                self.detachCarrierPlayerViewControllerIfOwned()
+            default:
+                break
+            }
+            #endif
+            self.publishTelemetry(.stateChanged)
         }
         core.telemetryDidChange = { [weak self] trigger in
             self?.publishTelemetry(
@@ -455,10 +474,24 @@ public final class AetherHybridPlaybackSession: ObservableObject {
     /// AVKit remains the controller and audio/system-integration owner. Its fixed black carrier stays
     /// aspect-fit and cannot write display criteria from the SDR carrier; Aether's Metal view owns the real
     /// video's fit/fill policy while `HybridPlaybackSession` writes criteria from real-video metadata.
+    /// The host must attach `metalPlayerView` beneath `contentOverlayView` before calling `prepare`.
     public func configureCarrierPlayerViewController(
         _ playerViewController: AVPlayerViewController,
         realVideoGravity: AetherHybridVideoGravity = .resizeAspect
-    ) {
+    ) throws {
+        if let error =
+                HybridCarrierPresentationContract
+                    .configurationFailure(
+                        sessionIsIdle: state == .idle
+                    ) {
+            throw error
+        }
+        if let previous =
+                configuredCarrierPlayerViewController,
+           previous !== playerViewController,
+           previous.player === avPlayer {
+            previous.player = nil
+        }
         playerViewController.player = avPlayer
         playerViewController.videoGravity = .resizeAspect
         playerViewController
@@ -522,28 +555,12 @@ public final class AetherHybridPlaybackSession: ObservableObject {
 
     public func prepare(timeout: TimeInterval = 15) async throws {
         #if os(tvOS)
-        let playerViewController =
-            configuredCarrierPlayerViewController
-        if let error = HybridCarrierPresentationContract.failure(
-                wasConfigured:
-                    didConfigureCarrierPlayerViewController,
-                playerControllerAvailable:
-                    playerViewController != nil,
-                playerMatchesSession:
-                    playerViewController?.player === avPlayer,
-                carrierUsesAspectFit:
-                    playerViewController?.videoGravity
-                        == .resizeAspect,
-                automaticallyAppliesDisplayCriteria:
-                    playerViewController?
-                        .appliesPreferredDisplayCriteriaAutomatically
-                        ?? true
-        ) {
-            core.rejectPreparation(with: error)
-            throw error
+        try await core.prepare(timeout: timeout) { [self] in
+            try validateCarrierPresentationContract()
         }
-        #endif
+        #else
         try await core.prepare(timeout: timeout)
+        #endif
     }
 
     public func play() throws {
@@ -579,6 +596,49 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         core.stop()
         telemetryHub.finish()
     }
+
+    #if os(tvOS)
+    private func validateCarrierPresentationContract() throws {
+        let playerViewController =
+            configuredCarrierPlayerViewController
+        let metalOverlayAttached: Bool
+        if let overlay =
+                playerViewController?.contentOverlayView {
+            metalOverlayAttached =
+                metalPlayerView.isDescendant(of: overlay)
+        } else {
+            metalOverlayAttached = false
+        }
+        if let error = HybridCarrierPresentationContract.failure(
+                wasConfigured:
+                    didConfigureCarrierPlayerViewController,
+                playerControllerAvailable:
+                    playerViewController != nil,
+                playerMatchesSession:
+                    playerViewController?.player === avPlayer,
+                carrierUsesAspectFit:
+                    playerViewController?.videoGravity
+                        == .resizeAspect,
+                automaticallyAppliesDisplayCriteria:
+                    playerViewController?
+                        .appliesPreferredDisplayCriteriaAutomatically
+                        ?? true,
+                metalOverlayAttached:
+                    metalOverlayAttached
+        ) {
+            throw error
+        }
+    }
+
+    private func detachCarrierPlayerViewControllerIfOwned() {
+        if configuredCarrierPlayerViewController?.player
+                === avPlayer {
+            configuredCarrierPlayerViewController?.player = nil
+        }
+        configuredCarrierPlayerViewController = nil
+        didConfigureCarrierPlayerViewController = false
+    }
+    #endif
 
     private func publishTelemetry(
         _ kind: AetherHybridPlaybackTelemetryEventKind

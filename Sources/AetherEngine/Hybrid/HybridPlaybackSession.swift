@@ -40,6 +40,7 @@ public enum HybridPlaybackSessionError:
     case carrierItemMissing
     case carrierClockUnavailable
     case carrierPresentationNotConfigured
+    case carrierPresentationConfigurationTooLate
     case carrierPresentationContractChanged
     case resumeIntentMissing
     case hlsPreflightGenerationInvalidated(
@@ -107,6 +108,8 @@ public enum HybridPlaybackSessionError:
             return "Hybrid carrier AVPlayer did not publish a valid timeline clock"
         case .carrierPresentationNotConfigured:
             return "Hybrid tvOS playback requires configureCarrierPlayerViewController before prepare"
+        case .carrierPresentationConfigurationTooLate:
+            return "Hybrid tvOS carrier presentation can only be configured while the session is idle"
         case .carrierPresentationContractChanged:
             return "Hybrid tvOS carrier presentation no longer matches the engine-owned AVKit/display-criteria contract"
         case .resumeIntentMissing:
@@ -659,7 +662,11 @@ final class HybridPlaybackSession {
         return timeline
     }
 
-    func prepare(timeout: TimeInterval = 15) async throws {
+    func prepare(
+        timeout: TimeInterval = 15,
+        presentationValidation:
+            @MainActor () throws -> Void = {}
+    ) async throws {
         guard timeout.isFinite, timeout > 0 else {
             throw HybridPlaybackSessionError.invalidReadinessTimeout
         }
@@ -684,21 +691,27 @@ final class HybridPlaybackSession {
         state = .preparing(generation: generation, target: target)
 
         do {
+            try presentationValidation()
             if let videoFrameRate {
-                _ = displayCriteriaController.apply(
+                let criteriaResult =
+                    displayCriteriaController.apply(
                     format: videoFormat,
                     frameRate: videoFrameRate,
                     codecTag: nil,
                     omitColorExtensions: false
                 )
-                await displayCriteriaController.waitForSwitch()
-                try ensureActiveGeneration(generation)
+                if criteriaResult.didApply {
+                    await displayCriteriaController
+                        .waitForSwitch()
+                }
             } else {
                 EngineLog.emit(
                     "[HybridPlaybackSession] display criteria skipped: real-video refresh rate unavailable",
                     category: .session
                 )
             }
+            try ensureActiveGeneration(generation)
+            try presentationValidation()
             try renderSurface.beginGeneration(
                 generation,
                 videoFormat: videoFormat
@@ -709,6 +722,7 @@ final class HybridPlaybackSession {
             )
             try await coordinator.prepareInitialGeneration()
             try ensureActiveGeneration(generation)
+            try presentationValidation()
             try transport.startPrepared()
             guard avPlayer.currentItem != nil else {
                 throw HybridPlaybackSessionError.carrierItemMissing
@@ -887,12 +901,6 @@ final class HybridPlaybackSession {
             "[HybridPlaybackSession] stopped",
             category: .session
         )
-    }
-
-    func rejectPreparation(
-        with error: HybridPlaybackSessionError
-    ) {
-        terminate(with: error)
     }
 
     private func removeAudioAnalysisSession(id: UUID) {

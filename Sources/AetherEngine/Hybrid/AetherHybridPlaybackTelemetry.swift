@@ -30,6 +30,7 @@ public enum AetherHybridPlaybackTelemetryFailure:
     case carrierItemMissing
     case carrierClockUnavailable
     case carrierPresentationNotConfigured
+    case carrierPresentationConfigurationTooLate
     case carrierPresentationContractChanged
     case resumeIntentMissing
     case hlsPreflightGenerationInvalidated(
@@ -87,6 +88,8 @@ public enum AetherHybridPlaybackTelemetryFailure:
             .carrierClockUnavailable
         case .carrierPresentationNotConfigured:
             .carrierPresentationNotConfigured
+        case .carrierPresentationConfigurationTooLate:
+            .carrierPresentationConfigurationTooLate
         case .carrierPresentationContractChanged:
             .carrierPresentationContractChanged
         case .resumeIntentMissing:

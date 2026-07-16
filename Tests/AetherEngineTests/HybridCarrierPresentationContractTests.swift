@@ -10,7 +10,8 @@ struct HybridCarrierPresentationContractTests {
             playerControllerAvailable: false,
             playerMatchesSession: false,
             carrierUsesAspectFit: false,
-            automaticallyAppliesDisplayCriteria: true
+            automaticallyAppliesDisplayCriteria: true,
+            metalOverlayAttached: false
         )
 
         #expect(failure == .carrierPresentationNotConfigured)
@@ -21,15 +22,17 @@ struct HybridCarrierPresentationContractTests {
         )
     }
 
-    @Test("Player, carrier gravity and automatic criteria drift all fail explicitly", arguments: [
-        (false, true, false),
-        (true, false, false),
-        (true, true, true),
+    @Test("Player, carrier gravity, automatic criteria and Metal overlay drift all fail explicitly", arguments: [
+        (false, true, false, true),
+        (true, false, false, true),
+        (true, true, true, true),
+        (true, true, false, false),
     ])
     func changedContractFails(
         playerMatchesSession: Bool,
         carrierUsesAspectFit: Bool,
-        automaticallyAppliesDisplayCriteria: Bool
+        automaticallyAppliesDisplayCriteria: Bool,
+        metalOverlayAttached: Bool
     ) {
         let failure = HybridCarrierPresentationContract.failure(
             wasConfigured: true,
@@ -37,7 +40,8 @@ struct HybridCarrierPresentationContractTests {
             playerMatchesSession: playerMatchesSession,
             carrierUsesAspectFit: carrierUsesAspectFit,
             automaticallyAppliesDisplayCriteria:
-                automaticallyAppliesDisplayCriteria
+                automaticallyAppliesDisplayCriteria,
+            metalOverlayAttached: metalOverlayAttached
         )
 
         #expect(failure == .carrierPresentationContractChanged)
@@ -55,7 +59,33 @@ struct HybridCarrierPresentationContractTests {
             playerControllerAvailable: true,
             playerMatchesSession: true,
             carrierUsesAspectFit: true,
-            automaticallyAppliesDisplayCriteria: false
+            automaticallyAppliesDisplayCriteria: false,
+            metalOverlayAttached: true
         ) == nil)
+    }
+
+    @Test("Carrier presentation cannot be configured after idle")
+    func lateConfigurationFails() {
+        #expect(
+            HybridCarrierPresentationContract
+                .configurationFailure(sessionIsIdle: true)
+                == nil
+        )
+        let failure =
+            HybridCarrierPresentationContract
+                .configurationFailure(sessionIsIdle: false)
+        #expect(
+            failure
+                == .carrierPresentationConfigurationTooLate
+        )
+        #expect(
+            AetherHybridPlaybackTelemetryState(
+                .failed(
+                    .carrierPresentationConfigurationTooLate
+                )
+            ) == .failed(
+                .carrierPresentationConfigurationTooLate
+            )
+        )
     }
 }

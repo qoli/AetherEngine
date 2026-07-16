@@ -1672,13 +1672,13 @@ public final class AetherEngine: ObservableObject {
         var didSwitchPanel = false
         if !options.suppressDisplayCriteria {
             let codecTag: FourCharCode? = detectedDVProfile ? 0x64766831 : nil
-            let willSwitch = displayCriteria.apply(
+            let criteriaResult = displayCriteria.apply(
                 format: effectiveFormat,
                 frameRate: snappedRate,
                 codecTag: codecTag,
                 omitColorExtensions: options.omitCriteriaColorExtensions
             )
-            if willSwitch {
+            if criteriaResult.requiresDynamicRangeSwitch {
                 didSwitchPanel = true
                 await displayCriteria.waitForSwitch()
                 // Superseded during panel handshake: close local probe and unwind.

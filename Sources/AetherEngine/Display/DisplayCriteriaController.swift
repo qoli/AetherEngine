@@ -11,6 +11,36 @@ import UIKit
 import AVKit
 #endif
 
+enum DisplayCriteriaSourceRatePolicy {
+    nonisolated static func validated(
+        _ frameRate: Double?
+    ) -> Double? {
+        guard let frameRate,
+              frameRate.isFinite,
+              frameRate > 0 else {
+            return nil
+        }
+        return frameRate
+    }
+}
+
+enum DisplayCriteriaApplicationResult: Equatable {
+    case notApplied
+    case applied(requiresDynamicRangeSwitch: Bool)
+
+    var didApply: Bool {
+        if case .applied = self { return true }
+        return false
+    }
+
+    var requiresDynamicRangeSwitch: Bool {
+        if case .applied(let requiresSwitch) = self {
+            return requiresSwitch
+        }
+        return false
+    }
+}
+
 /// HDMI HDR-mode handshake via AVDisplayManager (tvOS 11.2+). Programs AVDisplayCriteria before playback so the panel finishes its mode negotiation before the first frame. No-op stub on iOS/macOS. Lifted from Sodalite's PlayerViewModel so the engine owns the handshake; hosts no longer touch UIWindow.avDisplayManager.
 @MainActor
 final class DisplayCriteriaController {
@@ -26,21 +56,37 @@ final class DisplayCriteriaController {
 
     init() {}
 
-    /// Program AVDisplayCriteria before the session starts. `.sdr` programs a rate-only criteria so Match Frame Rate still engages. `codecTag` nil derives from format (`'dvh1'` for DV, `'hvc1'` otherwise). `omitColorExtensions` skips BT.2020 extensions for diagnostic builds. Returns true when a dynamic-range switch is expected (caller should call waitForSwitch).
+    /// Program AVDisplayCriteria before the session starts. `.sdr` programs a rate-only criteria so Match Frame Rate still engages. `codecTag` nil derives from format (`'dvh1'` for DV, `'hvc1'` otherwise). `omitColorExtensions` skips BT.2020 extensions for diagnostic builds. Missing or invalid source rate is an explicit no-write; the engine never substitutes a display rate. The result reports whether a criteria write occurred and whether a dynamic-range switch is expected.
     @discardableResult
-    func apply(format: VideoFormat, frameRate: Double?, codecTag: FourCharCode?, omitColorExtensions: Bool) -> Bool {
+    func apply(
+        format: VideoFormat,
+        frameRate: Double?,
+        codecTag: FourCharCode?,
+        omitColorExtensions: Bool
+    ) -> DisplayCriteriaApplicationResult {
         #if os(tvOS)
         // Reset up front so a skipped apply (Match Content off, no window)
         // can't leave a prior HDR session's flag for waitForSwitch to read.
         lastCriteriaWasHDR = false
         guard #available(tvOS 17.0, *) else {
             EngineLog.emit("[DisplayCriteria] skipped: tvOS < 17", category: .engine)
-            return false
+            return .notApplied
+        }
+
+        guard let sourceFrameRate =
+                DisplayCriteriaSourceRatePolicy.validated(
+                    frameRate
+                ) else {
+            EngineLog.emit(
+                "[DisplayCriteria] skipped: source frame rate missing or invalid",
+                category: .engine
+            )
+            return .notApplied
         }
 
         guard let window = resolveWindow() else {
             EngineLog.emit("[DisplayCriteria] skipped: no window", category: .engine)
-            return false
+            return .notApplied
         }
 
         let displayManager = window.avDisplayManager
@@ -48,7 +94,7 @@ final class DisplayCriteriaController {
         // isDisplayCriteriaMatchingEnabled covers both Match Dynamic Range and Match Frame Rate; tvOS picks the applicable dimension internally.
         guard displayManager.isDisplayCriteriaMatchingEnabled else {
             EngineLog.emit("[DisplayCriteria] skipped: Match Content disabled (both Dynamic Range AND Frame Rate off)", category: .engine)
-            return false
+            return .notApplied
         }
 
         // HDR sources attach BT.2020 + transfer + matrix extensions; SDR carries only codec + rate so Match Frame Rate can engage without Match Dynamic Range (DrHurt #4: previously early-returned for SDR and Match Frame Rate never fired).
@@ -75,10 +121,10 @@ final class DisplayCriteriaController {
             extensions: extensions,
             formatDescriptionOut: &formatDesc
         )
-        guard let desc = formatDesc else { return false }
+        guard let desc = formatDesc else { return .notApplied }
 
         // Always pass the real rate; tvOS uses it when Match Frame Rate is on, ignores it otherwise (dynamic-range switch still fires).
-        let effectiveRate = Float(frameRate ?? 24.0)
+        let effectiveRate = Float(sourceFrameRate)
         let criteria = AVDisplayCriteria(refreshRate: effectiveRate, formatDescription: desc)
         displayManager.preferredDisplayCriteria = criteria
         didApply = true
@@ -86,14 +132,16 @@ final class DisplayCriteriaController {
 
         EngineLog.emit(
             "[DisplayCriteria] SET: format=\(format) codec=\(fourccString(codecType)) "
-            + "rate=\(frameRate.map { String(format: "%.3f", $0) } ?? "default(24)") "
+            + "rate=\(String(format: "%.3f", sourceFrameRate)) "
             + "extensions=\(extensions != nil ? "HDR" : "none")",
             category: .engine
         )
         // SDR rate-only switches are sub-second; only HDR criteria need the waitForSwitch delay.
-        return isHDR
+        return .applied(
+            requiresDynamicRangeSwitch: isHDR
+        )
         #else
-        return false
+        return .notApplied
         #endif
     }
 
