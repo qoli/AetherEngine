@@ -149,6 +149,12 @@ final class HLSVODMediaPumpTests: XCTestCase {
         let audioSegmentBaseDecodeTimes: [UInt64]
     }
 
+    private struct MuxedFixture {
+        let preflight: AetherHLSPlaybackPreflight
+        let fetchStore: FetchStore
+        let videoSegmentURLs: [URL]
+    }
+
     func testIncrementalPumpNormalizesPacketsAndBuildsCarrierAudio()
         async throws
     {
@@ -553,6 +559,93 @@ final class HLSVODMediaPumpTests: XCTestCase {
             ),
             0
         )
+    }
+
+    func testHLSAudioAnalysisDecodesMuxedVariantWithoutMovingPlaybackState()
+        async throws
+    {
+        let fixture = try makeMuxedFixture()
+        let pump = try await HLSVODMediaPump.make(
+            preflight: fixture.preflight,
+            fetchOverride: { request, _ in
+                try fixture.fetchStore.response(
+                    for: request
+                )
+            }
+        )
+        addTeardownBlock {
+            try await pump.close()
+        }
+        let metadata = await pump.renditionMetadata
+        let trackID = try XCTUnwrap(
+            metadata.first?.sourceTrackID
+        )
+        let before = await pump.snapshot()
+        let input = try await pump
+            .makeAudioAnalysisInput()
+        let request = try AudioAnalysisRequest(
+            audioTrackID: trackID,
+            range: 0.25..<1.75
+        )
+        let session = AudioAnalysisSession()
+        let stream = AudioAnalysisStream(
+            gate: session.gate,
+            cancel: { session.cancel() }
+        )
+        let task = Task.detached {
+            await AudioAnalysisRunner.run(
+                session: session,
+                input: input,
+                request: request
+            )
+        }
+        session.install(task: task)
+
+        var iterator = stream.makeAsyncIterator()
+        var totalFrames: Int64 = 0
+        var firstPosition: Int64?
+        var finalPosition: Int64?
+        var sawDiscontinuity = false
+        while let buffer = try await iterator.next() {
+            firstPosition =
+                firstPosition
+                ?? buffer.sourceSamplePosition
+            totalFrames += Int64(
+                buffer.pcm.frameLength
+            )
+            finalPosition =
+                buffer.sourceSamplePosition
+                + Int64(buffer.pcm.frameLength)
+            sawDiscontinuity =
+                sawDiscontinuity
+                || buffer.isDiscontinuous
+        }
+        await task.value
+
+        XCTAssertEqual(
+            Double(try XCTUnwrap(firstPosition)),
+            12_000,
+            accuracy: 128
+        )
+        XCTAssertEqual(
+            Double(try XCTUnwrap(finalPosition)),
+            84_000,
+            accuracy: 128
+        )
+        XCTAssertEqual(
+            Double(totalFrames),
+            72_000,
+            accuracy: 256
+        )
+        XCTAssertFalse(sawDiscontinuity)
+        XCTAssertEqual(
+            fixture.fetchStore.count(
+                for: fixture.videoSegmentURLs[1]
+            ),
+            1
+        )
+        let after = await pump.snapshot()
+        XCTAssertEqual(after, before)
     }
 
     func testConcurrentDemandUsesOneSerializedProductionRun()
@@ -1736,6 +1829,136 @@ final class HLSVODMediaPumpTests: XCTestCase {
         )
     }
 
+    private func makeMuxedFixture()
+        throws -> MuxedFixture
+    {
+        let timeline =
+            try BlackCarrierTimeline.mirroredHLSVOD(
+                segmentDurations: [
+                    CMTime(
+                        value: 90_000,
+                        timescale: 90_000
+                    ),
+                    CMTime(
+                        value: 90_000,
+                        timescale: 90_000
+                    ),
+                ]
+            )
+        let muxed = try makeMuxedAVFMP4(
+            timeline: timeline
+        )
+        let rootURL = URL(
+            string:
+                "https://origin.example/muxed-master.m3u8"
+        )!
+        let effectiveRootURL = URL(
+            string:
+                "https://cdn.example/muxed-master.m3u8"
+        )!
+        let playlistURL = URL(
+            string:
+                "https://cdn.example/muxed/main.m3u8"
+        )!
+        let initURL = URL(
+            string:
+                "https://cdn.example/muxed/init.mp4"
+        )!
+        let segmentURLs = [
+            URL(
+                string:
+                    "https://cdn.example/muxed/v0.m4s"
+            )!,
+            URL(
+                string:
+                    "https://cdn.example/muxed/v1.m4s"
+            )!,
+        ]
+        let media = HLSMediaPlaylist(
+            targetDuration: 1,
+            mediaSequence: 41,
+            segments:
+                segmentURLs.map {
+                    HLSMediaSegment(
+                        uri: $0.lastPathComponent,
+                        duration: 1,
+                        discontinuityBefore: false
+                    )
+                },
+            hasEndList: true,
+            hasUnsupportedEncryption: false,
+            hasMap: true,
+            mapURI: initURL.lastPathComponent,
+            contentProtection: .none
+        )
+        let graph = try HLSVODResourceGraph.make(
+            requestedRootURL: rootURL,
+            effectiveRootURL: effectiveRootURL,
+            selectedMediaPlaylistURL: playlistURL,
+            selectedVariant: HLSVariant(
+                bandwidth: 1_800_000,
+                uri: "muxed/main.m3u8",
+                audioGroupID: nil,
+                codecs: [
+                    "avc1.42c01e",
+                    "ec-3",
+                ]
+            ),
+            separateAudioGroupID: nil,
+            mediaPlaylistData:
+                Data("#EXTM3U".utf8),
+            media: media,
+            audioRenditions: [],
+            inspectedInitSegmentData:
+                muxed.initData,
+            inspectedFirstMediaSegmentData:
+                muxed.mediaSegments[0],
+            httpHeaders: [:]
+        )
+        let result = PlaybackPreflightResult(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .hls,
+                isSeekableVOD: true,
+                videoCodec: .h264,
+                videoFormat: .sdr
+            ),
+            hlsPackaging: HLSVideoPackaging(
+                container: .fragmentedMP4,
+                sampleEntry: .avc1,
+                manifestCodecs: [
+                    "avc1.42c01e",
+                    "ec-3",
+                ],
+                actualVideoCodec: .h264,
+                codecVerification: .verified,
+                contentProtection: .none
+            ),
+            route: .hybridCarrierMetal,
+            reason:
+                .hybridHLSManifestSegmentMismatch
+        )
+        let responses: [
+            URL: HLSVODOriginFetchResponse
+        ] = [
+            segmentURLs[1]:
+                response(
+                    data: muxed.mediaSegments[1],
+                    url: segmentURLs[1]
+                ),
+        ]
+        return MuxedFixture(
+            preflight: AetherHLSPlaybackPreflight(
+                result: result,
+                resourceGraph: graph,
+                httpHeaders: [:]
+            ),
+            fetchStore: FetchStore(
+                responses: responses
+            ),
+            videoSegmentURLs: segmentURLs
+        )
+    }
+
     private func validBandwidthAdmissions()
         -> [BlackCarrierAudioBandwidthAdmission]
     {
@@ -1860,6 +2083,272 @@ final class HLSVODMediaPumpTests: XCTestCase {
                 )
             }
         )
+    }
+
+    private func makeMuxedAVFMP4(
+        timeline: BlackCarrierTimeline
+    ) throws -> (
+        initData: Data,
+        mediaSegments: [Data]
+    ) {
+        let videoDemuxer = Demuxer()
+        try videoDemuxer.open(
+            reader: DataIOReader(
+                data:
+                    try BlackCarrierEncodedSample
+                        .verifiedMP4Data()
+            ),
+            formatHint: "mp4"
+        )
+        defer { videoDemuxer.close() }
+        let videoIndex =
+            videoDemuxer.videoStreamIndex
+        let videoStream = try XCTUnwrap(
+            videoDemuxer.stream(at: videoIndex)
+        )
+        let sourceVideoPacket = try XCTUnwrap(
+            try videoDemuxer.readPacket()
+        )
+        defer {
+            var packet:
+                UnsafeMutablePointer<AVPacket>? =
+                    sourceVideoPacket
+            trackedPacketFree(&packet)
+        }
+
+        let audioDemuxer = Demuxer()
+        try audioDemuxer.open(
+            reader: DataIOReader(
+                data: makeWAV(
+                    sampleRate: 48_000,
+                    channels: 2,
+                    seconds:
+                        timeline.duration.seconds
+                )
+            ),
+            formatHint: "wav"
+        )
+        defer { audioDemuxer.close() }
+        let audioIndex =
+            audioDemuxer.audioStreamIndex
+        let audioStream = try XCTUnwrap(
+            audioDemuxer.stream(at: audioIndex)
+        )
+        let bridge = try AudioBridge(
+            srcCodecpar:
+                audioStream.pointee.codecpar,
+            srcTimeBase:
+                audioStream.pointee.time_base,
+            mode: .surroundCompat
+        )
+        defer { bridge.close() }
+        let encoderParameters = try XCTUnwrap(
+            bridge.encoderCodecpar
+        )
+
+        let directory =
+            FileManager.default.temporaryDirectory
+                .appendingPathComponent(
+                    "AetherHLSVODMuxed-\(UUID().uuidString)",
+                    isDirectory: true
+                )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer {
+            try? FileManager.default.removeItem(
+                at: directory
+            )
+        }
+        var initData: Data?
+        let muxer = try MP4SegmentMuxer(
+            initialSegmentIndex: 0,
+            sessionDir: directory,
+            video: MP4SegmentMuxer.VideoConfig(
+                codecpar:
+                    UnsafePointer(
+                        videoStream.pointee.codecpar
+                    ),
+                timeBase:
+                    videoStream.pointee.time_base,
+                codecTagOverride: "avc1"
+            ),
+            audio: MP4SegmentMuxer.AudioConfig(
+                codecpar:
+                    UnsafePointer(
+                        encoderParameters
+                    ),
+                timeBase:
+                    bridge.encoderTimeBase
+            ),
+            onInitCaptured: {
+                initData = $0
+            }
+        )
+        var packets: [
+            (
+                isVideo: Bool,
+                timeBase: AVRational,
+                packet: UnsafeMutablePointer<AVPacket>
+            )
+        ] = []
+        defer {
+            for entry in packets {
+                var packet:
+                    UnsafeMutablePointer<AVPacket>? =
+                        entry.packet
+                trackedPacketFree(&packet)
+            }
+        }
+
+        for timing in timeline.segments {
+            let packet = try XCTUnwrap(
+                av_packet_clone(
+                    sourceVideoPacket
+                )
+            )
+            packet.pointee.pts = av_rescale_q(
+                timing.startTime.value,
+                AVRational(
+                    num: 1,
+                    den:
+                        timing.startTime.timescale
+                ),
+                videoStream.pointee.time_base
+            )
+            packet.pointee.dts =
+                packet.pointee.pts
+            packet.pointee.duration =
+                av_rescale_q(
+                    timing.duration.value,
+                    AVRational(
+                        num: 1,
+                        den:
+                            timing.duration.timescale
+                    ),
+                    videoStream.pointee.time_base
+                )
+            packets.append((
+                isVideo: true,
+                timeBase:
+                    videoStream.pointee.time_base,
+                packet: packet
+            ))
+        }
+
+        while let sourcePacket =
+                try audioDemuxer.readPacket() {
+            var packetToFree:
+                UnsafeMutablePointer<AVPacket>? =
+                    sourcePacket
+            defer {
+                trackedPacketFree(
+                    &packetToFree
+                )
+            }
+            guard sourcePacket.pointee.stream_index
+                    == audioIndex else {
+                continue
+            }
+            for packet in try bridge.feed(
+                packet: sourcePacket
+            ) {
+                packets.append((
+                    isVideo: false,
+                    timeBase:
+                        bridge.encoderTimeBase,
+                    packet: packet
+                ))
+            }
+        }
+        for packet in bridge.flush() {
+            packets.append((
+                isVideo: false,
+                timeBase:
+                    bridge.encoderTimeBase,
+                packet: packet
+            ))
+        }
+        packets.sort {
+            packetTime(
+                $0.packet,
+                timeBase: $0.timeBase
+            ) < packetTime(
+                $1.packet,
+                timeBase: $1.timeBase
+            )
+        }
+
+        var mediaSegments: [Int: Data] = [:]
+        var nextSegmentIndex = 1
+        for entry in packets {
+            let time = packetTime(
+                entry.packet,
+                timeBase: entry.timeBase
+            )
+            while nextSegmentIndex
+                    < timeline.segments.count,
+                  time >= timeline.segments[
+                    nextSegmentIndex
+                  ].startTime.seconds {
+                let completed = try XCTUnwrap(
+                    muxer.cutFragmentForNextSegment(
+                        nextSegmentIndex
+                    )
+                )
+                mediaSegments[
+                    nextSegmentIndex - 1
+                ] = try Data(
+                    contentsOf: completed.path
+                )
+                nextSegmentIndex += 1
+            }
+            entry.packet.pointee.stream_index =
+                entry.isVideo
+                ? muxer.videoOutputStreamIndex
+                : muxer.audioOutputStreamIndex
+            av_packet_rescale_ts(
+                entry.packet,
+                entry.timeBase,
+                entry.isVideo
+                    ? muxer.muxerVideoTimeBase
+                    : muxer.muxerAudioTimeBase
+            )
+            XCTAssertGreaterThanOrEqual(
+                muxer.writePacket(entry.packet),
+                0
+            )
+        }
+        let final = try XCTUnwrap(
+            muxer.finalize()
+        )
+        mediaSegments[
+            muxer.currentSegmentIndex
+        ] = try Data(
+            contentsOf: final.path
+        )
+        return (
+            try XCTUnwrap(initData),
+            try timeline.segments.map {
+                try XCTUnwrap(
+                    mediaSegments[$0.index]
+                )
+            }
+        )
+    }
+
+    private func packetTime(
+        _ packet: UnsafeMutablePointer<AVPacket>,
+        timeBase: AVRational
+    ) -> Double {
+        let timestamp =
+            packet.pointee.dts != Int64.min
+            ? packet.pointee.dts
+            : packet.pointee.pts
+        return Double(timestamp)
+            * Double(timeBase.num)
+            / Double(timeBase.den)
     }
 
     private func assertAudioSegment(
