@@ -249,7 +249,7 @@ public struct LoadOptions: Sendable, Equatable {
 }
 
 /// Detected video dynamic range format. `hdr10Plus` shares the HDR10 base layer with `hdr10`; the distinction is the per-frame ST 2094-40 metadata forwarded via `kCMSampleAttachmentKey_HDR10PlusPerFrameData`. Both map to PQ + BT.2020 in AVDisplayCriteria; the split is for badge accuracy.
-public enum VideoFormat: Sendable, Equatable {
+public enum VideoFormat: Sendable, Equatable, Hashable {
     case sdr
     case hdr10
     case hdr10Plus

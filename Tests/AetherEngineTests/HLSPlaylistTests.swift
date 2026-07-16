@@ -56,6 +56,20 @@ final class HLSPlaylistTests: XCTestCase {
         XCTAssertEqual(variants[0].bandwidth, 100)
     }
 
+    func testParsesVariantCodecAndHDRAttributes() throws {
+        let text = """
+        #EXTM3U
+        #EXT-X-STREAM-INF:BANDWIDTH=6000000,CODECS="hvc1.2.4.L150,ec-3",SUPPLEMENTAL-CODECS="dvh1.08.06",VIDEO-RANGE=PQ
+        high/index.m3u8
+        """
+        guard case .master(let master) = try HLSPlaylistParser.parse(text) else {
+            return XCTFail("expected master playlist")
+        }
+        XCTAssertEqual(master.variants[0].codecs, ["hvc1.2.4.l150", "ec-3"])
+        XCTAssertEqual(master.variants[0].supplementalCodecs, ["dvh1.08.06"])
+        XCTAssertEqual(master.variants[0].videoRange, "PQ")
+    }
+
     func testDetectsDemuxedAudioGroups() throws {
         // ARD-style (Das Erste HD): demuxed audio playlist; ingesting without it yields silent video.
         let text = """
@@ -175,7 +189,35 @@ final class HLSPlaylistTests: XCTestCase {
         }
         XCTAssertTrue(media.isEncrypted)
         XCTAssertTrue(media.hasMap)
+        XCTAssertEqual(media.mapURI, "init.mp4")
+        XCTAssertEqual(media.contentProtection, .aes128)
         XCTAssertTrue(media.hasEndList)
+    }
+
+    func testDetectsSampleAESAndFairPlayProtection() throws {
+        let sampleAES = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:4
+        #EXT-X-KEY:METHOD=SAMPLE-AES,URI="key.bin"
+        #EXTINF:4.0,
+        seg0.ts
+        """
+        guard case .media(let sampleMedia) = try HLSPlaylistParser.parse(sampleAES) else {
+            return XCTFail("expected media playlist")
+        }
+        XCTAssertEqual(sampleMedia.contentProtection, .sampleAES)
+
+        let fairPlay = """
+        #EXTM3U
+        #EXT-X-TARGETDURATION:4
+        #EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT="com.apple.streamingkeydelivery",URI="skd://license"
+        #EXTINF:4.0,
+        seg0.ts
+        """
+        guard case .media(let fairPlayMedia) = try HLSPlaylistParser.parse(fairPlay) else {
+            return XCTFail("expected media playlist")
+        }
+        XCTAssertEqual(fairPlayMedia.contentProtection, .fairPlay)
     }
 
     func testKeyMethodNoneIsNotEncrypted() throws {

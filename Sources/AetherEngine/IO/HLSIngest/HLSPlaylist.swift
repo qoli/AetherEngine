@@ -5,6 +5,27 @@ struct HLSVariant: Equatable {
     let uri: String
     /// nil when the variant declares no alternate-audio group.
     let audioGroupID: String?
+    /// Normalized `CODECS` tokens declared by this selected variant. Empty means the manifest omitted the
+    /// required declaration; it is not treated as a codec capability guess by playback preflight.
+    let codecs: [String]
+    let videoRange: String?
+    let supplementalCodecs: [String]
+
+    init(
+        bandwidth: Int,
+        uri: String,
+        audioGroupID: String?,
+        codecs: [String] = [],
+        videoRange: String? = nil,
+        supplementalCodecs: [String] = []
+    ) {
+        self.bandwidth = bandwidth
+        self.uri = uri
+        self.audioGroupID = audioGroupID
+        self.codecs = codecs
+        self.videoRange = videoRange
+        self.supplementalCodecs = supplementalCodecs
+    }
 }
 
 /// EXT-X-MEDIA:TYPE=AUDIO with a URI. Companion reader ingests chosen rendition for demuxed-audio variants (ARD-style).
@@ -46,10 +67,34 @@ struct HLSMediaPlaylist: Equatable {
     let mediaSequence: Int
     let segments: [HLSMediaSegment]
     let hasEndList: Bool
-    let isEncrypted: Bool
     /// True for SAMPLE-AES / SAMPLE-AES-CTR or AES-128 with no URI; AES-128 with a URI is supported and decrypted inline.
     let hasUnsupportedEncryption: Bool
     let hasMap: Bool
+    /// Required to inspect fMP4 packaging. A Boolean `hasMap` cannot establish which init segment was used.
+    let mapURI: String?
+    let contentProtection: HLSContentProtection
+
+    var isEncrypted: Bool { contentProtection != .none }
+
+    init(
+        targetDuration: Double,
+        mediaSequence: Int,
+        segments: [HLSMediaSegment],
+        hasEndList: Bool,
+        hasUnsupportedEncryption: Bool,
+        hasMap: Bool,
+        mapURI: String?,
+        contentProtection: HLSContentProtection
+    ) {
+        self.targetDuration = targetDuration
+        self.mediaSequence = mediaSequence
+        self.segments = segments
+        self.hasEndList = hasEndList
+        self.hasUnsupportedEncryption = hasUnsupportedEncryption
+        self.hasMap = hasMap
+        self.mapURI = mapURI
+        self.contentProtection = contentProtection
+    }
 }
 
 enum HLSPlaylist: Equatable {
@@ -86,10 +131,16 @@ enum HLSPlaylistParser {
         var audioRenditions: [HLSAudioRendition] = []
         var pendingBandwidth: Int?
         var pendingAudioGroup: String?
+        var pendingCodecs: [String] = []
+        var pendingVideoRange: String?
+        var pendingSupplementalCodecs: [String] = []
         for line in lines {
             if line.hasPrefix("#EXT-X-STREAM-INF:") {
                 pendingBandwidth = attribute("BANDWIDTH", in: line).flatMap(Int.init) ?? 0
                 pendingAudioGroup = attribute("AUDIO", in: line)
+                pendingCodecs = codecTokens(attribute("CODECS", in: line))
+                pendingVideoRange = attribute("VIDEO-RANGE", in: line)
+                pendingSupplementalCodecs = codecTokens(attribute("SUPPLEMENTAL-CODECS", in: line))
             } else if line.hasPrefix("#EXT-X-MEDIA:") {
                 if attribute("TYPE", in: line) == "AUDIO",
                    let uri = attribute("URI", in: line),
@@ -102,9 +153,19 @@ enum HLSPlaylistParser {
                     ))
                 }
             } else if !line.hasPrefix("#"), let bw = pendingBandwidth {
-                variants.append(HLSVariant(bandwidth: bw, uri: line, audioGroupID: pendingAudioGroup))
+                variants.append(HLSVariant(
+                    bandwidth: bw,
+                    uri: line,
+                    audioGroupID: pendingAudioGroup,
+                    codecs: pendingCodecs,
+                    videoRange: pendingVideoRange,
+                    supplementalCodecs: pendingSupplementalCodecs
+                ))
                 pendingBandwidth = nil
                 pendingAudioGroup = nil
+                pendingCodecs = []
+                pendingVideoRange = nil
+                pendingSupplementalCodecs = []
             }
         }
         guard !variants.isEmpty else {
@@ -122,9 +183,10 @@ enum HLSPlaylistParser {
         var mediaSequence = 0
         var segments: [HLSMediaSegment] = []
         var hasEndList = false
-        var isEncrypted = false
+        var contentProtection: HLSContentProtection = .none
         var hasUnsupportedEncryption = false
         var hasMap = false
+        var mapURI: String?
         var pendingDuration: Double?
         var pendingDiscontinuity = false
         // AES-128 keys are "sticky": one EXT-X-KEY tag governs all following segments until the next tag. Pluto/Samsung-TV+ emit one tag per segment with the same URI and an incrementing explicit IV.
@@ -148,20 +210,31 @@ enum HLSPlaylistParser {
                     currentKeyURI = nil
                     currentExplicitIV = nil
                 case "AES-128":
-                    isEncrypted = true
+                    contentProtection = .aes128
                     currentKeyURI = attribute("URI", in: line)
                     currentExplicitIV = attribute("IV", in: line).flatMap(parseHexIV)
                     // A keyless AES-128 tag is unusable; treat as unsupported.
-                    if currentKeyURI == nil { hasUnsupportedEncryption = true }
+                    if currentKeyURI == nil {
+                        contentProtection = .unknown
+                        hasUnsupportedEncryption = true
+                    }
                 default:
                     // SAMPLE-AES / SAMPLE-AES-CTR / anything else: not decryptable here.
-                    isEncrypted = true
+                    let keyFormat = attribute("KEYFORMAT", in: line)?.lowercased()
+                    if keyFormat == "com.apple.streamingkeydelivery" {
+                        contentProtection = .fairPlay
+                    } else if method.hasPrefix("SAMPLE-AES") {
+                        contentProtection = .sampleAES
+                    } else {
+                        contentProtection = .unknown
+                    }
                     hasUnsupportedEncryption = true
                     currentKeyURI = nil
                     currentExplicitIV = nil
                 }
             } else if line.hasPrefix("#EXT-X-MAP:") {
                 hasMap = true
+                mapURI = attribute("URI", in: line)
             } else if line.hasPrefix("#EXT-X-ENDLIST") {
                 hasEndList = true
             } else if !line.hasPrefix("#") {
@@ -196,10 +269,18 @@ enum HLSPlaylistParser {
             mediaSequence: mediaSequence,
             segments: segments,
             hasEndList: hasEndList,
-            isEncrypted: isEncrypted,
             hasUnsupportedEncryption: hasUnsupportedEncryption,
-            hasMap: hasMap
+            hasMap: hasMap,
+            mapURI: mapURI,
+            contentProtection: contentProtection
         )
+    }
+
+    private static func codecTokens(_ raw: String?) -> [String] {
+        guard let raw else { return [] }
+        return raw
+            .split(separator: ",", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
     }
 
     /// Parse a `0x`-prefixed hex EXT-X-KEY IV into 16-byte big-endian Data. Returns nil on malformed length (caller falls back to sequence-number IV).

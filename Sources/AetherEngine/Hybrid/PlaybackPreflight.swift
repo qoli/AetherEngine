@@ -1,0 +1,368 @@
+import Foundation
+
+/// The only render route a host may use after AetherEngine has inspected a source.
+///
+/// A route is selected before creating an AVPlayer item or a decoder session. Hosts must not infer a
+/// different route from a later AVPlayer failure, a timeout, or a black frame.
+public enum PlaybackRenderRoute: String, Sendable, Equatable {
+    case nativeAVPlayer
+    case hybridCarrierMetal
+    case unsupported
+}
+
+/// The source family supplied to the deterministic playback preflight.
+///
+/// The caller must state this fact rather than relying on a URL suffix: HLS endpoints commonly have no
+/// `.m3u8` path extension.
+public enum AetherMediaSourceKind: String, Sendable, Equatable {
+    case hls
+    case progressive
+    case custom
+}
+
+/// Codec identity used by the route policy. `.unknown` is deliberately not treated as AVPlayer-compatible.
+public enum AetherVideoCodec: String, Sendable, Equatable {
+    case h264
+    case hevc
+    case av1
+    case vp9
+    case vp8
+    case mpeg2
+    case mpeg4Part2
+    case vc1
+    case unknown
+
+    init(codecName: String?) {
+        self = switch codecName?.lowercased() {
+        case "h264", "avc": .h264
+        case "hevc", "h265": .hevc
+        case "av1": .av1
+        case "vp9": .vp9
+        case "vp8": .vp8
+        case "mpeg2video": .mpeg2
+        case "mpeg4": .mpeg4Part2
+        case "vc1": .vc1
+        default: .unknown
+        }
+    }
+}
+
+/// Immutable source facts needed to select a playback route.
+///
+/// `isSeekableVOD` is intentionally a positive fact instead of a derived `!isLive`: the hybrid contract
+/// requires both VOD semantics and a seekable byte/timeline source.
+public struct AetherSourceProfile: Sendable, Equatable {
+    public let sourceKind: AetherMediaSourceKind
+    public let isSeekableVOD: Bool
+    public let videoCodec: AetherVideoCodec
+    public let videoFormat: VideoFormat
+
+    public init(
+        sourceKind: AetherMediaSourceKind,
+        isSeekableVOD: Bool,
+        videoCodec: AetherVideoCodec,
+        videoFormat: VideoFormat
+    ) {
+        self.sourceKind = sourceKind
+        self.isSeekableVOD = isSeekableVOD
+        self.videoCodec = videoCodec
+        self.videoFormat = videoFormat
+    }
+
+    /// Build a profile from a completed probe plus source facts that FFmpeg cannot infer reliably from a
+    /// standalone URL. The caller must explicitly establish `sourceKind` and `isSeekableVOD`.
+    public init(
+        probe: SourceProbe,
+        sourceKind: AetherMediaSourceKind,
+        isSeekableVOD: Bool
+    ) {
+        self.init(
+            sourceKind: sourceKind,
+            isSeekableVOD: isSeekableVOD,
+            videoCodec: AetherVideoCodec(codecName: probe.videoCodecName),
+            videoFormat: probe.videoFormat
+        )
+    }
+}
+
+/// Transport container established by HLS manifest and segment inspection.
+public enum HLSVideoContainer: String, Sendable, Equatable {
+    case fragmentedMP4
+    case mpegTransport
+    case unknown
+}
+
+/// BMFF sample entry observed in the selected HLS variant's init segment.
+///
+/// MPEG-TS has no BMFF sample entry, therefore uses `.notApplicable` rather than an invented value.
+public enum HLSVideoSampleEntry: String, Sendable, Equatable {
+    case avc1
+    case hvc1
+    case hev1
+    case dvh1
+    case notApplicable
+    case unknown
+}
+
+/// Result of comparing the selected variant's `CODECS` declaration with the inspected init/first segment.
+///
+/// `.segmentNotInspected` is an explicit stop condition. It must never be converted into a native route.
+public enum HLSManifestCodecVerification: String, Sendable, Equatable {
+    case verified
+    case manifestMissingButSegmentVerified
+    case mismatch
+    case segmentNotInspected
+}
+
+/// Content protection observed on the selected HLS variant.
+///
+/// Hybrid direct decode requires clear packets and samples. The policy refuses every protected form until a
+/// specific end-to-end decryption and license contract is implemented and verified.
+public enum HLSContentProtection: String, Sendable, Equatable {
+    case none
+    case aes128
+    case sampleAES
+    case fairPlay
+    case unknown
+}
+
+/// Verified selected-variant packaging facts. This is evidence, not a manifest-only guess.
+public struct HLSVideoPackaging: Sendable, Equatable {
+    public let container: HLSVideoContainer
+    public let sampleEntry: HLSVideoSampleEntry
+    /// Normalized video-related tokens from the selected variant's `CODECS` attribute. Empty is meaningful
+    /// only alongside `.manifestMissingButSegmentVerified`.
+    public let manifestCodecs: [String]
+    public let actualVideoCodec: AetherVideoCodec
+    public let codecVerification: HLSManifestCodecVerification
+    public let contentProtection: HLSContentProtection
+
+    public init(
+        container: HLSVideoContainer,
+        sampleEntry: HLSVideoSampleEntry,
+        manifestCodecs: [String],
+        actualVideoCodec: AetherVideoCodec,
+        codecVerification: HLSManifestCodecVerification,
+        contentProtection: HLSContentProtection
+    ) {
+        self.container = container
+        self.sampleEntry = sampleEntry
+        self.manifestCodecs = manifestCodecs
+        self.actualVideoCodec = actualVideoCodec
+        self.codecVerification = codecVerification
+        self.contentProtection = contentProtection
+    }
+}
+
+/// Capabilities that must all be positively established before the hybrid route can be selected.
+///
+/// The set of color formats is intentionally caller-supplied. A missing Dolby Vision/HDR format must select
+/// `.unsupported`, not an implicit SDR tone-map path.
+public struct HybridPlaybackCapabilities: Sendable, Equatable {
+    public let hasDirectVideoDecoder: Bool
+    public let hasMetalRenderer: Bool
+    public let supportedVideoFormats: Set<VideoFormat>
+
+    public init(
+        hasDirectVideoDecoder: Bool,
+        hasMetalRenderer: Bool,
+        supportedVideoFormats: Set<VideoFormat>
+    ) {
+        self.hasDirectVideoDecoder = hasDirectVideoDecoder
+        self.hasMetalRenderer = hasMetalRenderer
+        self.supportedVideoFormats = supportedVideoFormats
+    }
+}
+
+/// Stable diagnostic reason accompanying every preflight route.
+public enum PlaybackRouteReason: String, Sendable, Equatable {
+    case nativeHLSContractVerified
+    case nativeContainerRepackaging
+    case hybridHEV1SampleEntry
+    case hybridHEVCInMPEGTransport
+    case hybridHLSManifestMissingCodecs
+    case hybridHLSManifestSegmentMismatch
+    case hybridNonAVPlayerCodec
+    case unsupportedHLSPreflightMissing
+    case unsupportedHLSSegmentNotInspected
+    case unsupportedHLSContentProtection
+    case unsupportedHLSVideoPackaging
+    case unsupportedHybridRequiresSeekableVOD
+    case unsupportedHybridDecoderUnavailable
+    case unsupportedHybridMetalRendererUnavailable
+    case unsupportedHybridVideoFormat
+    case unsupportedVideoCodec
+}
+
+/// Complete deterministic preflight result. `route == .unsupported` is a valid, user-presentable result;
+/// it is not a request for the host to try a legacy player.
+public struct PlaybackPreflightResult: Sendable, Equatable {
+    public let sourceProfile: AetherSourceProfile
+    public let hlsPackaging: HLSVideoPackaging?
+    public let route: PlaybackRenderRoute
+    public let reason: PlaybackRouteReason
+
+    public init(
+        sourceProfile: AetherSourceProfile,
+        hlsPackaging: HLSVideoPackaging?,
+        route: PlaybackRenderRoute,
+        reason: PlaybackRouteReason
+    ) {
+        self.sourceProfile = sourceProfile
+        self.hlsPackaging = hlsPackaging
+        self.route = route
+        self.reason = reason
+    }
+}
+
+/// Pure route policy shared by HLS inspection, session creation and tests.
+///
+/// This policy performs no I/O. The HLS inspector is responsible for constructing
+/// `HLSVideoPackaging` from the selected playlist, init segment and first media segment before calling it.
+public enum PlaybackPreflight {
+    public static func resolve(
+        sourceProfile: AetherSourceProfile,
+        hlsPackaging: HLSVideoPackaging?,
+        hybridCapabilities: HybridPlaybackCapabilities
+    ) -> PlaybackPreflightResult {
+        switch sourceProfile.sourceKind {
+        case .hls:
+            return resolveHLS(
+                sourceProfile: sourceProfile,
+                hlsPackaging: hlsPackaging,
+                hybridCapabilities: hybridCapabilities
+            )
+        case .progressive, .custom:
+            switch sourceProfile.videoCodec {
+            case .h264, .hevc:
+                return result(
+                    sourceProfile,
+                    nil,
+                    .nativeAVPlayer,
+                    .nativeContainerRepackaging
+                )
+            case .unknown:
+                return result(sourceProfile, nil, .unsupported, .unsupportedVideoCodec)
+            default:
+                return hybridResult(
+                    sourceProfile: sourceProfile,
+                    hlsPackaging: nil,
+                    reason: .hybridNonAVPlayerCodec,
+                    capabilities: hybridCapabilities
+                )
+            }
+        }
+    }
+
+    private static func resolveHLS(
+        sourceProfile: AetherSourceProfile,
+        hlsPackaging: HLSVideoPackaging?,
+        hybridCapabilities: HybridPlaybackCapabilities
+    ) -> PlaybackPreflightResult {
+        guard let hlsPackaging else {
+            return result(sourceProfile, nil, .unsupported, .unsupportedHLSPreflightMissing)
+        }
+        guard hlsPackaging.contentProtection == .none else {
+            return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHLSContentProtection)
+        }
+        guard hlsPackaging.codecVerification != .segmentNotInspected else {
+            return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHLSSegmentNotInspected)
+        }
+        guard hlsPackaging.actualVideoCodec == sourceProfile.videoCodec else {
+            return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHLSVideoPackaging)
+        }
+
+        switch sourceProfile.videoCodec {
+        case .h264:
+            // H.264-in-TS and H.264-in-fMP4 are both an AVPlayer-native HLS contract after segment
+            // verification. A manifest/segment mismatch still uses the direct-decoder route because the
+            // selected variant is not a trustworthy AVPlayer contract.
+            if hlsPackaging.codecVerification == .verified {
+                return result(sourceProfile, hlsPackaging, .nativeAVPlayer, .nativeHLSContractVerified)
+            }
+            return hybridResult(
+                sourceProfile: sourceProfile,
+                hlsPackaging: hlsPackaging,
+                reason: hlsReason(for: hlsPackaging),
+                capabilities: hybridCapabilities
+            )
+
+        case .hevc:
+            if hlsPackaging.container == .fragmentedMP4,
+               hlsPackaging.codecVerification == .verified,
+               hlsPackaging.sampleEntry == .hvc1 || hlsPackaging.sampleEntry == .dvh1 {
+                return result(sourceProfile, hlsPackaging, .nativeAVPlayer, .nativeHLSContractVerified)
+            }
+            return hybridResult(
+                sourceProfile: sourceProfile,
+                hlsPackaging: hlsPackaging,
+                reason: hlsReason(for: hlsPackaging),
+                capabilities: hybridCapabilities
+            )
+
+        case .unknown:
+            return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedVideoCodec)
+
+        default:
+            return hybridResult(
+                sourceProfile: sourceProfile,
+                hlsPackaging: hlsPackaging,
+                reason: .hybridNonAVPlayerCodec,
+                capabilities: hybridCapabilities
+            )
+        }
+    }
+
+    private static func hlsReason(for packaging: HLSVideoPackaging) -> PlaybackRouteReason {
+        switch packaging.codecVerification {
+        case .manifestMissingButSegmentVerified:
+            return .hybridHLSManifestMissingCodecs
+        case .mismatch:
+            return .hybridHLSManifestSegmentMismatch
+        case .verified, .segmentNotInspected:
+            break
+        }
+        if packaging.container == .mpegTransport, packaging.actualVideoCodec == .hevc {
+            return .hybridHEVCInMPEGTransport
+        }
+        if packaging.sampleEntry == .hev1 {
+            return .hybridHEV1SampleEntry
+        }
+        return .hybridNonAVPlayerCodec
+    }
+
+    private static func hybridResult(
+        sourceProfile: AetherSourceProfile,
+        hlsPackaging: HLSVideoPackaging?,
+        reason: PlaybackRouteReason,
+        capabilities: HybridPlaybackCapabilities
+    ) -> PlaybackPreflightResult {
+        guard sourceProfile.isSeekableVOD else {
+            return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHybridRequiresSeekableVOD)
+        }
+        guard capabilities.hasDirectVideoDecoder else {
+            return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHybridDecoderUnavailable)
+        }
+        guard capabilities.hasMetalRenderer else {
+            return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHybridMetalRendererUnavailable)
+        }
+        guard capabilities.supportedVideoFormats.contains(sourceProfile.videoFormat) else {
+            return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHybridVideoFormat)
+        }
+        return result(sourceProfile, hlsPackaging, .hybridCarrierMetal, reason)
+    }
+
+    private static func result(
+        _ sourceProfile: AetherSourceProfile,
+        _ hlsPackaging: HLSVideoPackaging?,
+        _ route: PlaybackRenderRoute,
+        _ reason: PlaybackRouteReason
+    ) -> PlaybackPreflightResult {
+        PlaybackPreflightResult(
+            sourceProfile: sourceProfile,
+            hlsPackaging: hlsPackaging,
+            route: route,
+            reason: reason
+        )
+    }
+}

@@ -26,7 +26,8 @@ final class AudioTapHLSVariantResolverTests: XCTestCase {
     func testDirectMediaReturnsNil() {
         let media = HLSMediaPlaylist(targetDuration: 6, mediaSequence: 0,
             segments: [HLSMediaSegment(uri: "s0.ts", duration: 6, discontinuityBefore: false)],
-            hasEndList: true, isEncrypted: false, hasUnsupportedEncryption: false, hasMap: false)
+            hasEndList: true, hasUnsupportedEncryption: false, hasMap: false, mapURI: nil,
+            contentProtection: .none)
         XCTAssertNil(AudioTapHLSVariantResolver.pickAudioURI(from: .media(media)))
     }
 }

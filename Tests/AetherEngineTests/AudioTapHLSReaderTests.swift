@@ -25,7 +25,8 @@ final class AudioTapHLSReaderTests: XCTestCase {
     private func vodPlaylist() -> HLSMediaPlaylist {
         HLSMediaPlaylist(targetDuration: 6, mediaSequence: 0,
             segments: (0..<4).map { HLSMediaSegment(uri: "s\($0).ts", duration: 6, discontinuityBefore: false) },
-            hasEndList: true, isEncrypted: false, hasUnsupportedEncryption: false, hasMap: false)
+            hasEndList: true, hasUnsupportedEncryption: false, hasMap: false, mapURI: nil,
+            contentProtection: .none)
     }
 
     func testVODStepDecodesSegmentContainingPlayhead() async {
