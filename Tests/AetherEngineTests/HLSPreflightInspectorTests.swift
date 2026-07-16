@@ -455,6 +455,81 @@ final class HLSPreflightInspectorTests: XCTestCase {
         )
     }
 
+    func testAlternateAudioAnalysisPreflightPropagatesCancellation()
+        async throws
+    {
+        let rootURL = URL(
+            string: "https://example.com/master.m3u8"
+        )!
+        let mediaURL = URL(
+            string: "https://example.com/video.m3u8"
+        )!
+        let audioURL = URL(
+            string: "https://example.com/audio.m3u8"
+        )!
+        let responses: [URL: HLSPreflightFetchResponse] = [
+            rootURL: HLSPreflightFetchResponse(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",DEFAULT=YES,AUTOSELECT=YES,URI="audio.m3u8"
+                    #EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS="hvc1.2.4.L150",AUDIO="audio"
+                    video.m3u8
+                    """.utf8
+                ),
+                effectiveURL: rootURL
+            ),
+            mediaURL: HLSPreflightFetchResponse(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-TARGETDURATION:4
+                    #EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT="com.apple.streamingkeydelivery",URI="skd://license"
+                    #EXT-X-MAP:URI="init.mp4"
+                    #EXTINF:4,
+                    video0.m4s
+                    #EXT-X-ENDLIST
+                    """.utf8
+                ),
+                effectiveURL: mediaURL
+            ),
+        ]
+
+        do {
+            _ = try await HLSPreflightInspector(
+                httpHeaders: [:],
+                fetchOverride: { url, _ in
+                    if url == audioURL {
+                        throw CancellationError()
+                    }
+                    guard let response = responses[url] else {
+                        throw HLSPreflightError
+                            .httpStatus(599)
+                    }
+                    return response
+                }
+            ).inspect(
+                rootURL: rootURL,
+                sourceIsSeekableVOD: true,
+                variantSelection: .highestBandwidth,
+                hybridCapabilities:
+                    HybridPlaybackCapabilities(
+                        hasDirectVideoDecoder: true,
+                        hasMetalRenderer: true,
+                        supportedVideoFormats: [.sdr]
+                    )
+            )
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+            // Expected: host cancellation must not become an optional
+            // per-track unavailable result.
+        } catch {
+            XCTFail(
+                "expected CancellationError, got \(error)"
+            )
+        }
+    }
+
     func testProtectedAlternateAudioTurnsHybridCandidateIntoTypedUnsupported()
         async throws
     {
