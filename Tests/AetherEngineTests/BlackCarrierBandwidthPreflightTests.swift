@@ -252,6 +252,55 @@ struct BlackCarrierBandwidthPreflightTests {
         )
     }
 
+    @Test("Video-only source skips the full-asset audio measurement generation")
+    func videoOnlySkipsAudioMeasurement() throws {
+        let sourceData = try BlackCarrierEncodedSample
+            .verifiedMP4Data()
+        let probe = Demuxer()
+        try probe.open(reader: DataIOReader(data: sourceData))
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(
+                seconds: probe.duration,
+                preferredTimescale: 90_000
+            )
+        )
+        probe.close()
+
+        let state = ReaderState(payloads: [sourceData])
+        let videoProvider = try BlackCarrierVideoProvider(
+            timeline: timeline
+        )
+        let videoPeak = try #require(
+            videoProvider.masterBandwidth
+        )
+        let videoAverage = try #require(
+            videoProvider.masterAverageBandwidth
+        )
+        let provider = try BlackCarrierLazyCompositeProvider
+            .buildSeekableVOD(
+                videoProvider: videoProvider,
+                source: .custom(
+                    SequencedReader(state: state),
+                    formatHint: "mp4"
+                ),
+                options: LoadOptions(),
+                timeline: timeline,
+                decodedFrameHandler: { _ in }
+            )
+
+        #expect(state.cloneCount == 1)
+        #expect(state.prototypeCloseCount == 0)
+        #expect(state.cloneCloseCount == 0)
+        #expect(provider.audioAnalysisTrackIDs.isEmpty)
+        #expect(provider.masterCodecs == "avc1.42C01E")
+        #expect(provider.masterBandwidth == videoPeak)
+        #expect(provider.masterAverageBandwidth == videoAverage)
+
+        provider.close()
+        #expect(state.prototypeCloseCount == 1)
+        #expect(state.cloneCloseCount == 1)
+    }
+
     private func makeWAV(
         sampleRate: Int,
         channels: Int,

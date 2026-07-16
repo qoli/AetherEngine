@@ -274,19 +274,6 @@ final class BlackCarrierLazyCompositeProvider:
             throw error
         }
 
-        let measurement: BlackCarrierAudioBandwidthMeasurement
-        do {
-            measurement = try BlackCarrierAudioBandwidthPreflight.measure(
-                sourceFactory: sourceFactory,
-                timeline: timeline,
-                bridgeMode: bridgeMode
-            )
-        } catch {
-            sourceFactory.close()
-            videoProvider.close()
-            throw error
-        }
-
         let pump: BlackCarrierMediaFanoutPump
         do {
             pump = try BlackCarrierMediaFanoutPump.makeSeekableVOD(
@@ -301,6 +288,38 @@ final class BlackCarrierLazyCompositeProvider:
             )
         } catch {
             sourceFactory.close()
+            videoProvider.close()
+            throw error
+        }
+
+        guard !pump.renditionMetadata.isEmpty else {
+            EngineLog.emit(
+                "[BlackCarrierAudioBandwidthPreflight] skipped "
+                    + "reason=no-audio-renditions",
+                category: .session
+            )
+            do {
+                return try BlackCarrierLazyCompositeProvider(
+                    videoProvider: videoProvider,
+                    pump: pump,
+                    bandwidthAdmissions: []
+                )
+            } catch {
+                pump.close()
+                videoProvider.close()
+                throw error
+            }
+        }
+
+        let measurement: BlackCarrierAudioBandwidthMeasurement
+        do {
+            measurement = try BlackCarrierAudioBandwidthPreflight.measure(
+                sourceFactory: sourceFactory,
+                timeline: timeline,
+                bridgeMode: bridgeMode
+            )
+        } catch {
+            pump.close()
             videoProvider.close()
             throw error
         }
