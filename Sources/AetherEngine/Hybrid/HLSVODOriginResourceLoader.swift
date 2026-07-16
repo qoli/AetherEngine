@@ -41,6 +41,8 @@ enum HLSVODOriginResourceError:
     case resourceTooLarge(limit: Int, actual: Int?)
     case contentLengthMismatch(expected: Int64, actual: Int)
     case preflightEvidenceMismatch(HLSVODOriginResourceKey)
+    case effectiveOriginMismatch(HLSVODOriginResourceKey)
+    case redirectCredentialScopeViolation
     case transport(URLError.Code)
     case transportFailure
     case cacheDirectoryCreationFailed
@@ -75,6 +77,10 @@ enum HLSVODOriginResourceError:
             "HLS VOD origin resource declared \(expected) bytes but delivered \(actual)"
         case .preflightEvidenceMismatch:
             "HLS VOD origin resource no longer matches preflight evidence"
+        case .effectiveOriginMismatch:
+            "HLS VOD origin resource redirected outside its preflight-admitted origin scope"
+        case .redirectCredentialScopeViolation:
+            "HLS VOD redirect crossed origin while request-scoped headers were present"
         case .transport(let code):
             "HLS VOD origin-resource transport failed with URL error \(code.rawValue)"
         case .transportFailure:
@@ -149,7 +155,9 @@ private struct HLSVODBoundOriginResource: Sendable {
     let key: HLSVODOriginResourceKey
     let url: URL
     let seededData: Data?
+    let seededEffectiveURL: URL?
     let expectedSHA256: String?
+    let allowedEffectiveOrigins: Set<HLSVODOriginScope>
 }
 
 extension HLSVODResourceGraph {
@@ -166,9 +174,19 @@ extension HLSVODResourceGraph {
                 key: key,
                 url: initSegmentURL,
                 seededData: inspectedInitSegmentData,
+                seededEffectiveURL:
+                    inspectedInitSegmentEffectiveURL,
                 expectedSHA256:
                     HLSVODResourceDigest.sha256(
                         inspectedInitSegmentData
+                    ),
+                allowedEffectiveOrigins:
+                    try allowedOrigins(
+                        key: key,
+                        urls: [
+                            initSegmentURL,
+                            inspectedInitSegmentEffectiveURL,
+                        ].compactMap { $0 }
                     )
             )
 
@@ -182,8 +200,20 @@ extension HLSVODResourceGraph {
                 key: key,
                 url: segments[index].url,
                 seededData: seededData,
+                seededEffectiveURL:
+                    index == 0
+                    ? inspectedFirstMediaSegmentEffectiveURL
+                    : nil,
                 expectedSHA256:
-                    seededData.map(HLSVODResourceDigest.sha256)
+                    seededData.map(HLSVODResourceDigest.sha256),
+                allowedEffectiveOrigins:
+                    try allowedOrigins(
+                        key: key,
+                        urls: [
+                            segments[index].url,
+                            inspectedFirstMediaSegmentEffectiveURL,
+                        ]
+                    )
             )
 
         case .audioInit(let ordinal):
@@ -196,7 +226,17 @@ extension HLSVODResourceGraph {
                 key: key,
                 url: initSegmentURL,
                 seededData: nil,
-                expectedSHA256: nil
+                seededEffectiveURL: nil,
+                expectedSHA256: nil,
+                allowedEffectiveOrigins:
+                    try allowedOrigins(
+                        key: key,
+                        urls: [
+                            initSegmentURL,
+                            audioRenditions[ordinal]
+                                .playlistURL,
+                        ]
+                    )
             )
 
         case .audioSegment(let ordinal, let index):
@@ -209,9 +249,34 @@ extension HLSVODResourceGraph {
                 key: key,
                 url: audioRenditions[ordinal].segments[index].url,
                 seededData: nil,
-                expectedSHA256: nil
+                seededEffectiveURL: nil,
+                expectedSHA256: nil,
+                allowedEffectiveOrigins:
+                    try allowedOrigins(
+                        key: key,
+                        urls: [
+                            audioRenditions[ordinal]
+                                .segments[index].url,
+                            audioRenditions[ordinal]
+                                .playlistURL,
+                        ]
+                    )
             )
         }
+    }
+
+    private func allowedOrigins(
+        key: HLSVODOriginResourceKey,
+        urls: [URL]
+    ) throws -> Set<HLSVODOriginScope> {
+        let resolved = urls.compactMap(
+            HLSVODOriginScope.init
+        )
+        guard resolved.count == urls.count else {
+            throw HLSVODOriginResourceError
+                .effectiveOriginMismatch(key)
+        }
+        return Set(resolved)
     }
 }
 
@@ -604,9 +669,16 @@ actor HLSVODOriginResourceLoader {
             do {
                 let response: HLSVODOriginFetchResponse
                 if let seededData = resource.seededData {
+                    guard let seededEffectiveURL =
+                            resource.seededEffectiveURL else {
+                        throw HLSVODOriginResourceError
+                            .effectiveOriginMismatch(
+                                resource.key
+                            )
+                    }
                     response = HLSVODOriginFetchResponse(
                         data: seededData,
-                        effectiveURL: resource.url,
+                        effectiveURL: seededEffectiveURL,
                         statusCode: 200,
                         contentLength: Int64(seededData.count),
                         contentEncoding: nil
@@ -925,6 +997,15 @@ actor HLSVODOriginResourceLoader {
             )
         }
         let sha256 = HLSVODResourceDigest.sha256(response.data)
+        guard let effectiveOrigin =
+                HLSVODOriginScope(
+                    url: response.effectiveURL
+                ),
+              resource.allowedEffectiveOrigins
+                .contains(effectiveOrigin) else {
+            throw HLSVODOriginResourceError
+                .effectiveOriginMismatch(resource.key)
+        }
         if let expectedSHA256 = resource.expectedSHA256,
            sha256 != expectedSHA256 {
             throw HLSVODOriginResourceError
@@ -1112,15 +1193,84 @@ final class HLSVODBoundedHTTPFetcher:
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
+        guard let sourceURL =
+                response.url ?? task.currentRequest?.url,
+              let targetURL = request.url,
+              let sourceOrigin =
+                HLSVODOriginScope(url: sourceURL),
+              let targetOrigin =
+                HLSVODOriginScope(url: targetURL) else {
+            completionHandler(nil)
+            finish(
+                .failure(
+                    HLSVODOriginResourceError
+                        .redirectCredentialScopeViolation
+                )
+            )
+            return
+        }
+        let originalHeaders =
+            self.request.allHTTPHeaderFields ?? [:]
         var redirected = request
-        for (field, value) in self.request
-            .allHTTPHeaderFields ?? [:] {
-            redirected.setValue(
-                value,
-                forHTTPHeaderField: field
+        if sourceOrigin == targetOrigin {
+            for (field, value) in originalHeaders {
+                redirected.setValue(
+                    value,
+                    forHTTPHeaderField: field
+                )
+            }
+        } else {
+            guard !Self.hasRedirectScopedHeaders(
+                originalHeaders
+            ) else {
+                completionHandler(nil)
+                finish(
+                    .failure(
+                        HLSVODOriginResourceError
+                            .redirectCredentialScopeViolation
+                    )
+                )
+                return
+            }
+            for field in originalHeaders.keys {
+                redirected.setValue(
+                    nil,
+                    forHTTPHeaderField: field
+                )
+            }
+            for (field, value) in originalHeaders
+            where Self.safeCrossOriginHeaders.contains(
+                field.lowercased()
+            ) {
+                redirected.setValue(
+                    value,
+                    forHTTPHeaderField: field
+                )
+            }
+        }
+        redirected.setValue(
+            "identity",
+            forHTTPHeaderField: "Accept-Encoding"
+        )
+        completionHandler(redirected)
+    }
+
+    private static let safeCrossOriginHeaders: Set<String> = [
+        "accept",
+        "accept-encoding",
+        "accept-language",
+        "range",
+        "user-agent",
+    ]
+
+    private static func hasRedirectScopedHeaders(
+        _ headers: [String: String]
+    ) -> Bool {
+        headers.keys.contains {
+            !safeCrossOriginHeaders.contains(
+                $0.lowercased()
             )
         }
-        completionHandler(redirected)
     }
 
     func urlSession(

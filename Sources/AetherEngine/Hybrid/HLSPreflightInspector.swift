@@ -20,6 +20,7 @@ public enum HLSPreflightError: Error, Sendable, Equatable, LocalizedError {
     case resourceTooLarge(limit: Int)
     case unsupportedContentEncoding(String)
     case contentLengthMismatch(expected: Int64, actual: Int)
+    case redirectCredentialScopeViolation
     case nonHTTPResponse
     case transportFailure(code: Int?)
 
@@ -40,6 +41,8 @@ public enum HLSPreflightError: Error, Sendable, Equatable, LocalizedError {
             "HLS preflight requires identity content encoding, found \(value)"
         case .contentLengthMismatch(let expected, let actual):
             "HLS preflight resource declared \(expected) bytes but delivered \(actual)"
+        case .redirectCredentialScopeViolation:
+            "HLS preflight redirect crossed origin while request-scoped headers were present"
         case .nonHTTPResponse:
             "HLS preflight response was not HTTP"
         case .transportFailure(let code):
@@ -200,15 +203,19 @@ struct HLSPreflightInspector {
 
         let container: HLSVideoContainer
         let initSegment: Data?
+        let initSegmentEffectiveURL: URL?
         if let mapURI = resolved.media.mapURI {
             guard let initURL = HLSPlaylistParser.resolve(uri: mapURI, against: resolved.mediaURL) else {
                 throw HLSPreflightError.unresolvableURI(mapURI)
             }
             container = .fragmentedMP4
-            initSegment = try await fetch(initURL).data
+            let response = try await fetch(initURL)
+            initSegment = response.data
+            initSegmentEffectiveURL = response.effectiveURL
         } else if Self.isMPEGTransport(segment.data) {
             container = .mpegTransport
             initSegment = nil
+            initSegmentEffectiveURL = nil
         } else {
             return AetherHLSPlaybackPreflight(
                 result: unresolvedResult(
@@ -281,7 +288,11 @@ struct HLSPreflightInspector {
                     media: resolved.media,
                     audioRenditions: audioRenditions,
                     inspectedInitSegmentData: initSegment,
+                    inspectedInitSegmentEffectiveURL:
+                        initSegmentEffectiveURL,
                     inspectedFirstMediaSegmentData: segment.data,
+                    inspectedFirstMediaSegmentEffectiveURL:
+                        segment.effectiveURL,
                     httpHeaders: httpHeaders
                 )
             case .protected(let protection):
@@ -453,6 +464,9 @@ struct HLSPreflightInspector {
                         expected: expected,
                         actual: actual
                     )
+            case .redirectCredentialScopeViolation:
+                throw HLSPreflightError
+                    .redirectCredentialScopeViolation
             case .nonHTTPResponse:
                 throw HLSPreflightError.nonHTTPResponse
             case .transport(let code):

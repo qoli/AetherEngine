@@ -346,6 +346,14 @@ final class HLSPreflightInspectorTests: XCTestCase {
             string:
                 "https://cdn.example/catalog/video/seg0.m4s?token=segment-secret"
         )!
+        let effectiveInitURL = URL(
+            string:
+                "https://media-cdn.example/video/init.mp4?token=effective-init-secret"
+        )!
+        let effectiveSegmentURL = URL(
+            string:
+                "https://media-cdn.example/video/seg0.m4s?token=effective-segment-secret"
+        )!
         let audioPlaylistURL = URL(
             string:
                 "https://cdn.example/audio/en.m3u8?token=audio-playlist-secret"
@@ -411,11 +419,11 @@ final class HLSPreflightInspectorTests: XCTestCase {
             ),
             initURL: HLSPreflightFetchResponse(
                 data: initData,
-                effectiveURL: initURL
+                effectiveURL: effectiveInitURL
             ),
             segmentURL: HLSPreflightFetchResponse(
                 data: segmentData,
-                effectiveURL: segmentURL
+                effectiveURL: effectiveSegmentURL
             ),
             audioPlaylistURL: HLSPreflightFetchResponse(
                 data: audioMedia,
@@ -483,6 +491,16 @@ final class HLSPreflightInspectorTests: XCTestCase {
             segmentURL
         )
         XCTAssertEqual(
+            inspected.resourceGraph?
+                .inspectedInitSegmentEffectiveURL,
+            effectiveInitURL
+        )
+        XCTAssertEqual(
+            inspected.resourceGraph?
+                .inspectedFirstMediaSegmentEffectiveURL,
+            effectiveSegmentURL
+        )
+        XCTAssertEqual(
             inspected.resourceGraph?.audioRenditions.first?.name,
             "English"
         )
@@ -535,7 +553,11 @@ final class HLSPreflightInspectorTests: XCTestCase {
                 try XCTUnwrap(inspected.resourceGraph)
                     .audioRenditions,
             inspectedInitSegmentData: initData,
+            inspectedInitSegmentEffectiveURL:
+                effectiveInitURL,
             inspectedFirstMediaSegmentData: segmentData,
+            inspectedFirstMediaSegmentEffectiveURL:
+                effectiveSegmentURL,
             httpHeaders: [
                 "Authorization": "Bearer changed-secret",
                 "User-Agent": "AetherTests/1",
@@ -562,11 +584,47 @@ final class HLSPreflightInspectorTests: XCTestCase {
                 try XCTUnwrap(inspected.resourceGraph)
                     .audioRenditions,
             inspectedInitSegmentData: initData,
+            inspectedInitSegmentEffectiveURL:
+                effectiveInitURL,
             inspectedFirstMediaSegmentData:
                 changedFirstSegment,
+            inspectedFirstMediaSegmentEffectiveURL:
+                effectiveSegmentURL,
             httpHeaders: headers
         )
         XCTAssertNotEqual(changedEvidence.identity, identity)
+
+        let changedRedirect = try HLSVODResourceGraph.make(
+            requestedRootURL: requestedRoot,
+            effectiveRootURL: effectiveRoot,
+            selectedMediaPlaylistURL: selectedMediaURL,
+            selectedVariant: HLSVariant(
+                bandwidth: 1_400_000,
+                uri: selectedURI,
+                audioGroupID: "audio",
+                codecs: ["avc1.42c01e"]
+            ),
+            separateAudioGroupID: "audio",
+            mediaPlaylistData: media,
+            media: parsedMedia,
+            audioRenditions:
+                try XCTUnwrap(inspected.resourceGraph)
+                    .audioRenditions,
+            inspectedInitSegmentData: initData,
+            inspectedInitSegmentEffectiveURL:
+                effectiveInitURL,
+            inspectedFirstMediaSegmentData: segmentData,
+            inspectedFirstMediaSegmentEffectiveURL:
+                URL(
+                    string:
+                        "https://other-cdn.example/video/seg0.m4s"
+                )!,
+            httpHeaders: headers
+        )
+        XCTAssertNotEqual(
+            changedRedirect.identity,
+            identity
+        )
     }
 
     func testResourceGraphRejectsAlternateAudioOutsideSelectedGroup() throws {
@@ -614,7 +672,10 @@ final class HLSPreflightInspectorTests: XCTestCase {
                 media: media,
                 audioRenditions: [wrongGroup],
                 inspectedInitSegmentData: nil,
+                inspectedInitSegmentEffectiveURL: nil,
                 inspectedFirstMediaSegmentData: Data([0x47]),
+                inspectedFirstMediaSegmentEffectiveURL:
+                    baseURL,
                 httpHeaders: [:]
             )
         ) { error in
@@ -690,8 +751,11 @@ final class HLSPreflightInspectorTests: XCTestCase {
                 media: videoMedia,
                 audioRenditions: [audio],
                 inspectedInitSegmentData: nil,
+                inspectedInitSegmentEffectiveURL: nil,
                 inspectedFirstMediaSegmentData:
                     Data([0x47]),
+                inspectedFirstMediaSegmentEffectiveURL:
+                    baseURL,
                 httpHeaders: [:]
             )
         ) { error in
@@ -752,7 +816,10 @@ final class HLSPreflightInspectorTests: XCTestCase {
                 media: makeMedia(false, false, false),
                 audioRenditions: [],
                 inspectedInitSegmentData: nil,
+                inspectedInitSegmentEffectiveURL: nil,
                 inspectedFirstMediaSegmentData: Data([0x47]),
+                inspectedFirstMediaSegmentEffectiveURL:
+                    baseURL,
                 httpHeaders: [:]
             )
         ) { error in
@@ -776,7 +843,10 @@ final class HLSPreflightInspectorTests: XCTestCase {
                     media: media,
                     audioRenditions: [],
                     inspectedInitSegmentData: nil,
+                    inspectedInitSegmentEffectiveURL: nil,
                     inspectedFirstMediaSegmentData: Data([0x47]),
+                    inspectedFirstMediaSegmentEffectiveURL:
+                        baseURL,
                     httpHeaders: [:]
                 )
             )

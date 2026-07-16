@@ -1928,8 +1928,12 @@ final class HLSVODMediaPumpTests: XCTestCase {
             audioRenditions: [audioResource],
             inspectedInitSegmentData:
                 videoInitData,
+            inspectedInitSegmentEffectiveURL:
+                videoInitURL,
             inspectedFirstMediaSegmentData:
                 videoSegments[0],
+            inspectedFirstMediaSegmentEffectiveURL:
+                videoSegmentURLs[0],
             httpHeaders: [:]
         )
         let result = PlaybackPreflightResult(
@@ -2074,8 +2078,12 @@ final class HLSVODMediaPumpTests: XCTestCase {
             audioRenditions: [],
             inspectedInitSegmentData:
                 muxed.initData,
+            inspectedInitSegmentEffectiveURL:
+                initURL,
             inspectedFirstMediaSegmentData:
                 muxed.mediaSegments[0],
+            inspectedFirstMediaSegmentEffectiveURL:
+                segmentURLs[0],
             httpHeaders: [:]
         )
         let result = PlaybackPreflightResult(

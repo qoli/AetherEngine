@@ -48,6 +48,27 @@ struct HLSVODSegmentResource: Sendable, Equatable {
     let url: URL
 }
 
+struct HLSVODOriginScope:
+    Sendable,
+    Equatable,
+    Hashable
+{
+    let scheme: String
+    let host: String
+    let port: Int
+
+    init?(url: URL) {
+        guard let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host?.lowercased() else {
+            return nil
+        }
+        self.scheme = scheme
+        self.host = host
+        port = url.port ?? (scheme == "https" ? 443 : 80)
+    }
+}
+
 struct HLSVODAudioRenditionResource: Sendable, Equatable {
     let ordinal: Int
     let groupID: String
@@ -87,7 +108,9 @@ struct HLSVODResourceGraph: Sendable, Equatable {
     let segments: [HLSVODSegmentResource]
     let audioRenditions: [HLSVODAudioRenditionResource]
     let inspectedInitSegmentData: Data?
+    let inspectedInitSegmentEffectiveURL: URL?
     let inspectedFirstMediaSegmentData: Data
+    let inspectedFirstMediaSegmentEffectiveURL: URL
     let timeline: BlackCarrierTimeline
     let identity: String
 
@@ -101,7 +124,9 @@ struct HLSVODResourceGraph: Sendable, Equatable {
         media: HLSMediaPlaylist,
         audioRenditions: [HLSVODAudioRenditionResource],
         inspectedInitSegmentData: Data?,
+        inspectedInitSegmentEffectiveURL: URL?,
         inspectedFirstMediaSegmentData: Data,
+        inspectedFirstMediaSegmentEffectiveURL: URL,
         httpHeaders: [String: String]
     ) throws -> HLSVODResourceGraph {
         if let separateAudioGroupID {
@@ -139,15 +164,27 @@ struct HLSVODResourceGraph: Sendable, Equatable {
                 "selected video first-segment evidence is empty"
             )
         }
+        guard HLSVODOriginScope(
+            url: inspectedFirstMediaSegmentEffectiveURL
+        ) != nil else {
+            throw HLSPreflightError.invalidPlaylist(
+                "selected video first-segment effective URL is not HTTP(S)"
+            )
+        }
         if initSegmentURL == nil {
-            guard inspectedInitSegmentData == nil else {
+            guard inspectedInitSegmentData == nil,
+                  inspectedInitSegmentEffectiveURL == nil else {
                 throw HLSPreflightError.invalidPlaylist(
                     "selected video init-segment evidence has no bound URI"
                 )
             }
         } else {
             guard let inspectedInitSegmentData,
-                  !inspectedInitSegmentData.isEmpty else {
+                  !inspectedInitSegmentData.isEmpty,
+                  let inspectedInitSegmentEffectiveURL,
+                  HLSVODOriginScope(
+                    url: inspectedInitSegmentEffectiveURL
+                  ) != nil else {
                 throw HLSPreflightError.invalidPlaylist(
                     "selected video init-segment evidence is missing"
                 )
@@ -179,8 +216,12 @@ struct HLSVODResourceGraph: Sendable, Equatable {
             segmentResources: segmentResources,
             audioRenditions: audioRenditions,
             inspectedInitSegmentData: inspectedInitSegmentData,
+            inspectedInitSegmentEffectiveURL:
+                inspectedInitSegmentEffectiveURL,
             inspectedFirstMediaSegmentData:
                 inspectedFirstMediaSegmentData,
+            inspectedFirstMediaSegmentEffectiveURL:
+                inspectedFirstMediaSegmentEffectiveURL,
             httpHeaders: httpHeaders
         )
         return HLSVODResourceGraph(
@@ -194,8 +235,12 @@ struct HLSVODResourceGraph: Sendable, Equatable {
             segments: segmentResources,
             audioRenditions: audioRenditions,
             inspectedInitSegmentData: inspectedInitSegmentData,
+            inspectedInitSegmentEffectiveURL:
+                inspectedInitSegmentEffectiveURL,
             inspectedFirstMediaSegmentData:
                 inspectedFirstMediaSegmentData,
+            inspectedFirstMediaSegmentEffectiveURL:
+                inspectedFirstMediaSegmentEffectiveURL,
             timeline: timeline,
             identity: identity
         )
@@ -249,7 +294,9 @@ struct HLSVODResourceGraph: Sendable, Equatable {
         segmentResources: [HLSVODSegmentResource],
         audioRenditions: [HLSVODAudioRenditionResource],
         inspectedInitSegmentData: Data?,
+        inspectedInitSegmentEffectiveURL: URL?,
         inspectedFirstMediaSegmentData: Data,
+        inspectedFirstMediaSegmentEffectiveURL: URL,
         httpHeaders: [String: String]
     ) -> String {
         var evidence = Data()
@@ -269,9 +316,18 @@ struct HLSVODResourceGraph: Sendable, Equatable {
             to: &evidence
         )
         append(
+            inspectedInitSegmentEffectiveURL?.absoluteString
+                ?? "<no-inspected-init-effective-url>",
+            to: &evidence
+        )
+        append(
             HLSVODResourceDigest.sha256(
                 inspectedFirstMediaSegmentData
             ),
+            to: &evidence
+        )
+        append(
+            inspectedFirstMediaSegmentEffectiveURL.absoluteString,
             to: &evidence
         )
         evidence.append(mediaPlaylistData)

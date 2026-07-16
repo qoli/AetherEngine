@@ -8,6 +8,7 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         let graph: HLSVODResourceGraph
         let videoInitData: Data
         let videoFirstSegmentData: Data
+        let videoFirstSegmentEffectiveURL: URL
         let audioFirstSegmentData: Data
         let audioFirstSegmentURL: URL
     }
@@ -165,6 +166,10 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         XCTAssertEqual(
             firstVideo.data,
             fixture.videoFirstSegmentData
+        )
+        XCTAssertEqual(
+            firstVideo.effectiveURL,
+            fixture.videoFirstSegmentEffectiveURL
         )
         let seededRequestCount = await recorder.requestCount
         XCTAssertEqual(seededRequestCount, 0)
@@ -1180,6 +1185,107 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         try await loader.close()
     }
 
+    func testRuntimeEffectiveOriginMustRemainInsidePreflightScope()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let key = HLSVODOriginResourceKey.audioSegment(
+            renditionOrdinal: 0,
+            index: 0
+        )
+        let recorder = FetchRecorder(
+            responses: [
+                fixture.audioFirstSegmentURL:
+                    HLSVODOriginFetchResponse(
+                        data: fixture.audioFirstSegmentData,
+                        effectiveURL: URL(
+                            string:
+                                "https://unadmitted.example/audio/a0.aac"
+                        )!,
+                        statusCode: 200,
+                        contentLength: Int64(
+                            fixture.audioFirstSegmentData.count
+                        ),
+                        contentEncoding: nil
+                    ),
+            ]
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [:],
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+
+        do {
+            _ = try await loader.payload(for: key)
+            XCTFail(
+                "unadmitted redirect origin unexpectedly entered the graph cache"
+            )
+        } catch let error as HLSVODOriginResourceError {
+            XCTAssertEqual(
+                error,
+                .effectiveOriginMismatch(key)
+            )
+        }
+        let snapshot = await loader.snapshot
+        XCTAssertEqual(snapshot.cachedResourceCount, 0)
+        XCTAssertEqual(snapshot.cachedBytes, 0)
+        try await loader.close()
+    }
+
+    func testRuntimeRedirectMayUseThePreflightAdmittedVideoOrigin()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let key = HLSVODOriginResourceKey.videoSegment(
+            index: 1
+        )
+        let requestURL =
+            fixture.graph.segments[1].url
+        let responseURL =
+            fixture.videoFirstSegmentEffectiveURL
+                .deletingLastPathComponent()
+                .appendingPathComponent("v1.m4s")
+        let bytes = Data([
+            0x00, 0x00, 0x00, 0x08,
+            0x6D, 0x64, 0x61, 0x74,
+        ])
+        let recorder = FetchRecorder(
+            responses: [
+                requestURL:
+                    HLSVODOriginFetchResponse(
+                        data: bytes,
+                        effectiveURL: responseURL,
+                        statusCode: 200,
+                        contentLength: Int64(bytes.count),
+                        contentEncoding: nil
+                    ),
+            ]
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [:],
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+
+        let payload = try await loader.payload(
+            for: key
+        )
+        XCTAssertEqual(payload.effectiveURL, responseURL)
+        XCTAssertEqual(payload.data, bytes)
+        try await loader.close()
+    }
+
     func testCloseFailsActiveAndQueuedAnalysisRequests()
         async throws
     {
@@ -1376,6 +1482,136 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         )
     }
 
+    func testBoundedHTTPTransportRejectsCredentialedCrossOriginRedirect()
+        async throws
+    {
+        let sourceURL = URL(
+            string: "https://origin.test/redirect.m4s"
+        )!
+        let targetURL = URL(
+            string: "https://cdn.test/segment.m4s"
+        )!
+        HLSVODOriginURLProtocol.reset()
+        HLSVODOriginURLProtocol.fixtures[
+            sourceURL.absoluteString
+        ] = .init(
+            statusCode: 302,
+            headers: [
+                "Location": targetURL.absoluteString,
+            ],
+            body: Data(),
+            redirectURL: targetURL
+        )
+        HLSVODOriginURLProtocol.fixtures[
+            targetURL.absoluteString
+        ] = .init(
+            statusCode: 200,
+            headers: ["Content-Length": "1"],
+            body: Data([0xAB])
+        )
+        let configuration =
+            URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [
+            HLSVODOriginURLProtocol.self,
+        ]
+        var request = URLRequest(url: sourceURL)
+        request.setValue(
+            "Bearer secret",
+            forHTTPHeaderField: "Authorization"
+        )
+        request.setValue(
+            "identity",
+            forHTTPHeaderField: "Accept-Encoding"
+        )
+
+        do {
+            _ = try await HLSVODBoundedHTTPFetcher.fetch(
+                request: request,
+                maximumBytes: 4,
+                configuration: configuration
+            )
+            XCTFail(
+                "credentialed cross-origin redirect unexpectedly followed"
+            )
+        } catch let error as HLSVODOriginResourceError {
+            XCTAssertEqual(
+                error,
+                .redirectCredentialScopeViolation
+            )
+        }
+        XCTAssertNil(
+            HLSVODOriginURLProtocol.recordedHeaders(
+                for: targetURL
+            )
+        )
+    }
+
+    func testBoundedHTTPTransportKeepsHeadersOnSameOriginRedirect()
+        async throws
+    {
+        let sourceURL = URL(
+            string:
+                "https://origin.test/redirect-same-origin.m4s"
+        )!
+        let targetURL = URL(
+            string: "https://origin.test/segment.m4s"
+        )!
+        let bytes = Data([0xAB])
+        HLSVODOriginURLProtocol.reset()
+        HLSVODOriginURLProtocol.fixtures[
+            sourceURL.absoluteString
+        ] = .init(
+            statusCode: 302,
+            headers: [
+                "Location": targetURL.absoluteString,
+            ],
+            body: Data(),
+            redirectURL: targetURL
+        )
+        HLSVODOriginURLProtocol.fixtures[
+            targetURL.absoluteString
+        ] = .init(
+            statusCode: 200,
+            headers: ["Content-Length": "1"],
+            body: bytes
+        )
+        let configuration =
+            URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [
+            HLSVODOriginURLProtocol.self,
+        ]
+        var request = URLRequest(url: sourceURL)
+        request.setValue(
+            "Bearer secret",
+            forHTTPHeaderField: "Authorization"
+        )
+        request.setValue(
+            "identity",
+            forHTTPHeaderField: "Accept-Encoding"
+        )
+
+        let response =
+            try await HLSVODBoundedHTTPFetcher.fetch(
+                request: request,
+                maximumBytes: 4,
+                configuration: configuration
+            )
+        XCTAssertEqual(response.data, bytes)
+        XCTAssertEqual(response.effectiveURL, targetURL)
+        let targetHeaders =
+            HLSVODOriginURLProtocol.recordedHeaders(
+                for: targetURL
+            )
+        XCTAssertEqual(
+            targetHeaders?["Authorization"],
+            "Bearer secret"
+        )
+        XCTAssertEqual(
+            targetHeaders?["Accept-Encoding"],
+            "identity"
+        )
+    }
+
     private func waitForWaiters(
         _ expected: Int,
         loader: HLSVODOriginResourceLoader
@@ -1460,6 +1696,10 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         )!
         let videoFirstSegmentURL = URL(
             string: "https://cdn.example/video/v0.m4s"
+        )!
+        let videoFirstSegmentEffectiveURL = URL(
+            string:
+                "https://media-cdn.example/video/v0.m4s"
         )!
         let audioPlaylistURL = URL(
             string: "https://cdn.example/audio/en.m3u8"
@@ -1551,8 +1791,12 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
             media: videoMedia,
             audioRenditions: [audioResource],
             inspectedInitSegmentData: videoInitData,
+            inspectedInitSegmentEffectiveURL:
+                videoInitURL,
             inspectedFirstMediaSegmentData:
                 videoFirstSegmentData,
+            inspectedFirstMediaSegmentEffectiveURL:
+                videoFirstSegmentEffectiveURL,
             httpHeaders: [:]
         )
         XCTAssertEqual(
@@ -1571,6 +1815,8 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
             graph: graph,
             videoInitData: videoInitData,
             videoFirstSegmentData: videoFirstSegmentData,
+            videoFirstSegmentEffectiveURL:
+                videoFirstSegmentEffectiveURL,
             audioFirstSegmentData: audioFirstSegmentData,
             audioFirstSegmentURL: audioFirstSegmentURL
         )
@@ -1585,6 +1831,19 @@ private final class HLSVODOriginURLProtocol:
         let statusCode: Int
         let headers: [String: String]
         let body: Data
+        let redirectURL: URL?
+
+        init(
+            statusCode: Int,
+            headers: [String: String],
+            body: Data,
+            redirectURL: URL? = nil
+        ) {
+            self.statusCode = statusCode
+            self.headers = headers
+            self.body = body
+            self.redirectURL = redirectURL
+        }
     }
 
     private static let lock = NSLock()
@@ -1638,6 +1897,21 @@ private final class HLSVODOriginURLProtocol:
                 self,
                 didFailWithError:
                     URLError(.fileDoesNotExist)
+            )
+            return
+        }
+        if let redirectURL = fixture.redirectURL {
+            let response = HTTPURLResponse(
+                url: url,
+                statusCode: fixture.statusCode,
+                httpVersion: "HTTP/1.1",
+                headerFields: fixture.headers
+            )!
+            client?.urlProtocol(
+                self,
+                wasRedirectedTo:
+                    URLRequest(url: redirectURL),
+                redirectResponse: response
             )
             return
         }

@@ -269,8 +269,12 @@ final class HLSVODSegmentDemuxerTests: XCTestCase {
             media: videoMedia,
             audioRenditions: [audioResource],
             inspectedInitSegmentData: videoInitData,
+            inspectedInitSegmentEffectiveURL:
+                videoInitURL,
             inspectedFirstMediaSegmentData:
                 videoSegmentData,
+            inspectedFirstMediaSegmentEffectiveURL:
+                videoSegmentURL,
             httpHeaders: [:]
         )
         let result = PlaybackPreflightResult(
