@@ -19,7 +19,7 @@ enum BlackCarrierVideoMuxerError: Error, LocalizedError, Sendable, Equatable {
     case segmentReadFailed(index: Int)
     case initSegmentMissing
 
-    public var errorDescription: String? {
+    var errorDescription: String? {
         switch self {
         case .encodedSample(let error):
             return error.localizedDescription
@@ -92,6 +92,60 @@ enum BlackCarrierVideoMuxer {
     static func build(
         timeline: BlackCarrierTimeline
     ) throws -> BlackCarrierVideoPresentation {
+        let fileManager = FileManager.default
+        let outputDirectory = fileManager.temporaryDirectory.appendingPathComponent(
+            "AetherBlackCarrier-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        do {
+            try fileManager.createDirectory(
+                at: outputDirectory,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            throw BlackCarrierVideoMuxerError.outputDirectoryFailed
+        }
+        defer { try? fileManager.removeItem(at: outputDirectory) }
+
+        var capturedInitSegment: Data?
+        var outputSegments: [BlackCarrierVideoSegment] = []
+        outputSegments.reserveCapacity(timeline.segments.count)
+
+        try mux(
+            timeline: timeline,
+            sessionDirectory: outputDirectory,
+            onInit: { capturedInitSegment = $0 },
+            onSegment: { segment, path, bytesWritten in
+                guard let data = try? Data(contentsOf: path),
+                      data.count == bytesWritten else {
+                    throw BlackCarrierVideoMuxerError.segmentReadFailed(index: segment.index)
+                }
+                outputSegments.append(BlackCarrierVideoSegment(timing: segment, data: data))
+            }
+        )
+
+        guard let initSegment = capturedInitSegment else {
+            throw BlackCarrierVideoMuxerError.initSegmentMissing
+        }
+        return BlackCarrierVideoPresentation(
+            initSegment: initSegment,
+            segments: outputSegments,
+            duration: timeline.duration
+        )
+    }
+
+    /// Streams finalized segment files to an engine-owned sink without retaining the full VOD in
+    /// memory. `sessionDirectory` must be on the same volume as any cache that adopts the files.
+    static func mux(
+        timeline: BlackCarrierTimeline,
+        sessionDirectory: URL,
+        onInit: (Data) -> Void,
+        onSegment: (
+            _ timing: BlackCarrierSegmentTiming,
+            _ stagingPath: URL,
+            _ bytesWritten: Int
+        ) throws -> Void
+    ) throws {
         guard let firstSegment = timeline.segments.first else {
             throw BlackCarrierVideoMuxerError.emptyTimeline
         }
@@ -122,27 +176,12 @@ enum BlackCarrierVideoMuxer {
         var sourcePacketToFree: UnsafeMutablePointer<AVPacket>? = sourcePacket
         defer { trackedPacketFree(&sourcePacketToFree) }
 
-        let fileManager = FileManager.default
-        let outputDirectory = fileManager.temporaryDirectory.appendingPathComponent(
-            "AetherBlackCarrier-\(UUID().uuidString)",
-            isDirectory: true
-        )
-        do {
-            try fileManager.createDirectory(
-                at: outputDirectory,
-                withIntermediateDirectories: true
-            )
-        } catch {
-            throw BlackCarrierVideoMuxerError.outputDirectoryFailed
-        }
-        defer { try? fileManager.removeItem(at: outputDirectory) }
-
         var capturedInitSegment: Data?
         let muxer: MP4SegmentMuxer
         do {
             muxer = try MP4SegmentMuxer(
                 initialSegmentIndex: firstSegment.index,
-                sessionDir: outputDirectory,
+                sessionDir: sessionDirectory,
                 video: MP4SegmentMuxer.VideoConfig(
                     codecpar: UnsafePointer(sourceCodecParameters),
                     timeBase: approvedTimeBase,
@@ -163,9 +202,6 @@ enum BlackCarrierVideoMuxer {
                 reason: String(describing: error)
             )
         }
-
-        var outputSegments: [BlackCarrierVideoSegment] = []
-        outputSegments.reserveCapacity(timeline.segments.count)
 
         for (offset, segment) in timeline.segments.enumerated() {
             for sample in segment.samples {
@@ -188,21 +224,13 @@ enum BlackCarrierVideoMuxer {
             guard let finalized else {
                 throw BlackCarrierVideoMuxerError.segmentFinalizeFailed(index: segment.index)
             }
-            guard let data = try? Data(contentsOf: finalized.path),
-                  data.count == finalized.bytesWritten else {
-                throw BlackCarrierVideoMuxerError.segmentReadFailed(index: segment.index)
-            }
-            outputSegments.append(BlackCarrierVideoSegment(timing: segment, data: data))
+            try onSegment(segment, finalized.path, finalized.bytesWritten)
         }
 
         guard let initSegment = capturedInitSegment else {
             throw BlackCarrierVideoMuxerError.initSegmentMissing
         }
-        return BlackCarrierVideoPresentation(
-            initSegment: initSegment,
-            segments: outputSegments,
-            duration: timeline.duration
-        )
+        onInit(initSegment)
     }
 
     private static let approvedTimeBase = AVRational(
