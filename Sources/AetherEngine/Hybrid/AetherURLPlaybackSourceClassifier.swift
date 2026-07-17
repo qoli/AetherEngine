@@ -86,10 +86,6 @@ public enum AetherURLPlaybackSourceClassifier {
                 request.setValue(value, forHTTPHeaderField: field)
             }
             request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-            request.setValue(
-                "bytes=0-\(maximumPrefixBytes - 1)",
-                forHTTPHeaderField: "Range"
-            )
             data = try await AetherURLPlaybackPrefixFetcher.fetch(
                 request: request,
                 maximumBytes: maximumPrefixBytes
