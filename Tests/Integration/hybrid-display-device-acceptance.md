@@ -26,17 +26,20 @@ guess display criteria or switch route. Configuration attempted after idle throw
 
 The current Apple TV SDK makes the renderer split an architecture decision, not a shader-only task:
 
-- `CAMetalLayer.colorspace` and HDR-capable Metal pixel formats can describe direct PQ/HLG output, so
-  HDR10 and HLG may proceed to a physical-device candidate after the engine has an exact 10-bit
-  pixel-buffer/color-metadata contract.
+- tvOS 26 exposes `CALayer.preferredDynamicRange` / `contentsHeadroom`; together with
+  `CAMetalLayer.colorspace` and HDR-capable Metal pixel formats these can describe direct PQ/HLG output.
+  HDR10 and HLG may therefore proceed to a physical-device candidate after the engine has an exact
+  10-bit pixel-buffer/color-metadata contract.
 - `CAMetalLayer.wantsExtendedDynamicRangeContent`, `CAMetalLayer.EDRMetadata` and `CAEDRMetadata` are
   unavailable on tvOS in the AppleTVOS 26.4 SDK. The layer therefore has no public tvOS per-frame
   HDR10+ T.35 or Dolby Vision RPU metadata input.
-- Apple's Dolby Vision playback guidance names `AVPlayer`/`AVPlayerLayer` and
-  `AVSampleBufferDisplayLayer`; the lower-level path requires 10-bit-or-higher sample buffers carrying
-  Dolby Vision per-frame metadata propagated by `VTDecompressionSession`.
-- `kCMSampleAttachmentKey_HDR10PlusPerFrameData` is a `CMSampleBuffer` attachment, not a Metal drawable
-  attachment. Rendering only the HDR10 base layer in Metal would silently drop HDR10+ semantics.
+- [Apple's Dolby Vision playback guidance](https://developer.apple.com/news/?id=rwbholxw) names
+  `AVPlayer`/`AVPlayerLayer` and `AVSampleBufferDisplayLayer`; the lower-level path requires
+  10-bit-or-higher sample buffers carrying Dolby Vision per-frame metadata propagated by
+  `VTDecompressionSession`.
+- [`kCMSampleAttachmentKey_HDR10PlusPerFrameData`](https://developer.apple.com/documentation/coremedia/kcmsampleattachmentkey_hdr10plusperframedata)
+  is a `CMSampleBuffer` attachment, not a Metal drawable attachment. Rendering only the HDR10 base
+  layer in Metal would silently drop HDR10+ semantics.
 
 Accordingly, `.hdr10Plus` and `.dolbyVision` must remain outside
 `AetherMetalPlayerView.verifiedVideoFormats`. The engine must not relabel a base layer as the original
