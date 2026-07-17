@@ -105,6 +105,31 @@ public enum AetherHLSAudioAnalysisPolicy:
     case unavailableForAllTracks(AudioAnalysisError)
 }
 
+/// Decoder-free HDR10+ evidence from the exact first video segment already bound by HLS preflight.
+///
+/// This is a bounded startup contract, not a whole-asset scan. `.validated` proves that an HEVC
+/// `user_data_registered_itu_t_t35` SEI message carried the registered HDR10+ identifier and a
+/// syntactically valid ST 2094-40 application payload. Malformed or uninspectable compressed samples
+/// produce a typed unsupported route; the engine never starts as HDR10 and upgrades the renderer later.
+public enum AetherHLSHDR10PlusPreflightEvidence:
+    Sendable,
+    Equatable
+{
+    case notRequired
+    case notDetectedInFirstSegment(
+        scannedVideoSampleCount: Int
+    )
+    case validated(
+        sampleIndex: Int,
+        t35PayloadByteCount: Int
+    )
+    case malformed(sampleIndex: Int)
+    case compressedSampleUninspectable(
+        sampleIndex: Int
+    )
+    case validatorUnavailable(sampleIndex: Int)
+}
+
 /// Public, privacy-safe result of HLS inspection.
 ///
 /// The raw selected playlist, init-segment and media-segment URLs remain engine-private because they may
@@ -127,6 +152,8 @@ public struct AetherHLSPlaybackPreflight: Sendable, Equatable {
     public let audioRenditionCount: Int
     public let audioAnalysisPolicy:
         AetherHLSAudioAnalysisPolicy
+    public let hdr10PlusEvidence:
+        AetherHLSHDR10PlusPreflightEvidence
 
     let resourceGraph: HLSVODResourceGraph?
     let httpHeaders: [String: String]
@@ -136,7 +163,10 @@ public struct AetherHLSPlaybackPreflight: Sendable, Equatable {
         resourceGraph: HLSVODResourceGraph?,
         httpHeaders: [String: String],
         audioAnalysisPolicy:
-            AetherHLSAudioAnalysisPolicy? = nil
+            AetherHLSAudioAnalysisPolicy? = nil,
+        hdr10PlusEvidence:
+            AetherHLSHDR10PlusPreflightEvidence =
+                .notRequired
     ) {
         self.result = result
         hybridTimeline = resourceGraph?.timeline
@@ -152,6 +182,7 @@ public struct AetherHLSPlaybackPreflight: Sendable, Equatable {
                 result: result,
                 resourceGraph: resourceGraph
             )
+        self.hdr10PlusEvidence = hdr10PlusEvidence
         self.resourceGraph = resourceGraph
         self.httpHeaders = httpHeaders
     }

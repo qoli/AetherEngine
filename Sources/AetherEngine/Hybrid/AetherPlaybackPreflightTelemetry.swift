@@ -86,6 +86,8 @@ public struct AetherPlaybackPreflightTelemetryHLSEvidence:
     public let selectedVariantBandwidth: Int?
     public let mediaSegmentCount: Int
     public let audioRenditionCount: Int
+    public let hdr10PlusEvidence:
+        AetherHLSHDR10PlusPreflightEvidence
 
     init(_ preflight: AetherHLSPlaybackPreflight) {
         hasRetainedResourceGraph =
@@ -94,6 +96,7 @@ public struct AetherPlaybackPreflightTelemetryHLSEvidence:
             preflight.selectedVariantBandwidth
         mediaSegmentCount = preflight.mediaSegmentCount
         audioRenditionCount = preflight.audioRenditionCount
+        hdr10PlusEvidence = preflight.hdr10PlusEvidence
     }
 }
 

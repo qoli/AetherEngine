@@ -210,6 +210,11 @@ public enum PlaybackRouteReason: String, Sendable, Equatable {
     case unsupportedHybridDecoderUnavailable
     case unsupportedHybridMetalRendererUnavailable
     case unsupportedHybridVideoFormat
+    case unsupportedHDR10PlusBaseLayerMismatch
+    case unsupportedHDR10PlusCompressedSampleEvidenceMissing
+    case unsupportedHDR10PlusCompressedSampleMalformed
+    case unsupportedHDR10PlusCompressedSampleUninspectable
+    case unsupportedHDR10PlusValidatorUnavailable
     case unsupportedVideoCodec
 }
 

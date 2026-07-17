@@ -1,4 +1,5 @@
 import Foundation
+import Libavcodec
 
 /// Deterministic selected-variant policy for HLS preflight. The session must use the same selected variant
 /// that was inspected; it may not let an adaptive AVPlayer choice invalidate the route decision later.
@@ -124,6 +125,8 @@ private struct HLSInspectedVideo: Sendable {
     let codec: AetherVideoCodec
     let format: VideoFormat
     let sampleEntry: HLSVideoSampleEntry
+    let hdr10PlusEvidence:
+        AetherHLSHDR10PlusPreflightEvidence
 }
 
 private struct HLSProtectedManifestVideo: Sendable {
@@ -265,17 +268,29 @@ struct HLSPreflightInspector {
             ),
             contentProtection: .none
         )
+        let hdr10PlusAdmission = Self.resolveHDR10PlusAdmission(
+            baseFormat: inspected.format,
+            evidence: inspected.hdr10PlusEvidence
+        )
         let source = AetherSourceProfile(
             sourceKind: .hls,
             isSeekableVOD: sourceIsSeekableVOD,
             videoCodec: inspected.codec,
-            videoFormat: inspected.format
+            videoFormat: hdr10PlusAdmission.videoFormat
         )
-        let result = PlaybackPreflight.resolve(
+        let resolvedResult = PlaybackPreflight.resolve(
             sourceProfile: source,
             hlsPackaging: packaging,
             hybridCapabilities: hybridCapabilities
         )
+        let result = hdr10PlusAdmission.failureReason.map {
+            PlaybackPreflightResult(
+                sourceProfile: source,
+                hlsPackaging: packaging,
+                route: .unsupported,
+                reason: $0
+            )
+        } ?? resolvedResult
         let resourceGraph: HLSVODResourceGraph?
         let audioAnalysisPolicy:
             AetherHLSAudioAnalysisPolicy
@@ -328,7 +343,9 @@ struct HLSPreflightInspector {
                     audioAnalysisPolicy:
                         .selectedAlternateAudioRenditions(
                             renditionPolicies
-                        )
+                        ),
+                    hdr10PlusEvidence:
+                        inspected.hdr10PlusEvidence
                 )
             }
         } else {
@@ -343,7 +360,9 @@ struct HLSPreflightInspector {
             resourceGraph: resourceGraph,
             httpHeaders: httpHeaders,
             audioAnalysisPolicy:
-                audioAnalysisPolicy
+                audioAnalysisPolicy,
+            hdr10PlusEvidence:
+                inspected.hdr10PlusEvidence
         )
     }
 
@@ -918,9 +937,172 @@ struct HLSPreflightInspector {
             )
             let codec = AetherVideoCodec(codecName: probe.videoCodecName)
             guard codec != .unknown else { return nil }
-            return HLSInspectedVideo(codec: codec, format: probe.videoFormat, sampleEntry: sampleEntry)
+            let hdr10PlusEvidence = inspectHDR10PlusEvidence(
+                demuxer: demuxer,
+                codec: codec,
+                container: container
+            )
+            return HLSInspectedVideo(
+                codec: codec,
+                format: probe.videoFormat,
+                sampleEntry: sampleEntry,
+                hdr10PlusEvidence: hdr10PlusEvidence
+            )
         } catch {
             return nil
+        }
+    }
+
+    private static func inspectHDR10PlusEvidence(
+        demuxer: Demuxer,
+        codec: AetherVideoCodec,
+        container: HLSVideoContainer
+    ) -> AetherHLSHDR10PlusPreflightEvidence {
+        guard codec == .hevc else {
+            return .notRequired
+        }
+        let framing: HEVCCompressedSampleFraming
+        switch container {
+        case .mpegTransport:
+            framing = .annexB
+        case .fragmentedMP4:
+            guard let stream = demuxer.stream(
+                at: demuxer.videoStreamIndex
+            ),
+            let codecParameters = stream.pointee.codecpar,
+            let extradata = codecParameters.pointee.extradata,
+            codecParameters.pointee.extradata_size > 21 else {
+                return .compressedSampleUninspectable(
+                    sampleIndex: 0
+                )
+            }
+            let lengthFieldBytes =
+                Int(extradata[21] & 0x03) + 1
+            guard (1...4).contains(lengthFieldBytes) else {
+                return .compressedSampleUninspectable(
+                    sampleIndex: 0
+                )
+            }
+            framing = .lengthPrefixed(
+                lengthFieldBytes: lengthFieldBytes
+            )
+        case .unknown:
+            return .compressedSampleUninspectable(
+                sampleIndex: 0
+            )
+        }
+
+        let videoStreamIndex = demuxer.videoStreamIndex
+        guard videoStreamIndex >= 0 else {
+            return .compressedSampleUninspectable(
+                sampleIndex: 0
+            )
+        }
+        var sampleIndex = 0
+        do {
+            while let packet = try demuxer.readPacket() {
+                var packetToFree:
+                    UnsafeMutablePointer<AVPacket>? = packet
+                defer {
+                    trackedPacketFree(&packetToFree)
+                }
+                guard packet.pointee.stream_index
+                        == videoStreamIndex else {
+                    continue
+                }
+                guard let data = packet.pointee.data,
+                      packet.pointee.size > 0 else {
+                    return .compressedSampleUninspectable(
+                        sampleIndex: sampleIndex
+                    )
+                }
+                let sample = Data(
+                    bytes: data,
+                    count: Int(packet.pointee.size)
+                )
+                switch HDR10PlusCompressedSampleInspector.inspect(
+                    sample,
+                    framing: framing
+                ) {
+                case .notDetected:
+                    sampleIndex += 1
+                case .validated(
+                    let t35PayloadByteCount
+                ):
+                    return .validated(
+                        sampleIndex: sampleIndex,
+                        t35PayloadByteCount:
+                            t35PayloadByteCount
+                    )
+                case .malformedHDR10PlusMetadata:
+                    return .malformed(
+                        sampleIndex: sampleIndex
+                    )
+                case .malformedCompressedSample:
+                    return .compressedSampleUninspectable(
+                        sampleIndex: sampleIndex
+                    )
+                case .validatorUnavailable:
+                    return .validatorUnavailable(
+                        sampleIndex: sampleIndex
+                    )
+                }
+            }
+        } catch {
+            return .compressedSampleUninspectable(
+                sampleIndex: sampleIndex
+            )
+        }
+        guard sampleIndex > 0 else {
+            return .compressedSampleUninspectable(
+                sampleIndex: 0
+            )
+        }
+        return .notDetectedInFirstSegment(
+            scannedVideoSampleCount: sampleIndex
+        )
+    }
+
+    static func resolveHDR10PlusAdmission(
+        baseFormat: VideoFormat,
+        evidence: AetherHLSHDR10PlusPreflightEvidence
+    ) -> (
+        videoFormat: VideoFormat,
+        failureReason: PlaybackRouteReason?
+    ) {
+        switch evidence {
+        case .validated:
+            guard baseFormat == .hdr10 else {
+                return (
+                    baseFormat,
+                    .unsupportedHDR10PlusBaseLayerMismatch
+                )
+            }
+            return (.hdr10Plus, nil)
+        case .malformed:
+            return (
+                baseFormat,
+                .unsupportedHDR10PlusCompressedSampleMalformed
+            )
+        case .compressedSampleUninspectable:
+            return (
+                baseFormat,
+                .unsupportedHDR10PlusCompressedSampleUninspectable
+            )
+        case .validatorUnavailable:
+            return (
+                baseFormat,
+                .unsupportedHDR10PlusValidatorUnavailable
+            )
+        case .notRequired,
+             .notDetectedInFirstSegment:
+            guard baseFormat != .hdr10Plus else {
+                return (
+                    baseFormat,
+                    .unsupportedHDR10PlusCompressedSampleEvidenceMissing
+                )
+            }
+            return (baseFormat, nil)
         }
     }
 
