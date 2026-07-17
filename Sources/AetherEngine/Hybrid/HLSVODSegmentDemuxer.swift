@@ -172,7 +172,7 @@ actor HLSVODSegmentDemuxer {
         fetchOverride:
             HLSVODOriginResourceLoader.Fetch? = nil
     ) throws {
-        guard preflight.result.route == .hybridCarrierMetal,
+        guard preflight.result.route == .hybridCarrier,
               preflight.result.sourceProfile.sourceKind == .hls,
               let graph = preflight.resourceGraph else {
             throw HLSVODSegmentDemuxError.invalidPreflight

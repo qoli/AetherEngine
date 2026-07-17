@@ -11,7 +11,7 @@ struct HybridCarrierPresentationContractTests {
             playerMatchesSession: false,
             carrierUsesAspectFit: false,
             automaticallyAppliesDisplayCriteria: true,
-            metalOverlayAttached: false
+            presentationOverlayAttached: false
         )
 
         #expect(failure == .carrierPresentationNotConfigured)
@@ -22,7 +22,7 @@ struct HybridCarrierPresentationContractTests {
         )
     }
 
-    @Test("Player, carrier gravity, automatic criteria and Metal overlay drift all fail explicitly", arguments: [
+    @Test("Player, carrier gravity, automatic criteria and presentation overlay drift all fail explicitly", arguments: [
         (false, true, false, true),
         (true, false, false, true),
         (true, true, true, true),
@@ -32,7 +32,7 @@ struct HybridCarrierPresentationContractTests {
         playerMatchesSession: Bool,
         carrierUsesAspectFit: Bool,
         automaticallyAppliesDisplayCriteria: Bool,
-        metalOverlayAttached: Bool
+        presentationOverlayAttached: Bool
     ) {
         let failure = HybridCarrierPresentationContract.failure(
             wasConfigured: true,
@@ -41,7 +41,7 @@ struct HybridCarrierPresentationContractTests {
             carrierUsesAspectFit: carrierUsesAspectFit,
             automaticallyAppliesDisplayCriteria:
                 automaticallyAppliesDisplayCriteria,
-            metalOverlayAttached: metalOverlayAttached
+            presentationOverlayAttached: presentationOverlayAttached
         )
 
         #expect(failure == .carrierPresentationContractChanged)
@@ -60,7 +60,7 @@ struct HybridCarrierPresentationContractTests {
             playerMatchesSession: true,
             carrierUsesAspectFit: true,
             automaticallyAppliesDisplayCriteria: false,
-            metalOverlayAttached: true
+            presentationOverlayAttached: true
         ) == nil)
     }
 

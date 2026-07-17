@@ -99,7 +99,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
             variantSelection: .highestBandwidth,
             hybridCapabilities: HybridPlaybackCapabilities(
                 hasDirectVideoDecoder: true,
-                hasMetalRenderer: true,
+                hasSampleBufferRenderer: true,
                 supportedVideoFormats: [.sdr]
             )
         )
@@ -193,7 +193,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
             variantSelection: .highestBandwidth,
             hybridCapabilities: HybridPlaybackCapabilities(
                 hasDirectVideoDecoder: true,
-                hasMetalRenderer: true,
+                hasSampleBufferRenderer: true,
                 supportedVideoFormats: [.sdr]
             )
         )
@@ -305,7 +305,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
             variantSelection: .highestBandwidth,
             hybridCapabilities: HybridPlaybackCapabilities(
                 hasDirectVideoDecoder: true,
-                hasMetalRenderer: true,
+                hasSampleBufferRenderer: true,
                 supportedVideoFormats: [.sdr]
             )
         )
@@ -422,7 +422,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
             variantSelection: .highestBandwidth,
             hybridCapabilities: HybridPlaybackCapabilities(
                 hasDirectVideoDecoder: true,
-                hasMetalRenderer: true,
+                hasSampleBufferRenderer: true,
                 supportedVideoFormats: [.sdr]
             )
         )
@@ -515,7 +515,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
                 hybridCapabilities:
                     HybridPlaybackCapabilities(
                         hasDirectVideoDecoder: true,
-                        hasMetalRenderer: true,
+                        hasSampleBufferRenderer: true,
                         supportedVideoFormats: [.sdr]
                     )
             )
@@ -623,7 +623,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
             variantSelection: .highestBandwidth,
             hybridCapabilities: HybridPlaybackCapabilities(
                 hasDirectVideoDecoder: true,
-                hasMetalRenderer: true,
+                hasSampleBufferRenderer: true,
                 supportedVideoFormats: [.sdr]
             )
         )
@@ -803,7 +803,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
             hybridCapabilities: capabilities
         )
 
-        XCTAssertEqual(inspected.result.route, .hybridCarrierMetal)
+        XCTAssertEqual(inspected.result.route, .hybridCarrier)
         XCTAssertEqual(
             PlaybackPreflight.resolve(
                 sourceProfile:
@@ -1298,7 +1298,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
             variantSelection: .highestBandwidth,
             hybridCapabilities: HybridPlaybackCapabilities(
                 hasDirectVideoDecoder: true,
-                hasMetalRenderer: true,
+                hasSampleBufferRenderer: true,
                 supportedVideoFormats: [.sdr]
             )
         )
@@ -1342,7 +1342,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
             variantSelection: .highestBandwidth,
             hybridCapabilities: HybridPlaybackCapabilities(
                 hasDirectVideoDecoder: true,
-                hasMetalRenderer: true,
+                hasSampleBufferRenderer: true,
                 supportedVideoFormats: [.sdr]
             )
         )

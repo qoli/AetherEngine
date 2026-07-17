@@ -1,0 +1,746 @@
+import AVFoundation
+import CoreMedia
+import CoreVideo
+import Foundation
+import QuartzCore
+
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
+
+/// Backend-neutral scaling policy for real video over the fixed black carrier.
+public enum AetherHybridVideoGravity: String, Sendable, Equatable {
+    case resizeAspect
+    case resizeAspectFill
+}
+
+public enum HybridFrameEnqueueOutcome: Sendable, Equatable {
+    case accepted
+    case staleGeneration
+}
+
+/// Typed failures for the only Hybrid real-video presentation backend.
+///
+/// None of these failures select another renderer, clock, route, player, or
+/// color policy. The owning Hybrid session must terminate and preserve this
+/// exact cause.
+public enum AetherHybridPresentationError:
+    Error,
+    LocalizedError,
+    Sendable,
+    Equatable
+{
+    case invalidPresentationTime
+    case invalidFrameDuration
+    case invalidGeometry
+    case unsupportedRotation(Int)
+    case unsupportedVideoFormat(VideoFormat)
+    case frameFormatDiverged(expected: VideoFormat, actual: VideoFormat)
+    case pixelBufferNotIOSurfaceBacked
+    case nonMonotonicPresentationTime(previous: CMTime, current: CMTime)
+    case pendingQueueOverflow(limit: Int)
+    case formatDescriptionCreationFailed(status: OSStatus)
+    case sampleBufferCreationFailed(status: OSStatus)
+    case sampleAttachmentCreationFailed
+    case carrierTimebaseUnavailable
+    case carrierBindingChanged
+    case displayLayerTimebaseChanged
+    case rendererFailed(domain: String, code: Int, reason: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidPresentationTime:
+            return "Hybrid decoded frame has no valid presentation timestamp"
+        case .invalidFrameDuration:
+            return "Hybrid decoded frame has no valid positive duration"
+        case .invalidGeometry:
+            return "Hybrid decoded frame geometry is invalid"
+        case .unsupportedRotation(let degrees):
+            return "Hybrid sample-buffer presentation supports only quarter-turn rotation, got \(degrees) degrees"
+        case .unsupportedVideoFormat(let format):
+            return "Hybrid sample-buffer presentation has no verified device contract for \(String(describing: format))"
+        case .frameFormatDiverged(let expected, let actual):
+            return "Hybrid decoded frame format \(String(describing: actual)) diverged from session format \(String(describing: expected))"
+        case .pixelBufferNotIOSurfaceBacked:
+            return "Hybrid sample-buffer presentation requires an IOSurface-backed pixel buffer"
+        case .nonMonotonicPresentationTime(let previous, let current):
+            return "Hybrid sample-buffer presentation timestamp regressed from \(previous.seconds) to \(current.seconds)"
+        case .pendingQueueOverflow(let limit):
+            return "Hybrid sample-buffer pending queue exceeded its \(limit)-frame bound"
+        case .formatDescriptionCreationFailed(let status):
+            return "Hybrid CMSampleBuffer format description creation failed (\(status))"
+        case .sampleBufferCreationFailed(let status):
+            return "Hybrid CMSampleBuffer creation failed (\(status))"
+        case .sampleAttachmentCreationFailed:
+            return "Hybrid CMSampleBuffer could not create its per-frame attachment dictionary"
+        case .carrierTimebaseUnavailable:
+            return "Hybrid carrier AVPlayerItem did not publish a valid timebase"
+        case .carrierBindingChanged:
+            return "Hybrid carrier AVPlayerItem or timebase changed after presentation binding"
+        case .displayLayerTimebaseChanged:
+            return "Hybrid AVSampleBufferDisplayLayer controlTimebase no longer matches the carrier"
+        case .rendererFailed(let domain, let code, let reason):
+            return "Hybrid AVSampleBufferVideoRenderer failed: \(domain)(\(code)): \(reason)"
+        }
+    }
+}
+
+/// Aether-owned, backend-neutral Hybrid real-video surface.
+///
+/// The only production backend is `AVSampleBufferDisplayLayer`. The layer's
+/// `controlTimebase` is bound to the carrier `AVPlayerItem.timebase`, making
+/// the carrier AVPlayer the only Hybrid clock and audio owner. The host embeds
+/// this view but never receives the layer, queue, or timebase.
+@MainActor
+public final class AetherHybridPresentationView: PlatformBaseView {
+    public enum RendererStatus: String, Sendable, Equatable {
+        case unknown
+        case rendering
+        case failed
+    }
+
+    public struct Diagnostics: Sendable, Equatable {
+        public let generation: UInt64
+        public let pendingSampleBuffers: Int
+        public let staleGenerationDrops: Int
+        public let backPressureObservations: Int
+        public let enqueuedSampleBuffers: Int
+        public let lastEnqueuedTimeSeconds: Double?
+        public let carrierTimebaseBound: Bool
+        public let rendererStatus: RendererStatus
+
+        init(
+            generation: UInt64,
+            pendingSampleBuffers: Int,
+            staleGenerationDrops: Int,
+            backPressureObservations: Int,
+            enqueuedSampleBuffers: Int,
+            lastEnqueuedTimeSeconds: Double?,
+            carrierTimebaseBound: Bool,
+            rendererStatus: RendererStatus
+        ) {
+            self.generation = generation
+            self.pendingSampleBuffers = pendingSampleBuffers
+            self.staleGenerationDrops = staleGenerationDrops
+            self.backPressureObservations = backPressureObservations
+            self.enqueuedSampleBuffers = enqueuedSampleBuffers
+            self.lastEnqueuedTimeSeconds = lastEnqueuedTimeSeconds
+            self.carrierTimebaseBound = carrierTimebaseBound
+            self.rendererStatus = rendererStatus
+        }
+    }
+
+    /// Admission remains SDR-only until each additional format has fixture and
+    /// physical Apple TV evidence. The backend itself is never replaced.
+    public nonisolated static let verifiedVideoFormats: Set<VideoFormat> = [.sdr]
+
+    private struct PendingSample {
+        let sampleBuffer: CMSampleBuffer
+        let presentationTime: CMTime
+    }
+
+    static let maximumPendingSampleBuffers = 24
+
+    private let displayLayer = AVSampleBufferDisplayLayer()
+    private weak var boundCarrierItem: AVPlayerItem?
+    private var boundCarrierTimebase: CMTimebase?
+    private var pendingSamples: [PendingSample] = []
+    private var activeGeneration: UInt64 = 0
+    private var activeVideoFormat: VideoFormat = .sdr
+    private var sourceRotationDegrees: Int?
+    private var lastAcceptedPresentationTime: CMTime?
+    private var lastEnqueuedPresentationTime: CMTime?
+    private var staleGenerationDrops = 0
+    private var backPressureObservations = 0
+    private var enqueuedSampleBuffers = 0
+
+    public var videoGravity: AetherHybridVideoGravity = .resizeAspect {
+        didSet {
+            displayLayer.videoGravity = switch videoGravity {
+            case .resizeAspect: .resizeAspect
+            case .resizeAspectFill: .resizeAspectFill
+            }
+        }
+    }
+
+    #if canImport(UIKit)
+    public override init(frame: CGRect) {
+        super.init(frame: frame)
+        configureView()
+    }
+
+    public convenience init() {
+        self.init(frame: .zero)
+    }
+
+    public required init?(coder: NSCoder) {
+        return nil
+    }
+    #elseif canImport(AppKit)
+    public override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureView()
+    }
+
+    public convenience init() {
+        self.init(frame: .zero)
+    }
+
+    public required init?(coder: NSCoder) {
+        return nil
+    }
+    #endif
+
+    private func configureView() {
+        #if canImport(UIKit)
+        backgroundColor = .black
+        isUserInteractionEnabled = false
+        layer.addSublayer(displayLayer)
+        #elseif canImport(AppKit)
+        wantsLayer = true
+        layer?.backgroundColor = CGColor.black
+        layer?.addSublayer(displayLayer)
+        #endif
+        displayLayer.videoGravity = .resizeAspect
+        displayLayer.preventsDisplaySleepDuringVideoPlayback = true
+        applyLayerGeometry()
+    }
+
+    #if canImport(UIKit)
+    public override func layoutSubviews() {
+        super.layoutSubviews()
+        applyLayerGeometry()
+    }
+    #elseif canImport(AppKit)
+    public override func layout() {
+        super.layout()
+        applyLayerGeometry()
+    }
+    #endif
+
+    /// Start a new decoder/carrier generation and discard every pending sample
+    /// from the previous generation. A healthy renderer is flushed; a failed
+    /// renderer is surfaced instead of being reset and reused.
+    func beginGeneration(
+        _ generation: UInt64,
+        videoFormat: VideoFormat
+    ) throws {
+        guard Self.verifiedVideoFormats.contains(videoFormat) else {
+            throw AetherHybridPresentationError
+                .unsupportedVideoFormat(videoFormat)
+        }
+        try throwIfRendererFailed()
+        flushRenderer(removingDisplayedImage: false)
+        activeGeneration = generation
+        activeVideoFormat = videoFormat
+        pendingSamples.removeAll(keepingCapacity: true)
+        lastAcceptedPresentationTime = nil
+        lastEnqueuedPresentationTime = nil
+    }
+
+    /// Bind exactly once to the carrier item and its actual AVPlayerItem
+    /// timebase. Rebinding to another item or timebase is forbidden.
+    func bindCarrierClock(
+        item: AVPlayerItem,
+        timebase: CMTimebase
+    ) throws {
+        try validateTimebase(timebase)
+        if let boundCarrierItem,
+           let boundCarrierTimebase {
+            guard boundCarrierItem === item,
+                  Self.isSameTimebase(boundCarrierTimebase, timebase) else {
+                throw AetherHybridPresentationError.carrierBindingChanged
+            }
+            try validateCarrierClock(item: item, timebase: timebase)
+            try drainPendingSamples()
+            return
+        }
+        boundCarrierItem = item
+        boundCarrierTimebase = timebase
+        displayLayer.controlTimebase = timebase
+        try validateCarrierClock(item: item, timebase: timebase)
+        try drainPendingSamples()
+    }
+
+    func validateCarrierClock(
+        item: AVPlayerItem,
+        timebase: CMTimebase
+    ) throws {
+        try validateTimebase(timebase)
+        guard let boundCarrierItem,
+              let boundCarrierTimebase,
+              boundCarrierItem === item,
+              Self.isSameTimebase(boundCarrierTimebase, timebase) else {
+            throw AetherHybridPresentationError.carrierBindingChanged
+        }
+        guard let layerTimebase = displayLayer.controlTimebase,
+              Self.isSameTimebase(layerTimebase, timebase) else {
+            throw AetherHybridPresentationError.displayLayerTimebaseChanged
+        }
+        try throwIfRendererFailed()
+        try drainPendingSamples()
+    }
+
+    @discardableResult
+    func enqueue(
+        _ frame: DecodedVideoFrame
+    ) throws -> HybridFrameEnqueueOutcome {
+        guard frame.generation == activeGeneration else {
+            staleGenerationDrops += 1
+            return .staleGeneration
+        }
+        guard frame.presentationTime.isValid,
+              frame.presentationTime.isNumeric else {
+            throw AetherHybridPresentationError.invalidPresentationTime
+        }
+        guard frame.duration.isValid,
+              frame.duration.isNumeric,
+              CMTimeCompare(frame.duration, .zero) > 0 else {
+            throw AetherHybridPresentationError.invalidFrameDuration
+        }
+        guard Self.formatsAreCompatible(
+            expected: activeVideoFormat,
+            actual: frame.videoFormat
+        ) else {
+            throw AetherHybridPresentationError.frameFormatDiverged(
+                expected: activeVideoFormat,
+                actual: frame.videoFormat
+            )
+        }
+        try validateGeometry(frame.geometry)
+        if let sourceRotationDegrees {
+            guard sourceRotationDegrees == frame.geometry.rotationDegrees else {
+                throw AetherHybridPresentationError.invalidGeometry
+            }
+        } else {
+            sourceRotationDegrees = frame.geometry.rotationDegrees
+            applyLayerGeometry()
+        }
+        guard CVPixelBufferGetIOSurface(frame.pixelBuffer) != nil else {
+            throw AetherHybridPresentationError.pixelBufferNotIOSurfaceBacked
+        }
+        if let previous = lastAcceptedPresentationTime,
+           CMTimeCompare(frame.presentationTime, previous) <= 0 {
+            throw AetherHybridPresentationError
+                .nonMonotonicPresentationTime(
+                    previous: previous,
+                    current: frame.presentationTime
+                )
+        }
+        guard pendingSamples.count
+                < Self.maximumPendingSampleBuffers else {
+            throw AetherHybridPresentationError.pendingQueueOverflow(
+                limit: Self.maximumPendingSampleBuffers
+            )
+        }
+        let sampleBuffer = try makeSampleBuffer(frame)
+        pendingSamples.append(PendingSample(
+            sampleBuffer: sampleBuffer,
+            presentationTime: frame.presentationTime
+        ))
+        lastAcceptedPresentationTime = frame.presentationTime
+        try drainPendingSamples()
+        return .accepted
+    }
+
+    func flush(removingDisplayedImage: Bool) {
+        pendingSamples.removeAll(keepingCapacity: true)
+        lastAcceptedPresentationTime = nil
+        lastEnqueuedPresentationTime = nil
+        flushRenderer(removingDisplayedImage: removingDisplayedImage)
+    }
+
+    func invalidate() {
+        flush(removingDisplayedImage: true)
+        displayLayer.controlTimebase = nil
+        boundCarrierItem = nil
+        boundCarrierTimebase = nil
+        sourceRotationDegrees = nil
+        applyLayerGeometry()
+    }
+
+    var diagnostics: Diagnostics {
+        Diagnostics(
+            generation: activeGeneration,
+            pendingSampleBuffers: pendingSamples.count,
+            staleGenerationDrops: staleGenerationDrops,
+            backPressureObservations: backPressureObservations,
+            enqueuedSampleBuffers: enqueuedSampleBuffers,
+            lastEnqueuedTimeSeconds:
+                lastEnqueuedPresentationTime?.seconds,
+            carrierTimebaseBound:
+                boundCarrierItem != nil
+                && boundCarrierTimebase != nil,
+            rendererStatus: rendererStatus
+        )
+    }
+
+    var controlTimebase: CMTimebase? {
+        displayLayer.controlTimebase
+    }
+
+    private var queueTarget: any AVQueuedSampleBufferRendering {
+        if #available(tvOS 17.0, iOS 17.0, macOS 14.0, *) {
+            return displayLayer.sampleBufferRenderer
+        }
+        return displayLayer
+    }
+
+    private var rendererStatus: RendererStatus {
+        switch currentRendererStatus {
+        case .unknown: .unknown
+        case .rendering: .rendering
+        case .failed: .failed
+        @unknown default: .failed
+        }
+    }
+
+    private func throwIfRendererFailed() throws {
+        guard currentRendererStatus != .failed else {
+            let error = currentRendererError as NSError?
+            throw AetherHybridPresentationError.rendererFailed(
+                domain: error?.domain ?? "AVFoundation",
+                code: error?.code ?? -1,
+                reason: error?.localizedDescription
+                    ?? "renderer failed without an NSError"
+            )
+        }
+    }
+
+    private var currentRendererStatus: AVQueuedSampleBufferRenderingStatus {
+        if #available(tvOS 17.0, iOS 17.0, macOS 14.0, *) {
+            return displayLayer.sampleBufferRenderer.status
+        }
+        return displayLayer.status
+    }
+
+    private var currentRendererError: Error? {
+        if #available(tvOS 17.0, iOS 17.0, macOS 14.0, *) {
+            return displayLayer.sampleBufferRenderer.error
+        }
+        return displayLayer.error
+    }
+
+    private func drainPendingSamples() throws {
+        guard boundCarrierItem != nil,
+              boundCarrierTimebase != nil else {
+            return
+        }
+        try throwIfRendererFailed()
+        let target = queueTarget
+        while target.isReadyForMoreMediaData,
+              !pendingSamples.isEmpty {
+            let pending = pendingSamples.removeFirst()
+            target.enqueue(pending.sampleBuffer)
+            enqueuedSampleBuffers += 1
+            lastEnqueuedPresentationTime =
+                pending.presentationTime
+            try throwIfRendererFailed()
+        }
+        if !pendingSamples.isEmpty {
+            backPressureObservations += 1
+        }
+    }
+
+    private func flushRenderer(removingDisplayedImage: Bool) {
+        if #available(tvOS 17.0, iOS 17.0, macOS 14.0, *) {
+            displayLayer.sampleBufferRenderer.flush(
+                removingDisplayedImage: removingDisplayedImage,
+                completionHandler: nil
+            )
+        } else if removingDisplayedImage {
+            displayLayer.flushAndRemoveImage()
+        } else {
+            displayLayer.flush()
+        }
+    }
+
+    private func validateTimebase(_ timebase: CMTimebase) throws {
+        let time = CMTimebaseGetTime(timebase)
+        let rate = CMTimebaseGetRate(timebase)
+        guard time.isValid,
+              time.isNumeric,
+              rate.isFinite,
+              rate >= 0 else {
+            throw AetherHybridPresentationError
+                .carrierTimebaseUnavailable
+        }
+    }
+
+    private static func isSameTimebase(
+        _ lhs: CMTimebase,
+        _ rhs: CMTimebase
+    ) -> Bool {
+        Unmanaged.passUnretained(lhs).toOpaque()
+            == Unmanaged.passUnretained(rhs).toOpaque()
+    }
+
+    private static func formatsAreCompatible(
+        expected: VideoFormat,
+        actual: VideoFormat
+    ) -> Bool {
+        if expected == actual { return true }
+        return (expected == .hdr10 && actual == .hdr10Plus)
+            || (expected == .hdr10Plus && actual == .hdr10)
+    }
+
+    private func validateGeometry(
+        _ geometry: DecodedVideoFrameGeometry
+    ) throws {
+        guard geometry.codedWidth > 0,
+              geometry.codedHeight > 0,
+              geometry.cleanAperture.x.isFinite,
+              geometry.cleanAperture.y.isFinite,
+              geometry.cleanAperture.width.isFinite,
+              geometry.cleanAperture.height.isFinite,
+              geometry.cleanAperture.width > 0,
+              geometry.cleanAperture.height > 0,
+              geometry.cleanAperture.x >= 0,
+              geometry.cleanAperture.y >= 0,
+              geometry.cleanAperture.x
+                + geometry.cleanAperture.width
+                <= Double(geometry.codedWidth),
+              geometry.cleanAperture.y
+                + geometry.cleanAperture.height
+                <= Double(geometry.codedHeight),
+              geometry.pixelAspectRatioNumerator > 0,
+              geometry.pixelAspectRatioDenominator > 0 else {
+            throw AetherHybridPresentationError.invalidGeometry
+        }
+        guard [0, 90, 180, 270].contains(
+            geometry.rotationDegrees
+        ) else {
+            throw AetherHybridPresentationError
+                .unsupportedRotation(geometry.rotationDegrees)
+        }
+    }
+
+    func makeSampleBuffer(
+        _ frame: DecodedVideoFrame
+    ) throws -> CMSampleBuffer {
+        applyFormatDescriptionAttachments(to: frame.pixelBuffer, frame: frame)
+        var formatDescription: CMVideoFormatDescription?
+        let formatStatus = CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: frame.pixelBuffer,
+            formatDescriptionOut: &formatDescription
+        )
+        guard formatStatus == noErr,
+              let formatDescription else {
+            throw AetherHybridPresentationError
+                .formatDescriptionCreationFailed(
+                    status: formatStatus
+                )
+        }
+        var timing = CMSampleTimingInfo(
+            duration: frame.duration,
+            presentationTimeStamp: frame.presentationTime,
+            decodeTimeStamp: .invalid
+        )
+        var sampleBuffer: CMSampleBuffer?
+        let sampleStatus = CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: frame.pixelBuffer,
+            formatDescription: formatDescription,
+            sampleTiming: &timing,
+            sampleBufferOut: &sampleBuffer
+        )
+        guard sampleStatus == noErr,
+              let sampleBuffer else {
+            throw AetherHybridPresentationError
+                .sampleBufferCreationFailed(status: sampleStatus)
+        }
+        if let hdr10PlusT35 = frame.hdr10PlusT35 {
+            try attachHDR10Plus(
+                hdr10PlusT35,
+                to: sampleBuffer
+            )
+        }
+        return sampleBuffer
+    }
+
+    private func applyFormatDescriptionAttachments(
+        to pixelBuffer: CVPixelBuffer,
+        frame: DecodedVideoFrame
+    ) {
+        let geometry = frame.geometry
+        let horizontalOffset = geometry.cleanAperture.x
+            + geometry.cleanAperture.width / 2
+            - Double(geometry.codedWidth) / 2
+        let verticalOffset = geometry.cleanAperture.y
+            + geometry.cleanAperture.height / 2
+            - Double(geometry.codedHeight) / 2
+        let cleanAperture = [
+                kCVImageBufferCleanApertureWidthKey:
+                    geometry.cleanAperture.width,
+                kCVImageBufferCleanApertureHeightKey:
+                    geometry.cleanAperture.height,
+                kCVImageBufferCleanApertureHorizontalOffsetKey:
+                    horizontalOffset,
+                kCVImageBufferCleanApertureVerticalOffsetKey:
+                    verticalOffset,
+            ] as CFDictionary
+        let pixelAspectRatio = [
+                kCVImageBufferPixelAspectRatioHorizontalSpacingKey:
+                    geometry.pixelAspectRatioNumerator,
+                kCVImageBufferPixelAspectRatioVerticalSpacingKey:
+                    geometry.pixelAspectRatioDenominator,
+            ] as CFDictionary
+        CVBufferSetAttachment(
+            pixelBuffer,
+            kCVImageBufferCleanApertureKey,
+            cleanAperture,
+            .shouldPropagate
+        )
+        CVBufferSetAttachment(
+            pixelBuffer,
+            kCVImageBufferPixelAspectRatioKey,
+            pixelAspectRatio,
+            .shouldPropagate
+        )
+        let color = frame.colorMetadata
+        setAttachment(
+            colorPrimaries(color.colorPrimaries),
+            key: kCVImageBufferColorPrimariesKey,
+            on: pixelBuffer
+        )
+        setAttachment(
+            transferFunction(color.transferFunction),
+            key: kCVImageBufferTransferFunctionKey,
+            on: pixelBuffer
+        )
+        setAttachment(
+            yCbCrMatrix(color.yCbCrMatrix),
+            key: kCVImageBufferYCbCrMatrixKey,
+            on: pixelBuffer
+        )
+        setAttachment(
+            color.masteringDisplayColorVolume as CFData?,
+            key: kCVImageBufferMasteringDisplayColorVolumeKey,
+            on: pixelBuffer
+        )
+        setAttachment(
+            color.contentLightLevelInfo as CFData?,
+            key: kCVImageBufferContentLightLevelInfoKey,
+            on: pixelBuffer
+        )
+        setAttachment(
+            color.ambientViewingEnvironment as CFData?,
+            key: kCVImageBufferAmbientViewingEnvironmentKey,
+            on: pixelBuffer
+        )
+    }
+
+    private func setAttachment(
+        _ value: CFTypeRef?,
+        key: CFString,
+        on pixelBuffer: CVPixelBuffer
+    ) {
+        if let value {
+            CVBufferSetAttachment(
+                pixelBuffer,
+                key,
+                value,
+                .shouldPropagate
+            )
+        } else {
+            CVBufferRemoveAttachment(pixelBuffer, key)
+        }
+    }
+
+    private func attachHDR10Plus(
+        _ data: Data,
+        to sampleBuffer: CMSampleBuffer
+    ) throws {
+        guard let attachments =
+                CMSampleBufferGetSampleAttachmentsArray(
+                    sampleBuffer,
+                    createIfNecessary: true
+                ),
+              CFArrayGetCount(attachments) > 0,
+              let rawDictionary =
+                CFArrayGetValueAtIndex(attachments, 0) else {
+            throw AetherHybridPresentationError
+                .sampleAttachmentCreationFailed
+        }
+        let dictionary = unsafeBitCast(
+            rawDictionary,
+            to: CFMutableDictionary.self
+        )
+        let value = data as CFData
+        CFDictionarySetValue(
+            dictionary,
+            Unmanaged.passUnretained(
+                kCMSampleAttachmentKey_HDR10PlusPerFrameData
+            ).toOpaque(),
+            Unmanaged.passUnretained(value).toOpaque()
+        )
+    }
+
+    private func colorPrimaries(
+        _ value: DecodedVideoFrameColorMetadata.ColorPrimaries
+    ) -> CFString? {
+        switch value {
+        case .ituR709:
+            kCVImageBufferColorPrimaries_ITU_R_709_2
+        case .ituR2020:
+            kCVImageBufferColorPrimaries_ITU_R_2020
+        case .p3D65:
+            kCVImageBufferColorPrimaries_P3_D65
+        case .unspecified, .unrecognized:
+            nil
+        }
+    }
+
+    private func transferFunction(
+        _ value: DecodedVideoFrameColorMetadata.TransferFunction
+    ) -> CFString? {
+        switch value {
+        case .ituR709:
+            kCVImageBufferTransferFunction_ITU_R_709_2
+        case .pq:
+            kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
+        case .hlg:
+            kCVImageBufferTransferFunction_ITU_R_2100_HLG
+        case .unspecified, .unrecognized:
+            nil
+        }
+    }
+
+    private func yCbCrMatrix(
+        _ value: DecodedVideoFrameColorMetadata.YCbCrMatrix
+    ) -> CFString? {
+        switch value {
+        case .ituR709:
+            kCVImageBufferYCbCrMatrix_ITU_R_709_2
+        case .ituR2020:
+            kCVImageBufferYCbCrMatrix_ITU_R_2020
+        case .unspecified, .unrecognized:
+            nil
+        }
+    }
+
+    private func applyLayerGeometry() {
+        let rotation = CGFloat(sourceRotationDegrees ?? 0)
+            * .pi / 180
+        let rotated = sourceRotationDegrees == 90
+            || sourceRotationDegrees == 270
+        let layerSize = rotated
+            ? CGSize(width: bounds.height, height: bounds.width)
+            : bounds.size
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        displayLayer.setAffineTransform(.identity)
+        displayLayer.bounds = CGRect(origin: .zero, size: layerSize)
+        displayLayer.position = CGPoint(
+            x: bounds.midX,
+            y: bounds.midY
+        )
+        displayLayer.setAffineTransform(
+            CGAffineTransform(rotationAngle: rotation)
+        )
+        CATransaction.commit()
+    }
+}

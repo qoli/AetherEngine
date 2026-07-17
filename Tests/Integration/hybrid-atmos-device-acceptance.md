@@ -18,7 +18,7 @@ audio pipeline, selected track, playback route, or declared transport budget.
 
 Use a legally obtained, seekable VOD fixture with:
 
-- a video packaging shape that deterministically selects `.hybridCarrierMetal` on tvOS;
+- a video packaging shape that deterministically selects `.hybridCarrier` on tvOS;
 - one original E-AC-3 JOC / Atmos audio rendition that FFmpeg identifies as E-AC-3 profile 30;
 - at least one second selectable audio rendition so the AVKit audio-track switch can be tested;
 - a duration long enough for startup, a forward seek, a backward seek, two track changes, and a
@@ -40,7 +40,7 @@ Record the Apple TV model, tvOS build, Xcode build, Aether commit, host-app comm
 and UTC timestamp. Then perform one uninterrupted run:
 
 1. Start the Hybrid session with the Atmos rendition selected. Confirm AVPlayer reaches playback,
-   Metal presents real video, and audio is audible through an Atmos-capable output route.
+   sample-buffer presentation shows real video, and audio is audible through an Atmos-capable output route.
 2. Seek forward, then backward. Confirm the new generation presents real video and the original
    E-AC-3 JOC rendition remains selected and stream-copied.
 3. Change to the second audio rendition through AVKit, then change back to Atmos. Confirm the

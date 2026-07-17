@@ -41,21 +41,21 @@ struct PublicHybridPlaybackContractTests {
             AetherHybridPlaybackSession.systemFeaturePolicy
                 .availability(for: .pictureInPictureVideo)
                 == .unavailable(
-                    .metalOverlayUnavailableInPictureInPicture
+                    .presentationOverlayUnavailableInPictureInPicture
                 )
         )
         #expect(
             AetherHybridPlaybackSession.systemFeaturePolicy
                 .availability(for: .airPlayVideo)
                 == .unavailable(
-                    .metalOverlayUnavailableOnAirPlayReceiver
+                    .presentationOverlayUnavailableOnAirPlayReceiver
                 )
         )
         #expect(
             AetherHybridPlaybackSession.systemFeaturePolicy
                 .availability(for: .externalDisplayVideo)
                 == .unavailable(
-                    .metalOverlayUnavailableOnExternalDisplay
+                    .presentationOverlayUnavailableOnExternalDisplay
                 )
         )
     }
@@ -83,7 +83,7 @@ struct PublicHybridPlaybackContractTests {
                 AetherHybridPlaybackSession.capabilities
         )
 
-        #expect(result.route == .hybridCarrierMetal)
+        #expect(result.route == .hybridCarrier)
         #expect(result.reason == .hybridHEV1SampleEntry)
     }
 
@@ -150,7 +150,7 @@ struct PublicHybridPlaybackContractTests {
             hlsPackaging: packaging,
             hybridCapabilities: HybridPlaybackCapabilities(
                 hasDirectVideoDecoder: true,
-                hasMetalRenderer: true,
+                hasSampleBufferRenderer: true,
                 supportedVideoFormats: [.sdr]
             )
         )

@@ -132,7 +132,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             ]
         }
 
-        // 3. Pixel buffer attributes: 10-bit biplanar for HDR, 8-bit for SDR; IOSurface-backed for Metal rendering.
+        // 3. Pixel buffer attributes: 10-bit biplanar for HDR, 8-bit for SDR; IOSurface-backed for sample-buffer presentation.
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
         let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
         let use10Bit = bitsPerSample > 8 || isHDRTransfer
@@ -147,7 +147,6 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let pixelBufferAttrs: NSDictionary = [
             kCVPixelBufferPixelFormatTypeKey: pixelFormat,
             kCVPixelBufferIOSurfacePropertiesKey: NSDictionary(),
-            kCVPixelBufferMetalCompatibilityKey: true,
         ]
 
         // 4. Output callback: C function dispatches into handleDecodedFrame via refCon.

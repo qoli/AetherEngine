@@ -133,7 +133,7 @@ public enum AetherHLSHDR10PlusPreflightEvidence:
 /// Public, privacy-safe result of HLS inspection.
 ///
 /// The raw selected playlist, init-segment and media-segment URLs remain engine-private because they may
-/// contain signed query parameters. For an admitted `.hybridCarrierMetal` route, `resourceIdentity` is a
+/// contain signed query parameters. For an admitted `.hybridCarrier` route, `resourceIdentity` is a
 /// SHA-256 binding over those resolved video resources, every separate alternate-audio playlist/resource,
 /// the exact playlist bytes, the preflight-inspected video init/first-segment evidence and the request
 /// headers. Native and unsupported routes do not create the hybrid graph. A host may persist the digest,

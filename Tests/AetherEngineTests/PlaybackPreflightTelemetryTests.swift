@@ -12,7 +12,7 @@ struct PlaybackPreflightTelemetryTests {
             expectedReason: PlaybackRouteReason
         )] = [
             (.h264, .nativeAVPlayer, .nativeContainerRepackaging),
-            (.vp9, .hybridCarrierMetal, .hybridNonAVPlayerCodec),
+            (.vp9, .hybridCarrier, .hybridNonAVPlayerCodec),
             (.unknown, .unsupported, .unsupportedVideoCodec),
         ]
 
@@ -313,7 +313,7 @@ struct PlaybackPreflightTelemetryTests {
     private var capabilities: HybridPlaybackCapabilities {
         HybridPlaybackCapabilities(
             hasDirectVideoDecoder: true,
-            hasMetalRenderer: true,
+            hasSampleBufferRenderer: true,
             supportedVideoFormats: [.sdr],
             supportedSourceKinds: [
                 .hls,

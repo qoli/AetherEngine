@@ -1,146 +1,102 @@
-# Hybrid geometry, Metal and display-criteria tvOS device acceptance
+# Hybrid sample-buffer clock and HDR tvOS device acceptance
 
 ## Status
 
-Pending. Source-level decoded geometry, aspect-fit/fill, quarter-turn rotation, real-video frame-rate
-propagation, the AVPlayerViewController writer contract, and an immutable decoded-frame color snapshot
-exist, but simulator builds and pure contract tests do not prove physical display output.
-`AetherMetalPlayerView.verifiedVideoFormats` must remain `[.sdr]` until the relevant color rows below have
-physical evidence.
+Pending physical Apple TV evidence. Source tests now prove the exact carrier-timebase binding,
+generation flush, bounded no-drop pending queue, monotonic timing, format-description propagation,
+HDR10+ per-frame attachment, and absence of `DisplayImmediately`. These tests do not prove panel output.
 
-## Purpose
+`AetherHybridPresentationView.verifiedVideoFormats` must remain `[.sdr]` until each additional format row
+below has its own fixture and passing physical-device record. There is no Metal or second Hybrid renderer.
 
-Prove that the fixed 640×360 SDR black carrier never becomes the source of truth for real-video
-geometry, refresh rate or dynamic range. AVPlayerViewController remains the native control/audio host;
-AetherEngine remains the sole real-video renderer and display-criteria writer.
+## Architecture under test
 
-On tvOS, the host must `try configureCarrierPlayerViewController(_:realVideoGravity:)` while the
-session is idle, attach `metalPlayerView` beneath `contentOverlayView`, then call `prepare()`. The
-contract fixes carrier `videoGravity` to `.resizeAspect`, sets
-`appliesPreferredDisplayCriteriaAutomatically = false`, binds the session AVPlayer, and leaves real-video
-aspect-fit/fill to `AetherMetalPlayerView`. Missing or mutated configuration is terminal
-`carrierPresentationNotConfigured` / `carrierPresentationContractChanged`; it does not start AVPlayer,
-guess display criteria or switch route. Configuration attempted after idle throws
-`carrierPresentationConfigurationTooLate` without mutating the controller.
+- `AVPlayerViewController` owns native controls and presents the fixed black H.264 carrier.
+- The carrier contains the selected real audio and is the only audio owner.
+- One Aether-owned `AVSampleBufferDisplayLayer`, contained by `AetherHybridPresentationView`, presents all
+  Hybrid real video.
+- The display layer's `controlTimebase` is the exact `AVPlayerItem.timebase` of the carrier. A missing,
+  replaced, invalid or drifted binding is terminal.
+- Decoded frames become `CMSampleBuffer` values with source PTS/duration, generation, clean aperture,
+  pixel aspect ratio, rotation, bit depth, color signaling, static HDR metadata, and per-frame metadata.
+- Seek, track switch, stall recovery, stop and reopen flush obsolete samples and reject old generations.
+- HDR10+ discovered after startup remains a per-frame attachment on the same display layer. It never
+  changes route, player, renderer, track or generation.
+- Hybrid does not use `AVSampleBufferRenderSynchronizer`, `AVSampleBufferAudioRenderer`, `MTKView`,
+  `DisplayImmediately`, or another presentation clock.
 
-## tvOS public-API boundary
-
-The current Apple TV SDK makes the renderer split an architecture decision, not a shader-only task:
-
-- tvOS 26 exposes `CALayer.preferredDynamicRange` / `contentsHeadroom`; together with
-  `CAMetalLayer.colorspace` and HDR-capable Metal pixel formats these can describe direct PQ/HLG output.
-  HDR10 and HLG may therefore proceed to a physical-device candidate after the engine has an exact
-  10-bit pixel-buffer/color-metadata contract.
-- `CAMetalLayer.wantsExtendedDynamicRangeContent`, `CAMetalLayer.EDRMetadata` and `CAEDRMetadata` are
-  unavailable on tvOS in the AppleTVOS 26.4 SDK. The layer therefore has no public tvOS per-frame
-  HDR10+ T.35 or Dolby Vision RPU metadata input.
-- [Apple's Dolby Vision playback guidance](https://developer.apple.com/news/?id=rwbholxw) names
-  `AVPlayer`/`AVPlayerLayer` and `AVSampleBufferDisplayLayer`; the lower-level path requires
-  10-bit-or-higher sample buffers carrying Dolby Vision per-frame metadata propagated by
-  `VTDecompressionSession`.
-- [`kCMSampleAttachmentKey_HDR10PlusPerFrameData`](https://developer.apple.com/documentation/coremedia/kcmsampleattachmentkey_hdr10plusperframedata)
-  is a `CMSampleBuffer` attachment, not a Metal drawable attachment. Rendering only the HDR10 base
-  layer in Metal would silently drop HDR10+ semantics.
-
-Decision Record #19 was approved by the administrator on 2026-07-17: the Hybrid route uses a split,
-engine-owned renderer. SDR, HDR10 and HLG use `MTKView`; HDR10+ and Dolby Vision use an Aether-owned
-`AVSampleBufferDisplayLayer`. Both surfaces stay inside the same AVKit overlay, retain the black carrier
-and use the carrier AVPlayer as the sole master clock. The surface is selected from exact preflight
-evidence before session/provider construction and remains immutable for the whole session. Runtime
-metadata discovery must not switch surface, route, track or player.
-
-The current branch does not yet implement or admit that split surface. `.hdr10Plus` and `.dolbyVision`
-therefore remain outside `AetherMetalPlayerView.verifiedVideoFormats`. The existing decoder-side late
-upgrade from `.hdr10` to `.hdr10Plus` is insufficient for production admission: preflight must inspect
-compressed samples and prove HDR10+ T.35 before choosing the sample-buffer surface. If it cannot prove the
-format before construction, the source must remain typed unsupported rather than start as HDR10 Metal and
-switch at runtime. This decision does not affect the fixed 2 Mbps black-carrier policy.
-
-`DecodedVideoFrame` now snapshots pixel encoding, primaries, transfer, matrix and any present MDCV, CLLI
-or ambient-viewing payload from the decoded `CVPixelBuffer`. HDR10/HDR10+ require a 10-bit bi-planar
-buffer with BT.2020 + PQ + BT.2020 matrix; HLG requires 10-bit BT.2020 + HLG + BT.2020 matrix. The static
-payloads are optional, but a present MDCV/CLLI/ambient payload must be exactly 24/4/8 bytes. Missing or
-contradictory required color signaling, an 8-bit HDR buffer, the wrong attachment type or malformed payload
-is an explicit construction/decoder failure. No value is inferred from `VideoFormat`.
-
-Primary references:
-
-- [Apple: Using color spaces to display HDR content](https://developer.apple.com/documentation/metal/using-color-spaces-to-display-hdr-content)
-- [Apple: Incorporating HDR video with Dolby Vision into your apps](https://developer.apple.com/av-foundation/Incorporating-HDR-video-with-Dolby-Vision-into-your-apps.pdf)
-- [Apple: HDR10+ per-frame sample attachment](https://developer.apple.com/documentation/coremedia/cmsamplebuffer/sampleattachments-swift.struct/hdr10plusperframedata)
+On tvOS, configure the carrier controller while the session is idle, attach `presentationView` beneath
+`contentOverlayView`, then call `prepare()`. The carrier stays `.resizeAspect`, automatic AVKit display
+criteria are disabled, and real-video fit/fill remains an Aether policy. Missing or mutated host setup is
+a typed terminal failure rather than a route switch.
 
 ## Fixture contract
 
 Record provenance, redistribution status, byte size and SHA-256 for every fixture. Keep
-non-redistributable media under `Fixtures/user/`; never commit URLs, signed queries, cookies, headers,
-titles or track names.
+non-redistributable media under `Fixtures/user/`; never record URLs, headers, cookies, titles or track
+names in telemetry evidence.
 
-The SDR geometry set must include:
+Required geometry/timing rows:
 
-- a coded 1920×1088 frame with a 1920×1080 clean aperture;
-- an anamorphic source with a non-square sample aspect ratio;
-- 0°, 90°, 180° and 270° display-matrix rotation;
-- a standard source rate such as 23.976 or 29.97 fps;
-- a source whose rate does not snap to an advertised tvOS Match Frame Rate value.
+- 1920x1088 coded frame with 1920x1080 clean aperture;
+- non-square pixel aspect ratio;
+- 0, 90, 180 and 270 degree display rotation;
+- 23.976 or 29.97 fps plus one unusual source rate;
+- forward seek, backward seek, pause/resume, rates 0.5, 1.0 and 2.0, stall, stop/reopen.
 
-Before expanding `verifiedVideoFormats`, add separate, bitstream-verified fixtures for HDR10, HDR10+
-(including per-frame ST 2094-40 payload), HLG and every promised Dolby Vision profile. Container labels
-alone do not establish color format. Record mastering/display metadata, codec/sample entry, bit depth,
-primaries, transfer, matrix, frame rate and Dolby Vision profile where applicable. The HDR10+ fixture must
-also prove the preflight detector selects the sample-buffer surface before provider creation; a
-decoder-time `.hdr10` to `.hdr10Plus` upgrade is a negative case, not valid admission evidence.
+Required color rows before expanding `verifiedVideoFormats`:
+
+- SDR BT.709;
+- 10-bit HDR10 with BT.2020/PQ/matrix and known MDCV/CLLI;
+- 10-bit HLG with BT.2020/HLG/matrix;
+- HDR10+ with verified ST 2094-40 T.35, including a fixture whose first T.35 payload arrives after startup;
+- each promised Dolby Vision profile as a separate row with public Apple API support, profile-specific
+  fixture, propagated per-frame metadata and panel-mode evidence.
+
+Container labels are not evidence. Missing, contradictory, malformed or unpropagated metadata is a
+failure. No row may pass through tone mapping, HDR10 relabeling, base-layer-only display or an unverified
+Dolby Vision profile.
 
 ## Required physical-device run
 
-Record Apple TV model, tvOS build, display model/firmware, Xcode build, Aether commit, host-app commit,
-fixture SHA-256 and UTC timestamp. Run with Match Dynamic Range and Match Frame Rate enabled, then repeat
-the explicitly named control rows with them disabled.
+Record Apple TV model, tvOS build, display model/firmware, Xcode build, Aether commit, host commit, fixture
+SHA-256, UTC timestamp, and Match Dynamic Range / Match Frame Rate settings.
 
-1. Configure AVPlayerViewController through the public Aether method, attach the engine-owned Metal view
-   to `contentOverlayView`, and start the SDR geometry fixture. Confirm native AVKit controls and audio
-   operate while only the Metal surface shows real video.
-2. Exercise aspect-fit and aspect-fill. Confirm clean aperture, anamorphic SAR, letterbox/pillarbox and
-   center crop use real-video metadata rather than the carrier canvas.
-3. Play all four rotation rows, seek forward/backward and stop/reopen. Confirm orientation and geometry
-   remain stable across generations and no stale drawable survives teardown.
-4. For a standard real-video rate, confirm the display switches to the requested rate and structured
-   diagnostics report that source rate. For the unusual/unknown-rate row, confirm Aether does not invent
-   24 fps or issue a criteria write from the carrier.
-5. Confirm the host keeps `appliesPreferredDisplayCriteriaAutomatically = false` and the Metal surface
-   beneath `contentOverlayView` for the whole session. Deliberately mutate player binding, carrier gravity,
-   automatic-criteria ownership and overlay attachment in diagnostic builds; each mutation must produce
-   the matching typed terminal failure without playback startup or route change. Also attempt configuration
-   after `prepare()` begins and confirm `carrierPresentationConfigurationTooLate` without controller mutation.
-6. Stop and dismiss. Confirm Aether resets `preferredDisplayCriteria`, releases the Metal drawable/queue,
-   removes the carrier item and leaves no previous generation visible on reopen.
-7. For each future HDR/HLG/Dolby Vision row, confirm the panel enters the intended mode and the selected
-   engine surface matches Decision Record #19: Metal for HDR10/HLG, sample-buffer display layer for
-   HDR10+/Dolby Vision. Confirm transfer, primaries and applicable per-frame metadata survive, and compare
-   the image with a documented reference. Any silent SDR tone-map, metadata drop, runtime surface switch or
-   different panel mode is a failure.
+1. Start the SDR fixture. Confirm AVKit controls and selected real audio work while
+   `AetherHybridPresentationView` alone shows real video.
+2. Capture a clock-binding diagnostic showing the layer and current carrier item retain the same timebase
+   identity through pause, resume and rates 0.5, 1.0 and 2.0. Video must stop while paused and follow the
+   carrier at every rate.
+3. Seek forward and backward. Confirm the displayed image is cleared or replaced according to the seek
+   contract, no pre-seek generation appears after landing, and telemetry records one new generation.
+4. Induce a recoverable carrier stall. Confirm obsolete samples are flushed/rebuilt against the same
+   carrier clock without changing route, player, renderer or audio track.
+5. Exercise clean aperture, anamorphic ratio, aspect-fit/fill and all rotation rows. The black carrier's
+   640x360 geometry must never determine real-video layout.
+6. Deliberately replace the carrier item, invalidate its timebase, detach the presentation view, change
+   carrier gravity and enable automatic display criteria in diagnostic builds. Each mutation must produce
+   the documented typed terminal error without another backend starting.
+7. Stop and reopen. Confirm the display layer removes the old image, releases its timebase, the carrier item
+   is removed and no previous generation is visible.
+8. Run each admitted HDR row. Confirm the intended panel mode, 10-bit path, primaries/transfer/matrix,
+   static metadata and applicable per-frame metadata. For late HDR10+, confirm the same layer remains bound
+   and the first T.35 attachment does not change route or generation.
+9. For every Dolby Vision row, record the exact profile and compare against a documented reference. An
+   unlisted profile must resolve to typed unsupported before provider/session creation.
 
 ## Required assertions
 
-- Carrier geometry remains 640×360, 16:9, SDR BT.709 and never changes with the source.
-- Real-video clean aperture, SAR and rotation are present in `DecodedVideoFrame.geometry` and agree with
-  the displayed viewport.
-- Decoder output is either exact coded size plus clean aperture or exact already-cropped size. Any other
-  dimension relationship produces `decodedFrameDimensionsDiverged`; no proportional crop guess occurs.
-- Only canonical 0/90/180/270 rotation is accepted. A non-quarter display matrix fails explicitly.
-- AVPlayerViewController owns native controls/audio, uses carrier `.resizeAspect`, and cannot write display
-  criteria automatically.
-- Aether applies criteria only from a snapped real-video frame rate and restores the previous/default mode
-  at teardown. Unknown/unusual rate does not become 24 fps.
-- PiP video, AirPlay video and external-display video remain unavailable on the Hybrid route.
-- No failure changes source, video format, renderer, player, audio track or playback route.
-- HDR10+ preflight identifies T.35 before provider/session construction; late decoder discovery is rejected
-  and never changes an already selected Metal surface into a sample-buffer surface.
-- HDR10, HDR10+, HLG or Dolby Vision cannot enter `verifiedVideoFormats` from simulator, screenshot or
-  shader-unit evidence alone.
+- Carrier AVPlayer is the only master clock and only audio owner.
+- `displayLayer.controlTimebase` is identity-equal to the current carrier `AVPlayerItem.timebase`.
+- PTS and duration remain source-derived and monotonic; `DisplayImmediately` is absent.
+- Queue pressure is bounded and terminal; it never drops an accepted frame to conceal overload.
+- Old generations cannot enqueue after seek/track switch/stop.
+- HDR10+ T.35 is stored in the sample attachment dictionary under
+  `kCMSampleAttachmentKey_HDR10PlusPerFrameData`.
+- PiP video, AirPlay video and external-display video remain unavailable on Hybrid.
+- No failure starts KSPlayer, FFmpegKit, legacy Transmux, MTKView, another AVPlayer or another renderer.
 
 ## Evidence record
-
-Store one sanitized Markdown or JSON record per device/display combination:
 
 ```text
 status: pass | fail
@@ -157,23 +113,21 @@ fixtureFormat: sdr | hdr10 | hdr10Plus | hlg | dolbyVision
 fixtureDVProfile:
 matchDynamicRangeEnabled: true | false
 matchFrameRateEnabled: true | false
-reportedRealVideoFrameRate:
+carrierTimebaseIdentityStable: pass | fail
+pause: pass | fail
+rateHalf: pass | fail
+rateNormal: pass | fail
+rateDouble: pass | fail
+forwardSeekFlush: pass | fail
+backwardSeekFlush: pass | fail
+stallFlush: pass | fail
+trackSwitchFlush: pass | fail
+lateHDR10PlusSameLayer: pass | fail | notApplicable
 observedDisplayMode:
-aspectFit: pass | fail
-aspectFill: pass | fail
-cleanAperture: pass | fail
-pixelAspectRatio: pass | fail
-rotation0: pass | fail
-rotation90: pass | fail
-rotation180: pass | fail
-rotation270: pass | fail
-forwardSeek: pass | fail
-backwardSeek: pass | fail
 hostContractNegativeCases: pass | fail
-displayCriteriaReset: pass | fail
 stopAndReopen: pass | fail
 unexpectedToneMapCount: 0
-unexpectedCriteriaWriterCount: 0
+unexpectedRendererSwitchCount: 0
 unexpectedRouteSwitchCount: 0
 notes:
 ```

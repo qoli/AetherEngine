@@ -425,7 +425,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 kCVPixelBufferPixelFormatTypeKey: cvPixelFormat,
                 kCVPixelBufferWidthKey: width,
                 kCVPixelBufferHeightKey: height,
-                kCVPixelBufferMetalCompatibilityKey: true,
                 kCVPixelBufferIOSurfacePropertiesKey: NSDictionary(),
             ]
             CVPixelBufferPoolCreate(kCFAllocatorDefault, poolAttrs, pbAttrs, &pixelBufferPool)

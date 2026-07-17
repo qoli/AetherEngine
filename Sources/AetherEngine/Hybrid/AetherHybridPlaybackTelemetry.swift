@@ -38,7 +38,7 @@ public enum AetherHybridPlaybackTelemetryFailure:
     )
     case providerFailed
     case carrierFailed
-    case rendererFailed
+    case presentationFailed
     case decoderFailed
     case readinessFailed
     case readinessTimedOut
@@ -100,8 +100,8 @@ public enum AetherHybridPlaybackTelemetryFailure:
             .providerFailed
         case .carrierFailed:
             .carrierFailed
-        case .rendererFailed:
-            .rendererFailed
+        case .presentationFailed:
+            .presentationFailed
         case .decoderFailed:
             .decoderFailed
         case .readinessFailed:
@@ -314,30 +314,30 @@ public struct AetherHybridTimelineTelemetry:
     }
 }
 
-/// Periodic sample of the only master clock against the last real frame that
-/// reached the engine-owned renderer. `driftMilliseconds` is
-/// `(framePresentationTime - playerTime) * 1000`; a negative value means the
-/// presented real-video frame is behind the carrier master clock.
-public struct AetherHybridAVDriftTelemetry:
+/// Periodic sample of the only master clock against the latest real-video
+/// sample accepted by `AVSampleBufferDisplayLayer`. This reports enqueue lead,
+/// not display latency or presented-frame A/V drift.
+public struct AetherHybridSampleBufferQueueTelemetry:
     Sendable,
     Equatable
 {
     public let playerTimeSeconds: Double
-    public let framePresentationTimeSeconds: Double?
-    public let driftMilliseconds: Double?
-    public let rendererQueueDepth: Int
+    public let lastEnqueuedTimeSeconds: Double?
+    public let enqueueLeadMilliseconds: Double?
+    public let pendingSampleBuffers: Int
 
     init(
         playerTimeSeconds: Double,
-        framePresentationTimeSeconds: Double?,
-        driftMilliseconds: Double?,
-        rendererQueueDepth: Int
+        lastEnqueuedTimeSeconds: Double?,
+        enqueueLeadMilliseconds: Double?,
+        pendingSampleBuffers: Int
     ) {
         self.playerTimeSeconds = playerTimeSeconds
-        self.framePresentationTimeSeconds =
-            framePresentationTimeSeconds
-        self.driftMilliseconds = driftMilliseconds
-        self.rendererQueueDepth = rendererQueueDepth
+        self.lastEnqueuedTimeSeconds =
+            lastEnqueuedTimeSeconds
+        self.enqueueLeadMilliseconds =
+            enqueueLeadMilliseconds
+        self.pendingSampleBuffers = pendingSampleBuffers
     }
 }
 
@@ -389,7 +389,9 @@ public enum AetherHybridPlaybackTelemetryPayload:
     case playbackStarted(AetherHybridTimelineTelemetry)
     case seekRequested(AetherHybridTimelineTelemetry)
     case seekVideoReady(AetherHybridTimelineTelemetry)
-    case avDriftSample(AetherHybridAVDriftTelemetry)
+    case sampleBufferQueueSample(
+        AetherHybridSampleBufferQueueTelemetry
+    )
     case bufferStateChanged(AetherHybridBufferTelemetry)
     case sessionEnded(AetherHybridSessionEndReason)
     case sessionFailed(AetherHybridPlaybackTelemetryFailure)
@@ -413,7 +415,7 @@ public enum AetherHybridPlaybackTelemetryEventKind:
     case playbackStarted
     case seekRequested
     case seekVideoReady
-    case avDriftSample
+    case sampleBufferQueueSample
     case bufferStateChanged
     case sessionEnded
     case sessionFailed
@@ -449,7 +451,7 @@ public struct AetherHybridPlaybackTelemetrySnapshot:
     public let activeAudioAnalysisRequestCount: Int
     public let carrierBandwidth:
         AetherHybridCarrierBandwidthTelemetry
-    public let renderer: AetherMetalPlayerView.Diagnostics
+    public let renderer: AetherHybridPresentationView.Diagnostics
     public let systemFeaturePolicy:
         HybridPlaybackSystemFeaturePolicy
 
@@ -472,7 +474,7 @@ public struct AetherHybridPlaybackTelemetrySnapshot:
         activeAudioAnalysisRequestCount: Int,
         carrierBandwidth:
             AetherHybridCarrierBandwidthTelemetry,
-        renderer: AetherMetalPlayerView.Diagnostics,
+        renderer: AetherHybridPresentationView.Diagnostics,
         systemFeaturePolicy:
             HybridPlaybackSystemFeaturePolicy
     ) {

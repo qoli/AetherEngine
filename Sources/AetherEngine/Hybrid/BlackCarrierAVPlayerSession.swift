@@ -63,7 +63,7 @@ enum BlackCarrierTransportState: Sendable, Equatable {
 ///
 /// This type deliberately does not play, seek, render real video, or own hybrid first-frame
 /// readiness policy. It only proves the carrier transport reached `readyToPlay`. The eventual
-/// HybridPlaybackSession composes it with the decoder, Metal renderer, AVPlayer clock adapter,
+/// HybridPlaybackSession composes it with the decoder, sample-buffer presentation, and AVPlayer clock,
 /// and generation gates. Call `stop()` before releasing the session.
 @MainActor
 final class BlackCarrierAVPlayerSession {

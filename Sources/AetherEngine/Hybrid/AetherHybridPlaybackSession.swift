@@ -2,7 +2,6 @@ import AVFoundation
 import Combine
 import CoreMedia
 import Foundation
-import Metal
 
 #if os(tvOS)
 import AVKit
@@ -23,7 +22,7 @@ enum HybridCarrierPresentationContract {
         playerMatchesSession: Bool,
         carrierUsesAspectFit: Bool,
         automaticallyAppliesDisplayCriteria: Bool,
-        metalOverlayAttached: Bool
+        presentationOverlayAttached: Bool
     ) -> HybridPlaybackSessionError? {
         guard wasConfigured else {
             return .carrierPresentationNotConfigured
@@ -32,7 +31,7 @@ enum HybridCarrierPresentationContract {
               playerMatchesSession,
               carrierUsesAspectFit,
               !automaticallyAppliesDisplayCriteria,
-              metalOverlayAttached else {
+              presentationOverlayAttached else {
             return .carrierPresentationContractChanged
         }
         return nil
@@ -41,7 +40,7 @@ enum HybridCarrierPresentationContract {
 
 /// System video-output features whose presentation surface is outside the inline AVKit hierarchy.
 ///
-/// The first production hybrid contract does not move the engine-owned Metal surface into any of these
+/// The first production hybrid contract does not move the engine-owned sample-buffer surface into any of these
 /// destinations. A host must use this policy to disable the corresponding controls; it must not infer
 /// support from the carrier AVPlayer alone.
 public enum HybridPlaybackSystemFeature: String, Sendable, Equatable, CaseIterable {
@@ -51,9 +50,9 @@ public enum HybridPlaybackSystemFeature: String, Sendable, Equatable, CaseIterab
 }
 
 public enum HybridPlaybackSystemFeatureRestriction: String, Sendable, Equatable {
-    case metalOverlayUnavailableInPictureInPicture
-    case metalOverlayUnavailableOnAirPlayReceiver
-    case metalOverlayUnavailableOnExternalDisplay
+    case presentationOverlayUnavailableInPictureInPicture
+    case presentationOverlayUnavailableOnAirPlayReceiver
+    case presentationOverlayUnavailableOnExternalDisplay
 }
 
 public enum HybridPlaybackSystemFeatureAvailability: Sendable, Equatable {
@@ -93,13 +92,13 @@ public struct HybridPlaybackSystemFeaturePolicy: Sendable, Equatable {
 
     public static let firstRelease = HybridPlaybackSystemFeaturePolicy(
         pictureInPictureVideo: .unavailable(
-            .metalOverlayUnavailableInPictureInPicture
+            .presentationOverlayUnavailableInPictureInPicture
         ),
         airPlayVideo: .unavailable(
-            .metalOverlayUnavailableOnAirPlayReceiver
+            .presentationOverlayUnavailableOnAirPlayReceiver
         ),
         externalDisplayVideo: .unavailable(
-            .metalOverlayUnavailableOnExternalDisplay
+            .presentationOverlayUnavailableOnExternalDisplay
         )
     )
 }
@@ -134,7 +133,7 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
     public let activeAudioAnalysisRequestCount: Int
     public let carrierBandwidth:
         AetherHybridCarrierBandwidthTelemetry
-    public let renderer: AetherMetalPlayerView.Diagnostics
+    public let renderer: AetherHybridPresentationView.Diagnostics
     public let systemFeaturePolicy: HybridPlaybackSystemFeaturePolicy
 
     init(
@@ -156,7 +155,7 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
         activeAudioAnalysisRequestCount: Int,
         carrierBandwidth:
             AetherHybridCarrierBandwidthTelemetry,
-        renderer: AetherMetalPlayerView.Diagnostics,
+        renderer: AetherHybridPresentationView.Diagnostics,
         systemFeaturePolicy: HybridPlaybackSystemFeaturePolicy
     ) {
         self.preflightResult = preflightResult
@@ -182,9 +181,9 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
     }
 }
 
-/// Public host lifecycle for AetherEngine's `.hybridCarrierMetal` route.
+/// Public host lifecycle for AetherEngine's `.hybridCarrier` route.
 ///
-/// The host receives exactly one AVPlayer for AVPlayerViewController and one engine-owned Metal view for
+/// The host receives exactly one AVPlayer for AVPlayerViewController and one engine-owned presentation view for
 /// `contentOverlayView`. It never receives the provider, demuxer, decoder, frame queue or source-byte store.
 /// Call `stop()` when the playback page is dismissed.
 @MainActor
@@ -197,8 +196,8 @@ public final class AetherHybridPlaybackSession: ObservableObject {
     public nonisolated static var capabilities: HybridPlaybackCapabilities {
         HybridPlaybackCapabilities(
             hasDirectVideoDecoder: true,
-            hasMetalRenderer: MTLCreateSystemDefaultDevice() != nil,
-            supportedVideoFormats: AetherMetalPlayerView
+            hasSampleBufferRenderer: true,
+            supportedVideoFormats: AetherHybridPresentationView
                 .verifiedVideoFormats,
             supportedSourceKinds: [
                 .hls,
@@ -213,7 +212,7 @@ public final class AetherHybridPlaybackSession: ObservableObject {
 
     public let preflightResult: PlaybackPreflightResult
     public let avPlayer: AVPlayer
-    public let metalPlayerView: AetherMetalPlayerView
+    public let presentationView: AetherHybridPresentationView
     public let timeline: BlackCarrierTimeline
     public let telemetrySessionID: UUID
 
@@ -233,14 +232,14 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         core: HybridPlaybackSession,
         preflightResult: PlaybackPreflightResult,
         timeline: BlackCarrierTimeline,
-        metalPlayerView: AetherMetalPlayerView
+        presentationView: AetherHybridPresentationView
     ) {
         let telemetryHub =
             AetherHybridPlaybackTelemetryHub()
         self.core = core
         self.preflightResult = preflightResult
         self.timeline = timeline
-        self.metalPlayerView = metalPlayerView
+        self.presentationView = presentationView
         self.telemetryHub = telemetryHub
         telemetrySessionID = telemetryHub.sessionID
         avPlayer = core.avPlayer
@@ -277,7 +276,7 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         initialGeneration: UInt64 = 0,
         selectTitleID: Int? = nil
     ) async throws -> AetherHybridPlaybackSession {
-        guard preflightResult.route == .hybridCarrierMetal else {
+        guard preflightResult.route == .hybridCarrier else {
             throw HybridPlaybackSessionError.preflightRequiresHybrid(
                 route: preflightResult.route,
                 reason: preflightResult.reason
@@ -323,8 +322,8 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                     .independentReaderUnavailable {
             throw HybridPlaybackSessionError
                 .sourceIndependentReaderUnavailable
-        } catch let error as AetherMetalRendererError {
-            throw HybridPlaybackSessionError.rendererFailed(error)
+        } catch let error as AetherHybridPresentationError {
+            throw HybridPlaybackSessionError.presentationFailed(error)
         } catch {
             throw HybridPlaybackSessionError.providerFailed(
                 reason: String(describing: error)
@@ -340,7 +339,7 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                     decoded: decoded
                 )
         }
-        guard let metalPlayerView = core.metalPlayerView else {
+        guard let presentationView = core.presentationView else {
             core.stop()
             throw HybridPlaybackSessionError.renderSurfaceMissing
         }
@@ -348,7 +347,7 @@ public final class AetherHybridPlaybackSession: ObservableObject {
             core: core,
             preflightResult: preflightResult,
             timeline: timeline,
-            metalPlayerView: metalPlayerView
+            presentationView: presentationView
         )
     }
 
@@ -379,7 +378,7 @@ public final class AetherHybridPlaybackSession: ObservableObject {
             HLSVODOriginResourceLoader.Fetch?
     ) async throws -> AetherHybridPlaybackSession {
         guard preflight.result.route
-                == .hybridCarrierMetal else {
+                == .hybridCarrier else {
             throw HybridPlaybackSessionError
                 .preflightRequiresHybrid(
                     route: preflight.result.route,
@@ -428,9 +427,9 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                 )
         } catch let error as HybridPlaybackSessionError {
             throw error
-        } catch let error as AetherMetalRendererError {
+        } catch let error as AetherHybridPresentationError {
             throw HybridPlaybackSessionError
-                .rendererFailed(error)
+                .presentationFailed(error)
         } catch {
             throw HybridPlaybackSessionError
                 .providerFailed(
@@ -449,7 +448,7 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                     decoded: decoded
                 )
         }
-        guard let metalPlayerView = core.metalPlayerView else {
+        guard let presentationView = core.presentationView else {
             core.stop()
             throw HybridPlaybackSessionError
                 .renderSurfaceMissing
@@ -458,7 +457,7 @@ public final class AetherHybridPlaybackSession: ObservableObject {
             core: core,
             preflightResult: preflight.result,
             timeline: timeline,
-            metalPlayerView: metalPlayerView
+            presentationView: presentationView
         )
     }
 
@@ -470,9 +469,9 @@ public final class AetherHybridPlaybackSession: ObservableObject {
     /// Applies the non-negotiable tvOS carrier-host contract before presentation.
     ///
     /// AVKit remains the controller and audio/system-integration owner. Its fixed black carrier stays
-    /// aspect-fit and cannot write display criteria from the SDR carrier; Aether's Metal view owns the real
+    /// aspect-fit and cannot write display criteria from the SDR carrier; Aether's presentation view owns the real
     /// video's fit/fill policy while `HybridPlaybackSession` writes criteria from real-video metadata.
-    /// The host must attach `metalPlayerView` beneath `contentOverlayView` before calling `prepare`.
+    /// The host must attach `presentationView` beneath `contentOverlayView` before calling `prepare`.
     public func configureCarrierPlayerViewController(
         _ playerViewController: AVPlayerViewController,
         realVideoGravity: AetherHybridVideoGravity = .resizeAspect
@@ -494,7 +493,7 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         playerViewController.videoGravity = .resizeAspect
         playerViewController
             .appliesPreferredDisplayCriteriaAutomatically = false
-        metalPlayerView.videoGravity = realVideoGravity
+        presentationView.videoGravity = realVideoGravity
         configuredCarrierPlayerViewController =
             playerViewController
         didConfigureCarrierPlayerViewController = true
@@ -546,7 +545,7 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                 core.activeAudioAnalysisRequestCount,
             carrierBandwidth:
                 core.carrierBandwidthTelemetry,
-            renderer: metalPlayerView.diagnostics,
+            renderer: presentationView.diagnostics,
             systemFeaturePolicy: Self.systemFeaturePolicy
         )
     }
@@ -599,13 +598,13 @@ public final class AetherHybridPlaybackSession: ObservableObject {
     private func validateCarrierPresentationContract() throws {
         let playerViewController =
             configuredCarrierPlayerViewController
-        let metalOverlayAttached: Bool
+        let presentationOverlayAttached: Bool
         if let overlay =
                 playerViewController?.contentOverlayView {
-            metalOverlayAttached =
-                metalPlayerView.isDescendant(of: overlay)
+            presentationOverlayAttached =
+                presentationView.isDescendant(of: overlay)
         } else {
-            metalOverlayAttached = false
+            presentationOverlayAttached = false
         }
         if let error = HybridCarrierPresentationContract.failure(
                 wasConfigured:
@@ -621,8 +620,8 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                     playerViewController?
                         .appliesPreferredDisplayCriteriaAutomatically
                         ?? true,
-                metalOverlayAttached:
-                    metalOverlayAttached
+                presentationOverlayAttached:
+                    presentationOverlayAttached
         ) {
             throw error
         }
@@ -677,28 +676,29 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         case .transportChanged:
             publishTelemetry(.transportChanged)
         case .periodicSample(let playerTimeSeconds):
-            let renderer = metalPlayerView.diagnostics
-            let frameTime =
-                renderer.lastPresentedTimeSeconds
-            let driftMilliseconds: Double?
-            if let frameTime, frameTime.isFinite {
-                driftMilliseconds =
-                    (frameTime - playerTimeSeconds) * 1_000
+            let renderer = presentationView.diagnostics
+            let lastEnqueuedTime =
+                renderer.lastEnqueuedTimeSeconds
+            let enqueueLeadMilliseconds: Double?
+            if let lastEnqueuedTime,
+               lastEnqueuedTime.isFinite {
+                enqueueLeadMilliseconds =
+                    (lastEnqueuedTime - playerTimeSeconds) * 1_000
             } else {
-                driftMilliseconds = nil
+                enqueueLeadMilliseconds = nil
             }
             publishTelemetry(
-                .avDriftSample,
-                payload: .avDriftSample(
-                    AetherHybridAVDriftTelemetry(
+                .sampleBufferQueueSample,
+                payload: .sampleBufferQueueSample(
+                    AetherHybridSampleBufferQueueTelemetry(
                         playerTimeSeconds:
                             playerTimeSeconds,
-                        framePresentationTimeSeconds:
-                            frameTime,
-                        driftMilliseconds:
-                            driftMilliseconds,
-                        rendererQueueDepth:
-                            renderer.queuedFrames
+                        lastEnqueuedTimeSeconds:
+                            lastEnqueuedTime,
+                        enqueueLeadMilliseconds:
+                            enqueueLeadMilliseconds,
+                        pendingSampleBuffers:
+                            renderer.pendingSampleBuffers
                     )
                 )
             )

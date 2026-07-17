@@ -292,7 +292,7 @@ final class HLSVODSegmentDemuxerTests: XCTestCase {
                 codecVerification: .verified,
                 contentProtection: .none
             ),
-            route: .hybridCarrierMetal,
+            route: .hybridCarrier,
             reason: .hybridHLSManifestSegmentMismatch
         )
         return Fixture(

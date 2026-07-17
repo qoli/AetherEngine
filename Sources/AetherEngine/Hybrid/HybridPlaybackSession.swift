@@ -48,7 +48,7 @@ public enum HybridPlaybackSessionError:
     )
     case providerFailed(reason: String)
     case carrierFailed(reason: String)
-    case rendererFailed(AetherMetalRendererError)
+    case presentationFailed(AetherHybridPresentationError)
     case decoderFailed(reason: String)
     case readinessFailed(reason: String)
     case readinessTimedOut(seconds: Double)
@@ -64,7 +64,7 @@ public enum HybridPlaybackSessionError:
         case .videoPipelineMissing:
             return "Hybrid playback requires a generation-aware real-video decoder"
         case .renderSurfaceMissing:
-            return "Hybrid playback did not create its engine-owned Metal render surface"
+            return "Hybrid playback did not create its engine-owned sample-buffer presentation surface"
         case .invalidSeekableVODOptions:
             return "Hybrid playback requires non-live, video-bearing, seekable VOD load options"
         case .sourceIndependentReaderUnavailable:
@@ -82,7 +82,7 @@ public enum HybridPlaybackSessionError:
             return "Hybrid playback \(sourceKind.rawValue) source cannot use "
                 + "\(String(describing: timelineSource)) carrier timing"
         case .preflightRequiresHybrid(let route, let reason):
-            return "Hybrid session creation requires .hybridCarrierMetal, received "
+            return "Hybrid session creation requires .hybridCarrier, received "
                 + "\(route.rawValue) (\(reason.rawValue))"
         case .preflightContractChanged(let route, let reason):
             return "Hybrid session capabilities now resolve the source as "
@@ -120,8 +120,8 @@ public enum HybridPlaybackSessionError:
             return "Hybrid carrier provider failed: \(reason)"
         case .carrierFailed(let reason):
             return "Hybrid AVPlayer carrier failed: \(reason)"
-        case .rendererFailed(let error):
-            return "Hybrid Metal renderer failed: \(error.localizedDescription)"
+        case .presentationFailed(let error):
+            return "Hybrid sample-buffer presentation failed: \(error.localizedDescription)"
         case .decoderFailed(let reason):
             return "Hybrid real-video decoder failed: \(reason)"
         case .readinessFailed(let reason):
@@ -256,11 +256,19 @@ protocol HybridPlaybackRenderSurface: AnyObject {
     func enqueue(
         _ frame: DecodedVideoFrame
     ) throws -> HybridFrameEnqueueOutcome
-    func advanceMasterClock(to time: CMTime, tolerance: CMTime)
-    func flush()
+    func bindCarrierClock(
+        item: AVPlayerItem,
+        timebase: CMTimebase
+    ) throws
+    func validateCarrierClock(
+        item: AVPlayerItem,
+        timebase: CMTimebase
+    ) throws
+    func flush(removingDisplayedImage: Bool)
+    func invalidate()
 }
 
-extension AetherMetalPlayerView: HybridPlaybackRenderSurface {}
+extension AetherHybridPresentationView: HybridPlaybackRenderSurface {}
 
 actor HybridPlaybackProviderCoordinator {
     private let provider: any HybridCarrierTransportProvider
@@ -353,7 +361,7 @@ final class HybridPlaybackFrameRelay: @unchecked Sendable {
     }
 }
 
-/// Engine-owned composition of AVPlayer carrier transport, real-video decode demand and Metal timing.
+/// Engine-owned composition of AVPlayer carrier transport, real-video decode demand and sample-buffer timing.
 ///
 /// The carrier AVPlayer is the only clock. FFmpeg work stays behind
 /// `HybridPlaybackProviderCoordinator`; MainActor owns only AVPlayer state, generation readiness and
@@ -369,10 +377,6 @@ final class HybridPlaybackSession {
     private static let clockInterval = CMTime(
         value: 1,
         timescale: 60
-    )
-    private static let presentationTolerance = CMTime(
-        value: 1,
-        timescale: 120
     )
     private static let decodeLookahead = CMTime(
         seconds: 0.25,
@@ -390,8 +394,8 @@ final class HybridPlaybackSession {
         }
     }
 
-    var metalPlayerView: AetherMetalPlayerView? {
-        renderSurface as? AetherMetalPlayerView
+    var presentationView: AetherHybridPresentationView? {
+        renderSurface as? AetherHybridPresentationView
     }
 
     private let transport: any HybridCarrierPlayerTransport
@@ -567,7 +571,7 @@ final class HybridPlaybackSession {
         }.value
 
         do {
-            let renderView = try AetherMetalPlayerView()
+            let renderView = AetherHybridPresentationView()
             let transport = BlackCarrierAVPlayerSession(
                 provider: provider
             )
@@ -594,7 +598,7 @@ final class HybridPlaybackSession {
             HLSVODOriginResourceLoader.Fetch? = nil
     ) async throws -> HybridPlaybackSession {
         guard preflight.result.route
-                == .hybridCarrierMetal else {
+                == .hybridCarrier else {
             throw HybridPlaybackSessionError
                 .preflightRequiresHybrid(
                     route: preflight.result.route,
@@ -635,7 +639,7 @@ final class HybridPlaybackSession {
         }
 
         do {
-            let renderView = try AetherMetalPlayerView()
+            let renderView = AetherHybridPresentationView()
             let transport = BlackCarrierAVPlayerSession(
                 provider: provider
             )
@@ -737,9 +741,7 @@ final class HybridPlaybackSession {
             try ensureActiveGeneration(generation)
             try presentationValidation()
             try transport.startPrepared()
-            guard avPlayer.currentItem != nil else {
-                throw HybridPlaybackSessionError.carrierItemMissing
-            }
+            try bindCarrierClock()
             installClockObservers()
             try await transport.prepare(
                 timeout: try remainingTime(
@@ -748,6 +750,7 @@ final class HybridPlaybackSession {
                 )
             )
             try ensureActiveGeneration(generation)
+            try validateCarrierClock()
             _ = readinessGate.markCarrierReady(
                 generation: generation
             )
@@ -766,8 +769,8 @@ final class HybridPlaybackSession {
                 throw HybridPlaybackSessionError
                     .carrierClockUnavailable
             }
+            try processClockTick(initialTime)
             state = .ready(generation: generation)
-            handleClockTick(initialTime)
             telemetryDidChange?(
                 .playbackStarted(
                     AetherHybridTimelineTelemetry(
@@ -796,6 +799,7 @@ final class HybridPlaybackSession {
         guard case .ready = state else {
             throw currentAvailabilityError()
         }
+        try validateCarrierClock()
         avPlayer.play()
         telemetryDidChange?(.transportChanged)
         reevaluateAudioAnalysisPlaybackPressure()
@@ -804,6 +808,7 @@ final class HybridPlaybackSession {
     func pause() throws {
         switch state {
         case .ready:
+            try validateCarrierClock()
             avPlayer.pause()
         case .seeking:
             guard let pendingResumeIntent else {
@@ -831,6 +836,7 @@ final class HybridPlaybackSession {
         guard case .ready = state else {
             throw currentAvailabilityError()
         }
+        try validateCarrierClock()
         avPlayer.rate = rate
         telemetryDidChange?(.transportChanged)
         reevaluateAudioAnalysisPlaybackPressure()
@@ -930,7 +936,7 @@ final class HybridPlaybackSession {
         cancelAudioAnalysisStreams()
         relay.detach()
         avPlayer.pause()
-        renderSurface.flush()
+        renderSurface.invalidate()
         transport.stop()
         displayCriteriaController.reset()
         EngineLog.emit(
@@ -966,8 +972,8 @@ final class HybridPlaybackSession {
         }
         do {
             _ = try renderSurface.enqueue(frame)
-        } catch let error as AetherMetalRendererError {
-            terminate(with: .rendererFailed(error))
+        } catch let error as AetherHybridPresentationError {
+            terminate(with: .presentationFailed(error))
             return
         } catch {
             terminate(with: .readinessFailed(
@@ -997,19 +1003,31 @@ final class HybridPlaybackSession {
     }
 
     func handleClockTick(_ time: CMTime) {
-        guard Self.isValidTimelineTime(time) else { return }
         switch state {
         case .preparing, .ready, .seeking:
             break
         case .idle, .failed, .stopped:
             return
         }
+        do {
+            try processClockTick(time)
+        } catch let error as HybridPlaybackSessionError {
+            terminate(with: error)
+        } catch {
+            terminate(with: .readinessFailed(
+                reason: String(describing: error)
+            ))
+        }
+    }
+
+    private func processClockTick(_ time: CMTime) throws {
+        guard Self.isValidTimelineTime(time) else {
+            throw HybridPlaybackSessionError
+                .carrierClockUnavailable
+        }
+        try validateCarrierClock()
         lastObservedPlayerTime = time
         reevaluateAudioAnalysisPlaybackPressure()
-        renderSurface.advanceMasterClock(
-            to: time,
-            tolerance: Self.presentationTolerance
-        )
         let requested = CMTimeMinimum(
             timeline.duration,
             CMTimeAdd(time, Self.decodeLookahead)
@@ -1039,6 +1057,7 @@ final class HybridPlaybackSession {
         case .idle, .preparing:
             throw HybridPlaybackSessionError.notReady
         }
+        try validateCarrierClock()
 
         let intent = try issueCarrierSeek
             ? classifier.registerExplicitHostSeek(to: target)
@@ -1136,6 +1155,7 @@ final class HybridPlaybackSession {
                     throw HybridPlaybackSessionError
                         .carrierSeekDidNotLand
                 }
+                try validateCarrierClock()
                 _ = readinessGate.markCarrierReady(
                     generation: generation
                 )
@@ -1164,7 +1184,7 @@ final class HybridPlaybackSession {
                 throw HybridPlaybackSessionError
                     .carrierClockUnavailable
             }
-            handleClockTick(landedTime)
+            try processClockTick(landedTime)
             restoreResumeIntent(resumeIntent)
             state = .ready(generation: generation)
             EngineLog.emit(
@@ -1245,11 +1265,7 @@ final class HybridPlaybackSession {
                     queue: .main
                 ) { [weak self] _ in
                     MainActor.assumeIsolated {
-                        guard let self else { return }
-                        self.playbackStallLatched = true
-                        self.reevaluateAudioAnalysisPlaybackPressure(
-                            allowClearingStall: false
-                        )
+                        self?.handleCarrierStall()
                     }
                 }
             notificationObservers.append(stalledObserver)
@@ -1275,6 +1291,22 @@ final class HybridPlaybackSession {
                     }
                 }
             notificationObservers.append(endedObserver)
+            let mediaSelectionObserver =
+                NotificationCenter.default.addObserver(
+                    forName:
+                        AVPlayerItem
+                            .mediaSelectionDidChangeNotification,
+                    object: item,
+                    queue: .main
+                ) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        self?
+                            .handleCarrierMediaSelectionChange()
+                    }
+                }
+            notificationObservers.append(
+                mediaSelectionObserver
+            )
         }
         playerObservations.append(
             avPlayer.observe(
@@ -1324,6 +1356,51 @@ final class HybridPlaybackSession {
         externalJumpTask?.cancel()
         externalJumpTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            defer { self.externalJumpTask = nil }
+            do {
+                _ = try await self.performSeek(
+                    to: target,
+                    issueCarrierSeek: false,
+                    timeout: 15
+                )
+            } catch let error as HybridPlaybackSessionError {
+                if error != .cancelled {
+                    self.terminate(with: error)
+                }
+            } catch {
+                self.terminate(with: .providerFailed(
+                    reason: String(describing: error)
+                ))
+            }
+        }
+    }
+
+    func handleCarrierStall() {
+        playbackStallLatched = true
+        reevaluateAudioAnalysisPlaybackPressure(
+            allowClearingStall: false
+        )
+        rebuildPresentationAtCarrierTime()
+    }
+
+    func handleCarrierMediaSelectionChange() {
+        rebuildPresentationAtCarrierTime()
+    }
+
+    private func rebuildPresentationAtCarrierTime() {
+        guard externalJumpTask == nil,
+              managedSeekGeneration == nil,
+              case .ready = state else {
+            return
+        }
+        let target = avPlayer.currentTime()
+        guard Self.isValidTimelineTime(target) else {
+            terminate(with: .carrierClockUnavailable)
+            return
+        }
+        externalJumpTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.externalJumpTask = nil }
             do {
                 _ = try await self.performSeek(
                     to: target,
@@ -1778,6 +1855,46 @@ final class HybridPlaybackSession {
         return .superseded(currentGeneration: currentGeneration)
     }
 
+    private func bindCarrierClock() throws {
+        guard let item = avPlayer.currentItem else {
+            throw HybridPlaybackSessionError.carrierItemMissing
+        }
+        guard let timebase = item.timebase else {
+            throw HybridPlaybackSessionError.presentationFailed(
+                .carrierTimebaseUnavailable
+            )
+        }
+        do {
+            try renderSurface.bindCarrierClock(
+                item: item,
+                timebase: timebase
+            )
+        } catch let error as AetherHybridPresentationError {
+            throw HybridPlaybackSessionError
+                .presentationFailed(error)
+        }
+    }
+
+    private func validateCarrierClock() throws {
+        guard let item = avPlayer.currentItem else {
+            throw HybridPlaybackSessionError.carrierItemMissing
+        }
+        guard let timebase = item.timebase else {
+            throw HybridPlaybackSessionError.presentationFailed(
+                .carrierTimebaseUnavailable
+            )
+        }
+        do {
+            try renderSurface.validateCarrierClock(
+                item: item,
+                timebase: timebase
+            )
+        } catch let error as AetherHybridPresentationError {
+            throw HybridPlaybackSessionError
+                .presentationFailed(error)
+        }
+    }
+
     private func terminate(
         with error: HybridPlaybackSessionError
     ) {
@@ -1800,7 +1917,7 @@ final class HybridPlaybackSession {
         cancelAudioAnalysisStreams()
         relay.detach()
         avPlayer.pause()
-        renderSurface.flush()
+        renderSurface.invalidate()
         transport.stop()
         displayCriteriaController.reset()
         EngineLog.emit(
@@ -1840,8 +1957,9 @@ final class HybridPlaybackSession {
             .terminalHybridPlaybackError() {
             return typed
         }
-        if let renderer = error as? AetherMetalRendererError {
-            return .rendererFailed(renderer)
+        if let presentation =
+                error as? AetherHybridPresentationError {
+            return .presentationFailed(presentation)
         }
         if error is BlackCarrierAVPlayerSessionError {
             return .carrierFailed(reason: String(describing: error))
@@ -1866,8 +1984,9 @@ final class HybridPlaybackSession {
             .terminalHybridPlaybackError() {
             return typed
         }
-        if let renderer = error as? AetherMetalRendererError {
-            return .rendererFailed(renderer)
+        if let presentation =
+                error as? AetherHybridPresentationError {
+            return .presentationFailed(presentation)
         }
         return .providerFailed(reason: String(describing: error))
     }

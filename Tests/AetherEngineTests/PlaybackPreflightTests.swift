@@ -4,7 +4,7 @@ import XCTest
 final class PlaybackPreflightTests: XCTestCase {
     private let fullHybridCapabilities = HybridPlaybackCapabilities(
         hasDirectVideoDecoder: true,
-        hasMetalRenderer: true,
+        hasSampleBufferRenderer: true,
         supportedVideoFormats: [.sdr, .hdr10, .hdr10Plus, .hlg, .dolbyVision]
     )
 
@@ -61,25 +61,25 @@ final class PlaybackPreflightTests: XCTestCase {
         XCTAssertEqual(result.reason, .nativeHLSContractVerified)
     }
 
-    func testHEV1VODUsesHybridCarrierMetal() {
+    func testHEV1VODUsesHybridCarrier() {
         let result = PlaybackPreflight.resolve(
             sourceProfile: source(),
             hlsPackaging: hls(sampleEntry: .hev1),
             hybridCapabilities: fullHybridCapabilities
         )
 
-        XCTAssertEqual(result.route, .hybridCarrierMetal)
+        XCTAssertEqual(result.route, .hybridCarrier)
         XCTAssertEqual(result.reason, .hybridHEV1SampleEntry)
     }
 
-    func testHEVCInMPEGTransportVODUsesHybridCarrierMetal() {
+    func testHEVCInMPEGTransportVODUsesHybridCarrier() {
         let result = PlaybackPreflight.resolve(
             sourceProfile: source(),
             hlsPackaging: hls(container: .mpegTransport, sampleEntry: .notApplicable),
             hybridCapabilities: fullHybridCapabilities
         )
 
-        XCTAssertEqual(result.route, .hybridCarrierMetal)
+        XCTAssertEqual(result.route, .hybridCarrier)
         XCTAssertEqual(result.reason, .hybridHEVCInMPEGTransport)
     }
 
@@ -101,7 +101,7 @@ final class PlaybackPreflightTests: XCTestCase {
             hybridCapabilities: fullHybridCapabilities
         )
 
-        XCTAssertEqual(result.route, .hybridCarrierMetal)
+        XCTAssertEqual(result.route, .hybridCarrier)
         XCTAssertEqual(result.reason, .hybridHLSManifestMissingCodecs)
     }
 
@@ -112,7 +112,7 @@ final class PlaybackPreflightTests: XCTestCase {
             hybridCapabilities: fullHybridCapabilities
         )
 
-        XCTAssertEqual(result.route, .hybridCarrierMetal)
+        XCTAssertEqual(result.route, .hybridCarrier)
         XCTAssertEqual(result.reason, .hybridHLSManifestSegmentMismatch)
     }
 
@@ -226,7 +226,7 @@ final class PlaybackPreflightTests: XCTestCase {
     func testHybridRequiresAnExplicitRendererColorContract() {
         let noDolbyVision = HybridPlaybackCapabilities(
             hasDirectVideoDecoder: true,
-            hasMetalRenderer: true,
+            hasSampleBufferRenderer: true,
             supportedVideoFormats: [.sdr, .hdr10, .hdr10Plus, .hlg]
         )
         let result = PlaybackPreflight.resolve(
@@ -246,14 +246,14 @@ final class PlaybackPreflightTests: XCTestCase {
             hybridCapabilities: fullHybridCapabilities
         )
 
-        XCTAssertEqual(result.route, .hybridCarrierMetal)
+        XCTAssertEqual(result.route, .hybridCarrier)
         XCTAssertEqual(result.reason, .hybridNonAVPlayerCodec)
     }
 
     func testHybridSourceKindMustBePubliclyAdmitted() {
         let progressiveOnly = HybridPlaybackCapabilities(
             hasDirectVideoDecoder: true,
-            hasMetalRenderer: true,
+            hasSampleBufferRenderer: true,
             supportedVideoFormats: [.sdr],
             supportedSourceKinds: [.progressive, .custom]
         )

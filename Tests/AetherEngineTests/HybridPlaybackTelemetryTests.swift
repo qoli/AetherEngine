@@ -178,7 +178,7 @@ struct HybridPlaybackTelemetryTests {
         state: AetherHybridPlaybackTelemetryState
     ) -> AetherHybridPlaybackTelemetrySnapshot {
         AetherHybridPlaybackTelemetrySnapshot(
-            route: .hybridCarrierMetal,
+            route: .hybridCarrier,
             routeReason: .hybridNonAVPlayerCodec,
             state: state,
             generation: 0,
@@ -195,13 +195,15 @@ struct HybridPlaybackTelemetryTests {
             carrierBandwidth: .awaiting(
                 audioRenditionCount: 2
             ),
-            renderer: AetherMetalPlayerView.Diagnostics(
+            renderer: AetherHybridPresentationView.Diagnostics(
                 generation: 0,
-                queuedFrames: 0,
+                pendingSampleBuffers: 0,
                 staleGenerationDrops: 0,
-                queuePressureDrops: 0,
-                timelineDrops: 0,
-                lastPresentedTimeSeconds: nil
+                backPressureObservations: 0,
+                enqueuedSampleBuffers: 0,
+                lastEnqueuedTimeSeconds: nil,
+                carrierTimebaseBound: true,
+                rendererStatus: .unknown
             ),
             systemFeaturePolicy:
                 AetherHybridPlaybackSession

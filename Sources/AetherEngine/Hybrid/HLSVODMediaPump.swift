@@ -183,7 +183,7 @@ struct HLSVODMediaPumpSnapshot: Sendable, Equatable {
 ///
 /// This remains an engine-private source pump. The public HLS session factory, transport,
 /// seek-generation replacement and independent graph-bound analysis cursor own the same bounded origin
-/// loader; callers receive only the AVPlayer, Metal surface and typed public diagnostics.
+/// loader; callers receive only the AVPlayer, sample-buffer surface and typed public diagnostics.
 /// Audio production may read one upstream segment ahead because an audio access unit from
 /// the next carrier interval is the evidence that lets the long-lived fMP4 writer finalize the requested
 /// fragment; the following carrier fragment is not finalized until a later demand.
@@ -234,7 +234,7 @@ actor HLSVODMediaPump {
         fetchOverride:
             HLSVODOriginResourceLoader.Fetch? = nil
     ) async throws -> HLSVODMediaPump {
-        guard preflight.result.route == .hybridCarrierMetal,
+        guard preflight.result.route == .hybridCarrier,
               preflight.result.sourceProfile.sourceKind == .hls,
               let graph = preflight.resourceGraph else {
             throw HLSVODMediaPumpError.invalidPreflight

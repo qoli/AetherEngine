@@ -294,7 +294,7 @@ struct HLSPreflightInspector {
         let resourceGraph: HLSVODResourceGraph?
         let audioAnalysisPolicy:
             AetherHLSAudioAnalysisPolicy
-        if result.route == .hybridCarrierMetal {
+        if result.route == .hybridCarrier {
             let audioResolution = try await resolveAudioRenditions(
                 resolved.audioRenditions,
                 rootEffectiveURL: resolved.rootEffectiveURL

@@ -6,8 +6,9 @@ Checks that need a running engine + a real media file, so they cannot run under 
 
 [`hybrid-display-device-acceptance.md`](hybrid-display-device-acceptance.md) locks the physical-tvOS
 geometry, AVPlayerViewController writer, Match Frame Rate, HDR/HLG/Dolby Vision and teardown evidence.
-The source-level SDR geometry contract is implemented, but the physical gate remains pending and no
-unverified color format may be added to `AetherMetalPlayerView.verifiedVideoFormats`.
+The source-level sample-buffer timing and metadata contract is implemented, but the physical gate remains
+pending and no unverified color format may be added to
+`AetherHybridPresentationView.verifiedVideoFormats`.
 
 ## Hybrid Atmos tvOS device gate
 

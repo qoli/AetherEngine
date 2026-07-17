@@ -493,26 +493,3 @@ public final class DecodedVideoFrame: @unchecked Sendable {
         self.generation = generation
     }
 }
-
-public enum AetherMetalRendererError: Error, LocalizedError, Sendable, Equatable {
-    case metalDeviceUnavailable
-    case invalidPresentationTime
-    case invalidGeometry
-    case unsupportedRotation(Int)
-    case unsupportedVideoFormat(VideoFormat)
-
-    public var errorDescription: String? {
-        switch self {
-        case .metalDeviceUnavailable:
-            return "Aether Metal renderer requires a Metal device"
-        case .invalidPresentationTime:
-            return "Decoded video frame has no valid presentation timestamp"
-        case .invalidGeometry:
-            return "Decoded video frame geometry is invalid"
-        case .unsupportedRotation(let degrees):
-            return "Aether Metal renderer does not have a verified rotation pipeline for \(degrees) degrees"
-        case .unsupportedVideoFormat(let format):
-            return "Aether Metal renderer does not have a verified color pipeline for \(String(describing: format))"
-        }
-    }
-}

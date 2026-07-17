@@ -1279,7 +1279,7 @@ final class HLSVODMediaPumpTests: XCTestCase {
     }
 
     @MainActor
-    func testPublicHybridSessionComposesHLSProviderIntoAVPlayerAndMetal()
+    func testPublicHybridSessionComposesHLSProviderIntoAVPlayerAndSampleBufferPresentation()
         async throws
     {
         let fixture = try makeFixture()
@@ -1315,15 +1315,15 @@ final class HLSVODMediaPumpTests: XCTestCase {
             [0]
         )
         XCTAssertNotNil(session.avPlayer.currentItem)
-        let metalView = session.metalPlayerView
+        let presentationView = session.presentationView
         XCTAssertEqual(
-            metalView.diagnostics.generation,
+            presentationView.diagnostics.generation,
             0
         )
         XCTAssertEqual(
             try XCTUnwrap(
-                metalView.diagnostics
-                    .lastPresentedTimeSeconds
+                presentationView.diagnostics
+                    .lastEnqueuedTimeSeconds
             ),
             0,
             accuracy: 0.000_001
@@ -1450,13 +1450,13 @@ final class HLSVODMediaPumpTests: XCTestCase {
             hybridCapabilities:
                 HybridPlaybackCapabilities(
                     hasDirectVideoDecoder: true,
-                    hasMetalRenderer: true,
+                    hasSampleBufferRenderer: true,
                     supportedVideoFormats: [.hdr10]
                 )
         )
         XCTAssertEqual(
             result.route,
-            .hybridCarrierMetal
+            .hybridCarrier
         )
         let preflight = AetherHLSPlaybackPreflight(
             result: result,
@@ -2185,7 +2185,7 @@ final class HLSVODMediaPumpTests: XCTestCase {
                 codecVerification: .mismatch,
                 contentProtection: .none
             ),
-            route: .hybridCarrierMetal,
+            route: .hybridCarrier,
             reason:
                 .hybridHLSManifestSegmentMismatch
         )
@@ -2337,7 +2337,7 @@ final class HLSVODMediaPumpTests: XCTestCase {
                 codecVerification: .mismatch,
                 contentProtection: .none
             ),
-            route: .hybridCarrierMetal,
+            route: .hybridCarrier,
             reason:
                 .hybridHLSManifestSegmentMismatch
         )

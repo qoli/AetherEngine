@@ -6,7 +6,7 @@ import Foundation
 /// different route from a later AVPlayer failure, a timeout, or a black frame.
 public enum PlaybackRenderRoute: String, Sendable, Equatable {
     case nativeAVPlayer
-    case hybridCarrierMetal
+    case hybridCarrier
     case unsupported
 }
 
@@ -170,13 +170,13 @@ public struct HLSVideoPackaging: Sendable, Equatable {
 /// `.unsupported`, not an implicit SDR tone-map path.
 public struct HybridPlaybackCapabilities: Sendable, Equatable {
     public let hasDirectVideoDecoder: Bool
-    public let hasMetalRenderer: Bool
+    public let hasSampleBufferRenderer: Bool
     public let supportedVideoFormats: Set<VideoFormat>
     public let supportedSourceKinds: Set<AetherMediaSourceKind>
 
     public init(
         hasDirectVideoDecoder: Bool,
-        hasMetalRenderer: Bool,
+        hasSampleBufferRenderer: Bool,
         supportedVideoFormats: Set<VideoFormat>,
         supportedSourceKinds: Set<AetherMediaSourceKind> = [
             .hls,
@@ -185,7 +185,7 @@ public struct HybridPlaybackCapabilities: Sendable, Equatable {
         ]
     ) {
         self.hasDirectVideoDecoder = hasDirectVideoDecoder
-        self.hasMetalRenderer = hasMetalRenderer
+        self.hasSampleBufferRenderer = hasSampleBufferRenderer
         self.supportedVideoFormats = supportedVideoFormats
         self.supportedSourceKinds = supportedSourceKinds
     }
@@ -208,7 +208,7 @@ public enum PlaybackRouteReason: String, Sendable, Equatable {
     case unsupportedHybridRequiresSeekableVOD
     case unsupportedHybridSourceKind
     case unsupportedHybridDecoderUnavailable
-    case unsupportedHybridMetalRendererUnavailable
+    case unsupportedHybridSampleBufferRendererUnavailable
     case unsupportedHybridVideoFormat
     case unsupportedHDR10PlusBaseLayerMismatch
     case unsupportedHDR10PlusCompressedSampleEvidenceMissing
@@ -429,13 +429,18 @@ public enum PlaybackPreflight {
         guard capabilities.hasDirectVideoDecoder else {
             return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHybridDecoderUnavailable)
         }
-        guard capabilities.hasMetalRenderer else {
-            return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHybridMetalRendererUnavailable)
+        guard capabilities.hasSampleBufferRenderer else {
+            return result(
+                sourceProfile,
+                hlsPackaging,
+                .unsupported,
+                .unsupportedHybridSampleBufferRendererUnavailable
+            )
         }
         guard capabilities.supportedVideoFormats.contains(sourceProfile.videoFormat) else {
             return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHybridVideoFormat)
         }
-        return result(sourceProfile, hlsPackaging, .hybridCarrierMetal, reason)
+        return result(sourceProfile, hlsPackaging, .hybridCarrier, reason)
     }
 
     private static func result(

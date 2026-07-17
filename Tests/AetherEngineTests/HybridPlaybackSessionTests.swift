@@ -317,7 +317,9 @@ struct HybridPlaybackSessionTests {
         private(set) var generation: UInt64 = 0
         private(set) var videoFormat: VideoFormat?
         private(set) var frames: [DecodedVideoFrame] = []
-        private(set) var clockSamples: [CMTime] = []
+        private(set) var carrierClockValidationCount = 0
+        private(set) var boundItem: AVPlayerItem?
+        private(set) var boundTimebase: CMTimebase?
         private(set) var flushCount = 0
 
         func beginGeneration(
@@ -339,16 +341,36 @@ struct HybridPlaybackSessionTests {
             return .accepted
         }
 
-        func advanceMasterClock(
-            to time: CMTime,
-            tolerance: CMTime
-        ) {
-            clockSamples.append(time)
+        func bindCarrierClock(
+            item: AVPlayerItem,
+            timebase: CMTimebase
+        ) throws {
+            boundItem = item
+            boundTimebase = timebase
         }
 
-        func flush() {
+        func validateCarrierClock(
+            item: AVPlayerItem,
+            timebase: CMTimebase
+        ) throws {
+            guard boundItem === item,
+                  let boundTimebase,
+                  CFEqual(boundTimebase, timebase) else {
+                throw AetherHybridPresentationError
+                    .carrierBindingChanged
+            }
+            carrierClockValidationCount += 1
+        }
+
+        func flush(removingDisplayedImage: Bool) {
             flushCount += 1
             frames.removeAll()
+        }
+
+        func invalidate() {
+            flush(removingDisplayedImage: true)
+            boundItem = nil
+            boundTimebase = nil
         }
     }
 
@@ -778,6 +800,11 @@ struct HybridPlaybackSessionTests {
         #expect(fixture.renderSurface.generation == 0)
         #expect(fixture.renderSurface.frames.count == 1)
         #expect(fixture.renderSurface.videoFormat == .sdr)
+        #expect(
+            fixture.renderSurface.boundItem
+                === fixture.transport.avPlayer.currentItem
+        )
+        #expect(fixture.renderSurface.boundTimebase != nil)
         #expect(fixture.provider.snapshot().prepared)
         #expect(
             fixture.provider.snapshot().prepareMainThreads == [false]
@@ -798,9 +825,7 @@ struct HybridPlaybackSessionTests {
         )
         #expect(abs(demand.seconds - 1.25) < 0.000_001)
         #expect(
-            fixture.renderSurface.clockSamples.contains {
-                abs($0.seconds - 1) < 0.000_001
-            }
+            fixture.renderSurface.carrierClockValidationCount > 0
         )
     }
 
@@ -1038,6 +1063,64 @@ struct HybridPlaybackSessionTests {
         #expect(fixture.renderSurface.flushCount == 1)
     }
 
+    @Test("Carrier stall rebuilds sample-buffer presentation in a new generation")
+    @MainActor
+    func carrierStallRebuildsGeneration() async throws {
+        let fixture = try makeSession()
+        defer { fixture.session.stop() }
+        try await fixture.session.prepare(timeout: 1)
+
+        fixture.session.handleCarrierStall()
+        try await waitUntil {
+            fixture.session.state == .ready(generation: 1)
+        }
+
+        #expect(fixture.provider.snapshot().restarts.count == 1)
+        #expect(fixture.renderSurface.generation == 1)
+        #expect(fixture.transport.seekTargets.isEmpty)
+    }
+
+    @Test("Carrier media-selection change flushes into a new video generation")
+    @MainActor
+    func mediaSelectionChangeRebuildsGeneration() async throws {
+        let fixture = try makeSession()
+        defer { fixture.session.stop() }
+        try await fixture.session.prepare(timeout: 1)
+
+        fixture.session.handleCarrierMediaSelectionChange()
+        try await waitUntil {
+            fixture.session.state == .ready(generation: 1)
+        }
+
+        #expect(fixture.provider.snapshot().restarts.count == 1)
+        #expect(fixture.renderSurface.generation == 1)
+        #expect(fixture.transport.seekTargets.isEmpty)
+    }
+
+    @Test("Replacing the carrier item after binding is a terminal typed failure")
+    @MainActor
+    func carrierItemReplacementTerminates() async throws {
+        let fixture = try makeSession()
+        try await fixture.session.prepare(timeout: 1)
+        let replacement = AVPlayerItem(asset: AVURLAsset(
+            url: URL(
+                string:
+                    "https://example.invalid/replaced-carrier.m3u8"
+            )!
+        ))
+        fixture.transport.avPlayer.replaceCurrentItem(
+            with: replacement
+        )
+
+        fixture.session.handleClockTick(.zero)
+
+        #expect(fixture.session.state == .failed(
+            .presentationFailed(.carrierBindingChanged)
+        ))
+        #expect(fixture.transport.didStop)
+        #expect(fixture.renderSurface.flushCount == 1)
+    }
+
     @Test("Provider invalidation terminates a paused session without waiting for decode demand")
     @MainActor
     func providerInvalidationTerminatesPausedSession()
@@ -1163,7 +1246,7 @@ struct HybridPlaybackSessionTests {
         #expect(fixture.renderSurface.flushCount == 1)
     }
 
-    @Test("Real video-only fixture composes carrier, decoder and Metal surface")
+    @Test("Real video-only fixture composes carrier, decoder and sample-buffer surface")
     @MainActor
     func realVideoOnlyComposition() async throws {
         let sourceData = try BlackCarrierEncodedSample
@@ -1195,13 +1278,15 @@ struct HybridPlaybackSessionTests {
 
         #expect(session.state == .ready(generation: 0))
         #expect(session.avPlayer.currentItem != nil)
-        let metalView = try #require(session.metalPlayerView)
-        #expect(metalView.diagnostics.generation == 0)
+        let presentationView = try #require(
+            session.presentationView
+        )
+        #expect(presentationView.diagnostics.generation == 0)
         #expect(
             abs(
                 try #require(
-                    metalView.diagnostics
-                        .lastPresentedTimeSeconds
+                    presentationView.diagnostics
+                        .lastEnqueuedTimeSeconds
                 )
             ) < 0.000_001
         )
