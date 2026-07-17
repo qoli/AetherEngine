@@ -155,7 +155,7 @@ struct HybridPresentationReadinessGateTests {
             nil,
             &pixelBuffer
         ) == kCVReturnSuccess)
-        return DecodedVideoFrame(
+        return try! DecodedVideoFrame(
             pixelBuffer: pixelBuffer!,
             presentationTime: time(seconds),
             duration: time(duration),

@@ -160,6 +160,10 @@ enum HybridVideoDecodeSinkError:
     case streamContractMismatch
     case decoderOpenFailed(reason: String)
     case decoderFailed(VideoDecoderError)
+    case invalidDecodedFrameColorMetadata(
+        DecodedVideoFrameColorMetadataError
+    )
+    case decodedFrameConstructionFailed(reason: String)
     case invalidDecodedFrameGeometry
     case decodedFrameDimensionsDiverged(
         pixelWidth: Int,
@@ -192,6 +196,10 @@ enum HybridVideoDecodeSinkError:
             return "Hybrid video decoder could not open: \(reason)"
         case .decoderFailed(let error):
             return "Hybrid video decoder failed: \(error.localizedDescription)"
+        case .invalidDecodedFrameColorMetadata(let error):
+            return "Hybrid decoded frame color metadata is invalid: \(error.localizedDescription)"
+        case .decodedFrameConstructionFailed(let reason):
+            return "Hybrid decoded frame construction failed: \(reason)"
         case .invalidDecodedFrameGeometry:
             return "Hybrid decoded frame has invalid presentation geometry"
         case .decodedFrameDimensionsDiverged(
@@ -633,15 +641,26 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
             recordFailure(.packetTimestampMissing)
             return
         }
-        let frame = DecodedVideoFrame(
-            pixelBuffer: pixelBuffer,
-            presentationTime: normalizedPresentationTime,
-            duration: resolvedDuration,
-            videoFormat: videoFormat,
-            geometry: geometry,
-            hdr10PlusT35: hdr10PlusT35,
-            generation: frameGeneration
-        )
+        let frame: DecodedVideoFrame
+        do {
+            frame = try DecodedVideoFrame(
+                pixelBuffer: pixelBuffer,
+                presentationTime: normalizedPresentationTime,
+                duration: resolvedDuration,
+                videoFormat: videoFormat,
+                geometry: geometry,
+                hdr10PlusT35: hdr10PlusT35,
+                generation: frameGeneration
+            )
+        } catch let error as DecodedVideoFrameColorMetadataError {
+            recordFailure(.invalidDecodedFrameColorMetadata(error))
+            return
+        } catch {
+            recordFailure(.decodedFrameConstructionFailed(
+                reason: String(describing: error)
+            ))
+            return
+        }
         if HybridPresentationReadinessGate.frameIntersectsTargetWindow(
             frame: frame,
             targetTime: target,

@@ -43,7 +43,7 @@ private func makeHybridPlaybackSessionFrame(
         throw HybridPlaybackSessionFixtureError
             .pixelBufferCreationFailed
     }
-    return DecodedVideoFrame(
+    return try DecodedVideoFrame(
         pixelBuffer: pixelBuffer,
         presentationTime: CMTime(
             seconds: time,

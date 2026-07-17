@@ -17,7 +17,7 @@ final class HybridFrameSchedulerTests: XCTestCase {
             ),
             kCVReturnSuccess
         )
-        return DecodedVideoFrame(
+        return try! DecodedVideoFrame(
             pixelBuffer: pixelBuffer!,
             presentationTime: CMTime(seconds: time, preferredTimescale: 600),
             duration: CMTime(seconds: 1.0 / 24.0, preferredTimescale: 600),

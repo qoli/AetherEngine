@@ -3,9 +3,10 @@
 ## Status
 
 Pending. Source-level decoded geometry, aspect-fit/fill, quarter-turn rotation, real-video frame-rate
-propagation and the AVPlayerViewController writer contract exist, but simulator builds and pure layout
-tests do not prove physical display output. `AetherMetalPlayerView.verifiedVideoFormats` must remain
-`[.sdr]` until the relevant color rows below have physical evidence.
+propagation, the AVPlayerViewController writer contract, and an immutable decoded-frame color snapshot
+exist, but simulator builds and pure contract tests do not prove physical display output.
+`AetherMetalPlayerView.verifiedVideoFormats` must remain `[.sdr]` until the relevant color rows below have
+physical evidence.
 
 ## Purpose
 
@@ -41,12 +42,26 @@ The current Apple TV SDK makes the renderer split an architecture decision, not 
   is a `CMSampleBuffer` attachment, not a Metal drawable attachment. Rendering only the HDR10 base
   layer in Metal would silently drop HDR10+ semantics.
 
-Accordingly, `.hdr10Plus` and `.dolbyVision` must remain outside
-`AetherMetalPlayerView.verifiedVideoFormats`. The engine must not relabel a base layer as the original
-format, silently tone-map, or route-switch. Before either format can be admitted, the administrator must
-choose and validate one explicit presentation route: an engine-owned `AVSampleBufferDisplayLayer`, a
-compressed-bitstream AVPlayer repackaging route, or continued typed unsupported. This decision does not
-affect the fixed 2 Mbps black-carrier policy.
+Decision Record #19 was approved by the administrator on 2026-07-17: the Hybrid route uses a split,
+engine-owned renderer. SDR, HDR10 and HLG use `MTKView`; HDR10+ and Dolby Vision use an Aether-owned
+`AVSampleBufferDisplayLayer`. Both surfaces stay inside the same AVKit overlay, retain the black carrier
+and use the carrier AVPlayer as the sole master clock. The surface is selected from exact preflight
+evidence before session/provider construction and remains immutable for the whole session. Runtime
+metadata discovery must not switch surface, route, track or player.
+
+The current branch does not yet implement or admit that split surface. `.hdr10Plus` and `.dolbyVision`
+therefore remain outside `AetherMetalPlayerView.verifiedVideoFormats`. The existing decoder-side late
+upgrade from `.hdr10` to `.hdr10Plus` is insufficient for production admission: preflight must inspect
+compressed samples and prove HDR10+ T.35 before choosing the sample-buffer surface. If it cannot prove the
+format before construction, the source must remain typed unsupported rather than start as HDR10 Metal and
+switch at runtime. This decision does not affect the fixed 2 Mbps black-carrier policy.
+
+`DecodedVideoFrame` now snapshots pixel encoding, primaries, transfer, matrix and any present MDCV, CLLI
+or ambient-viewing payload from the decoded `CVPixelBuffer`. HDR10/HDR10+ require a 10-bit bi-planar
+buffer with BT.2020 + PQ + BT.2020 matrix; HLG requires 10-bit BT.2020 + HLG + BT.2020 matrix. The static
+payloads are optional, but a present MDCV/CLLI/ambient payload must be exactly 24/4/8 bytes. Missing or
+contradictory required color signaling, an 8-bit HDR buffer, the wrong attachment type or malformed payload
+is an explicit construction/decoder failure. No value is inferred from `VideoFormat`.
 
 Primary references:
 
@@ -71,7 +86,9 @@ The SDR geometry set must include:
 Before expanding `verifiedVideoFormats`, add separate, bitstream-verified fixtures for HDR10, HDR10+
 (including per-frame ST 2094-40 payload), HLG and every promised Dolby Vision profile. Container labels
 alone do not establish color format. Record mastering/display metadata, codec/sample entry, bit depth,
-primaries, transfer, matrix, frame rate and Dolby Vision profile where applicable.
+primaries, transfer, matrix, frame rate and Dolby Vision profile where applicable. The HDR10+ fixture must
+also prove the preflight detector selects the sample-buffer surface before provider creation; a
+decoder-time `.hdr10` to `.hdr10Plus` upgrade is a negative case, not valid admission evidence.
 
 ## Required physical-device run
 
@@ -96,9 +113,11 @@ the explicitly named control rows with them disabled.
    after `prepare()` begins and confirm `carrierPresentationConfigurationTooLate` without controller mutation.
 6. Stop and dismiss. Confirm Aether resets `preferredDisplayCriteria`, releases the Metal drawable/queue,
    removes the carrier item and leaves no previous generation visible on reopen.
-7. For each future HDR/HLG/Dolby Vision row, confirm the panel enters the intended mode, the Metal output
-   preserves the declared transfer/primaries/dynamic metadata, and the image matches a documented
-   reference. Any silent SDR tone-map, metadata drop or different panel mode is a failure.
+7. For each future HDR/HLG/Dolby Vision row, confirm the panel enters the intended mode and the selected
+   engine surface matches Decision Record #19: Metal for HDR10/HLG, sample-buffer display layer for
+   HDR10+/Dolby Vision. Confirm transfer, primaries and applicable per-frame metadata survive, and compare
+   the image with a documented reference. Any silent SDR tone-map, metadata drop, runtime surface switch or
+   different panel mode is a failure.
 
 ## Required assertions
 
@@ -114,6 +133,8 @@ the explicitly named control rows with them disabled.
   at teardown. Unknown/unusual rate does not become 24 fps.
 - PiP video, AirPlay video and external-display video remain unavailable on the Hybrid route.
 - No failure changes source, video format, renderer, player, audio track or playback route.
+- HDR10+ preflight identifies T.35 before provider/session construction; late decoder discovery is rejected
+  and never changes an already selected Metal surface into a sample-buffer surface.
 - HDR10, HDR10+, HLG or Dolby Vision cannot enter `verifiedVideoFormats` from simulator, screenshot or
   shader-unit evidence alone.
 
