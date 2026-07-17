@@ -706,14 +706,32 @@ final class HLSPreflightInspectorTests: XCTestCase {
             string:
                 "https://cdn.example/audio/fr.m3u8?token=alternate-audio-playlist-secret"
         )!
+        let subtitlePlaylistURL = URL(
+            string:
+                "https://cdn.example/subs/en.m3u8?token=subtitle-playlist-secret"
+        )!
+        let subtitleSegmentURL = URL(
+            string:
+                "https://cdn.example/subs/seg0.vtt?token=subtitle-segment-secret"
+        )!
+        let invalidSubtitlePlaylistURL = URL(
+            string:
+                "https://cdn.example/subs/invalid.m3u8?token=invalid-subtitle-playlist-secret"
+        )!
+        let invalidSubtitleSegmentURL = URL(
+            string:
+                "https://cdn.example/subs/invalid0.vtt?token=invalid-subtitle-segment-secret"
+        )!
         let master = Data(
             """
             #EXTM3U
             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2",URI="../audio/en.m3u8?token=audio-playlist-secret"
             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Français",LANGUAGE="fr",DEFAULT=NO,AUTOSELECT=YES,CHANNELS="2",URI="../audio/fr.m3u8?token=alternate-audio-playlist-secret"
+            #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,URI="../subs/en.m3u8?token=subtitle-playlist-secret"
+            #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Invalid",LANGUAGE="fr",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,URI="../subs/invalid.m3u8?token=invalid-subtitle-playlist-secret"
             #EXT-X-STREAM-INF:BANDWIDTH=900000,CODECS="avc1.42C01E"
             video/low.m3u8
-            #EXT-X-STREAM-INF:BANDWIDTH=1400000,CODECS="hvc1.2.4.L150",AUDIO="audio"
+            #EXT-X-STREAM-INF:BANDWIDTH=1400000,CODECS="hvc1.2.4.L150",AUDIO="audio",SUBTITLES="subs"
             \(selectedURI)
             """.utf8
         )
@@ -752,6 +770,35 @@ final class HLSPreflightInspectorTests: XCTestCase {
             #EXT-X-ENDLIST
             """.utf8
         )
+        let subtitleMedia = Data(
+            """
+            #EXTM3U
+            #EXT-X-TARGETDURATION:2
+            #EXT-X-MEDIA-SEQUENCE:51
+            #EXTINF:1.250,
+            seg0.vtt?token=subtitle-segment-secret
+            #EXT-X-ENDLIST
+            """.utf8
+        )
+        let subtitleSegment = Data(
+            """
+            WEBVTT
+
+            00:00:00.100 --> 00:00:01.000
+            preflight subtitle
+
+            """.utf8
+        )
+        let invalidSubtitleMedia = Data(
+            """
+            #EXTM3U
+            #EXT-X-TARGETDURATION:2
+            #EXT-X-MEDIA-SEQUENCE:61
+            #EXTINF:1.250,
+            invalid0.vtt?token=invalid-subtitle-segment-secret
+            #EXT-X-ENDLIST
+            """.utf8
+        )
         let responses: [URL: HLSPreflightFetchResponse] = [
             requestedRoot: HLSPreflightFetchResponse(
                 data: master,
@@ -776,6 +823,22 @@ final class HLSPreflightInspectorTests: XCTestCase {
             alternateAudioPlaylistURL: HLSPreflightFetchResponse(
                 data: alternateAudioMedia,
                 effectiveURL: alternateAudioPlaylistURL
+            ),
+            subtitlePlaylistURL: HLSPreflightFetchResponse(
+                data: subtitleMedia,
+                effectiveURL: subtitlePlaylistURL
+            ),
+            subtitleSegmentURL: HLSPreflightFetchResponse(
+                data: subtitleSegment,
+                effectiveURL: subtitleSegmentURL
+            ),
+            invalidSubtitlePlaylistURL: HLSPreflightFetchResponse(
+                data: invalidSubtitleMedia,
+                effectiveURL: invalidSubtitlePlaylistURL
+            ),
+            invalidSubtitleSegmentURL: HLSPreflightFetchResponse(
+                data: Data("not WebVTT".utf8),
+                effectiveURL: invalidSubtitleSegmentURL
             ),
         ]
         let headers = [
@@ -836,6 +899,31 @@ final class HLSPreflightInspectorTests: XCTestCase {
                         .requiresPlaybackSessionBinding
                 ),
             ])
+        )
+        XCTAssertEqual(
+            inspected.subtitleRenditions,
+            [
+                AetherHLSSubtitleRenditionPolicy(
+                    subtitleTrackID: 0,
+                    name: "English",
+                    language: "en",
+                    isDefault: true,
+                    isAutoselect: true,
+                    isForced: false,
+                    availability: .nativeWebVTT
+                ),
+                AetherHLSSubtitleRenditionPolicy(
+                    subtitleTrackID: 1,
+                    name: "Invalid",
+                    language: "fr",
+                    isDefault: false,
+                    isAutoselect: true,
+                    isForced: false,
+                    availability: .unavailable(
+                        .unsupportedFormat
+                    )
+                ),
+            ]
         )
         XCTAssertEqual(
             inspected.result.reason,
@@ -903,6 +991,24 @@ final class HLSPreflightInspectorTests: XCTestCase {
             inspected.resourceGraph?.audioRenditions.last?.segments
                 .map(\.mediaSequence),
             [41, 42]
+        )
+        XCTAssertEqual(
+            inspected.resourceGraph?.separateSubtitleGroupID,
+            "subs"
+        )
+        XCTAssertEqual(
+            inspected.resourceGraph?.subtitleRenditions.first?.name,
+            "English"
+        )
+        XCTAssertEqual(
+            inspected.resourceGraph?.subtitleRenditions.first?.segments
+                .map(\.mediaSequence),
+            [51]
+        )
+        XCTAssertEqual(
+            inspected.resourceGraph?.subtitleRenditions.first?
+                .inspectedFirstSegmentData,
+            subtitleSegment
         )
 
         guard case .media(let parsedMedia) = try HLSPlaylistParser.parse(

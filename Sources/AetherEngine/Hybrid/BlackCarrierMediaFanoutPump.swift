@@ -96,6 +96,19 @@ struct BlackCarrierDemuxContract: Sendable, Equatable {
     }
 }
 
+struct BlackCarrierNativeSubtitleRenditionMetadata:
+    Sendable,
+    Equatable
+{
+    let ordinal: Int
+    let sourceTrackID: Int
+    let language: String?
+    let name: String
+    let isDefault: Bool
+    let isAutoselect: Bool
+    let isForced: Bool
+}
+
 /// Incremental single-demux packet fanout for carrier audio and the future real-video decoder.
 ///
 /// `produce(throughSegment:)` advances only until every audio rendition has finalized the requested
@@ -125,9 +138,39 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         }
     }
 
+    private final class NativeSubtitleRendition {
+        let metadata: BlackCarrierNativeSubtitleRenditionMetadata
+        let sourceTrackInfo: TrackInfo
+        let store = NativeSubtitleCueStore()
+        var decoder: EmbeddedSubtitleDecoder
+        var timeBase: AVRational
+        var isAvailable = true
+
+        init(
+            metadata: BlackCarrierNativeSubtitleRenditionMetadata,
+            sourceTrackInfo: TrackInfo,
+            decoder: EmbeddedSubtitleDecoder,
+            timeBase: AVRational,
+            shiftSeconds: Double
+        ) {
+            self.metadata = metadata
+            self.sourceTrackInfo = sourceTrackInfo
+            self.decoder = decoder
+            self.timeBase = timeBase
+            store.setShiftSeconds(shiftSeconds)
+        }
+    }
+
     let renditionMetadata: [BlackCarrierAudioRenditionMetadata]
     let renditionDescriptors: [BlackCarrierAudioRenditionDescriptor]
+    let nativeSubtitleRenditionMetadata:
+        [BlackCarrierNativeSubtitleRenditionMetadata]
     let sourceContract: BlackCarrierDemuxContract
+    let hybridSubtitleContracts:
+        [HybridSubtitleDecodeContract]
+    let hybridSubtitlePacketStore = SubtitlePacketStore()
+    let hybridSubtitleRuntimeAvailability =
+        HybridSubtitleRuntimeAvailabilityStore()
 
     private var demuxer: Demuxer
     private let freshDemuxerFactory: FreshDemuxerFactory?
@@ -145,6 +188,15 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     private var renditionsByStream: [
         Int32: Rendition
     ]
+    private var subtitleContractsByStream: [
+        Int32: HybridSubtitleDecodeContract
+    ]
+    private var nativeSubtitleRenditionsByStream: [
+        Int32: NativeSubtitleRendition
+    ]
+    private let overlaySourceTrackInfos: [TrackInfo]
+    private let nativeSubtitleRenditions:
+        [NativeSubtitleRendition]
     private let lock = NSLock()
     private let restartLock = NSLock()
     private let generationLock = NSLock()
@@ -217,6 +269,102 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             : demuxer.stream(at: resolvedVideoStreamIndex)
         if resolvedVideoPacketSink != nil, videoStream == nil {
             throw BlackCarrierMediaFanoutPumpError.videoStreamMissing
+        }
+        let allSubtitleTrackInfos = demuxer
+            .subtitleTrackInfos()
+        let overlaySourceTrackInfos = allSubtitleTrackInfos
+            .filter(Self.isHybridOverlaySubtitleTrack)
+        let nativeSubtitleSourceTrackInfos = allSubtitleTrackInfos
+            .filter(Self.isFaithfullyConvertibleNativeSubtitleTrack)
+        let splitDisplaySetStreams = demuxer
+            .splitDisplaySetSubtitleStreamIndices()
+        let sourceVideoWidth = max(
+            1,
+            videoStream?.pointee.codecpar?.pointee.width
+                ?? 1_920
+        )
+        let sourceVideoHeight = max(
+            1,
+            videoStream?.pointee.codecpar?.pointee.height
+                ?? 1_080
+        )
+        let subtitleContracts: [HybridSubtitleDecodeContract] =
+            overlaySourceTrackInfos.compactMap {
+            info in
+            let streamIndex = Int32(info.id)
+            guard let stream = demuxer.stream(at: streamIndex) else {
+                return nil
+            }
+            return HybridSubtitleDecodeContract(
+                trackID: info.id,
+                packetStreamID: streamIndex,
+                info: info,
+                stream: stream,
+                sourceVideoWidth: sourceVideoWidth,
+                sourceVideoHeight: sourceVideoHeight,
+                assembleSplitDisplaySets:
+                    splitDisplaySetStreams.contains(streamIndex)
+            )
+        }
+        guard subtitleContracts.count
+                == overlaySourceTrackInfos.count else {
+            throw BlackCarrierMediaFanoutPumpError.demuxFailed(
+                reason: "Hybrid subtitle contract could not be copied"
+            )
+        }
+        let nativeSubtitleMetadata =
+            Self.nativeSubtitleMetadata(
+                for: nativeSubtitleSourceTrackInfos
+            )
+        var preparedNativeSubtitles:
+            [NativeSubtitleRendition] = []
+        for (info, renditionMetadata) in zip(
+            nativeSubtitleSourceTrackInfos,
+            nativeSubtitleMetadata
+        ) {
+            let streamIndex = Int32(info.id)
+            guard let stream = demuxer.stream(at: streamIndex),
+                  let decoder = EmbeddedSubtitleDecoder(
+                    stream: stream,
+                    sourceVideoWidth: Int32(sourceVideoWidth),
+                    sourceVideoHeight: Int32(sourceVideoHeight),
+                    preserveASSMarkup: false
+                  ) else {
+                EngineLog.emit(
+                    "[BlackCarrierMediaFanoutPump] native subtitle track unavailable during admission trackID=\(info.id)",
+                    category: .session
+                )
+                continue
+            }
+            let timeBase = stream.pointee.time_base
+            let sourceStartPTS =
+                BlackCarrierSourceAxis.sourceStartPTS(
+                    demuxer: demuxer,
+                    streamIndex: streamIndex
+                )
+            let shiftSeconds = Double(sourceStartPTS)
+                * Double(timeBase.num)
+                / Double(timeBase.den)
+            preparedNativeSubtitles.append(
+                NativeSubtitleRendition(
+                    metadata:
+                        BlackCarrierNativeSubtitleRenditionMetadata(
+                            ordinal: preparedNativeSubtitles.count,
+                            sourceTrackID:
+                                renditionMetadata.sourceTrackID,
+                            language: renditionMetadata.language,
+                            name: renditionMetadata.name,
+                            isDefault: renditionMetadata.isDefault,
+                            isAutoselect:
+                                renditionMetadata.isAutoselect,
+                            isForced: renditionMetadata.isForced
+                        ),
+                    sourceTrackInfo: info,
+                    decoder: decoder,
+                    timeBase: timeBase,
+                    shiftSeconds: shiftSeconds
+                )
+            )
         }
         let tracks = demuxer.audioTrackInfos()
         let metadata = BlackCarrierCompositeProvider.renditionMetadata(
@@ -297,6 +445,11 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         renditionMetadata = metadata
         renditions = prepared
         renditionDescriptors = prepared.map(\.writer.descriptor)
+        nativeSubtitleRenditions = preparedNativeSubtitles
+        nativeSubtitleRenditionMetadata =
+            preparedNativeSubtitles.map(\.metadata)
+        hybridSubtitleContracts = subtitleContracts
+        self.overlaySourceTrackInfos = overlaySourceTrackInfos
         generationStartSegmentIndex = firstSegmentIndex
         currentGeneration = initialGeneration
         interruptibleDemuxer = demuxer
@@ -306,11 +459,23 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                 ($0.writer.sourceStreamIndex, $0)
             }
         )
+        subtitleContractsByStream = Dictionary(
+            uniqueKeysWithValues: subtitleContracts.map {
+                ($0.packetStreamID, $0)
+            }
+        )
+        nativeSubtitleRenditionsByStream = Dictionary(
+            uniqueKeysWithValues: preparedNativeSubtitles.map {
+                (Int32($0.metadata.sourceTrackID), $0)
+            }
+        )
 
         var keep = Set(renditionsByStream.keys)
         if self.videoStreamIndex >= 0 {
             keep.insert(self.videoStreamIndex)
         }
+        keep.formUnion(subtitleContractsByStream.keys)
+        keep.formUnion(nativeSubtitleRenditionsByStream.keys)
         demuxer.discardAllStreamsExcept(keep)
     }
 
@@ -530,6 +695,78 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                 throw BlackCarrierMediaFanoutPumpError
                     .restartTrackContractMismatch
             }
+            let freshSubtitleTracks = freshDemuxer
+                .subtitleTrackInfos()
+                .filter(Self.isHybridOverlaySubtitleTrack)
+            let freshSubtitleTracksByID = Dictionary(
+                uniqueKeysWithValues: freshSubtitleTracks.map {
+                    ($0.id, $0)
+                }
+            )
+            var freshSubtitleContractsByStream:
+                [Int32: HybridSubtitleDecodeContract] = [:]
+            for (sourceTrack, contract) in zip(
+                overlaySourceTrackInfos,
+                hybridSubtitleContracts
+            ) {
+                guard freshSubtitleTracksByID[sourceTrack.id]
+                        == sourceTrack else {
+                    hybridSubtitleRuntimeAvailability
+                        .markUnavailable(
+                            trackID: contract.track.id,
+                            reason: .decodeFailed
+                        )
+                    continue
+                }
+                freshSubtitleContractsByStream[
+                    Int32(sourceTrack.id)
+                ] = contract
+            }
+            let freshNativeSubtitleTracksByID = Dictionary(
+                uniqueKeysWithValues: freshDemuxer
+                    .subtitleTrackInfos()
+                    .filter(Self.isFaithfullyConvertibleNativeSubtitleTrack)
+                    .map { ($0.id, $0) }
+            )
+            var freshNativeSubtitleRenditionsByStream:
+                [Int32: NativeSubtitleRendition] = [:]
+            for rendition in nativeSubtitleRenditions
+            where rendition.isAvailable {
+                let trackID = rendition.metadata.sourceTrackID
+                guard freshNativeSubtitleTracksByID[trackID]
+                        == rendition.sourceTrackInfo,
+                      let freshStream = freshDemuxer.stream(
+                        at: Int32(trackID)
+                      ),
+                      let decoder = EmbeddedSubtitleDecoder(
+                        stream: freshStream,
+                        sourceVideoWidth: Int32(max(
+                            1,
+                            freshDemuxer.stream(
+                                at: freshDemuxer.videoStreamIndex
+                            )?.pointee.codecpar?.pointee.width ?? 1_920
+                        )),
+                        sourceVideoHeight: Int32(max(
+                            1,
+                            freshDemuxer.stream(
+                                at: freshDemuxer.videoStreamIndex
+                            )?.pointee.codecpar?.pointee.height ?? 1_080
+                        )),
+                        preserveASSMarkup: false
+                      ) else {
+                    rendition.isAvailable = false
+                    EngineLog.emit(
+                        "[BlackCarrierMediaFanoutPump] native subtitle track unavailable after generation change trackID=\(trackID)",
+                        category: .session
+                    )
+                    continue
+                }
+                rendition.decoder = decoder
+                rendition.timeBase = freshStream.pointee.time_base
+                freshNativeSubtitleRenditionsByStream[
+                    Int32(trackID)
+                ] = rendition
+            }
             let freshVideoStreamIndex: Int32
             if videoPacketSink == nil {
                 freshVideoStreamIndex = -1
@@ -610,12 +847,22 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             if freshVideoStreamIndex >= 0 {
                 keep.insert(freshVideoStreamIndex)
             }
+            keep.formUnion(
+                freshSubtitleContractsByStream.keys
+            )
+            keep.formUnion(
+                freshNativeSubtitleRenditionsByStream.keys
+            )
             freshDemuxer.discardAllStreamsExcept(keep)
             renditionsByStream = Dictionary(
                 uniqueKeysWithValues: renditions.map {
                     ($0.writer.sourceStreamIndex, $0)
                 }
             )
+            subtitleContractsByStream =
+                freshSubtitleContractsByStream
+            nativeSubtitleRenditionsByStream =
+                freshNativeSubtitleRenditionsByStream
             videoStreamIndex = freshVideoStreamIndex
             summaries.removeAll(keepingCapacity: true)
             isFinished = false
@@ -739,6 +986,43 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                                 reason: String(describing: error)
                             )
                     }
+                } else if let contract =
+                            subtitleContractsByStream[
+                                packet.pointee.stream_index
+                            ],
+                          let stream = demuxer.stream(
+                            at: packet.pointee.stream_index
+                          ) {
+                    hybridSubtitlePacketStore.harvest(
+                        streamIndex: contract.packetStreamID,
+                        packet: packet,
+                        timeBase: stream.pointee.time_base,
+                        assembleSplitDisplaySets:
+                            contract.assembleSplitDisplaySets
+                    )
+                } else if let rendition =
+                            nativeSubtitleRenditionsByStream[
+                                packet.pointee.stream_index
+                            ],
+                          rendition.isAvailable {
+                    let event = rendition.decoder.decode(
+                        packet: packet,
+                        streamTimeBase: rendition.timeBase
+                    )
+                    if let event {
+                        rendition.store.appendCues(event.cues)
+                    }
+                    if let errorCode =
+                            rendition.decoder.lastDecodeErrorCode {
+                        rendition.isAvailable = false
+                        nativeSubtitleRenditionsByStream.removeValue(
+                            forKey: packet.pointee.stream_index
+                        )
+                        EngineLog.emit(
+                            "[BlackCarrierMediaFanoutPump] native subtitle track disabled after decode failure trackID=\(rendition.metadata.sourceTrackID) code=\(errorCode)",
+                            category: .session
+                        )
+                    }
                 }
             }
             try throwIfVideoDecoderFailed()
@@ -813,6 +1097,33 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return rendition(at: ordinal)?.cache.peek(index: index)
+    }
+
+    func nativeSubtitleVTT(
+        ordinal: Int,
+        segmentIndex: Int
+    ) throws -> String? {
+        guard nativeSubtitleRenditions.indices.contains(ordinal),
+              timeline.segments.indices.contains(segmentIndex) else {
+            return nil
+        }
+        let subtitle = nativeSubtitleRenditions[ordinal]
+        try produce(throughSegment: segmentIndex)
+        lock.lock()
+        defer { lock.unlock() }
+        guard subtitle.isAvailable else { return nil }
+        let segment = timeline.segments[segmentIndex]
+        let start = CMTimeGetSeconds(segment.startTime)
+        let end = CMTimeGetSeconds(
+            CMTimeAdd(segment.startTime, segment.duration)
+        )
+        return WebVTTBuilder.segment(
+            cues: subtitle.store.cuesInWindow(
+                start: start,
+                end: end
+            ),
+            segmentStart: start
+        )
     }
 
     func summary(
@@ -1006,6 +1317,9 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                     error: error
                 )
             }
+        }
+        nativeSubtitleRenditions.forEach {
+            $0.store.markFinished()
         }
         isFinished = true
     }
@@ -1246,5 +1560,52 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         .max(by: {
             CMTimeCompare($0, $1) < 0
         })
+    }
+
+    private static func isHybridOverlaySubtitleTrack(
+        _ info: TrackInfo
+    ) -> Bool {
+        AetherEngine.isBitmapSubtitleCodec(info.codec)
+            || info.codec == "ass"
+            || info.codec == "ssa"
+    }
+
+    static func isFaithfullyConvertibleNativeSubtitleTrack(
+        _ info: TrackInfo
+    ) -> Bool {
+        guard !AetherEngine.isEmbeddedClosedCaptionCodec(info.codec) else {
+            return false
+        }
+        switch info.codec.lowercased() {
+        case "subrip", "srt", "mov_text", "webvtt", "text":
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func nativeSubtitleMetadata(
+        for tracks: [TrackInfo]
+    ) -> [BlackCarrierNativeSubtitleRenditionMetadata] {
+        let defaultTrackID = tracks.first(where: \.isDefault)?.id
+        var nameCounts: [String: Int] = [:]
+        return tracks.enumerated().map { ordinal, track in
+            let baseName = track.name.isEmpty
+                ? "Subtitle \(ordinal + 1)"
+                : track.name
+            let count = (nameCounts[baseName] ?? 0) + 1
+            nameCounts[baseName] = count
+            return BlackCarrierNativeSubtitleRenditionMetadata(
+                ordinal: ordinal,
+                sourceTrackID: track.id,
+                language: track.language,
+                name: count == 1
+                    ? baseName
+                    : "\(baseName) \(count)",
+                isDefault: track.id == defaultTrackID,
+                isAutoselect: true,
+                isForced: track.isForced
+            )
+        }
     }
 }

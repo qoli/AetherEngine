@@ -192,6 +192,7 @@ struct HybridPlaybackTelemetryTests {
             audioAnalysisPlaybackPressure: .none,
             audioAnalysisTrackIDs: [0, 1],
             activeAudioAnalysisRequestCount: 0,
+            readinessPrerollFramesRejected: 0,
             carrierBandwidth: .awaiting(
                 audioRenditionCount: 2
             ),
@@ -202,8 +203,12 @@ struct HybridPlaybackTelemetryTests {
                 backPressureObservations: 0,
                 enqueuedSampleBuffers: 0,
                 lastEnqueuedTimeSeconds: nil,
+                lastAcceptedFrameDurationSeconds: nil,
+                lastAcceptedGeometry: nil,
                 carrierTimebaseBound: true,
-                rendererStatus: .unknown
+                rendererStatus: .unknown,
+                styledSubtitleVisible: false,
+                visibleBitmapSubtitleCount: 0
             ),
             systemFeaturePolicy:
                 AetherHybridPlaybackSession

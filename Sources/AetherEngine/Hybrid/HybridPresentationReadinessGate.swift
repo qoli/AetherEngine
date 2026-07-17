@@ -55,8 +55,8 @@ enum HybridPresentationReadinessSignalOutcome: Sendable, Equatable {
 ///
 /// The carrier signal means the AVPlayer transport is ready at startup, or its seek completion has
 /// landed for a later generation. A decoded frame qualifies only when its presentation interval
-/// intersects the target window. Decoder pre-roll from an older point may fill the frame queue, but
-/// cannot unlock audible playback until a target-near frame arrives.
+/// intersects the target window. Decoder pre-roll from an older point is rejected by the session
+/// before renderer admission, so it cannot fill the presentation queue or reveal pre-seek content.
 struct HybridPresentationReadinessGate {
     private(set) var state: HybridPresentationReadinessState = .idle
 

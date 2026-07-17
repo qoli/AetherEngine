@@ -6,16 +6,42 @@ Checks that need a running engine + a real media file, so they cannot run under 
 
 [`hybrid-display-device-acceptance.md`](hybrid-display-device-acceptance.md) locks the physical-tvOS
 geometry, AVPlayerViewController writer, Match Frame Rate, HDR/HLG/Dolby Vision and teardown evidence.
-The source-level sample-buffer timing and metadata contract is implemented, but the physical gate remains
-pending and no unverified color format may be added to
+The source-level sample-buffer timing and metadata contract is implemented. A 2026-07-17 physical-device
+run passes the automated SDR clock, seek, pre-roll admission, bidirectional audio selection,
+recoverable origin-stall, geometry/cadence, host-negative, native WebVTT selection, E-AC-3 JOC and
+styled ASS overlay select/seek/off/reselect, plus stop/reopen sub-matrix. Human display/audio/AVKit
+confirmation, bitmap physical-fixture coverage, HDR panel-output, HDR10+ and Dolby
+Vision remain pending. See
+[`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md). No unverified
+color format may be added to
 `AetherHybridPresentationView.verifiedVideoFormats`.
 
 ## Hybrid Atmos tvOS device gate
 
 [`hybrid-atmos-device-acceptance.md`](hybrid-atmos-device-acceptance.md) defines the physical-tvOS
 E-AC-3 JOC / Atmos fixture, start/seek/track-switch/stall matrix, privacy-safe telemetry evidence,
-and the rule for reopening the fixed 2 Mbps policy. This gate is currently pending; source-level
-profile-30 routing tests do not count as device evidence.
+and the rule for reopening the fixed 2 Mbps policy. The automated physical-device startup, seek,
+bidirectional JOC/AAC selection, recoverable stall and stop/reopen rows pass on the study Apple TV.
+The downstream television/AVR Atmos indicator remains a human row, so the complete gate is still
+pending.
+
+## Hybrid native WebVTT tvOS device gate
+
+The standalone `Examples/HybridCarrierTVOS` app and local fixture generators exercise both real-source
+HLS WebVTT through graph-bound preflight and a progressive VP9 Matroska source carrying SubRip. Both
+are republished through the carrier's AVFoundation `.legible` selection group. The 2026-07-17 study
+Apple TV runs pass select/deselect/reselect while retaining the same route, carrier clock and
+sample-buffer renderer. HLS source `DEFAULT`/`AUTOSELECT`/`FORCED` values and progressive container
+selection semantics are preserved by the carrier master. AVKit menu visibility and visible cue
+placement remain separate human checks; bitmap/styled overlay selection is not covered by this row.
+
+## Hybrid styled subtitle overlay tvOS device gate
+
+The standalone app's progressive VP9 + ASS mode exercises Aether's public overlay-track contract,
+AVKit custom-menu installation, real libass pixel output, explicit Off/reselect, and an exact seek
+generation on the same carrier timebase and real-video display layer. The 2026-07-17 study Apple TV run
+passes the automated row. Human-visible menu/cue confirmation and a legal bitmap-subtitle physical
+fixture remain pending.
 
 ## `avplayer-open-check.swift` (#15, E8)
 

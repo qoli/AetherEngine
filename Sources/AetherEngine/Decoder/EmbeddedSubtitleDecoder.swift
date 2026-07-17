@@ -27,6 +27,7 @@ final class EmbeddedSubtitleDecoder {
     let codecID: AVCodecID
 
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
+    private(set) var lastDecodeErrorCode: Int32?
     private var nextCueID: Int = 0
     private var seenKeys: Set<String> = []
 
@@ -43,10 +44,26 @@ final class EmbeddedSubtitleDecoder {
     private let preserveASSMarkup: Bool
 
     /// Open the subtitle decoder for `stream`. Returns `nil` if the codec couldn't be opened.
-    init?(stream: UnsafeMutablePointer<AVStream>, sourceVideoWidth: Int32, sourceVideoHeight: Int32, preserveASSMarkup: Bool = false) {
-        guard let codecpar = stream.pointee.codecpar,
-              codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE
-        else { return nil }
+    convenience init?(stream: UnsafeMutablePointer<AVStream>, sourceVideoWidth: Int32, sourceVideoHeight: Int32, preserveASSMarkup: Bool = false) {
+        guard let codecpar = stream.pointee.codecpar else { return nil }
+        self.init(
+            codecParameters: codecpar,
+            sourceVideoWidth: sourceVideoWidth,
+            sourceVideoHeight: sourceVideoHeight,
+            preserveASSMarkup: preserveASSMarkup
+        )
+        // Some demuxers default to AVDISCARD_DEFAULT and swallow packets;
+        // force NONE so everything reaches av_read_frame.
+        stream.pointee.discard = AVDISCARD_NONE
+    }
+
+    /// Build a fresh decoder from an immutable copied codec contract. Hybrid
+    /// subtitle selection uses this after the segment/demuxer that established
+    /// the track contract has closed, and again for every seek generation.
+    init?(codecParameters codecpar: UnsafePointer<AVCodecParameters>, sourceVideoWidth: Int32, sourceVideoHeight: Int32, preserveASSMarkup: Bool = false) {
+        guard codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE else {
+            return nil
+        }
         let id = codecpar.pointee.codec_id
         guard let codec = avcodec_find_decoder(id),
               let ctx = avcodec_alloc_context3(codec)
@@ -83,8 +100,6 @@ final class EmbeddedSubtitleDecoder {
         self.preserveASSMarkup = preserveASSMarkup
             && (id == AV_CODEC_ID_ASS || id == AV_CODEC_ID_SSA)
 
-        // Some demuxers default to AVDISCARD_DEFAULT and swallow packets; force NONE so everything reaches av_read_frame.
-        stream.pointee.discard = AVDISCARD_NONE
     }
 
     deinit {
@@ -107,6 +122,7 @@ final class EmbeddedSubtitleDecoder {
         var gotSub: Int32 = 0
         var fixedPayload: [UInt8]? = nil
         let ret = decodeWithFixups(ctx: ctx, pkt: packet, sub: &sub, gotSub: &gotSub, capturedPayload: &fixedPayload)
+        lastDecodeErrorCode = ret < 0 ? ret : nil
 
         // #112: remember this packet's PGS composition state (a PCS-only packet carries it; the later END emits the
         // cue). Only overwrite when a PCS is actually present so the state survives the intervening ODS/END packets.

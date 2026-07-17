@@ -131,6 +131,8 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
         Double
     public let audioAnalysisTrackIDs: [Int]
     public let activeAudioAnalysisRequestCount: Int
+    /// Decoder pre-roll rejected before renderer admission in the current generation.
+    public let readinessPrerollFramesRejected: UInt64
     public let carrierBandwidth:
         AetherHybridCarrierBandwidthTelemetry
     public let renderer: AetherHybridPresentationView.Diagnostics
@@ -153,6 +155,7 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
             Double,
         audioAnalysisTrackIDs: [Int],
         activeAudioAnalysisRequestCount: Int,
+        readinessPrerollFramesRejected: UInt64,
         carrierBandwidth:
             AetherHybridCarrierBandwidthTelemetry,
         renderer: AetherHybridPresentationView.Diagnostics,
@@ -175,6 +178,8 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
             audioAnalysisForwardBufferPressureThresholdSeconds
         self.audioAnalysisTrackIDs = audioAnalysisTrackIDs
         self.activeAudioAnalysisRequestCount = activeAudioAnalysisRequestCount
+        self.readinessPrerollFramesRejected =
+            readinessPrerollFramesRejected
         self.carrierBandwidth = carrierBandwidth
         self.renderer = renderer
         self.systemFeaturePolicy = systemFeaturePolicy
@@ -218,6 +223,10 @@ public final class AetherHybridPlaybackSession: ObservableObject {
 
     @Published public private(set) var state:
         HybridPlaybackSessionState
+    @Published public private(set) var overlaySubtitleTracks:
+        [AetherHybridOverlaySubtitleTrack]
+    @Published public private(set) var activeOverlaySubtitleTrackID:
+        Int?
 
     private let core: HybridPlaybackSession
     private let telemetryHub:
@@ -226,6 +235,8 @@ public final class AetherHybridPlaybackSession: ObservableObject {
     private weak var configuredCarrierPlayerViewController:
         AVPlayerViewController?
     private var didConfigureCarrierPlayerViewController = false
+    private var hostTransportBarCustomMenuItems:
+        [UIMenuElement] = []
     #endif
 
     private init(
@@ -244,6 +255,9 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         telemetrySessionID = telemetryHub.sessionID
         avPlayer = core.avPlayer
         state = core.state
+        overlaySubtitleTracks = core.overlaySubtitleTracks
+        activeOverlaySubtitleTrackID =
+            core.activeOverlaySubtitleTrackID
         core.stateDidChange = { [weak self] state in
             guard let self else { return }
             self.state = state
@@ -260,6 +274,25 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         core.telemetryDidChange = { [weak self] trigger in
             self?.publishTelemetry(for: trigger)
         }
+        core.subtitleTracksDidChange = {
+            [weak self] tracks, selectedTrackID in
+            guard let self else { return }
+            self.overlaySubtitleTracks = tracks
+            self.activeOverlaySubtitleTrackID = selectedTrackID
+            #if os(tvOS)
+            self.installOverlaySubtitleMenuIfNeeded()
+            #endif
+        }
+        #if os(tvOS)
+        core.runtimePresentationValidation = {
+            [weak self] in
+            guard let self else {
+                throw HybridPlaybackSessionError
+                    .carrierPresentationContractChanged
+            }
+            try self.validateCarrierPresentationContract()
+        }
+        #endif
         publishTelemetry(.sessionCreated)
     }
 
@@ -483,19 +516,33 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                     ) {
             throw error
         }
-        if let previous =
-                configuredCarrierPlayerViewController,
-           previous !== playerViewController,
-           previous.player === avPlayer {
-            previous.player = nil
+        let isReplacingController =
+            configuredCarrierPlayerViewController != nil
+                && configuredCarrierPlayerViewController
+                    !== playerViewController
+        if isReplacingController,
+           let previous = configuredCarrierPlayerViewController {
+            previous.transportBarCustomMenuItems =
+                hostTransportBarCustomMenuItems
+            if previous.player === avPlayer {
+                previous.player = nil
+            }
+            hostTransportBarCustomMenuItems = []
         }
         playerViewController.player = avPlayer
         playerViewController.videoGravity = .resizeAspect
         playerViewController
             .appliesPreferredDisplayCriteriaAutomatically = false
         presentationView.videoGravity = realVideoGravity
+        if configuredCarrierPlayerViewController
+                !== playerViewController {
+            hostTransportBarCustomMenuItems =
+                playerViewController
+                    .transportBarCustomMenuItems
+        }
         configuredCarrierPlayerViewController =
             playerViewController
+        installOverlaySubtitleMenuIfNeeded()
         didConfigureCarrierPlayerViewController = true
     }
     #endif
@@ -543,6 +590,8 @@ public final class AetherHybridPlaybackSession: ObservableObject {
             audioAnalysisTrackIDs: core.audioAnalysisTrackIDs,
             activeAudioAnalysisRequestCount:
                 core.activeAudioAnalysisRequestCount,
+            readinessPrerollFramesRejected:
+                core.readinessPrerollFramesRejected,
             carrierBandwidth:
                 core.carrierBandwidthTelemetry,
             renderer: presentationView.diagnostics,
@@ -589,6 +638,14 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         core.cancelAudioAnalysisStreams()
     }
 
+    /// Select one Aether-owned bitmap/styled subtitle track, or `nil` for
+    /// off. Native WebVTT remains in AVKit's native media-selection menu.
+    public func selectOverlaySubtitleTrack(
+        _ trackID: Int?
+    ) throws {
+        try core.selectOverlaySubtitleTrack(trackID)
+    }
+
     public func stop() {
         core.stop()
         telemetryHub.finish()
@@ -628,12 +685,77 @@ public final class AetherHybridPlaybackSession: ObservableObject {
     }
 
     private func detachCarrierPlayerViewControllerIfOwned() {
+        configuredCarrierPlayerViewController?
+            .transportBarCustomMenuItems =
+                hostTransportBarCustomMenuItems
         if configuredCarrierPlayerViewController?.player
                 === avPlayer {
             configuredCarrierPlayerViewController?.player = nil
         }
         configuredCarrierPlayerViewController = nil
         didConfigureCarrierPlayerViewController = false
+        hostTransportBarCustomMenuItems = []
+    }
+
+    private func installOverlaySubtitleMenuIfNeeded() {
+        guard let controller =
+                configuredCarrierPlayerViewController else {
+            return
+        }
+        guard !overlaySubtitleTracks.isEmpty else {
+            controller.transportBarCustomMenuItems =
+                hostTransportBarCustomMenuItems
+            return
+        }
+        let off = UIAction(
+            title: "Off",
+            state: activeOverlaySubtitleTrackID == nil
+                ? .on
+                : .off
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                do {
+                    try self?.selectOverlaySubtitleTrack(nil)
+                } catch {
+                    EngineLog.emit(
+                        "[AetherHybridPlaybackSession] overlay subtitle off failed: "
+                            + String(describing: error),
+                        category: .session
+                    )
+                }
+            }
+        }
+        let actions = overlaySubtitleTracks.map { track in
+            let action = UIAction(
+                title: track.name,
+                state: activeOverlaySubtitleTrackID == track.id
+                    ? .on
+                    : .off
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    do {
+                        try self?.selectOverlaySubtitleTrack(track.id)
+                    } catch {
+                        EngineLog.emit(
+                            "[AetherHybridPlaybackSession] overlay subtitle selection failed trackID=\(track.id): "
+                                + String(describing: error),
+                            category: .session
+                        )
+                    }
+                }
+            }
+            if case .unavailable = track.availability {
+                action.attributes.insert(.disabled)
+            }
+            return action
+        }
+        let menu = UIMenu(
+            title: "Styled Subtitles",
+            image: UIImage(systemName: "captions.bubble"),
+            children: [off] + actions
+        )
+        controller.transportBarCustomMenuItems =
+            hostTransportBarCustomMenuItems + [menu]
     }
     #endif
 
@@ -801,6 +923,8 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                 current.audioAnalysisTrackIDs,
             activeAudioAnalysisRequestCount:
                 current.activeAudioAnalysisRequestCount,
+            readinessPrerollFramesRejected:
+                current.readinessPrerollFramesRejected,
             carrierBandwidth:
                 current.carrierBandwidth,
             renderer: current.renderer,

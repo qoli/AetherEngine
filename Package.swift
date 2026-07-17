@@ -29,16 +29,26 @@ let package = Package(
         // No network stack, we use custom AVIO + URLSession for HTTP streams.
         // Resolved over Git rather than a local path so consumers (and
         // Xcode Cloud) can build without a sibling FFmpegBuild checkout.
-        .package(url: "https://github.com/superuser404notfound/FFmpegBuild", from: "1.0.1"),  // 1.0.2: FFmpeg n8.1.2 + dca_core bitstream filter (#64)
+        .package(
+            url: "https://github.com/qoli/FFmpegBuild",
+            revision: "d24262133163dab1a8997e22493176a0db4adea8"
+        ),
         // Pure-Swift SMB2 client (MIT) that speaks the protocol over
         // NWConnection. Replaces AMSMB2/libsmb2, which EPERMs on tvOS/iOS.
-        // Pinned to the 0.3.x minor: SMBClient is pre-1.0 with an actively
-        // moving API, so allow patch updates but not a minor bump.
-        .package(url: "https://github.com/kishikawakatsumi/SMBClient", .upToNextMinor(from: "0.3.1")),
+        // Native release dependencies are exact-pinned so a consumer resolve
+        // cannot silently change the audited source/link graph.
+        .package(url: "https://github.com/kishikawakatsumi/SMBClient", exact: "0.3.1"),
         // libdovi (Dolby Vision RPU parser/converter). Resolved over Git like
         // FFmpegBuild so consumers (and Xcode Cloud) build without a sibling
         // LibDovi checkout; the prebuilt xcframework needs no Rust at build time.
-        .package(url: "https://github.com/superuser404notfound/LibDovi", from: "1.0.2"),  // 1.0.2: iOS slices + x86_64 (Intel Macs)
+        .package(url: "https://github.com/superuser404notfound/LibDovi", exact: "1.0.2"),
+        // libass C API used by the Aether-owned Hybrid styled-subtitle overlay.
+        // Keep this exact: the package carries prebuilt native XCFrameworks and
+        // therefore must never move independently of the audited release graph.
+        .package(
+            url: "https://github.com/qoli/swift-libass",
+            revision: "01c5ebb8ee8b36cefcbcabea819a47208d1e1216"
+        ),
     ],
     targets: [
         .target(
@@ -46,6 +56,7 @@ let package = Package(
             dependencies: [
                 .product(name: "FFmpegBuild", package: "FFmpegBuild"),
                 .product(name: "Dovi", package: "LibDovi"),
+                .product(name: "SwiftLibass", package: "swift-libass"),
             ],
             resources: [
                 .process("Resources"),

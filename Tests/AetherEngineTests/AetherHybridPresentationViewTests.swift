@@ -55,17 +55,30 @@ struct AetherHybridPresentationViewTests {
             timeValue: 0,
             generation: 3
         )) == .staleGeneration)
-        #expect(try view.enqueue(makeSDRFrame(
+        let acceptedFrame = try makeSDRFrame(
             timeValue: 0,
             generation: 4
-        )) == .accepted)
+        )
+        #expect(try view.enqueue(acceptedFrame) == .accepted)
         #expect(view.diagnostics.pendingSampleBuffers == 1)
         #expect(view.diagnostics.staleGenerationDrops == 1)
+        #expect(
+            view.diagnostics.lastAcceptedGeometry
+                == acceptedFrame.geometry
+        )
+        #expect(
+            view.diagnostics.lastAcceptedFrameDurationSeconds
+                == acceptedFrame.duration.seconds
+        )
 
         try view.beginGeneration(5, videoFormat: .sdr)
         #expect(view.diagnostics.generation == 5)
         #expect(view.diagnostics.pendingSampleBuffers == 0)
         #expect(view.diagnostics.lastEnqueuedTimeSeconds == nil)
+        #expect(
+            view.diagnostics.lastAcceptedFrameDurationSeconds == nil
+        )
+        #expect(view.diagnostics.lastAcceptedGeometry == nil)
     }
 
     @Test("Pending samples are bounded without dropping an accepted frame")

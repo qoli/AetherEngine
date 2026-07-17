@@ -29,6 +29,7 @@ enum BlackCarrierLazyCompositeProviderError:
 final class BlackCarrierLazyCompositeProvider:
     BlackCarrierTransportProvider,
     HybridCarrierBandwidthTelemetrySource,
+    HybridOverlaySubtitleSource,
     @unchecked Sendable
 {
     private let videoProvider: BlackCarrierVideoProvider
@@ -132,6 +133,22 @@ final class BlackCarrierLazyCompositeProvider:
 
     var hybridVideoFrameRate: Double? {
         pump.hybridVideoFrameRate
+    }
+
+    var hybridSubtitleContracts:
+        [HybridSubtitleDecodeContract]
+    {
+        pump.hybridSubtitleContracts
+    }
+
+    var hybridSubtitlePacketStore: SubtitlePacketStore {
+        pump.hybridSubtitlePacketStore
+    }
+
+    var hybridSubtitleRuntimeAvailability:
+        HybridSubtitleRuntimeAvailabilityStore
+    {
+        pump.hybridSubtitleRuntimeAvailability
     }
 
     var audioAnalysisTrackIDs: [Int] {
@@ -293,6 +310,61 @@ final class BlackCarrierLazyCompositeProvider:
                 isAutoselect: metadata.isAutoselect,
                 channels: descriptor.channelsAttribute
             )
+        }
+    }
+
+    var nativeSubtitleRenditions: [(
+        ordinal: Int,
+        language: String?,
+        name: String,
+        isDefault: Bool,
+        isAutoselect: Bool,
+        isForced: Bool
+    )] {
+        pump.nativeSubtitleRenditionMetadata.map {
+            (
+                ordinal: $0.ordinal,
+                language: $0.language,
+                name: $0.name,
+                isDefault: $0.isDefault,
+                isAutoselect: $0.isAutoselect,
+                isForced: $0.isForced
+            )
+        }
+    }
+
+    var nativeSubtitleDefaultOrdinal: Int {
+        pump.nativeSubtitleRenditionMetadata
+            .first(where: \.isDefault)?.ordinal ?? 0
+    }
+
+    var nativeSubtitleWholeProgram: Bool { false }
+
+    func nativeSubtitleVTT(
+        ordinal: Int,
+        segmentIndex: Int
+    ) -> String? {
+        guard pump.nativeSubtitleRenditionMetadata.indices
+                .contains(ordinal),
+              0..<segmentCount ~= segmentIndex else {
+            return nil
+        }
+        do {
+            return try pump.nativeSubtitleVTT(
+                ordinal: ordinal,
+                segmentIndex: segmentIndex
+            )
+        } catch let error as BlackCarrierMediaFanoutPumpError {
+            if case .generationSuperseded = error {
+                return nil
+            }
+            recordIfTerminal(error)
+            return nil
+        } catch {
+            record(.pump(.demuxFailed(
+                reason: String(describing: error)
+            )))
+            return nil
         }
     }
 

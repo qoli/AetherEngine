@@ -108,8 +108,16 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         public let backPressureObservations: Int
         public let enqueuedSampleBuffers: Int
         public let lastEnqueuedTimeSeconds: Double?
+        /// Source-derived duration of the newest frame admitted in the active generation.
+        public let lastAcceptedFrameDurationSeconds: Double?
+        /// Geometry from the newest frame admitted in the active generation.
+        /// The fixed black carrier canvas is never a source for this value.
+        public let lastAcceptedGeometry:
+            DecodedVideoFrameGeometry?
         public let carrierTimebaseBound: Bool
         public let rendererStatus: RendererStatus
+        public let styledSubtitleVisible: Bool
+        public let visibleBitmapSubtitleCount: Int
 
         init(
             generation: UInt64,
@@ -118,8 +126,13 @@ public final class AetherHybridPresentationView: PlatformBaseView {
             backPressureObservations: Int,
             enqueuedSampleBuffers: Int,
             lastEnqueuedTimeSeconds: Double?,
+            lastAcceptedFrameDurationSeconds: Double?,
+            lastAcceptedGeometry:
+                DecodedVideoFrameGeometry?,
             carrierTimebaseBound: Bool,
-            rendererStatus: RendererStatus
+            rendererStatus: RendererStatus,
+            styledSubtitleVisible: Bool,
+            visibleBitmapSubtitleCount: Int
         ) {
             self.generation = generation
             self.pendingSampleBuffers = pendingSampleBuffers
@@ -127,8 +140,14 @@ public final class AetherHybridPresentationView: PlatformBaseView {
             self.backPressureObservations = backPressureObservations
             self.enqueuedSampleBuffers = enqueuedSampleBuffers
             self.lastEnqueuedTimeSeconds = lastEnqueuedTimeSeconds
+            self.lastAcceptedFrameDurationSeconds =
+                lastAcceptedFrameDurationSeconds
+            self.lastAcceptedGeometry = lastAcceptedGeometry
             self.carrierTimebaseBound = carrierTimebaseBound
             self.rendererStatus = rendererStatus
+            self.styledSubtitleVisible = styledSubtitleVisible
+            self.visibleBitmapSubtitleCount =
+                visibleBitmapSubtitleCount
         }
     }
 
@@ -144,6 +163,7 @@ public final class AetherHybridPresentationView: PlatformBaseView {
     static let maximumPendingSampleBuffers = 24
 
     private let displayLayer = AVSampleBufferDisplayLayer()
+    private var subtitleCanvas: HybridSubtitleOverlayCanvas!
     private weak var boundCarrierItem: AVPlayerItem?
     private var boundCarrierTimebase: CMTimebase?
     private var pendingSamples: [PendingSample] = []
@@ -151,6 +171,9 @@ public final class AetherHybridPresentationView: PlatformBaseView {
     private var activeVideoFormat: VideoFormat = .sdr
     private var sourceRotationDegrees: Int?
     private var lastAcceptedPresentationTime: CMTime?
+    private var lastAcceptedFrameDurationSeconds: Double?
+    private var lastAcceptedGeometry:
+        DecodedVideoFrameGeometry?
     private var lastEnqueuedPresentationTime: CMTime?
     private var staleGenerationDrops = 0
     private var backPressureObservations = 0
@@ -162,6 +185,7 @@ public final class AetherHybridPresentationView: PlatformBaseView {
             case .resizeAspect: .resizeAspect
             case .resizeAspectFill: .resizeAspectFill
             }
+            applyLayerGeometry()
         }
     }
 
@@ -197,11 +221,21 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         #if canImport(UIKit)
         backgroundColor = .black
         isUserInteractionEnabled = false
+        clipsToBounds = true
         layer.addSublayer(displayLayer)
+        subtitleCanvas = HybridSubtitleOverlayCanvas(
+            parent: layer
+        )
         #elseif canImport(AppKit)
         wantsLayer = true
         layer?.backgroundColor = CGColor.black
+        layer?.masksToBounds = true
         layer?.addSublayer(displayLayer)
+        if let layer {
+            subtitleCanvas = HybridSubtitleOverlayCanvas(
+                parent: layer
+            )
+        }
         #endif
         displayLayer.videoGravity = .resizeAspect
         displayLayer.preventsDisplaySleepDuringVideoPlayback = true
@@ -237,7 +271,10 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         activeVideoFormat = videoFormat
         pendingSamples.removeAll(keepingCapacity: true)
         lastAcceptedPresentationTime = nil
+        lastAcceptedFrameDurationSeconds = nil
+        lastAcceptedGeometry = nil
         lastEnqueuedPresentationTime = nil
+        subtitleCanvas.clear()
     }
 
     /// Bind exactly once to the carrier item and its actual AVPlayerItem
@@ -341,6 +378,9 @@ public final class AetherHybridPresentationView: PlatformBaseView {
             presentationTime: frame.presentationTime
         ))
         lastAcceptedPresentationTime = frame.presentationTime
+        lastAcceptedFrameDurationSeconds = frame.duration.seconds
+        lastAcceptedGeometry = frame.geometry
+        applyLayerGeometry()
         try drainPendingSamples()
         return .accepted
     }
@@ -349,6 +389,7 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         pendingSamples.removeAll(keepingCapacity: true)
         lastAcceptedPresentationTime = nil
         lastEnqueuedPresentationTime = nil
+        subtitleCanvas.clear()
         flushRenderer(removingDisplayedImage: removingDisplayedImage)
     }
 
@@ -358,6 +399,8 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         boundCarrierItem = nil
         boundCarrierTimebase = nil
         sourceRotationDegrees = nil
+        lastAcceptedFrameDurationSeconds = nil
+        lastAcceptedGeometry = nil
         applyLayerGeometry()
     }
 
@@ -370,15 +413,40 @@ public final class AetherHybridPresentationView: PlatformBaseView {
             enqueuedSampleBuffers: enqueuedSampleBuffers,
             lastEnqueuedTimeSeconds:
                 lastEnqueuedPresentationTime?.seconds,
+            lastAcceptedFrameDurationSeconds:
+                lastAcceptedFrameDurationSeconds,
+            lastAcceptedGeometry: lastAcceptedGeometry,
             carrierTimebaseBound:
                 boundCarrierItem != nil
                 && boundCarrierTimebase != nil,
-            rendererStatus: rendererStatus
+            rendererStatus: rendererStatus,
+            styledSubtitleVisible:
+                subtitleCanvas.styledSubtitleVisible,
+            visibleBitmapSubtitleCount:
+                subtitleCanvas.visibleBitmapSubtitleCount
         )
     }
 
     var controlTimebase: CMTimebase? {
         displayLayer.controlTimebase
+    }
+
+    var subtitleCanvasSize: CGSize {
+        subtitleCanvas.canvasSize
+    }
+
+    func showStyledSubtitle(
+        _ frame: HybridStyledSubtitleFrame?
+    ) {
+        subtitleCanvas.showStyled(frame)
+    }
+
+    func showBitmapSubtitles(_ images: [SubtitleImage]) {
+        subtitleCanvas.showBitmaps(images)
+    }
+
+    func clearSubtitleOverlay() {
+        subtitleCanvas.clear()
     }
 
     private var queueTarget: any AVQueuedSampleBufferRendering {
@@ -741,6 +809,49 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         displayLayer.setAffineTransform(
             CGAffineTransform(rotationAngle: rotation)
         )
+        subtitleCanvas?.layout(
+            in: bounds,
+            videoRect: realVideoRect(in: bounds)
+        )
         CATransaction.commit()
+    }
+
+    private func realVideoRect(in bounds: CGRect) -> CGRect {
+        guard let geometry = lastAcceptedGeometry else {
+            return bounds
+        }
+        var width = geometry.cleanAperture.width
+            * Double(geometry.pixelAspectRatioNumerator)
+            / Double(geometry.pixelAspectRatioDenominator)
+        var height = geometry.cleanAperture.height
+        if geometry.rotationDegrees == 90
+            || geometry.rotationDegrees == 270 {
+            swap(&width, &height)
+        }
+        guard width.isFinite,
+              height.isFinite,
+              width > 0,
+              height > 0,
+              !bounds.isEmpty else {
+            return bounds
+        }
+        let horizontalScale = bounds.width / width
+        let verticalScale = bounds.height / height
+        let scale = switch videoGravity {
+        case .resizeAspect:
+            min(horizontalScale, verticalScale)
+        case .resizeAspectFill:
+            max(horizontalScale, verticalScale)
+        }
+        let size = CGSize(
+            width: width * scale,
+            height: height * scale
+        )
+        return CGRect(
+            x: bounds.midX - size.width / 2,
+            y: bounds.midY - size.height / 2,
+            width: size.width,
+            height: size.height
+        )
     }
 }

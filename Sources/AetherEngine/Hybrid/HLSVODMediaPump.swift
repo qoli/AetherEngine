@@ -193,9 +193,19 @@ actor HLSVODMediaPump {
 
     let renditionMetadata: [BlackCarrierAudioRenditionMetadata]
     let renditionDescriptors: [BlackCarrierAudioRenditionDescriptor]
+    let subtitleRenditions:
+        [HLSVODSubtitleRenditionResource]
+    let hybridSubtitleContracts:
+        [HybridSubtitleDecodeContract]
+    let hybridSubtitlePacketStore: SubtitlePacketStore
+    let hybridSubtitleRuntimeAvailability:
+        HybridSubtitleRuntimeAvailabilityStore
 
     private let graph: HLSVODResourceGraph
     private let loader: HLSVODOriginResourceLoader
+    /// Isolated so a subtitle-origin failure can disable only that track without invalidating playback.
+    private let subtitleLoader:
+        HLSVODOriginResourceLoader?
     private let worker: Worker
     private let videoInitData: Data?
     private let audioInitData: [Data?]
@@ -211,6 +221,8 @@ actor HLSVODMediaPump {
     private var generationStartSegmentIndex = 0
     private var didRestart = false
     private var requestedRestartGeneration: UInt64?
+    private var unavailableSubtitleOrdinals:
+        Set<Int> = []
     private var productionTask: Task<Void, Never>?
     private var productionWaiters: [
         CheckedContinuation<Void, Never>
@@ -258,6 +270,30 @@ actor HLSVODMediaPump {
             )
         } catch let error as HLSVODOriginResourceError {
             throw HLSVODMediaPumpError.origin(error)
+        }
+
+        let subtitleLoader:
+            HLSVODOriginResourceLoader?
+        if graph.subtitleRenditions.isEmpty {
+            subtitleLoader = nil
+        } else {
+            do {
+                subtitleLoader = try HLSVODOriginResourceLoader(
+                    graph: graph,
+                    httpHeaders: preflight.httpHeaders,
+                    maximumResourceBytes:
+                        maximumResourceBytes,
+                    capacityBytes: capacityBytes,
+                    baseDirectory: baseDirectory,
+                    fetchOverride: fetchOverride
+                )
+            } catch {
+                EngineLog.emit(
+                    "[HLSVODMediaPump] subtitle loader unavailable; subtitle renditions disabled",
+                    category: .session
+                )
+                subtitleLoader = nil
+            }
         }
 
         do {
@@ -321,9 +357,15 @@ actor HLSVODMediaPump {
                     videoFailureHandler,
                 initialGeneration: initialGeneration
             )
+            guard worker.hybridSubtitleContracts.map(\.track)
+                    == preflight.overlaySubtitleTracks else {
+                worker.close()
+                throw HLSVODMediaPumpError.invalidPreflight
+            }
             return try HLSVODMediaPump(
                 graph: graph,
                 loader: loader,
+                subtitleLoader: subtitleLoader,
                 worker: worker,
                 videoInitData: videoInitData,
                 audioInitData: audioInitData,
@@ -339,6 +381,16 @@ actor HLSVODMediaPump {
                     category: .session
                 )
             }
+            if let subtitleLoader {
+                do {
+                    try await subtitleLoader.close()
+                } catch {
+                    EngineLog.emit(
+                        "[HLSVODMediaPump] subtitle setup cleanup failed",
+                        category: .session
+                    )
+                }
+            }
             throw Self.typed(error)
         }
     }
@@ -346,6 +398,8 @@ actor HLSVODMediaPump {
     private init(
         graph: HLSVODResourceGraph,
         loader: HLSVODOriginResourceLoader,
+        subtitleLoader:
+            HLSVODOriginResourceLoader?,
         worker: Worker,
         videoInitData: Data?,
         audioInitData: [Data?],
@@ -353,6 +407,7 @@ actor HLSVODMediaPump {
     ) throws {
         self.graph = graph
         self.loader = loader
+        self.subtitleLoader = subtitleLoader
         self.worker = worker
         self.videoInitData = videoInitData
         self.audioInitData = audioInitData
@@ -367,6 +422,15 @@ actor HLSVODMediaPump {
         currentGeneration = initialGeneration
         renditionMetadata = worker.renditionMetadata
         renditionDescriptors = worker.renditionDescriptors
+        subtitleRenditions = subtitleLoader == nil
+            ? []
+            : graph.subtitleRenditions
+        hybridSubtitleContracts =
+            worker.hybridSubtitleContracts
+        hybridSubtitlePacketStore =
+            worker.hybridSubtitlePacketStore
+        hybridSubtitleRuntimeAvailability =
+            worker.hybridSubtitleRuntimeAvailability
         nextAudioInputSegmentIndices = Array(
             repeating: 0,
             count: graph.audioRenditions.count
@@ -618,8 +682,8 @@ actor HLSVODMediaPump {
                 .contains(segmentIndex) else {
             return nil
         }
-        try await produce(
-            throughSegment: segmentIndex
+        try await produceCarrierAudioSegment(
+            segmentIndex
         )
         return worker.audioMediaSegmentURL(
             renditionOrdinal: renditionOrdinal,
@@ -637,13 +701,43 @@ actor HLSVODMediaPump {
                 .contains(segmentIndex) else {
             return nil
         }
-        try await produce(
-            throughSegment: segmentIndex
+        try await produceCarrierAudioSegment(
+            segmentIndex
         )
         return worker.audioMediaSegment(
             renditionOrdinal: renditionOrdinal,
             segmentIndex: segmentIndex
         )
+    }
+
+    /// A loopback audio request is bound to an advertised carrier URI, not to the decoder generation
+    /// that happened to be active when AVPlayer opened the HTTP connection. If a stall-triggered seek
+    /// retires that generation, keep the same local request attached to the replacement production and
+    /// fulfill it from the new writer. Returning `generationSuperseded` here truncates an already-committed
+    /// chunked response; AVPlayer does not reliably re-request alternate audio after that truncation.
+    private func produceCarrierAudioSegment(
+        _ segmentIndex: Int
+    ) async throws {
+        while true {
+            do {
+                try await produce(
+                    throughSegment: segmentIndex
+                )
+                return
+            } catch let error
+                    as HLSVODMediaPumpError {
+                guard case .generationSuperseded =
+                        error else {
+                    throw error
+                }
+                while requestedRestartGeneration
+                        != nil
+                        || restartInProgress {
+                    try requireAvailable()
+                    try await waitForProduction()
+                }
+            }
+        }
     }
 
     /// Exhausts the graph for deterministic mux-fixture verification.
@@ -748,6 +842,57 @@ actor HLSVODMediaPump {
         worker.observedAudioBandwidthSegmentSamples()
     }
 
+    /// Return the exact admitted WebVTT segment. Any failure disables only this rendition.
+    func subtitleVTT(
+        renditionOrdinal: Int,
+        segmentIndex: Int
+    ) async -> String? {
+        guard let subtitleLoader,
+              subtitleRenditions.indices.contains(
+                renditionOrdinal
+              ),
+              subtitleRenditions[renditionOrdinal]
+                .segments.indices.contains(segmentIndex),
+              !unavailableSubtitleOrdinals.contains(
+                renditionOrdinal
+              ) else {
+            return nil
+        }
+        do {
+            let data = try await subtitleLoader.payload(
+                for: .subtitleSegment(
+                    renditionOrdinal:
+                        renditionOrdinal,
+                    index: segmentIndex
+                )
+            ).data
+            guard Self.isWebVTT(data),
+                  let text = String(
+                    data: data,
+                    encoding: .utf8
+                  ) else {
+                unavailableSubtitleOrdinals.insert(
+                    renditionOrdinal
+                )
+                EngineLog.emit(
+                    "[HLSVODMediaPump] subtitle rendition disabled after invalid WebVTT payload ordinal=\(renditionOrdinal)",
+                    category: .session
+                )
+                return nil
+            }
+            return text
+        } catch {
+            unavailableSubtitleOrdinals.insert(
+                renditionOrdinal
+            )
+            EngineLog.emit(
+                "[HLSVODMediaPump] subtitle rendition disabled after origin failure ordinal=\(renditionOrdinal)",
+                category: .session
+            )
+            return nil
+        }
+    }
+
     func originLoaderSnapshot() async
         -> HLSVODOriginResourceLoaderSnapshot
     {
@@ -761,10 +906,27 @@ actor HLSVODMediaPump {
         productionTask?.cancel()
         worker.close()
         resumeProductionWaiters()
+        var loaderCloseError:
+            HLSVODOriginResourceError?
         do {
             try await loader.close()
         } catch let error as HLSVODOriginResourceError {
-            throw HLSVODMediaPumpError.origin(error)
+            loaderCloseError = error
+        }
+        if let subtitleLoader {
+            do {
+                try await subtitleLoader.close()
+            } catch {
+                EngineLog.emit(
+                    "[HLSVODMediaPump] subtitle loader cleanup failed",
+                    category: .session
+                )
+            }
+        }
+        if let loaderCloseError {
+            throw HLSVODMediaPumpError.origin(
+                loaderCloseError
+            )
         }
     }
 
@@ -867,6 +1029,14 @@ actor HLSVODMediaPump {
                     generation: generation
                 )
         }
+    }
+
+    private static func isWebVTT(_ data: Data) -> Bool {
+        var bytes = data
+        if bytes.starts(with: [0xEF, 0xBB, 0xBF]) {
+            bytes.removeFirst(3)
+        }
+        return bytes.starts(with: Data("WEBVTT".utf8))
     }
 
     private func performProduction(
@@ -1061,6 +1231,11 @@ private extension HLSVODMediaPump {
             [BlackCarrierAudioRenditionMetadata]
         let renditionDescriptors:
             [BlackCarrierAudioRenditionDescriptor]
+        let hybridSubtitleContracts:
+            [HybridSubtitleDecodeContract]
+        let hybridSubtitlePacketStore = SubtitlePacketStore()
+        let hybridSubtitleRuntimeAvailability =
+            HybridSubtitleRuntimeAvailabilityStore()
 
         private let graph: HLSVODResourceGraph
         private let bridgeMode: AudioBridgeMode
@@ -1072,6 +1247,7 @@ private extension HLSVODMediaPump {
             HybridVideoDecodeSink?
         private let audioRenditions: [AudioRendition]
         private let usesSeparateAudio: Bool
+        private let overlaySourceTrackInfos: [TrackInfo]
 
         private var highestProducedVideoSegmentIndex =
             -1
@@ -1145,6 +1321,47 @@ private extension HLSVODMediaPump {
             } else {
                 videoDecodeSink = nil
             }
+
+            let overlaySourceTrackInfos = videoDemuxer
+                .subtitleTrackInfos()
+                .filter(Self.isHybridOverlaySubtitleTrack)
+            let splitDisplaySetStreams = videoDemuxer
+                .splitDisplaySetSubtitleStreamIndices()
+            let sourceVideoWidth = max(
+                1,
+                videoStream.pointee.codecpar?.pointee.width
+                    ?? 1_920
+            )
+            let sourceVideoHeight = max(
+                1,
+                videoStream.pointee.codecpar?.pointee.height
+                    ?? 1_080
+            )
+            let subtitleContracts: [HybridSubtitleDecodeContract] =
+                overlaySourceTrackInfos.compactMap {
+                info in
+                let streamIndex = Int32(info.id)
+                guard let stream = videoDemuxer.stream(
+                    at: streamIndex
+                ) else { return nil }
+                return HybridSubtitleDecodeContract(
+                    trackID: info.id,
+                    packetStreamID: streamIndex,
+                    info: info,
+                    stream: stream,
+                    sourceVideoWidth: sourceVideoWidth,
+                    sourceVideoHeight: sourceVideoHeight,
+                    assembleSplitDisplaySets:
+                        splitDisplaySetStreams.contains(streamIndex)
+                )
+            }
+            guard subtitleContracts.count
+                    == overlaySourceTrackInfos.count else {
+                videoDecodeSink?.close()
+                throw HLSVODMediaPumpError.invalidPreflight
+            }
+            self.overlaySourceTrackInfos = overlaySourceTrackInfos
+            hybridSubtitleContracts = subtitleContracts
 
             if usesSeparateAudio {
                 guard audioInitData.count
@@ -1694,6 +1911,31 @@ private extension HLSVODMediaPump {
             var muxedByStream: [
                 Int32: AudioRendition
             ] = [:]
+            let actualOverlayTracks = demuxer
+                .subtitleTrackInfos()
+                .filter(Self.isHybridOverlaySubtitleTrack)
+            let subtitleContractsByStream:
+                [Int32: HybridSubtitleDecodeContract]
+            if actualOverlayTracks == overlaySourceTrackInfos {
+                subtitleContractsByStream = Dictionary(
+                    uniqueKeysWithValues: zip(
+                        actualOverlayTracks,
+                        hybridSubtitleContracts
+                    ).map { info, contract in
+                        (Int32(info.id), contract)
+                    }
+                )
+            } else {
+                subtitleContractsByStream = [:]
+                for contract in hybridSubtitleContracts {
+                    hybridSubtitleRuntimeAvailability.markUnavailable(
+                        trackID: contract.track.id,
+                        reason: .decodeFailed
+                    )
+                }
+            }
+            let splitDisplaySetStreams = demuxer
+                .splitDisplaySetSubtitleStreamIndices()
             if !usesSeparateAudio {
                 guard actualAudioStreams.count
                         == audioRenditions.count else {
@@ -1836,6 +2078,50 @@ private extension HLSVODMediaPump {
                             rendition: rendition
                         )
                         audioPackets[ordinal] += 1
+                    } else if let contract =
+                                subtitleContractsByStream[
+                                    streamIndex
+                                ],
+                              let stream = demuxer.stream(
+                                at: streamIndex
+                              ) {
+                        do {
+                            let assembles = splitDisplaySetStreams
+                                .contains(streamIndex)
+                            if packet.pointee.pts != Int64.min
+                                || packet.pointee.dts != Int64.min {
+                                try Self.normalize(
+                                    packet: packet,
+                                    demuxer: demuxer,
+                                    streamIndex: streamIndex,
+                                    outputStreamIndex:
+                                        contract.packetStreamID,
+                                    segmentStart:
+                                        graph.timeline.segments[
+                                            index
+                                        ].startTime,
+                                    segmentIndex: index
+                                )
+                            } else {
+                                packet.pointee.stream_index =
+                                    contract.packetStreamID
+                            }
+                            hybridSubtitlePacketStore.harvest(
+                                streamIndex:
+                                    contract.packetStreamID,
+                                packet: packet,
+                                timeBase:
+                                    stream.pointee.time_base,
+                                assembleSplitDisplaySets:
+                                    assembles
+                            )
+                        } catch {
+                            hybridSubtitleRuntimeAvailability
+                                .markUnavailable(
+                                    trackID: contract.track.id,
+                                    reason: .decodeFailed
+                                )
+                        }
                     }
                 }
             } catch let error
@@ -2900,6 +3186,14 @@ private extension HLSVODMediaPump {
                 indices.append(Int32(index))
             }
             return indices
+        }
+
+        private static func isHybridOverlaySubtitleTrack(
+            _ info: TrackInfo
+        ) -> Bool {
+            AetherEngine.isBitmapSubtitleCodec(info.codec)
+                || info.codec == "ass"
+                || info.codec == "ssa"
         }
 
         private static func normalize(

@@ -38,19 +38,29 @@ final class HLSVODCarrierProvider:
     HybridAudioAnalysisSource,
     HybridAudioAnalysisPlaybackPressureSink,
     HybridCarrierBandwidthTelemetrySource,
+    HybridOverlaySubtitleSource,
     @unchecked Sendable
 {
+    private static let slowServeThresholdSeconds: TimeInterval = 2
+
     private let videoProvider: BlackCarrierVideoProvider
     private let pump: HLSVODMediaPump
     private let metadata:
         [BlackCarrierAudioRenditionMetadata]
     private let descriptors:
         [BlackCarrierAudioRenditionDescriptor]
+    private let subtitleRenditions:
+        [HLSVODSubtitleRenditionResource]
     private let timeline: BlackCarrierTimeline
     private let codecs: String
     private let resolvedHybridVideoFormat: VideoFormat?
     private let resolvedHybridVideoFrameRate: Double?
     private let analysisInput: AudioAnalysisInput
+    let hybridSubtitleContracts:
+        [HybridSubtitleDecodeContract]
+    let hybridSubtitlePacketStore: SubtitlePacketStore
+    let hybridSubtitleRuntimeAvailability:
+        HybridSubtitleRuntimeAvailabilityStore
 
     private let closeLock = NSLock()
     private let restartLock = NSLock()
@@ -159,15 +169,24 @@ final class HLSVODCarrierProvider:
         let metadata = pump.renditionMetadata
         let descriptors =
             pump.renditionDescriptors
+        let subtitleRenditions =
+            pump.subtitleRenditions
         self.videoProvider = videoProvider
         self.pump = pump
         self.metadata = metadata
         self.descriptors = descriptors
+        self.subtitleRenditions = subtitleRenditions
         self.timeline = timeline
         resolvedHybridVideoFormat =
             await pump.hybridVideoFormat
         resolvedHybridVideoFrameRate =
             await pump.hybridVideoFrameRate
+        hybridSubtitleContracts =
+            pump.hybridSubtitleContracts
+        hybridSubtitlePacketStore =
+            pump.hybridSubtitlePacketStore
+        hybridSubtitleRuntimeAvailability =
+            pump.hybridSubtitleRuntimeAvailability
         analysisInput =
             try await pump.makeAudioAnalysisInput()
 
@@ -491,6 +510,61 @@ final class HLSVODCarrierProvider:
         }
     }
 
+    var nativeSubtitleRenditions: [(
+        ordinal: Int,
+        language: String?,
+        name: String,
+        isDefault: Bool,
+        isAutoselect: Bool,
+        isForced: Bool
+    )] {
+        subtitleRenditions.map {
+            (
+                ordinal: $0.ordinal,
+                language: $0.language,
+                name: $0.name,
+                isDefault: $0.isDefault,
+                isAutoselect: $0.isAutoselect,
+                isForced: $0.isForced
+            )
+        }
+    }
+
+    var nativeSubtitleDefaultOrdinal: Int {
+        subtitleRenditions.first(where: \.isDefault)?
+            .ordinal ?? 0
+    }
+
+    var nativeSubtitleWholeProgram: Bool { false }
+
+    func nativeSubtitleVTT(
+        ordinal: Int,
+        segmentIndex: Int
+    ) -> String? {
+        guard subtitleRenditions.indices.contains(
+                ordinal
+              ),
+              timeline.segments.indices.contains(
+                segmentIndex
+              ) else {
+            return nil
+        }
+        do {
+            return try BlockingAsyncBridge.wait {
+                await self.pump.subtitleVTT(
+                    renditionOrdinal: ordinal,
+                    segmentIndex: segmentIndex
+                )
+            }
+        } catch {
+            EngineLog.emit(
+                "[HLSVODCarrierProvider] subtitle rendition unavailable ordinal=\(ordinal)",
+                category: .session
+            )
+            return nil
+        }
+    }
+
     func alternateAudioInitSegment(
         ordinal: Int
     ) -> Data? {
@@ -563,6 +637,29 @@ final class HLSVODCarrierProvider:
             )
             return nil
         }
+    }
+
+    func alternateAudioMediaSegmentURL(
+        ordinal: Int,
+        index: Int,
+        onSlow: (@Sendable () -> Void)?
+    ) -> URL? {
+        guard let onSlow else {
+            return alternateAudioMediaSegmentURL(
+                ordinal: ordinal,
+                index: index
+            )
+        }
+        let signal = SlowServeSignal(
+            thresholdSeconds:
+                Self.slowServeThresholdSeconds,
+            onSlow: onSlow
+        )
+        defer { signal.complete() }
+        return alternateAudioMediaSegmentURL(
+            ordinal: ordinal,
+            index: index
+        )
     }
 
     func sourceTrackID(

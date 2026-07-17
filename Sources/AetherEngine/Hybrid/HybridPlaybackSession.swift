@@ -411,6 +411,8 @@ final class HybridPlaybackSession {
         (any HybridAudioAnalysisSource)?
     private let carrierBandwidthTelemetrySource:
         (any HybridCarrierBandwidthTelemetrySource)?
+    private let subtitleController:
+        HybridSubtitleSessionController?
 
     private var classifier: HybridSeekIntentClassifier
     private var readinessGate = HybridPresentationReadinessGate()
@@ -432,6 +434,7 @@ final class HybridPlaybackSession {
     private var lastCarrierReadyTelemetryGeneration: UInt64?
     private var lastVideoReadyTelemetryGeneration: UInt64?
     private var didEmitPlaybackCompletedTelemetry = false
+    private(set) var readinessPrerollFramesRejected: UInt64 = 0
 
     private var latestDecodeDemand: CMTime?
     private var decodeDemandWorker: Task<Void, Never>?
@@ -444,6 +447,13 @@ final class HybridPlaybackSession {
         (@MainActor @Sendable (HybridPlaybackSessionState) -> Void)?
     var telemetryDidChange:
         (@MainActor @Sendable (HybridPlaybackTelemetryTrigger) -> Void)?
+    var subtitleTracksDidChange:
+        (@MainActor @Sendable (
+            [AetherHybridOverlaySubtitleTrack],
+            Int?
+        ) -> Void)?
+    var runtimePresentationValidation:
+        (@MainActor () throws -> Void) = {}
 
     var sourceVideoFormat: VideoFormat {
         videoFormat
@@ -486,6 +496,16 @@ final class HybridPlaybackSession {
         audioAnalysisSessions.count
     }
 
+    var overlaySubtitleTracks:
+        [AetherHybridOverlaySubtitleTrack]
+    {
+        subtitleController?.tracks ?? []
+    }
+
+    var activeOverlaySubtitleTrackID: Int? {
+        subtitleController?.selectedTrackID
+    }
+
     var carrierBandwidthTelemetry:
         AetherHybridCarrierBandwidthTelemetry
     {
@@ -525,12 +545,31 @@ final class HybridPlaybackSession {
         carrierBandwidthTelemetrySource =
             provider as?
                 any HybridCarrierBandwidthTelemetrySource
+        if let source = provider as?
+                any HybridOverlaySubtitleSource,
+           let view = renderSurface as?
+                AetherHybridPresentationView,
+           !source.hybridSubtitleContracts.isEmpty {
+            subtitleController = HybridSubtitleSessionController(
+                source: source,
+                presentationView: view
+            )
+        } else {
+            subtitleController = nil
+        }
         classifier = HybridSeekIntentClassifier(
             timeline: timeline,
             initialGeneration: initialGeneration
         )
         avPlayer = transport.avPlayer
         relay.attach(self)
+        subtitleController?.tracksDidChange = {
+            [weak self] tracks, selectedTrackID in
+            self?.subtitleTracksDidChange?(
+                tracks,
+                selectedTrackID
+            )
+        }
         if let terminalErrorSource =
                 provider as?
                 any HybridPlaybackTerminalErrorSource {
@@ -922,6 +961,17 @@ final class HybridPlaybackSession {
         }
     }
 
+    func selectOverlaySubtitleTrack(_ trackID: Int?) throws {
+        guard let subtitleController else {
+            if let trackID {
+                throw AetherHybridSubtitleSelectionError
+                    .unknownTrack(trackID)
+            }
+            return
+        }
+        try subtitleController.select(trackID: trackID)
+    }
+
     func stop() {
         guard state != .stopped else { return }
         state = .stopped
@@ -934,6 +984,7 @@ final class HybridPlaybackSession {
         managedTimeJumpSuppressionDeadline = nil
         pendingResumeIntent = nil
         cancelAudioAnalysisStreams()
+        subtitleController?.stop()
         relay.detach()
         avPlayer.pause()
         renderSurface.invalidate()
@@ -970,6 +1021,16 @@ final class HybridPlaybackSession {
         case .idle, .preparing, .ready, .seeking:
             break
         }
+        let outcome = readinessGate.considerDecodedFrame(frame)
+        switch outcome {
+        case .staleGeneration, .terminalFailure:
+            return
+        case .frameOutsideTargetWindow:
+            readinessPrerollFramesRejected += 1
+            return
+        case .acceptedWaiting, .becameReady, .alreadyReady:
+            break
+        }
         do {
             _ = try renderSurface.enqueue(frame)
         } catch let error as AetherHybridPresentationError {
@@ -981,7 +1042,6 @@ final class HybridPlaybackSession {
             ))
             return
         }
-        let outcome = readinessGate.considerDecodedFrame(frame)
         guard outcome == .acceptedWaiting
                 || outcome == .becameReady else {
             return
@@ -1027,6 +1087,9 @@ final class HybridPlaybackSession {
         }
         try validateCarrierClock()
         lastObservedPlayerTime = time
+        subtitleController?.update(
+            playheadSeconds: time.seconds
+        )
         reevaluateAudioAnalysisPlaybackPressure()
         let requested = CMTimeMinimum(
             timeline.duration,
@@ -1069,6 +1132,7 @@ final class HybridPlaybackSession {
         ) = intent else {
             throw HybridPlaybackSessionError.invalidSeekTarget
         }
+        readinessPrerollFramesRejected = 0
 
         let deadline = ProcessInfo.processInfo.systemUptime + timeout
         let resumeIntent: ResumeIntent
@@ -1098,6 +1162,7 @@ final class HybridPlaybackSession {
                 generation,
                 videoFormat: videoFormat
             )
+            subtitleController?.resetForGeneration()
             try readinessGate.beginGeneration(
                 generation,
                 targetTime: target,
@@ -1876,6 +1941,7 @@ final class HybridPlaybackSession {
     }
 
     private func validateCarrierClock() throws {
+        try runtimePresentationValidation()
         guard let item = avPlayer.currentItem else {
             throw HybridPlaybackSessionError.carrierItemMissing
         }
@@ -1915,6 +1981,7 @@ final class HybridPlaybackSession {
         pendingResumeIntent = nil
         decodeDemandSuspended = true
         cancelAudioAnalysisStreams()
+        subtitleController?.stop()
         relay.detach()
         avPlayer.pause()
         renderSurface.invalidate()

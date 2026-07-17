@@ -2,9 +2,24 @@
 
 ## Status
 
-Pending physical Apple TV evidence. Source tests now prove the exact carrier-timebase binding,
-generation flush, bounded no-drop pending queue, monotonic timing, format-description propagation,
-HDR10+ per-frame attachment, and absence of `DisplayImmediately`. These tests do not prove panel output.
+Partially verified on a physical Apple TV. The 2026-07-17 automated SDR runs prove exact carrier-timebase
+binding through pause/rates, forward and backward generation flush, explicit decoder pre-roll rejection
+before renderer admission, bidirectional carrier media-selection rebuild, recoverable origin-stall
+generation replacement, clean aperture/SAR/quarter-turn rotation/source-cadence rows, fit/fill ownership,
+all five host-contract negative cases, E-AC-3 JOC stream-copy startup/seek/selection/stall, and complete
+stop/reopen teardown. Native WebVTT also passes graph-bound preflight and AVFoundation
+select/deselect/reselect on the carrier. Styled ASS passes Aether overlay select/seek/off/reselect and
+AVKit custom-menu installation on the same carrier clock; bitmap physical-fixture evidence remains
+pending. HDR10 and HLG also have
+engine/device candidate evidence, but remain unadmitted without human panel-mode and visual confirmation.
+See
+[`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md).
+
+The complete physical gate remains pending. Source tests prove the bounded no-drop pending queue,
+monotonic timing, format-description propagation, HDR10+ per-frame attachment, and absence of
+`DisplayImmediately`, but neither those tests nor the partial runs prove the remaining visual/audio,
+panel-mode, HDR10+, or Dolby Vision rows. Automated geometry passes, but its final human
+visible-orientation/crop confirmation remains part of the visual row.
 
 `AetherHybridPresentationView.verifiedVideoFormats` must remain `[.sdr]` until each additional format row
 below has its own fixture and passing physical-device record. There is no Metal or second Hybrid renderer.
@@ -53,6 +68,15 @@ Required color rows before expanding `verifiedVideoFormats`:
 - each promised Dolby Vision profile as a separate row with public Apple API support, profile-specific
   fixture, propagated per-frame metadata and panel-mode evidence.
 
+Required Atmos row:
+
+- a licensed E-AC-3 JOC vector whose bitstream probe reports Atmos/profile 30;
+- source and carrier signaling `ec-3` plus `CHANNELS="16/JOC"`;
+- JOC stream-copy startup, seek, JOC-to-non-JOC and return selection, recoverable stall, and stop/reopen;
+- fixed carrier `BANDWIDTH=2000000` plus privacy-safe observed peak/average telemetry;
+- downstream device Atmos indication recorded by a human. The vector and generated fixture stay local
+  unless their license explicitly permits redistribution.
+
 Container labels are not evidence. Missing, contradictory, malformed or unpropagated metadata is a
 failure. No row may pass through tone mapping, HDR10 relabeling, base-layer-only display or an unverified
 Dolby Vision profile.
@@ -83,6 +107,12 @@ SHA-256, UTC timestamp, and Match Dynamic Range / Match Frame Rate settings.
    and the first T.35 attachment does not change route or generation.
 9. For every Dolby Vision row, record the exact profile and compare against a documented reference. An
    unlisted profile must resolve to typed unsupported before provider/session creation.
+10. For each faithfully convertible text subtitle, confirm the carrier master preserves source
+    default/autoselect/forced metadata, AVKit exposes a native legible option, and
+    select/deselect/reselect does not stop the carrier clock or replace the renderer. Confirm menu and
+    cue rendering visually. Run this row for both graph-bound HLS WebVTT and at least one progressive
+    embedded plain-text track. Exercise bitmap/styled subtitle selection separately through the
+    Aether overlay and AVKit custom-menu contract.
 
 ## Required assertions
 
@@ -122,6 +152,14 @@ forwardSeekFlush: pass | fail
 backwardSeekFlush: pass | fail
 stallFlush: pass | fail
 trackSwitchFlush: pass | fail
+nativeWebVTTSelection: pass | fail | notApplicable
+nativeWebVTTVisibleCue: pass | fail | notRecorded
+bitmapStyledOverlaySelection: pass | fail | notApplicable
+atmosJOCStreamCopy: pass | fail | notApplicable
+atmosDownstreamIndicator: pass | fail | notRecorded
+carrierDeclaredTransportBudget:
+carrierObservedPeakBandwidth:
+carrierObservedAverageBandwidth:
 lateHDR10PlusSameLayer: pass | fail | notApplicable
 observedDisplayMode:
 hostContractNegativeCases: pass | fail

@@ -5,6 +5,79 @@ import Testing
 
 @Suite("Black carrier lazy composite provider", .serialized)
 struct BlackCarrierLazyCompositeProviderTests {
+    @Test("Only faithfully convertible plain-text subtitle codecs enter native WebVTT")
+    func nativeSubtitleCodecAdmission() {
+        for codec in ["subrip", "srt", "mov_text", "webvtt", "text"] {
+            #expect(
+                BlackCarrierMediaFanoutPump
+                    .isFaithfullyConvertibleNativeSubtitleTrack(
+                        subtitleTrack(id: 0, codec: codec)
+                    )
+            )
+        }
+        for codec in [
+            "ass",
+            "ssa",
+            "hdmv_pgs_subtitle",
+            "dvb_subtitle",
+            "eia_608",
+            "unknown",
+        ] {
+            #expect(
+                !BlackCarrierMediaFanoutPump
+                    .isFaithfullyConvertibleNativeSubtitleTrack(
+                        subtitleTrack(id: 0, codec: codec)
+                    )
+            )
+        }
+    }
+
+    @Test("Native subtitle metadata preserves selection semantics and unique names")
+    func nativeSubtitleMetadata() {
+        let tracks = [
+            subtitleTrack(
+                id: 3,
+                codec: "subrip",
+                name: "English",
+                language: "eng",
+                isDefault: false
+            ),
+            subtitleTrack(
+                id: 5,
+                codec: "webvtt",
+                name: "English",
+                language: "eng",
+                isDefault: true,
+                isForced: true
+            ),
+        ]
+
+        #expect(
+            BlackCarrierMediaFanoutPump.nativeSubtitleMetadata(
+                for: tracks
+            ) == [
+                BlackCarrierNativeSubtitleRenditionMetadata(
+                    ordinal: 0,
+                    sourceTrackID: 3,
+                    language: "eng",
+                    name: "English",
+                    isDefault: false,
+                    isAutoselect: true,
+                    isForced: false
+                ),
+                BlackCarrierNativeSubtitleRenditionMetadata(
+                    ordinal: 1,
+                    sourceTrackID: 5,
+                    language: "eng",
+                    name: "English 2",
+                    isDefault: true,
+                    isAutoselect: true,
+                    isForced: true
+                ),
+            ]
+        )
+    }
+
     @Test("Loopback audio requests advance only through the requested segment")
     func requestedSegmentProduction() async throws {
         let timeline = try BlackCarrierTimeline.fileVOD(
@@ -197,5 +270,23 @@ struct BlackCarrierLazyCompositeProviderTests {
         appendUInt32(UInt32(pcm.count))
         data.append(pcm)
         return data
+    }
+
+    private func subtitleTrack(
+        id: Int,
+        codec: String,
+        name: String = "Subtitle",
+        language: String? = nil,
+        isDefault: Bool = false,
+        isForced: Bool = false
+    ) -> TrackInfo {
+        TrackInfo(
+            id: id,
+            name: name,
+            codec: codec,
+            language: language,
+            isDefault: isDefault,
+            isForced: isForced
+        )
     }
 }

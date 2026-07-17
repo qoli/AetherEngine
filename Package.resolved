@@ -1,13 +1,12 @@
 {
-  "originHash" : "e8e51c88a81ac7ce92e945ff40a1b0f2de98fb65d0a578c782e91d26230ff49c",
+  "originHash" : "d496359e6070f22732d2f680eb51743b8d99bec64f9866cbf9f83edca0cf6e6e",
   "pins" : [
     {
       "identity" : "ffmpegbuild",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/superuser404notfound/FFmpegBuild",
+      "location" : "https://github.com/qoli/FFmpegBuild",
       "state" : {
-        "revision" : "f2d077708370f0098d73a3328cd7aea3c90291f5",
-        "version" : "1.0.5"
+        "revision" : "d24262133163dab1a8997e22493176a0db4adea8"
       }
     },
     {
@@ -26,6 +25,14 @@
       "state" : {
         "revision" : "e636c2b2458930770932a36d311ec9d478575b90",
         "version" : "0.3.1"
+      }
+    },
+    {
+      "identity" : "swift-libass",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/qoli/swift-libass",
+      "state" : {
+        "revision" : "01c5ebb8ee8b36cefcbcabea819a47208d1e1216"
       }
     }
   ],

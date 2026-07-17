@@ -63,12 +63,28 @@ protocol HLSSegmentProvider: AnyObject {
     func alternateAudioInitSegment(ordinal: Int) -> Data?
     func alternateAudioMediaSegment(ordinal: Int, index: Int) -> Data?
     func alternateAudioMediaSegmentURL(ordinal: Int, index: Int) -> URL?
+    /// Alternate-audio equivalent of `mediaSegment(at:onSlow:)`. A provider that may block while
+    /// producing a disk-backed rendition invokes `onSlow` exactly once, and never after returning,
+    /// so the loopback server can commit an early chunked response before AVPlayer's TTFB window.
+    func alternateAudioMediaSegmentURL(
+        ordinal: Int,
+        index: Int,
+        onSlow: (@Sendable () -> Void)?
+    ) -> URL?
 
     /// Native subtitle renditions (#15): one per text track, for the master EXT-X-MEDIA:TYPE=SUBTITLES tags
     /// and the /subs_{N} endpoints. Empty unless prepareNativeSubtitles is on and the cue stores are threaded.
     /// NAMEs must be unique within the group (duplicates collapse AVFoundation's legible options).
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { get }
-    /// Ordinal advertised as DEFAULT=YES in the master SUBTITLES group (Sodalite#32).
+    var nativeSubtitleRenditions: [(
+        ordinal: Int,
+        language: String?,
+        name: String,
+        isDefault: Bool,
+        isAutoselect: Bool,
+        isForced: Bool
+    )] { get }
+    /// Legacy embedded-subtitle policy input used by `VideoSegmentProvider` when constructing the
+    /// rendition metadata above. HLS graph-bound providers preserve the source master metadata.
     var nativeSubtitleDefaultOrdinal: Int { get }
     /// Serve the SUBTITLES rendition as one whole-program .vtt (single VOD segment) instead of per-video-segment (Sodalite#32).
     var nativeSubtitleWholeProgram: Bool { get }
@@ -111,7 +127,24 @@ extension HLSSegmentProvider {
     func alternateAudioInitSegment(ordinal: Int) -> Data? { nil }
     func alternateAudioMediaSegment(ordinal: Int, index: Int) -> Data? { nil }
     func alternateAudioMediaSegmentURL(ordinal: Int, index: Int) -> URL? { nil }
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] { [] }
+    func alternateAudioMediaSegmentURL(
+        ordinal: Int,
+        index: Int,
+        onSlow: (@Sendable () -> Void)?
+    ) -> URL? {
+        alternateAudioMediaSegmentURL(
+            ordinal: ordinal,
+            index: index
+        )
+    }
+    var nativeSubtitleRenditions: [(
+        ordinal: Int,
+        language: String?,
+        name: String,
+        isDefault: Bool,
+        isAutoselect: Bool,
+        isForced: Bool
+    )] { [] }
     var nativeSubtitleDefaultOrdinal: Int { 0 }
     var nativeSubtitleWholeProgram: Bool { false }
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? { nil }
@@ -748,16 +781,51 @@ final class HLSLocalServer: @unchecked Sendable {
                     contentType: "audio/mp4"
                 )
             case .mediaSegment(let ordinal, let index):
-                if let url = provider.alternateAudioMediaSegmentURL(
+                let early = EarlyHeaderState()
+                let url = provider.alternateAudioMediaSegmentURL(
                     ordinal: ordinal,
-                    index: index
-                ) {
+                    index: index,
+                    onSlow: { [weak self] in
+                        guard let self,
+                              early.markSentOnce() else {
+                            return
+                        }
+                        EngineLog.emit(
+                            "[HLSLocalServer] alternate-audio \(ordinal)/\(index): "
+                                + "slow serve, sending early chunked header",
+                            category: .hlsServer
+                        )
+                        _ = self.writeAll(
+                            fd: fd,
+                            data: Self.chunkedResponseHeader(
+                                contentType: "audio/mp4"
+                            ),
+                            path: "\(normalizedPath) [early header]"
+                        )
+                    }
+                )
+                if let url {
+                    if early.wasSent {
+                        return sendChunkedFileBody(
+                            fd: fd,
+                            path: normalizedPath,
+                            fileURL: url
+                        )
+                    }
                     return send200File(
                         fd: fd,
                         path: normalizedPath,
                         fileURL: url,
                         contentType: "audio/mp4"
                     )
+                }
+                if early.wasSent {
+                    EngineLog.emit(
+                        "[HLSLocalServer] alternate-audio \(ordinal)/\(index): "
+                            + "early-header serve missed; closing connection for AVPlayer retry",
+                        category: .hlsServer
+                    )
+                    return false
                 }
                 guard let data = provider.alternateAudioMediaSegment(
                     ordinal: ordinal,
@@ -955,6 +1023,53 @@ final class HLSLocalServer: @unchecked Sendable {
               writeAll(fd: fd, data: data, path: path),
               writeAll(fd: fd, data: Self.chunkFrameTrailer, path: "\(path) [chunk trailer]"),
               writeAll(fd: fd, data: Self.chunkedFinal, path: "\(path) [chunk final]") else {
+            return false
+        }
+        return true
+    }
+
+    /// Completes a chunked response whose header was already committed while a disk-backed
+    /// alternate-audio segment was still being produced. The file remains on the zero-copy-ish
+    /// bounded-buffer path; it is not materialized as one Swift `Data` allocation.
+    private func sendChunkedFileBody(
+        fd: Int32,
+        path: String,
+        fileURL: URL
+    ) -> Bool {
+        let attributes = try? FileManager.default
+            .attributesOfItem(atPath: fileURL.path)
+        let fileSize = (attributes?[.size] as? Int) ?? 0
+        guard fileSize > 0 else {
+            EngineLog.emit(
+                "[HLSLocalServer] chunked file missing or empty for \(path)",
+                category: .hlsServer
+            )
+            return false
+        }
+        EngineLog.emit(
+            "[HLSLocalServer] -> 200 \(path) bytes=\(fileSize) "
+                + "type=audio/mp4 [chunked, early header, filestream]",
+            category: .hlsServer,
+            level: .verbose
+        )
+        guard writeAll(
+            fd: fd,
+            data: Self.chunkFrameHeader(size: fileSize),
+            path: "\(path) [chunk size]"
+        ), streamFileToSocket(
+            fileURL: fileURL,
+            socketFd: fd,
+            path: path,
+            expectedLength: fileSize
+        ), writeAll(
+            fd: fd,
+            data: Self.chunkFrameTrailer,
+            path: "\(path) [chunk trailer]"
+        ), writeAll(
+            fd: fd,
+            data: Self.chunkedFinal,
+            path: "\(path) [chunk final]"
+        ) else {
             return false
         }
         return true
@@ -1278,23 +1393,18 @@ final class HLSLocalServer: @unchecked Sendable {
         if !audioRenditions.isEmpty {
             streamInfAttrs.append("AUDIO=\"audio\"")
         }
-        // #15: native WebVTT subtitle renditions (separate from the A/V variant; in-band timed text is
-        // non-conformant for HLS). Orthogonal to the video VIDEO-RANGE/CODECS attributes.
-        // Sodalite#32: DEFAULT=NO,AUTOSELECT=NO so AVKit never auto-selects a subtitle rendition in fullscreen
-        // (the on-frame overlay owns fullscreen subtitles). The host explicitly selects the matching rendition
-        // only on PiP entry and deselects it on PiP exit, so the two never double up.
+        // Native WebVTT renditions are separate from A/V and retain the provider's selection semantics.
+        // Text subtitles are owned by AVPlayer/AVKit in Hybrid. Bitmap or styled subtitles use the separate
+        // Aether overlay contract and must never be advertised here as a lossy WebVTT conversion.
         let subRenditions = provider.nativeSubtitleRenditions
         for r in subRenditions {
             var mediaAttrs = ["TYPE=SUBTITLES", "GROUP-ID=\"subs\"", "NAME=\"\(r.name)\""]
             if let lang = r.language { mediaAttrs.append("LANGUAGE=\"\(lang)\"") }
-            mediaAttrs.append(contentsOf: ["DEFAULT=NO", "AUTOSELECT=NO"])
-            // Deliberately NO FORCED=YES, even for a source-forced track: AVKit force-displays a FORCED
-            // rendition whose language matches the selected audio regardless of DEFAULT/AUTOSELECT and the
-            // user's CC-off preference, which self-engages a rendition and contradicts the invariant above
-            // (the on-frame overlay owns fullscreen subtitles; the host selects a rendition only on PiP).
-            // A source-forced German track on German audio then rendered with subtitles off (Sodalite#38
-            // follow-on, DV-master path). Same-language forced/full pairs are disambiguated by NAME, not
-            // FORCED. `r.isForced` still rides the published track list so the host can label/pick it.
+            mediaAttrs.append("DEFAULT=\(r.isDefault ? "YES" : "NO")")
+            mediaAttrs.append(
+                "AUTOSELECT=\((r.isDefault || r.isAutoselect) ? "YES" : "NO")"
+            )
+            mediaAttrs.append("FORCED=\(r.isForced ? "YES" : "NO")")
             mediaAttrs.append("URI=\"subs_\(r.ordinal).m3u8\"")
             lines.append("#EXT-X-MEDIA:\(mediaAttrs.joined(separator: ","))")
         }

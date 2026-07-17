@@ -136,6 +136,35 @@ final class HLSPlaylistTests: XCTestCase {
         )
     }
 
+    func testExtractsSelectedSubtitleGroupAndRenditions() throws {
+        let text = """
+        #EXTM3U
+        #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,URI="subs/en.m3u8"
+        #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English Forced",LANGUAGE="en",DEFAULT=NO,AUTOSELECT=YES,FORCED=YES,URI="subs/en-forced.m3u8"
+        #EXT-X-STREAM-INF:BANDWIDTH=2500000,SUBTITLES="subs"
+        video/main.m3u8
+        """
+        guard case .master(let master) =
+                try HLSPlaylistParser.parse(text) else {
+            return XCTFail("expected master playlist")
+        }
+        XCTAssertEqual(
+            master.variants[0].subtitleGroupID,
+            "subs"
+        )
+        XCTAssertEqual(master.subtitleRenditions.count, 2)
+        XCTAssertEqual(master.subtitleRenditions[0].name, "English")
+        XCTAssertEqual(master.subtitleRenditions[0].language, "en")
+        XCTAssertTrue(master.subtitleRenditions[0].isDefault)
+        XCTAssertTrue(master.subtitleRenditions[0].isAutoselect)
+        XCTAssertFalse(master.subtitleRenditions[0].isForced)
+        XCTAssertEqual(
+            master.subtitleRenditions[1].name,
+            "English Forced"
+        )
+        XCTAssertTrue(master.subtitleRenditions[1].isForced)
+    }
+
     func testAudioRenditionWithoutDefaultFallsBackToFirst() throws {
         let text = """
         #EXTM3U

@@ -181,11 +181,25 @@ struct Issue93SlowSegmentServeTests {
         /// (delayUntilOnSlow, delayUntilReturn); nil = immediate return.
         let slow: (signalAt: TimeInterval, returnAt: TimeInterval)?
         let returnsNil: Bool
+        let alternateAudioFileURL: URL?
+        let alternateAudioSlow:
+            (signalAt: TimeInterval, returnAt: TimeInterval)?
 
-        init(payload: Data, slow: (TimeInterval, TimeInterval)? = nil, returnsNil: Bool = false) {
+        init(
+            payload: Data,
+            slow: (TimeInterval, TimeInterval)? = nil,
+            returnsNil: Bool = false,
+            alternateAudioFileURL: URL? = nil,
+            alternateAudioSlow:
+                (TimeInterval, TimeInterval)? = nil
+        ) {
             self.payload = payload
             self.slow = slow
             self.returnsNil = returnsNil
+            self.alternateAudioFileURL =
+                alternateAudioFileURL
+            self.alternateAudioSlow =
+                alternateAudioSlow
         }
 
         func initSegment() -> Data? { Data("ftypinit".utf8) }
@@ -203,6 +217,51 @@ struct Issue93SlowSegmentServeTests {
             onSlow?()
             Thread.sleep(forTimeInterval: slow.returnAt - slow.signalAt)
             return returnsNil ? nil : payload
+        }
+
+        var alternateAudioRenditions:
+            [HLSAudioRenditionInfo] {
+            guard alternateAudioFileURL != nil else {
+                return []
+            }
+            return [
+                HLSAudioRenditionInfo(
+                    ordinal: 0,
+                    language: "eng",
+                    name: "English",
+                    isDefault: true,
+                    isAutoselect: true,
+                    channels: "2"
+                ),
+            ]
+        }
+
+        func alternateAudioMediaSegmentURL(
+            ordinal: Int,
+            index: Int
+        ) -> URL? {
+            alternateAudioFileURL
+        }
+
+        func alternateAudioMediaSegmentURL(
+            ordinal: Int,
+            index: Int,
+            onSlow: (@Sendable () -> Void)?
+        ) -> URL? {
+            guard let alternateAudioSlow else {
+                return alternateAudioFileURL
+            }
+            Thread.sleep(
+                forTimeInterval:
+                    alternateAudioSlow.signalAt
+            )
+            onSlow?()
+            Thread.sleep(
+                forTimeInterval:
+                    alternateAudioSlow.returnAt
+                        - alternateAudioSlow.signalAt
+            )
+            return alternateAudioFileURL
         }
     }
 
@@ -306,6 +365,62 @@ struct Issue93SlowSegmentServeTests {
         #expect(firstByteAfter >= 0)
         #expect(firstByteAfter < 0.7, "header must arrive near the slow signal, got \(firstByteAfter)s")
         #expect(header.contains("Transfer-Encoding: chunked"))
+        #expect(!header.contains("Content-Length"))
+        #expect(Self.decodeChunkedBody(body) == payload)
+    }
+
+    @Test("slow alternate audio answers early and streams the file when it lands")
+    func slowAlternateAudioEarlyHeader() throws {
+        let payload = Data(
+            repeating: 0x58,
+            count: 12_288
+        )
+        let directory = FileManager.default
+            .temporaryDirectory
+            .appendingPathComponent(
+                UUID().uuidString,
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer {
+            try? FileManager.default
+                .removeItem(at: directory)
+        }
+        let fileURL = directory
+            .appendingPathComponent("audio.m4s")
+        try payload.write(to: fileURL)
+
+        let provider = StubProvider(
+            payload: Data(),
+            alternateAudioFileURL: fileURL,
+            alternateAudioSlow: (0.15, 1.0)
+        )
+        let server = HLSLocalServer(
+            provider: provider
+        )
+        try server.start()
+        defer { server.stop() }
+
+        let (raw, firstByteAfter) = Self.rawGET(
+            port: server.port,
+            path: "/audio_0_seg_1.mp4",
+            deadline: 1.0
+        )
+        let (header, body) = Self.splitResponse(raw)
+        #expect(firstByteAfter >= 0)
+        #expect(
+            firstByteAfter < 0.7,
+            "header must arrive near the slow signal, got \(firstByteAfter)s"
+        )
+        #expect(header.contains(
+            "Content-Type: audio/mp4"
+        ))
+        #expect(header.contains(
+            "Transfer-Encoding: chunked"
+        ))
         #expect(!header.contains("Content-Length"))
         #expect(Self.decodeChunkedBody(body) == payload)
     }

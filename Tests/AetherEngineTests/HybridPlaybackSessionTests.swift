@@ -23,6 +23,11 @@ private final class HybridTelemetryTriggerRecorder {
     }
 }
 
+@MainActor
+private final class HybridPresentationContractState {
+    var isValid = true
+}
+
 private func makeHybridPlaybackSessionFrame(
     time: Double,
     duration: Double = 1,
@@ -99,6 +104,7 @@ struct HybridPlaybackSessionTests {
             BlackCarrierMediaFanoutRestartResult?
         private var terminalError:
             HybridPlaybackSessionError?
+        private var preparedGenerationFrameTimes: [Double]?
         private var terminalErrorHandler:
             (@Sendable (
                 HybridPlaybackSessionError
@@ -208,7 +214,18 @@ struct HybridPlaybackSessionTests {
             lock.lock()
             preparedSegments.append(segmentIndex)
             let generation = currentGeneration
+            let configuredFrameTimes = preparedGenerationFrameTimes
             lock.unlock()
+            if let configuredFrameTimes {
+                for time in configuredFrameTimes {
+                    relay.emit(try makeHybridPlaybackSessionFrame(
+                        time: time,
+                        duration: 1 / 24,
+                        generation: generation
+                    ))
+                }
+                return
+            }
             let segment = timeline.segments[segmentIndex]
             relay.emit(try makeHybridPlaybackSessionFrame(
                 time: segment.startTime.seconds,
@@ -234,6 +251,14 @@ struct HybridPlaybackSessionTests {
         ) {
             lock.lock()
             forcedRestartResult = result
+            lock.unlock()
+        }
+
+        func configurePreparedGenerationFrameTimes(
+            _ frameTimes: [Double]
+        ) {
+            lock.lock()
+            preparedGenerationFrameTimes = frameTimes
             lock.unlock()
         }
 
@@ -1039,6 +1064,40 @@ struct HybridPlaybackSessionTests {
         )
     }
 
+    @Test("Seek decoder preroll is rejected before renderer admission")
+    @MainActor
+    func seekPrerollAdmission() async throws {
+        let fixture = try makeSession()
+        defer { fixture.session.stop() }
+        try await fixture.session.prepare(timeout: 1)
+
+        let prerollTimes = (0..<64).map { Double($0) * 0.05 }
+        fixture.provider.configurePreparedGenerationFrameTimes(
+            prerollTimes + [4.5]
+        )
+        let target = CMTime(
+            seconds: 4.5,
+            preferredTimescale: 600
+        )
+        let result = try await fixture.session.seek(
+            to: target,
+            timeout: 1
+        )
+
+        #expect(result == .applied(
+            generation: 1,
+            target: target
+        ))
+        #expect(
+            fixture.session.readinessPrerollFramesRejected == 64
+        )
+        #expect(fixture.renderSurface.frames.count == 1)
+        #expect(
+            fixture.renderSurface.frames.first?.presentationTime
+                == target
+        )
+    }
+
     @Test("Decoder failure is terminal and tears down transport and renderer")
     @MainActor
     func decoderFailureTerminates() async throws {
@@ -1116,6 +1175,32 @@ struct HybridPlaybackSessionTests {
 
         #expect(fixture.session.state == .failed(
             .presentationFailed(.carrierBindingChanged)
+        ))
+        #expect(fixture.transport.didStop)
+        #expect(fixture.renderSurface.flushCount == 1)
+    }
+
+    @Test("Runtime host presentation drift is terminal on the next carrier clock validation")
+    @MainActor
+    func runtimePresentationDriftTerminates()
+        async throws
+    {
+        let fixture = try makeSession()
+        let presentationContract =
+            HybridPresentationContractState()
+        fixture.session.runtimePresentationValidation = {
+            guard presentationContract.isValid else {
+                throw HybridPlaybackSessionError
+                    .carrierPresentationContractChanged
+            }
+        }
+        try await fixture.session.prepare(timeout: 1)
+        presentationContract.isValid = false
+
+        fixture.session.handleClockTick(.zero)
+
+        #expect(fixture.session.state == .failed(
+            .carrierPresentationContractChanged
         ))
         #expect(fixture.transport.didStop)
         #expect(fixture.renderSurface.flushCount == 1)

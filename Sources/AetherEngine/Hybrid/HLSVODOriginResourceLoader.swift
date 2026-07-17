@@ -5,6 +5,7 @@ enum HLSVODOriginResourceKey: Hashable, Sendable {
     case videoSegment(index: Int)
     case audioInit(renditionOrdinal: Int)
     case audioSegment(renditionOrdinal: Int, index: Int)
+    case subtitleSegment(renditionOrdinal: Int, index: Int)
 
     fileprivate var cacheFileName: String {
         switch self {
@@ -16,6 +17,8 @@ enum HLSVODOriginResourceKey: Hashable, Sendable {
             "audio-\(ordinal)-init"
         case .audioSegment(let ordinal, let index):
             "audio-\(ordinal)-segment-\(index)"
+        case .subtitleSegment(let ordinal, let index):
+            "subtitle-\(ordinal)-segment-\(index)"
         }
     }
 
@@ -29,6 +32,11 @@ enum HLSVODOriginResourceKey: Hashable, Sendable {
             .audioInit(renditionOrdinal: ordinal)
         case .audioSegment(let ordinal, let index):
             .audioSegment(
+                renditionOrdinal: ordinal,
+                index: index
+            )
+        case .subtitleSegment(let ordinal, let index):
+            .subtitleSegment(
                 renditionOrdinal: ordinal,
                 index: index
             )
@@ -377,6 +385,44 @@ extension HLSVODResourceGraph {
                             audioRenditions[ordinal]
                                 .playlistURL,
                         ]
+                    )
+            )
+        case .subtitleSegment(let ordinal, let index):
+            guard subtitleRenditions.indices.contains(
+                    ordinal
+                  ),
+                  subtitleRenditions[ordinal]
+                    .segments.indices.contains(index) else {
+                throw HLSVODOriginResourceError
+                    .resourceNotBound(key)
+            }
+            let rendition =
+                subtitleRenditions[ordinal]
+            let seededData = index == 0
+                ? rendition.inspectedFirstSegmentData
+                : nil
+            return HLSVODBoundOriginResource(
+                key: key,
+                url: rendition.segments[index].url,
+                seededData: seededData,
+                seededEffectiveURL: index == 0
+                    ? rendition
+                        .inspectedFirstSegmentEffectiveURL
+                    : nil,
+                expectedSHA256: seededData.map(
+                    HLSVODResourceDigest.sha256
+                ),
+                allowedEffectiveOrigins:
+                    try allowedOrigins(
+                        key: key,
+                        urls: [
+                            rendition.segments[index].url,
+                            rendition.playlistURL,
+                            index == 0
+                                ? rendition
+                                    .inspectedFirstSegmentEffectiveURL
+                                : nil,
+                        ].compactMap { $0 }
                     )
             )
         }

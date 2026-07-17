@@ -690,7 +690,14 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     // MARK: - Native subtitle renditions (#15)
 
-    var nativeSubtitleRenditions: [(ordinal: Int, language: String?, name: String, isForced: Bool)] {
+    var nativeSubtitleRenditions: [(
+        ordinal: Int,
+        language: String?,
+        name: String,
+        isDefault: Bool,
+        isAutoselect: Bool,
+        isForced: Bool
+    )] {
         guard !nativeSubStores.isEmpty else { return [] }
         return nativeSubStores.indices.map { i in
             // Session-built infos carry deduped NAMEs + forced dispositions; the legacy per-ordinal
@@ -698,11 +705,27 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             // AVFoundation's legible options, so real sessions should always pass infos).
             if i < nativeSubRenditionInfos.count {
                 let info = nativeSubRenditionInfos[i]
-                return (ordinal: i, language: info.language, name: info.name, isForced: info.isForced)
+                return (
+                    ordinal: i,
+                    language: info.language,
+                    name: info.name,
+                    isDefault: i == nativeSubtitleDefaultOrdinal,
+                    isAutoselect:
+                        i == nativeSubtitleDefaultOrdinal
+                            || info.isForced,
+                    isForced: info.isForced
+                )
             }
             let lang = i < nativeSubLanguages.count ? nativeSubLanguages[i] : nil
             let name = lang.flatMap { Locale.current.localizedString(forIdentifier: $0) } ?? "Subtitle \(i + 1)"
-            return (ordinal: i, language: lang, name: name, isForced: false)
+            return (
+                ordinal: i,
+                language: lang,
+                name: name,
+                isDefault: i == nativeSubtitleDefaultOrdinal,
+                isAutoselect: i == nativeSubtitleDefaultOrdinal,
+                isForced: false
+            )
         }
     }
 

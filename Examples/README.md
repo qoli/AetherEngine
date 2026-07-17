@@ -1,5 +1,12 @@
 # Examples
 
+## Hybrid carrier tvOS acceptance
+
+[`HybridCarrierTVOS/`](HybridCarrierTVOS/README.md) is the standalone physical-tvOS acceptance host for
+the public Hybrid black-carrier plus `AVSampleBufferDisplayLayer` contract. It verifies route admission,
+carrier clock binding, pause/rates, seek generations, decoder pre-roll rejection, and stop/reopen without
+requiring Syncnext.
+
 Two complementary samples covering different audiences:
 
 - **MinimalPlayer**: source-only SwiftUI drop-in for **developers** integrating AetherEngine into their own apps. Read the file, paste it into your Xcode project, change the URL.

@@ -16,6 +16,68 @@ public enum AetherHLSResourceReference:
         renditionOrdinal: Int,
         index: Int
     )
+    case subtitleSegment(
+        renditionOrdinal: Int,
+        index: Int
+    )
+}
+
+/// Track-local result of inspecting one subtitle rendition in the selected HLS group.
+///
+/// Subtitle failure is the one media-resource failure allowed to degrade without changing the playback
+/// route. The failed track stays unavailable; Aether never selects another subtitle automatically.
+public enum AetherHLSSubtitleRenditionAvailability:
+    Sendable,
+    Equatable
+{
+    case nativeWebVTT
+    case unavailable(AetherHLSSubtitleUnavailableReason)
+}
+
+public enum AetherHLSSubtitleUnavailableReason:
+    String,
+    Sendable,
+    Equatable
+{
+    case invalidManifest
+    case contentProtectionUnsupported
+    case unsupportedFormat
+    case timelineMismatch
+    case resourceUnavailable
+}
+
+/// Privacy-safe selected-group subtitle policy. It contains no URI or request credential.
+public struct AetherHLSSubtitleRenditionPolicy:
+    Sendable,
+    Equatable
+{
+    public let subtitleTrackID: Int
+    public let name: String
+    public let language: String?
+    public let isDefault: Bool
+    public let isAutoselect: Bool
+    public let isForced: Bool
+    public let availability:
+        AetherHLSSubtitleRenditionAvailability
+
+    init(
+        subtitleTrackID: Int,
+        name: String,
+        language: String?,
+        isDefault: Bool,
+        isAutoselect: Bool = false,
+        isForced: Bool,
+        availability:
+            AetherHLSSubtitleRenditionAvailability
+    ) {
+        self.subtitleTrackID = subtitleTrackID
+        self.name = name
+        self.language = language
+        self.isDefault = isDefault
+        self.isAutoselect = isAutoselect
+        self.isForced = isForced
+        self.availability = availability
+    }
 }
 
 /// A runtime fact proving that the immutable HLS resource graph admitted by preflight is no longer valid.
@@ -152,6 +214,10 @@ public struct AetherHLSPlaybackPreflight: Sendable, Equatable {
     public let audioRenditionCount: Int
     public let audioAnalysisPolicy:
         AetherHLSAudioAnalysisPolicy
+    public let subtitleRenditions:
+        [AetherHLSSubtitleRenditionPolicy]
+    public let overlaySubtitleTracks:
+        [AetherHybridOverlaySubtitleTrack]
     public let hdr10PlusEvidence:
         AetherHLSHDR10PlusPreflightEvidence
 
@@ -164,6 +230,10 @@ public struct AetherHLSPlaybackPreflight: Sendable, Equatable {
         httpHeaders: [String: String],
         audioAnalysisPolicy:
             AetherHLSAudioAnalysisPolicy? = nil,
+        subtitleRenditions:
+            [AetherHLSSubtitleRenditionPolicy]? = nil,
+        overlaySubtitleTracks:
+            [AetherHybridOverlaySubtitleTrack] = [],
         hdr10PlusEvidence:
             AetherHLSHDR10PlusPreflightEvidence =
                 .notRequired
@@ -182,6 +252,21 @@ public struct AetherHLSPlaybackPreflight: Sendable, Equatable {
                 result: result,
                 resourceGraph: resourceGraph
             )
+        self.subtitleRenditions =
+            subtitleRenditions
+            ?? resourceGraph?.subtitleRenditions.map {
+                AetherHLSSubtitleRenditionPolicy(
+                    subtitleTrackID: $0.ordinal,
+                    name: $0.name,
+                    language: $0.language,
+                    isDefault: $0.isDefault,
+                    isAutoselect: $0.isAutoselect,
+                    isForced: $0.isForced,
+                    availability: .nativeWebVTT
+                )
+            }
+            ?? []
+        self.overlaySubtitleTracks = overlaySubtitleTracks
         self.hdr10PlusEvidence = hdr10PlusEvidence
         self.resourceGraph = resourceGraph
         self.httpHeaders = httpHeaders
@@ -293,6 +378,24 @@ struct HLSVODAudioRenditionResource: Sendable, Equatable {
     let segments: [HLSVODSegmentResource]
 }
 
+struct HLSVODSubtitleRenditionResource:
+    Sendable,
+    Equatable
+{
+    let ordinal: Int
+    let groupID: String
+    let name: String
+    let language: String?
+    let isDefault: Bool
+    let isAutoselect: Bool
+    let isForced: Bool
+    let playlistURL: URL
+    let playlistData: Data
+    let segments: [HLSVODSegmentResource]
+    let inspectedFirstSegmentData: Data
+    let inspectedFirstSegmentEffectiveURL: URL
+}
+
 enum HLSVODResourceDigest {
     static func sha256(_ data: Data) -> String {
         SHA256.hash(data: data)
@@ -313,9 +416,12 @@ struct HLSVODResourceGraph: Sendable, Equatable {
     let selectedVariantURI: String?
     let selectedVariantBandwidth: Int?
     let separateAudioGroupID: String?
+    let separateSubtitleGroupID: String?
     let initSegmentURL: URL?
     let segments: [HLSVODSegmentResource]
     let audioRenditions: [HLSVODAudioRenditionResource]
+    let subtitleRenditions:
+        [HLSVODSubtitleRenditionResource]
     let inspectedInitSegmentData: Data?
     let inspectedInitSegmentEffectiveURL: URL?
     let inspectedFirstMediaSegmentData: Data
@@ -332,6 +438,9 @@ struct HLSVODResourceGraph: Sendable, Equatable {
         mediaPlaylistData: Data,
         media: HLSMediaPlaylist,
         audioRenditions: [HLSVODAudioRenditionResource],
+        separateSubtitleGroupID: String? = nil,
+        subtitleRenditions:
+            [HLSVODSubtitleRenditionResource] = [],
         inspectedInitSegmentData: Data?,
         inspectedInitSegmentEffectiveURL: URL?,
         inspectedFirstMediaSegmentData: Data,
@@ -357,6 +466,31 @@ struct HLSVODResourceGraph: Sendable, Equatable {
                 .unsupportedSeekableVODResourceGraph(
                     reason:
                         "alternate-audio resources without a selected group"
+                )
+        }
+        if let separateSubtitleGroupID {
+            guard !subtitleRenditions.isEmpty,
+                  subtitleRenditions.allSatisfy({
+                      $0.groupID
+                        == separateSubtitleGroupID
+                  }),
+                  subtitleRenditions.map(\.ordinal)
+                    == Array(subtitleRenditions.indices),
+                  subtitleRenditions.filter(\.isDefault)
+                    .count <= 1,
+                  Set(subtitleRenditions.map(\.name)).count
+                    == subtitleRenditions.count else {
+                throw HLSPreflightError
+                    .unsupportedSeekableVODResourceGraph(
+                        reason:
+                            "invalid separate subtitle group"
+                    )
+            }
+        } else if !subtitleRenditions.isEmpty {
+            throw HLSPreflightError
+                .unsupportedSeekableVODResourceGraph(
+                    reason:
+                        "subtitle resources without a selected group"
                 )
         }
         let initSegmentURL = try resolvedInitSegmentURL(
@@ -414,16 +548,41 @@ struct HLSVODResourceGraph: Sendable, Equatable {
                     )
             }
         }
+        for rendition in subtitleRenditions {
+            let subtitleDuration = try summedDuration(
+                rendition.segments
+            )
+            guard subtitleDuration
+                    == timeline.duration.value,
+                  rendition.segments.count
+                    == segmentResources.count,
+                  zip(
+                    rendition.segments,
+                    segmentResources
+                  ).allSatisfy({ pair in
+                      pair.0.duration == pair.1.duration
+                  }) else {
+                throw HLSPreflightError
+                    .unsupportedSeekableVODResourceGraph(
+                        reason:
+                            "subtitle rendition timeline does not match selected video"
+                    )
+            }
+        }
         let identity = makeIdentity(
             requestedRootURL: requestedRootURL,
             effectiveRootURL: effectiveRootURL,
             selectedMediaPlaylistURL: selectedMediaPlaylistURL,
             selectedVariant: selectedVariant,
             separateAudioGroupID: separateAudioGroupID,
+            separateSubtitleGroupID:
+                separateSubtitleGroupID,
             mediaPlaylistData: mediaPlaylistData,
             initSegmentURL: initSegmentURL,
             segmentResources: segmentResources,
             audioRenditions: audioRenditions,
+            subtitleRenditions:
+                subtitleRenditions,
             inspectedInitSegmentData: inspectedInitSegmentData,
             inspectedInitSegmentEffectiveURL:
                 inspectedInitSegmentEffectiveURL,
@@ -440,9 +599,13 @@ struct HLSVODResourceGraph: Sendable, Equatable {
             selectedVariantURI: selectedVariant?.uri,
             selectedVariantBandwidth: selectedVariant?.bandwidth,
             separateAudioGroupID: separateAudioGroupID,
+            separateSubtitleGroupID:
+                separateSubtitleGroupID,
             initSegmentURL: initSegmentURL,
             segments: segmentResources,
             audioRenditions: audioRenditions,
+            subtitleRenditions:
+                subtitleRenditions,
             inspectedInitSegmentData: inspectedInitSegmentData,
             inspectedInitSegmentEffectiveURL:
                 inspectedInitSegmentEffectiveURL,
@@ -492,16 +655,70 @@ struct HLSVODResourceGraph: Sendable, Equatable {
         )
     }
 
+    static func makeSubtitleRendition(
+        ordinal: Int,
+        metadata: HLSSubtitleRendition,
+        playlistURL: URL,
+        playlistData: Data,
+        media: HLSMediaPlaylist,
+        inspectedFirstSegmentData: Data,
+        inspectedFirstSegmentEffectiveURL: URL
+    ) throws -> HLSVODSubtitleRenditionResource {
+        guard media.contentProtection == .none,
+              media.mapURI == nil,
+              !media.hasByteRange,
+              media.hasEndList else {
+            throw HLSPreflightError
+                .unsupportedSeekableVODResourceGraph(
+                    reason:
+                        "subtitle rendition is not clear finite WebVTT"
+                )
+        }
+        guard Self.isWebVTT(
+            inspectedFirstSegmentData
+        ) else {
+            throw HLSPreflightError
+                .unsupportedSeekableVODResourceGraph(
+                    reason:
+                        "subtitle rendition first segment is not WebVTT"
+                )
+        }
+        return HLSVODSubtitleRenditionResource(
+            ordinal: ordinal,
+            groupID: metadata.groupID,
+            name: metadata.name,
+            language: metadata.language,
+            isDefault: metadata.isDefault,
+            isAutoselect: metadata.isAutoselect,
+            isForced: metadata.isForced,
+            playlistURL: playlistURL,
+            playlistData: playlistData,
+            segments: try validatedSegments(
+                media: media,
+                playlistURL: playlistURL,
+                label:
+                    "subtitle rendition \(metadata.name)"
+            ),
+            inspectedFirstSegmentData:
+                inspectedFirstSegmentData,
+            inspectedFirstSegmentEffectiveURL:
+                inspectedFirstSegmentEffectiveURL
+        )
+    }
+
     private static func makeIdentity(
         requestedRootURL: URL,
         effectiveRootURL: URL,
         selectedMediaPlaylistURL: URL,
         selectedVariant: HLSVariant?,
         separateAudioGroupID: String?,
+        separateSubtitleGroupID: String?,
         mediaPlaylistData: Data,
         initSegmentURL: URL?,
         segmentResources: [HLSVODSegmentResource],
         audioRenditions: [HLSVODAudioRenditionResource],
+        subtitleRenditions:
+            [HLSVODSubtitleRenditionResource],
         inspectedInitSegmentData: Data?,
         inspectedInitSegmentEffectiveURL: URL?,
         inspectedFirstMediaSegmentData: Data,
@@ -518,6 +735,11 @@ struct HLSVODResourceGraph: Sendable, Equatable {
             to: &evidence
         )
         append(separateAudioGroupID ?? "<no-separate-audio>", to: &evidence)
+        append(
+            separateSubtitleGroupID
+                ?? "<no-separate-subtitles>",
+            to: &evidence
+        )
         append(initSegmentURL?.absoluteString ?? "<no-init-segment>", to: &evidence)
         append(
             inspectedInitSegmentData.map(HLSVODResourceDigest.sha256)
@@ -581,6 +803,49 @@ struct HLSVODResourceGraph: Sendable, Equatable {
                 append(segment.url.absoluteString, to: &evidence)
             }
         }
+        for rendition in subtitleRenditions {
+            append(String(rendition.ordinal), to: &evidence)
+            append(rendition.groupID, to: &evidence)
+            append(rendition.name, to: &evidence)
+            append(rendition.language ?? "<no-language>", to: &evidence)
+            append(
+                rendition.isDefault ? "default" : "not-default",
+                to: &evidence
+            )
+            append(
+                rendition.isAutoselect
+                    ? "autoselect"
+                    : "not-autoselect",
+                to: &evidence
+            )
+            append(
+                rendition.isForced ? "forced" : "not-forced",
+                to: &evidence
+            )
+            append(rendition.playlistURL.absoluteString, to: &evidence)
+            evidence.append(rendition.playlistData)
+            evidence.append(0)
+            append(
+                HLSVODResourceDigest.sha256(
+                    rendition.inspectedFirstSegmentData
+                ),
+                to: &evidence
+            )
+            append(
+                rendition.inspectedFirstSegmentEffectiveURL
+                    .absoluteString,
+                to: &evidence
+            )
+            for segment in rendition.segments {
+                append(String(segment.index), to: &evidence)
+                append(String(segment.mediaSequence), to: &evidence)
+                append(
+                    "\(segment.duration.value)/\(segment.duration.timescale)",
+                    to: &evidence
+                )
+                append(segment.url.absoluteString, to: &evidence)
+            }
+        }
         for (field, value) in httpHeaders.sorted(by: {
             let left = $0.key.lowercased()
             let right = $1.key.lowercased()
@@ -595,6 +860,14 @@ struct HLSVODResourceGraph: Sendable, Equatable {
     private static func append(_ value: String, to data: inout Data) {
         data.append(contentsOf: value.utf8)
         data.append(0)
+    }
+
+    private static func isWebVTT(_ data: Data) -> Bool {
+        var bytes = data
+        if bytes.starts(with: [0xEF, 0xBB, 0xBF]) {
+            bytes.removeFirst(3)
+        }
+        return bytes.starts(with: Data("WEBVTT".utf8))
     }
 
     private static func resolvedInitSegmentURL(

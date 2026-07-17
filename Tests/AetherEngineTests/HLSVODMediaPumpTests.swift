@@ -288,6 +288,59 @@ final class HLSVODMediaPumpTests: XCTestCase {
         )
     }
 
+    func testWebVTTRenditionUsesNativeCarrierEndpointsAndFailureStaysTrackLocal()
+        async throws
+    {
+        let fixture = try makeFixture(
+            includeWebVTTSubtitles: true,
+            omitSecondSubtitleSegment: true
+        )
+        let provider = try await HLSVODCarrierProvider.make(
+            preflight: fixture.preflight,
+            fetchOverride: { request, _ in
+                try fixture.fetchStore.response(
+                    for: request
+                )
+            }
+        )
+        addTeardownBlock {
+            provider.close()
+        }
+
+        XCTAssertEqual(
+            provider.nativeSubtitleRenditions.map(\.name),
+            ["English"]
+        )
+        let master = try HLSLocalServer
+            .buildMasterPlaylistText(provider: provider)
+        XCTAssertTrue(
+            master.contains(
+                "#EXT-X-MEDIA:TYPE=SUBTITLES"
+            )
+        )
+        XCTAssertTrue(master.contains("SUBTITLES=\"subs\""))
+        XCTAssertTrue(
+            master.contains(
+                "DEFAULT=YES,AUTOSELECT=YES,FORCED=NO"
+            )
+        )
+        XCTAssertEqual(
+            provider.nativeSubtitleVTT(
+                ordinal: 0,
+                segmentIndex: 0
+            ),
+            "WEBVTT\n\n00:00:00.100 --> 00:00:00.900\nfirst\n"
+        )
+        XCTAssertNil(
+            provider.nativeSubtitleVTT(
+                ordinal: 0,
+                segmentIndex: 1
+            )
+        )
+        XCTAssertNotNil(provider.mediaSegment(at: 1))
+        XCTAssertNil(provider.terminalError)
+    }
+
     func testHLSAudioAnalysisIsDemandDrivenRangeExactAndCursorIndependent()
         async throws
     {
@@ -971,6 +1024,83 @@ final class HLSVODMediaPumpTests: XCTestCase {
             ),
             fixture
                 .audioSegmentBaseDecodeTimes[0]
+        )
+    }
+
+    func testPendingCarrierAudioServeTransfersToReplacementGeneration()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let blocker = FetchBlocker(
+            store: fixture.fetchStore,
+            blockedURL:
+                fixture.audioSegmentURLs[1]
+        )
+        let pump = try await HLSVODMediaPump.make(
+            preflight: fixture.preflight,
+            fetchOverride: { request, _ in
+                try await blocker.response(
+                    for: request
+                )
+            }
+        )
+        addTeardownBlock {
+            try await pump.close()
+        }
+
+        let pendingCarrierServe = Task {
+            try await pump.audioMediaSegmentURL(
+                renditionOrdinal: 0,
+                segmentIndex: 1
+            )
+        }
+        try await blocker.waitForRequestCount(1)
+
+        var classifier =
+            HybridSeekIntentClassifier(
+                timeline:
+                    try XCTUnwrap(
+                        fixture.preflight
+                            .hybridTimeline
+                    )
+            )
+        let intent = try classifier
+            .registerExplicitHostSeek(
+                to: CMTime(
+                    seconds: 1.5,
+                    preferredTimescale: 90_000
+                )
+            )
+        let restart = Task {
+            try await pump.restart(for: intent)
+        }
+        try await blocker.waitForRequestCount(2)
+        await blocker.release()
+
+        let restartResult = try await restart.value
+        XCTAssertEqual(
+            restartResult,
+            .applied(
+                generation: 1,
+                segmentIndex: 1
+            )
+        )
+        let servedURL = try await
+            pendingCarrierServe.value
+        XCTAssertNotNil(servedURL)
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: try XCTUnwrap(
+                    servedURL
+                ).path
+            )
+        )
+        let snapshot = await pump.snapshot()
+        XCTAssertEqual(snapshot.generation, 1)
+        XCTAssertEqual(
+            snapshot
+                .highestFinalizedAudioSegmentIndices,
+            [1]
         )
     }
 
@@ -2007,7 +2137,9 @@ final class HLSVODMediaPumpTests: XCTestCase {
 
     private func makeFixture(
         declaredAudioChannels: String = "2",
-        omitSecondAudioSegment: Bool = false
+        omitSecondAudioSegment: Bool = false,
+        includeWebVTTSubtitles: Bool = false,
+        omitSecondSubtitleSegment: Bool = false
     ) throws -> Fixture {
         let timeline =
             try BlackCarrierTimeline.mirroredHLSVOD(
@@ -2086,6 +2218,30 @@ final class HLSVODMediaPumpTests: XCTestCase {
                     "https://cdn.example/audio/a1.m4s"
             )!,
         ]
+        let subtitlePlaylistURL = URL(
+            string:
+                "https://cdn.example/subtitles/en.m3u8"
+        )!
+        let subtitleSegmentURLs = [
+            URL(
+                string:
+                    "https://cdn.example/subtitles/s0.vtt"
+            )!,
+            URL(
+                string:
+                    "https://cdn.example/subtitles/s1.vtt"
+            )!,
+        ]
+        let subtitleSegments = [
+            Data(
+                "WEBVTT\n\n00:00:00.100 --> 00:00:00.900\nfirst\n"
+                    .utf8
+            ),
+            Data(
+                "WEBVTT\n\n00:00:01.100 --> 00:00:01.900\nsecond\n"
+                    .utf8
+            ),
+        ]
         let videoMedia = HLSMediaPlaylist(
             targetDuration: 1,
             mediaSequence: 17,
@@ -2143,6 +2299,53 @@ final class HLSVODMediaPumpTests: XCTestCase {
                         Data("#EXTM3U".utf8),
                     media: audioMedia
                 )
+        let subtitleResources:
+            [HLSVODSubtitleRenditionResource]
+        if includeWebVTTSubtitles {
+            let subtitleMedia = HLSMediaPlaylist(
+                targetDuration: 1,
+                mediaSequence: 51,
+                segments:
+                    subtitleSegmentURLs.map {
+                        HLSMediaSegment(
+                            uri: $0.lastPathComponent,
+                            duration: 1,
+                            discontinuityBefore: false
+                        )
+                    },
+                hasEndList: true,
+                hasUnsupportedEncryption: false,
+                hasMap: false,
+                mapURI: nil,
+                contentProtection: .none
+            )
+            subtitleResources = [
+                try HLSVODResourceGraph
+                    .makeSubtitleRendition(
+                        ordinal: 0,
+                        metadata: HLSSubtitleRendition(
+                            groupID: "subs",
+                            uri: "en.m3u8",
+                            name: "English",
+                            language: "en",
+                            isDefault: true,
+                            isAutoselect: true,
+                            isForced: false
+                        ),
+                        playlistURL:
+                            subtitlePlaylistURL,
+                        playlistData:
+                            Data("#EXTM3U".utf8),
+                        media: subtitleMedia,
+                        inspectedFirstSegmentData:
+                            subtitleSegments[0],
+                        inspectedFirstSegmentEffectiveURL:
+                            subtitleSegmentURLs[0]
+                    ),
+            ]
+        } else {
+            subtitleResources = []
+        }
         let graph = try HLSVODResourceGraph.make(
             requestedRootURL: rootURL,
             effectiveRootURL: effectiveRootURL,
@@ -2152,6 +2355,10 @@ final class HLSVODMediaPumpTests: XCTestCase {
                 bandwidth: 1_400_000,
                 uri: "video/main.m3u8",
                 audioGroupID: "audio",
+                subtitleGroupID:
+                    includeWebVTTSubtitles
+                    ? "subs"
+                    : nil,
                 codecs: ["avc1.42c01e"]
             ),
             separateAudioGroupID: "audio",
@@ -2159,6 +2366,12 @@ final class HLSVODMediaPumpTests: XCTestCase {
                 Data("#EXTM3U".utf8),
             media: videoMedia,
             audioRenditions: [audioResource],
+            separateSubtitleGroupID:
+                includeWebVTTSubtitles
+                ? "subs"
+                : nil,
+            subtitleRenditions:
+                subtitleResources,
             inspectedInitSegmentData:
                 videoInitData,
             inspectedInitSegmentEffectiveURL:
@@ -2208,6 +2421,13 @@ final class HLSVODMediaPumpTests: XCTestCase {
                     data: audio.mediaSegments[index],
                     url: audioSegmentURLs[index]
                 )
+        }
+        if includeWebVTTSubtitles,
+           !omitSecondSubtitleSegment {
+            responses[subtitleSegmentURLs[1]] = response(
+                data: subtitleSegments[1],
+                url: subtitleSegmentURLs[1]
+            )
         }
         return Fixture(
             preflight: AetherHLSPlaybackPreflight(

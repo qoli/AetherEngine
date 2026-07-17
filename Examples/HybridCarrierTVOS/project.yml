@@ -1,0 +1,30 @@
+name: AetherHybridAcceptance
+options:
+  minimumXcodeGenVersion: 2.44.1
+  deploymentTarget:
+    tvOS: "16.0"
+packages:
+  AetherEngine:
+    path: ../..
+targets:
+  AetherHybridAcceptance:
+    type: application
+    platform: tvOS
+    sources:
+      - Sources
+    dependencies:
+      - package: AetherEngine
+        product: AetherEngine
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.qoli.AetherHybridAcceptance
+        PRODUCT_NAME: AetherHybridAcceptance
+        DEVELOPMENT_TEAM: WQY45CL427
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: 6.0
+        TARGETED_DEVICE_FAMILY: 3
+        EXCLUDED_ARCHS[sdk=appletvsimulator*]: x86_64
+        INFOPLIST_FILE: Sources/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+    scheme:
+      gatherCoverageData: false

@@ -1,3 +1,4 @@
+import CoreMedia
 import Foundation
 import Libavcodec
 
@@ -115,6 +116,8 @@ private struct HLSPreflightResolvedMedia: Sendable {
     let variant: HLSVariant?
     let separateAudioGroupID: String?
     let audioRenditions: [HLSAudioRendition]
+    let separateSubtitleGroupID: String?
+    let subtitleRenditions: [HLSSubtitleRendition]
     let rootEffectiveURL: URL
     let mediaURL: URL
     let mediaData: Data
@@ -127,6 +130,8 @@ private struct HLSInspectedVideo: Sendable {
     let sampleEntry: HLSVideoSampleEntry
     let hdr10PlusEvidence:
         AetherHLSHDR10PlusPreflightEvidence
+    let overlaySubtitleTracks:
+        [AetherHybridOverlaySubtitleTrack]
 }
 
 private struct HLSProtectedManifestVideo: Sendable {
@@ -294,7 +299,19 @@ struct HLSPreflightInspector {
         let resourceGraph: HLSVODResourceGraph?
         let audioAnalysisPolicy:
             AetherHLSAudioAnalysisPolicy
+        let subtitlePolicies:
+            [AetherHLSSubtitleRenditionPolicy]
         if result.route == .hybridCarrier {
+            let subtitleResolution =
+                try await resolveSubtitleRenditions(
+                    resolved.subtitleRenditions,
+                    rootEffectiveURL:
+                        resolved.rootEffectiveURL,
+                    selectedVideoMedia:
+                        resolved.media
+                )
+            subtitlePolicies =
+                subtitleResolution.policies
             let audioResolution = try await resolveAudioRenditions(
                 resolved.audioRenditions,
                 rootEffectiveURL: resolved.rootEffectiveURL
@@ -313,6 +330,12 @@ struct HLSPreflightInspector {
                     mediaPlaylistData: resolved.mediaData,
                     media: resolved.media,
                     audioRenditions: audioRenditions,
+                    separateSubtitleGroupID:
+                        subtitleResolution.resources.isEmpty
+                        ? nil
+                        : resolved.separateSubtitleGroupID,
+                    subtitleRenditions:
+                        subtitleResolution.resources,
                     inspectedInitSegmentData: initSegment,
                     inspectedInitSegmentEffectiveURL:
                         initSegmentEffectiveURL,
@@ -344,12 +367,15 @@ struct HLSPreflightInspector {
                         .selectedAlternateAudioRenditions(
                             renditionPolicies
                         ),
+                    subtitleRenditions:
+                        subtitlePolicies,
                     hdr10PlusEvidence:
                         inspected.hdr10PlusEvidence
                 )
             }
         } else {
             resourceGraph = nil
+            subtitlePolicies = []
             audioAnalysisPolicy =
                 try await inspectNativeAudioAnalysisPolicy(
                     resolved
@@ -361,6 +387,10 @@ struct HLSPreflightInspector {
             httpHeaders: httpHeaders,
             audioAnalysisPolicy:
                 audioAnalysisPolicy,
+            subtitleRenditions:
+                subtitlePolicies,
+            overlaySubtitleTracks:
+                inspected.overlaySubtitleTracks,
             hdr10PlusEvidence:
                 inspected.hdr10PlusEvidence
         )
@@ -378,6 +408,8 @@ struct HLSPreflightInspector {
                 variant: nil,
                 separateAudioGroupID: nil,
                 audioRenditions: [],
+                separateSubtitleGroupID: nil,
+                subtitleRenditions: [],
                 rootEffectiveURL: root.effectiveURL,
                 mediaURL: root.effectiveURL,
                 mediaData: root.data,
@@ -418,6 +450,15 @@ struct HLSPreflightInspector {
                         $0.groupID == groupID
                     }
                 } ?? [],
+                separateSubtitleGroupID:
+                    variant.subtitleGroupID,
+                subtitleRenditions:
+                    variant.subtitleGroupID.map {
+                        groupID in
+                        master.subtitleRenditions.filter {
+                            $0.groupID == groupID
+                        }
+                    } ?? [],
                 rootEffectiveURL: root.effectiveURL,
                 mediaURL: response.effectiveURL,
                 mediaData: response.data,
@@ -435,6 +476,261 @@ struct HLSPreflightInspector {
             HLSContentProtection,
             [AetherHLSAudioRenditionAnalysisPolicy]
         )
+    }
+
+    private struct SubtitleRenditionResolution {
+        let resources:
+            [HLSVODSubtitleRenditionResource]
+        let policies:
+            [AetherHLSSubtitleRenditionPolicy]
+    }
+
+    private func resolveSubtitleRenditions(
+        _ renditions: [HLSSubtitleRendition],
+        rootEffectiveURL: URL,
+        selectedVideoMedia: HLSMediaPlaylist
+    ) async throws -> SubtitleRenditionResolution {
+        guard !renditions.isEmpty else {
+            return SubtitleRenditionResolution(
+                resources: [],
+                policies: []
+            )
+        }
+        let manifestIsValid =
+            renditions.filter(\.isDefault).count <= 1
+            && Set(renditions.map(\.name)).count
+                == renditions.count
+        guard manifestIsValid else {
+            return SubtitleRenditionResolution(
+                resources: [],
+                policies: renditions.enumerated().map {
+                    Self.subtitlePolicy(
+                        sourceOrdinal: $0.offset,
+                        rendition: $0.element,
+                        availability: .unavailable(
+                            .invalidManifest
+                        )
+                    )
+                }
+            )
+        }
+
+        var resources:
+            [HLSVODSubtitleRenditionResource] = []
+        var policies:
+            [AetherHLSSubtitleRenditionPolicy] = []
+        resources.reserveCapacity(renditions.count)
+        policies.reserveCapacity(renditions.count)
+        for (sourceOrdinal, rendition) in
+                renditions.enumerated() {
+            do {
+                guard let playlistURL =
+                        HLSPlaylistParser.resolve(
+                            uri: rendition.uri,
+                            against: rootEffectiveURL
+                        ) else {
+                    policies.append(
+                        Self.subtitlePolicy(
+                            sourceOrdinal: sourceOrdinal,
+                            rendition: rendition,
+                            availability: .unavailable(
+                                .invalidManifest
+                            )
+                        )
+                    )
+                    continue
+                }
+                let playlistResponse = try await fetch(
+                    playlistURL
+                )
+                guard case .media(let media) =
+                        try parsePlaylist(
+                            playlistResponse.data
+                        ) else {
+                    policies.append(
+                        Self.subtitlePolicy(
+                            sourceOrdinal: sourceOrdinal,
+                            rendition: rendition,
+                            availability: .unavailable(
+                                .invalidManifest
+                            )
+                        )
+                    )
+                    continue
+                }
+                guard media.contentProtection == .none else {
+                    policies.append(
+                        Self.subtitlePolicy(
+                            sourceOrdinal: sourceOrdinal,
+                            rendition: rendition,
+                            availability: .unavailable(
+                                .contentProtectionUnsupported
+                            )
+                        )
+                    )
+                    continue
+                }
+                guard Self.subtitleTimelineMatches(
+                    media,
+                    selectedVideoMedia
+                ) else {
+                    policies.append(
+                        Self.subtitlePolicy(
+                            sourceOrdinal: sourceOrdinal,
+                            rendition: rendition,
+                            availability: .unavailable(
+                                .timelineMismatch
+                            )
+                        )
+                    )
+                    continue
+                }
+                guard let first = media.segments.first,
+                      let firstURL =
+                        HLSPlaylistParser.resolve(
+                            uri: first.uri,
+                            against:
+                                playlistResponse.effectiveURL
+                        ) else {
+                    policies.append(
+                        Self.subtitlePolicy(
+                            sourceOrdinal: sourceOrdinal,
+                            rendition: rendition,
+                            availability: .unavailable(
+                                .invalidManifest
+                            )
+                        )
+                    )
+                    continue
+                }
+                let firstResponse = try await fetch(firstURL)
+                let resource = try HLSVODResourceGraph
+                    .makeSubtitleRendition(
+                        ordinal: resources.count,
+                        metadata: rendition,
+                        playlistURL:
+                            playlistResponse.effectiveURL,
+                        playlistData:
+                            playlistResponse.data,
+                        media: media,
+                        inspectedFirstSegmentData:
+                            firstResponse.data,
+                        inspectedFirstSegmentEffectiveURL:
+                            firstResponse.effectiveURL
+                    )
+                resources.append(resource)
+                policies.append(
+                    Self.subtitlePolicy(
+                        sourceOrdinal: sourceOrdinal,
+                        rendition: rendition,
+                        availability: .nativeWebVTT
+                    )
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as HLSPreflightError {
+                if case .transportFailure(let code) = error,
+                   code == URLError.cancelled.rawValue {
+                    throw CancellationError()
+                }
+                policies.append(
+                    Self.subtitlePolicy(
+                        sourceOrdinal: sourceOrdinal,
+                        rendition: rendition,
+                        availability: .unavailable(
+                            Self.subtitleUnavailableReason(
+                                error
+                            )
+                        )
+                    )
+                )
+            } catch {
+                policies.append(
+                    Self.subtitlePolicy(
+                        sourceOrdinal: sourceOrdinal,
+                        rendition: rendition,
+                        availability: .unavailable(
+                            .resourceUnavailable
+                        )
+                    )
+                )
+            }
+        }
+        return SubtitleRenditionResolution(
+            resources: resources,
+            policies: policies
+        )
+    }
+
+    private static func subtitleTimelineMatches(
+        _ subtitle: HLSMediaPlaylist,
+        _ video: HLSMediaPlaylist
+    ) -> Bool {
+        guard subtitle.hasEndList,
+              !subtitle.hasByteRange,
+              subtitle.mapURI == nil,
+              subtitle.segments.count
+                == video.segments.count else {
+            return false
+        }
+        return zip(
+            subtitle.segments,
+            video.segments
+        ).allSatisfy { pair in
+            CMTime(
+                seconds: pair.0.duration,
+                preferredTimescale:
+                    BlackCarrierProfile.approved.timescale
+            ) == CMTime(
+                seconds: pair.1.duration,
+                preferredTimescale:
+                    BlackCarrierProfile.approved.timescale
+            )
+        }
+    }
+
+    private static func subtitlePolicy(
+        sourceOrdinal: Int,
+        rendition: HLSSubtitleRendition,
+        availability:
+            AetherHLSSubtitleRenditionAvailability
+    ) -> AetherHLSSubtitleRenditionPolicy {
+        AetherHLSSubtitleRenditionPolicy(
+            subtitleTrackID: sourceOrdinal,
+            name: rendition.name,
+            language: rendition.language,
+            isDefault: rendition.isDefault,
+            isAutoselect: rendition.isAutoselect,
+            isForced: rendition.isForced,
+            availability: availability
+        )
+    }
+
+    private static func subtitleUnavailableReason(
+        _ error: HLSPreflightError
+    ) -> AetherHLSSubtitleUnavailableReason {
+        switch error {
+        case .unsupportedSeekableVODResourceGraph(
+            let reason
+        ) where reason.contains("not WebVTT"):
+            .unsupportedFormat
+        case .unsupportedSeekableVODResourceGraph:
+            .invalidManifest
+        case .invalidPlaylist,
+             .unresolvableURI,
+             .selectedVariantWasNotMediaPlaylist,
+             .seekableVODPlaylistNotFinite:
+            .invalidManifest
+        case .httpStatus,
+             .resourceTooLarge,
+             .unsupportedContentEncoding,
+             .contentLengthMismatch,
+             .redirectCredentialScopeViolation,
+             .nonHTTPResponse,
+             .transportFailure,
+             .requestedVariantNotFound:
+            .resourceUnavailable
+        }
     }
 
     private func resolveAudioRenditions(
@@ -946,7 +1242,31 @@ struct HLSPreflightInspector {
                 codec: codec,
                 format: probe.videoFormat,
                 sampleEntry: sampleEntry,
-                hdr10PlusEvidence: hdr10PlusEvidence
+                hdr10PlusEvidence: hdr10PlusEvidence,
+                overlaySubtitleTracks:
+                    demuxer.subtitleTrackInfos().compactMap {
+                        info in
+                        let kind:
+                            AetherHybridOverlaySubtitleKind
+                        if AetherEngine.isBitmapSubtitleCodec(
+                            info.codec
+                        ) {
+                            kind = .bitmap
+                        } else if info.codec == "ass"
+                                    || info.codec == "ssa" {
+                            kind = .styledText
+                        } else {
+                            return nil
+                        }
+                        return AetherHybridOverlaySubtitleTrack(
+                            id: info.id,
+                            name: info.name,
+                            language: info.language,
+                            isDefault: info.isDefault,
+                            isForced: info.isForced,
+                            kind: kind
+                        )
+                    }
             )
         } catch {
             return nil
