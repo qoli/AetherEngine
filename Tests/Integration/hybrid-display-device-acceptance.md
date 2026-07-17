@@ -22,6 +22,35 @@ aspect-fit/fill to `AetherMetalPlayerView`. Missing or mutated configuration is 
 guess display criteria or switch route. Configuration attempted after idle throws
 `carrierPresentationConfigurationTooLate` without mutating the controller.
 
+## tvOS public-API boundary
+
+The current Apple TV SDK makes the renderer split an architecture decision, not a shader-only task:
+
+- `CAMetalLayer.colorspace` and HDR-capable Metal pixel formats can describe direct PQ/HLG output, so
+  HDR10 and HLG may proceed to a physical-device candidate after the engine has an exact 10-bit
+  pixel-buffer/color-metadata contract.
+- `CAMetalLayer.wantsExtendedDynamicRangeContent`, `CAMetalLayer.EDRMetadata` and `CAEDRMetadata` are
+  unavailable on tvOS in the AppleTVOS 26.4 SDK. The layer therefore has no public tvOS per-frame
+  HDR10+ T.35 or Dolby Vision RPU metadata input.
+- Apple's Dolby Vision playback guidance names `AVPlayer`/`AVPlayerLayer` and
+  `AVSampleBufferDisplayLayer`; the lower-level path requires 10-bit-or-higher sample buffers carrying
+  Dolby Vision per-frame metadata propagated by `VTDecompressionSession`.
+- `kCMSampleAttachmentKey_HDR10PlusPerFrameData` is a `CMSampleBuffer` attachment, not a Metal drawable
+  attachment. Rendering only the HDR10 base layer in Metal would silently drop HDR10+ semantics.
+
+Accordingly, `.hdr10Plus` and `.dolbyVision` must remain outside
+`AetherMetalPlayerView.verifiedVideoFormats`. The engine must not relabel a base layer as the original
+format, silently tone-map, or route-switch. Before either format can be admitted, the administrator must
+choose and validate one explicit presentation route: an engine-owned `AVSampleBufferDisplayLayer`, a
+compressed-bitstream AVPlayer repackaging route, or continued typed unsupported. This decision does not
+affect the fixed 2 Mbps black-carrier policy.
+
+Primary references:
+
+- [Apple: Using color spaces to display HDR content](https://developer.apple.com/documentation/metal/using-color-spaces-to-display-hdr-content)
+- [Apple: Incorporating HDR video with Dolby Vision into your apps](https://developer.apple.com/av-foundation/Incorporating-HDR-video-with-Dolby-Vision-into-your-apps.pdf)
+- [Apple: HDR10+ per-frame sample attachment](https://developer.apple.com/documentation/coremedia/cmsamplebuffer/sampleattachments-swift.struct/hdr10plusperframedata)
+
 ## Fixture contract
 
 Record provenance, redistribution status, byte size and SHA-256 for every fixture. Keep
