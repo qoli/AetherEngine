@@ -319,6 +319,60 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         try await loader.close()
     }
 
+    func testAnalysisDeliveryDistinguishesOriginFetchFromReuse()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let recorder = FetchRecorder(
+            responses: [
+                fixture.audioFirstSegmentURL:
+                    HLSVODOriginFetchResponse(
+                        data: fixture.audioFirstSegmentData,
+                        effectiveURL:
+                            fixture.audioFirstSegmentURL,
+                        statusCode: 200,
+                        contentLength: Int64(
+                            fixture.audioFirstSegmentData.count
+                        ),
+                        contentEncoding: nil
+                    ),
+            ]
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [:],
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+        let key = HLSVODOriginResourceKey.audioSegment(
+            renditionOrdinal: 0,
+            index: 0
+        )
+
+        let fetched = try await loader.payloadWithDelivery(
+            for: key,
+            purpose: .analysis
+        )
+        let reused = try await loader.payloadWithDelivery(
+            for: key,
+            purpose: .analysis
+        )
+
+        XCTAssertEqual(fetched.source, .analysisOriginFetch)
+        XCTAssertEqual(reused.source, .reused)
+        XCTAssertEqual(
+            fetched.payload.data,
+            fixture.audioFirstSegmentData
+        )
+        let requestCount = await recorder.requestCount
+        XCTAssertEqual(requestCount, 1)
+        try await loader.close()
+    }
+
     func testAnalysisSchedulerAllowsOnlyOneOriginFetch()
         async throws
     {

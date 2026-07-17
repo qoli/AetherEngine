@@ -23,14 +23,199 @@ enum AudioAnalysisInput: Sendable {
 /// receives the terminal state asynchronously while `Demuxer.markClosed()` and `IOReader.cancel()` immediately
 /// unblock any C/IO read that is currently in progress.
 final class AudioAnalysisSession: @unchecked Sendable {
+    private static let telemetryProgressIntervalSeconds = 0.5
+
     let id = UUID()
     let gate = AudioAnalysisDemandGate()
     let demuxer = Demuxer()
 
     private let lock = NSLock()
+    private let telemetryRequest: AudioAnalysisRequest?
+    private let telemetryHandler:
+        (@Sendable (
+            AetherHybridAudioAnalysisTelemetry
+        ) -> Void)?
     private var cancelled = false
     private var ownedReader: IOReader?
     private var task: Task<Void, Never>?
+    private var telemetryTerminal = false
+    private var decodedUntilSeconds: Double?
+    private var lastEmittedDecodedUntilSeconds: Double?
+    private var bufferedFrames: Int64 = 0
+    private var sourceCacheHitBytes: Int64 = 0
+    private var sourceFetchedBytes: Int64 = 0
+    private var pausedForPlaybackCount = 0
+    private var pausedForPlaybackDurationSeconds = 0.0
+    private var playbackPressure:
+        HybridAudioAnalysisPlaybackPressure = .none
+    private var playbackPressureStartedAt: TimeInterval?
+
+    init() {
+        telemetryRequest = nil
+        telemetryHandler = nil
+    }
+
+    init(
+        request: AudioAnalysisRequest,
+        telemetryHandler:
+            @escaping @Sendable (
+                AetherHybridAudioAnalysisTelemetry
+            ) -> Void
+    ) {
+        telemetryRequest = request
+        self.telemetryHandler = telemetryHandler
+    }
+
+    func emitTelemetryStarted() {
+        emitTelemetry(phase: .started)
+    }
+
+    func recordTelemetryProgress(
+        decodedUntilSeconds: Double,
+        bufferedFrames: Int64,
+        sourceCacheHitBytes: Int64,
+        sourceFetchedBytes: Int64
+    ) {
+        lock.lock()
+        guard !telemetryTerminal,
+              let telemetryRequest else {
+            lock.unlock()
+            return
+        }
+        self.decodedUntilSeconds = decodedUntilSeconds
+        self.bufferedFrames = bufferedFrames
+        self.sourceCacheHitBytes = sourceCacheHitBytes
+        self.sourceFetchedBytes = sourceFetchedBytes
+        let shouldEmit: Bool
+        if let last = lastEmittedDecodedUntilSeconds {
+            shouldEmit = decodedUntilSeconds - last
+                >= Self.telemetryProgressIntervalSeconds
+                || decodedUntilSeconds
+                    >= telemetryRequest.range.upperBound
+        } else {
+            shouldEmit = true
+        }
+        guard shouldEmit else {
+            lock.unlock()
+            return
+        }
+        lastEmittedDecodedUntilSeconds = decodedUntilSeconds
+        let event = telemetryEventLocked(phase: .progress)
+        let handler = telemetryHandler
+        lock.unlock()
+        if let event {
+            handler?(event)
+        }
+    }
+
+    func recordTelemetryCompleted() {
+        recordTelemetryTerminal(phase: .completed)
+    }
+
+    func recordTelemetryFailed(_ error: AudioAnalysisError) {
+        recordTelemetryTerminal(
+            phase: .failed(
+                AetherHybridAudioAnalysisTelemetryFailure(error)
+            )
+        )
+    }
+
+    func setPlaybackPressureForTelemetry(
+        _ pressure: HybridAudioAnalysisPlaybackPressure
+    ) {
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        guard !telemetryTerminal,
+              pressure != playbackPressure else {
+            lock.unlock()
+            return
+        }
+        if playbackPressure == .none,
+           pressure != .none {
+            pausedForPlaybackCount += 1
+            playbackPressureStartedAt = now
+        } else if playbackPressure != .none,
+                  pressure == .none,
+                  let started = playbackPressureStartedAt {
+            pausedForPlaybackDurationSeconds +=
+                max(0, now - started)
+            playbackPressureStartedAt = nil
+        }
+        playbackPressure = pressure
+        lock.unlock()
+    }
+
+    private func emitTelemetry(
+        phase: AetherHybridAudioAnalysisTelemetryPhase
+    ) {
+        lock.lock()
+        let event = telemetryEventLocked(phase: phase)
+        let handler = telemetryHandler
+        lock.unlock()
+        if let event {
+            handler?(event)
+        }
+    }
+
+    private func recordTelemetryTerminal(
+        phase: AetherHybridAudioAnalysisTelemetryPhase
+    ) {
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        guard !telemetryTerminal else {
+            lock.unlock()
+            return
+        }
+        telemetryTerminal = true
+        if let started = playbackPressureStartedAt {
+            pausedForPlaybackDurationSeconds +=
+                max(0, now - started)
+            playbackPressureStartedAt = nil
+        }
+        bufferedFrames = 0
+        let event = telemetryEventLocked(
+            phase: phase,
+            now: now
+        )
+        let handler = telemetryHandler
+        lock.unlock()
+        if let event {
+            handler?(event)
+        }
+    }
+
+    private func telemetryEventLocked(
+        phase: AetherHybridAudioAnalysisTelemetryPhase,
+        now: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> AetherHybridAudioAnalysisTelemetry? {
+        guard let telemetryRequest else {
+            return nil
+        }
+        let activePausedDuration: Double
+        if let started = playbackPressureStartedAt {
+            activePausedDuration = max(0, now - started)
+        } else {
+            activePausedDuration = 0
+        }
+        return AetherHybridAudioAnalysisTelemetry(
+            analysisID: id,
+            audioTrackID: telemetryRequest.audioTrackID,
+            rangeStartSeconds:
+                telemetryRequest.range.lowerBound,
+            rangeEndSeconds:
+                telemetryRequest.range.upperBound,
+            phase: phase,
+            decodedUntilSeconds: decodedUntilSeconds,
+            bufferedFrames: bufferedFrames,
+            sourceCacheHitBytes: sourceCacheHitBytes,
+            sourceFetchedBytes: sourceFetchedBytes,
+            pausedForPlaybackCount:
+                pausedForPlaybackCount,
+            pausedForPlaybackDurationSeconds:
+                pausedForPlaybackDurationSeconds
+                + activePausedDuration
+        )
+    }
 
     func install(task: Task<Void, Never>) {
         lock.lock()
@@ -125,6 +310,7 @@ enum AudioAnalysisRunner {
                     request: request,
                     hasOutstandingDemand: true
                 )
+                session.recordTelemetryCompleted()
                 await session.gate.finish()
                 return
             }
@@ -155,13 +341,20 @@ enum AudioAnalysisRunner {
 
             try await pump(decoder: decoder, session: session, request: request,
                            hasOutstandingDemand: true)
+            session.recordTelemetryCompleted()
             await session.gate.finish()
         } catch let error as AudioAnalysisError {
+            session.recordTelemetryFailed(error)
             await session.gate.fail(error)
         } catch is CancellationError {
+            session.recordTelemetryFailed(.cancelled)
             await session.gate.fail(.cancelled)
         } catch {
-            await session.gate.fail(.analysisFailed(String(describing: error)))
+            let typed = AudioAnalysisError.analysisFailed(
+                String(describing: error)
+            )
+            session.recordTelemetryFailed(typed)
+            await session.gate.fail(typed)
         }
     }
 
@@ -221,8 +414,26 @@ enum AudioAnalysisRunner {
                         sourceSamplePosition: sourceSamplePosition,
                         isDiscontinuous: sourceSamplePosition != expectedSourceSamplePosition
                     )
-                    guard await session.gate.yield(buffer) else { return }
+                    guard await session.gate.yield(buffer) else {
+                        throw AudioAnalysisError.cancelled
+                    }
                     expectedSourceSamplePosition = sourceSamplePosition + Int64(pcm.frameLength)
+                    session.recordTelemetryProgress(
+                        decodedUntilSeconds:
+                            Double(expectedSourceSamplePosition)
+                            / AetherEngine.audioAnalysisFormat.sampleRate,
+                        bufferedFrames:
+                            pendingChunks.reduce(into: Int64(0)) {
+                                $0 += Int64(
+                                    $1.buffer.frameLength
+                                )
+                            },
+                        sourceCacheHitBytes:
+                            session.demuxer
+                                .avioSourceStoreBytesServed,
+                        sourceFetchedBytes:
+                            session.demuxer.avioBytesFetched
+                    )
                     demandIsOutstanding = false
                     break
                 }
@@ -256,6 +467,8 @@ enum AudioAnalysisRunner {
                     * AetherEngine.audioAnalysisFormat.sampleRate
             ).rounded()
         )
+        var sourceCacheHitBytes: Int64 = 0
+        var sourceFetchedBytes: Int64 = 0
 
         while true {
             if !demandIsOutstanding {
@@ -294,16 +507,32 @@ enum AudioAnalysisRunner {
                         if !didLoadInit {
                             didLoadInit = true
                             if let key = track.initResourceKey {
-                                initData = try await hlsPayload(
+                                let delivery = try await hlsPayload(
                                     source: source,
                                     key: key
+                                )
+                                initData = delivery.payload.data
+                                try accumulate(
+                                    delivery,
+                                    cacheHitBytes:
+                                        &sourceCacheHitBytes,
+                                    fetchedBytes:
+                                        &sourceFetchedBytes
                                 )
                             }
                         }
                         let segment = segments[segmentCursor]
-                        let segmentData = try await hlsPayload(
+                        let delivery = try await hlsPayload(
                             source: source,
                             key: segment.resourceKey
+                        )
+                        let segmentData = delivery.payload.data
+                        try accumulate(
+                            delivery,
+                            cacheHitBytes:
+                                &sourceCacheHitBytes,
+                            fetchedBytes:
+                                &sourceFetchedBytes
                         )
                         try session.throwIfCancelled()
                         segmentDecoder =
@@ -359,11 +588,28 @@ enum AudioAnalysisRunner {
                             != expectedSourceSamplePosition
                     )
                     guard await session.gate.yield(buffer) else {
-                        return
+                        throw AudioAnalysisError.cancelled
                     }
                     expectedSourceSamplePosition =
                         sourceSamplePosition
                         + Int64(pcm.frameLength)
+                    session.recordTelemetryProgress(
+                        decodedUntilSeconds:
+                            Double(expectedSourceSamplePosition)
+                            / AetherEngine.audioAnalysisFormat.sampleRate,
+                        bufferedFrames:
+                            drainedChunks.reduce(into: Int64(0)) {
+                                $0 += Int64(
+                                    $1.buffer.frameLength
+                                )
+                            }
+                            + (segmentDecoder?
+                                .bufferedFrameCount ?? 0),
+                        sourceCacheHitBytes:
+                            sourceCacheHitBytes,
+                        sourceFetchedBytes:
+                            sourceFetchedBytes
+                    )
                     demandIsOutstanding = false
                 }
                 break
@@ -374,12 +620,12 @@ enum AudioAnalysisRunner {
     private static func hlsPayload(
         source: HLSVODAudioAnalysisInput,
         key: HLSVODOriginResourceKey
-    ) async throws -> Data {
+    ) async throws -> HLSVODOriginResourceDelivery {
         do {
-            return try await source.loader.payload(
+            return try await source.loader.payloadWithDelivery(
                 for: key,
                 purpose: .analysis
-            ).data
+            )
         } catch is CancellationError {
             throw AudioAnalysisError.cancelled
         } catch let error as HLSVODOriginResourceError {
@@ -393,6 +639,34 @@ enum AudioAnalysisRunner {
         }
     }
 
+    private static func accumulate(
+        _ delivery: HLSVODOriginResourceDelivery,
+        cacheHitBytes: inout Int64,
+        fetchedBytes: inout Int64
+    ) throws {
+        let count = Int64(delivery.payload.data.count)
+        switch delivery.source {
+        case .reused:
+            let result = cacheHitBytes
+                .addingReportingOverflow(count)
+            guard !result.overflow else {
+                throw AudioAnalysisError.analysisFailed(
+                    "audio-analysis cache byte counter overflow"
+                )
+            }
+            cacheHitBytes = result.partialValue
+        case .analysisOriginFetch:
+            let result = fetchedBytes
+                .addingReportingOverflow(count)
+            guard !result.overflow else {
+                throw AudioAnalysisError.analysisFailed(
+                    "audio-analysis origin byte counter overflow"
+                )
+            }
+            fetchedBytes = result.partialValue
+        }
+    }
+
     private final class HLSAudioSegmentDecoder {
         private let track: HLSVODAudioAnalysisTrack
         private let segment: HLSVODAudioAnalysisSegment
@@ -402,6 +676,12 @@ enum AudioAnalysisRunner {
         private var pendingChunks: [AudioTapChunk] = []
         private var inputEOF = false
         private var selectedPacketCount = 0
+
+        var bufferedFrameCount: Int64 {
+            pendingChunks.reduce(into: Int64(0)) {
+                $0 += Int64($1.buffer.frameLength)
+            }
+        }
 
         init(
             track: HLSVODAudioAnalysisTrack,

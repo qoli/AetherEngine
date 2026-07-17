@@ -151,6 +151,13 @@ public final class Demuxer: @unchecked Sendable {
     // Memory probe: compare against RSS growth; 0 for file:// sources.
     var avioBytesFetched: Int64 { avioProvider?.cumulativeBytesFetched ?? 0 }
 
+    // Bytes served from the validated, session-scoped immutable source store.
+    // Kept separate from origin bytes so audio-analysis telemetry can prove
+    // byte reuse without exposing a URL, path, header or credential.
+    var avioSourceStoreBytesServed: Int64 {
+        (avioProvider as? AVIOReader)?.sourceStoreBytesServed ?? 0
+    }
+
     // Forward-only custom sources report false.
     var isSourceSeekable: Bool { avioProvider?.isSeekable ?? true }
 

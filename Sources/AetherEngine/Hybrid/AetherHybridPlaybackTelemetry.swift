@@ -168,6 +168,234 @@ public enum AetherHybridPlaybackTelemetryState:
     }
 }
 
+/// Stable terminal identity for one independent audio-analysis request.
+///
+/// Error descriptions remain local diagnostics because transport and decoder
+/// messages can contain source details. Track and segment identities are
+/// carried by the typed event fields when they are part of the admitted graph.
+public enum AetherHybridAudioAnalysisTelemetryFailure:
+    String,
+    Sendable,
+    Equatable
+{
+    case invalidRange
+    case noActiveSession
+    case liveOrDVRUnsupported
+    case sourceNotSeekable
+    case sourceCannotCreateIndependentReader
+    case audioTrackUnavailable
+    case rangeOutsideSource
+    case contentProtectionUnsupported
+    case hlsResourceFailure
+    case hlsAudioContractChanged
+    case hlsSegmentDecodeFailed
+    case hlsTimestampInvalid
+    case concurrentConsumer
+    case cancelled
+    case analysisFailed
+
+    init(_ error: AudioAnalysisError) {
+        self = switch error {
+        case .invalidRange:
+            .invalidRange
+        case .noActiveSession:
+            .noActiveSession
+        case .liveOrDVRUnsupported:
+            .liveOrDVRUnsupported
+        case .sourceNotSeekable:
+            .sourceNotSeekable
+        case .sourceCannotCreateIndependentReader:
+            .sourceCannotCreateIndependentReader
+        case .audioTrackUnavailable:
+            .audioTrackUnavailable
+        case .rangeOutsideSource:
+            .rangeOutsideSource
+        case .contentProtectionUnsupported:
+            .contentProtectionUnsupported
+        case .hlsResourceFailure:
+            .hlsResourceFailure
+        case .hlsAudioContractChanged:
+            .hlsAudioContractChanged
+        case .hlsSegmentDecodeFailed:
+            .hlsSegmentDecodeFailed
+        case .hlsTimestampInvalid:
+            .hlsTimestampInvalid
+        case .concurrentConsumer:
+            .concurrentConsumer
+        case .cancelled:
+            .cancelled
+        case .analysisFailed:
+            .analysisFailed
+        }
+    }
+}
+
+public enum AetherHybridAudioAnalysisTelemetryPhase:
+    Sendable,
+    Equatable
+{
+    case started
+    case progress
+    case completed
+    case failed(AetherHybridAudioAnalysisTelemetryFailure)
+}
+
+/// Privacy-safe lifecycle snapshot for one independent analysis cursor.
+///
+/// Byte counters describe only this analysis request. `sourceCacheHitBytes`
+/// includes validated immutable-byte reuse and admitted HLS payload reuse;
+/// `sourceFetchedBytes` includes origin bytes fetched by this request. Neither
+/// counter is used to select a route, track, decoder or recovery action.
+public struct AetherHybridAudioAnalysisTelemetry:
+    Sendable,
+    Equatable
+{
+    public let analysisID: UUID
+    public let audioTrackID: Int
+    public let rangeStartSeconds: Double
+    public let rangeEndSeconds: Double
+    public let phase: AetherHybridAudioAnalysisTelemetryPhase
+    public let decodedUntilSeconds: Double?
+    public let bufferedFrames: Int64
+    public let sourceCacheHitBytes: Int64
+    public let sourceFetchedBytes: Int64
+    public let pausedForPlaybackCount: Int
+    public let pausedForPlaybackDurationSeconds: Double
+
+    init(
+        analysisID: UUID,
+        audioTrackID: Int,
+        rangeStartSeconds: Double,
+        rangeEndSeconds: Double,
+        phase: AetherHybridAudioAnalysisTelemetryPhase,
+        decodedUntilSeconds: Double?,
+        bufferedFrames: Int64,
+        sourceCacheHitBytes: Int64,
+        sourceFetchedBytes: Int64,
+        pausedForPlaybackCount: Int,
+        pausedForPlaybackDurationSeconds: Double
+    ) {
+        self.analysisID = analysisID
+        self.audioTrackID = audioTrackID
+        self.rangeStartSeconds = rangeStartSeconds
+        self.rangeEndSeconds = rangeEndSeconds
+        self.phase = phase
+        self.decodedUntilSeconds = decodedUntilSeconds
+        self.bufferedFrames = bufferedFrames
+        self.sourceCacheHitBytes = sourceCacheHitBytes
+        self.sourceFetchedBytes = sourceFetchedBytes
+        self.pausedForPlaybackCount = pausedForPlaybackCount
+        self.pausedForPlaybackDurationSeconds =
+            pausedForPlaybackDurationSeconds
+    }
+}
+
+/// Generation-bound timeline point for carrier, decoded-frame and seek events.
+public struct AetherHybridTimelineTelemetry:
+    Sendable,
+    Equatable
+{
+    public let generation: UInt64
+    public let targetSeconds: Double
+    public let segmentIndex: Int
+    public let framePresentationTimeSeconds: Double?
+
+    init(
+        generation: UInt64,
+        targetSeconds: Double,
+        segmentIndex: Int,
+        framePresentationTimeSeconds: Double? = nil
+    ) {
+        self.generation = generation
+        self.targetSeconds = targetSeconds
+        self.segmentIndex = segmentIndex
+        self.framePresentationTimeSeconds =
+            framePresentationTimeSeconds
+    }
+}
+
+/// Periodic sample of the only master clock against the last real frame that
+/// reached the engine-owned renderer. `driftMilliseconds` is
+/// `(framePresentationTime - playerTime) * 1000`; a negative value means the
+/// presented real-video frame is behind the carrier master clock.
+public struct AetherHybridAVDriftTelemetry:
+    Sendable,
+    Equatable
+{
+    public let playerTimeSeconds: Double
+    public let framePresentationTimeSeconds: Double?
+    public let driftMilliseconds: Double?
+    public let rendererQueueDepth: Int
+
+    init(
+        playerTimeSeconds: Double,
+        framePresentationTimeSeconds: Double?,
+        driftMilliseconds: Double?,
+        rendererQueueDepth: Int
+    ) {
+        self.playerTimeSeconds = playerTimeSeconds
+        self.framePresentationTimeSeconds =
+            framePresentationTimeSeconds
+        self.driftMilliseconds = driftMilliseconds
+        self.rendererQueueDepth = rendererQueueDepth
+    }
+}
+
+public struct AetherHybridBufferTelemetry:
+    Sendable,
+    Equatable
+{
+    public let pressure: HybridAudioAnalysisPlaybackPressure
+    public let carrierForwardBufferSeconds: Double?
+    public let carrierTimeControlStatus:
+        HybridCarrierTimeControlStatus
+    public let carrierRate: Float
+
+    init(
+        pressure: HybridAudioAnalysisPlaybackPressure,
+        carrierForwardBufferSeconds: Double?,
+        carrierTimeControlStatus:
+            HybridCarrierTimeControlStatus,
+        carrierRate: Float
+    ) {
+        self.pressure = pressure
+        self.carrierForwardBufferSeconds =
+            carrierForwardBufferSeconds
+        self.carrierTimeControlStatus =
+            carrierTimeControlStatus
+        self.carrierRate = carrierRate
+    }
+}
+
+public enum AetherHybridSessionEndReason:
+    String,
+    Sendable,
+    Equatable
+{
+    case playbackCompleted
+    case stoppedByHost
+}
+
+/// Event-specific facts. The complete session snapshot remains attached to
+/// every event; this payload prevents consumers from parsing state changes or
+/// human-readable logs to infer lifecycle meaning.
+public enum AetherHybridPlaybackTelemetryPayload:
+    Sendable,
+    Equatable
+{
+    case none
+    case carrierReady(AetherHybridTimelineTelemetry)
+    case videoFirstFrameReady(AetherHybridTimelineTelemetry)
+    case playbackStarted(AetherHybridTimelineTelemetry)
+    case seekRequested(AetherHybridTimelineTelemetry)
+    case seekVideoReady(AetherHybridTimelineTelemetry)
+    case avDriftSample(AetherHybridAVDriftTelemetry)
+    case bufferStateChanged(AetherHybridBufferTelemetry)
+    case sessionEnded(AetherHybridSessionEndReason)
+    case sessionFailed(AetherHybridPlaybackTelemetryFailure)
+    case audioAnalysis(AetherHybridAudioAnalysisTelemetry)
+}
+
 /// Why a structured snapshot was emitted.
 public enum AetherHybridPlaybackTelemetryEventKind:
     String,
@@ -180,6 +408,19 @@ public enum AetherHybridPlaybackTelemetryEventKind:
     case periodicSample
     case playbackPressureChanged
     case audioAnalysisChanged
+    case carrierReady
+    case videoFirstFrameReady
+    case playbackStarted
+    case seekRequested
+    case seekVideoReady
+    case avDriftSample
+    case bufferStateChanged
+    case sessionEnded
+    case sessionFailed
+    case audioAnalysisStarted
+    case audioAnalysisProgress
+    case audioAnalysisCompleted
+    case audioAnalysisFailed
 }
 
 /// Privacy-safe hybrid playback facts captured at one ordered event boundary.
@@ -268,17 +509,20 @@ public struct AetherHybridPlaybackTelemetryEvent:
     public let sessionID: UUID
     public let sequence: UInt64
     public let kind: AetherHybridPlaybackTelemetryEventKind
+    public let payload: AetherHybridPlaybackTelemetryPayload
     public let snapshot: AetherHybridPlaybackTelemetrySnapshot
 
     init(
         sessionID: UUID,
         sequence: UInt64,
         kind: AetherHybridPlaybackTelemetryEventKind,
+        payload: AetherHybridPlaybackTelemetryPayload,
         snapshot: AetherHybridPlaybackTelemetrySnapshot
     ) {
         self.sessionID = sessionID
         self.sequence = sequence
         self.kind = kind
+        self.payload = payload
         self.snapshot = snapshot
     }
 }
@@ -340,6 +584,7 @@ final class AetherHybridPlaybackTelemetryHub {
     @discardableResult
     func emit(
         kind: AetherHybridPlaybackTelemetryEventKind,
+        payload: AetherHybridPlaybackTelemetryPayload = .none,
         snapshot: AetherHybridPlaybackTelemetrySnapshot
     ) -> AetherHybridPlaybackTelemetryEvent? {
         guard !isFinished else { return nil }
@@ -348,6 +593,7 @@ final class AetherHybridPlaybackTelemetryHub {
             sessionID: sessionID,
             sequence: sequence,
             kind: kind,
+            payload: payload,
             snapshot: snapshot
         )
         history.append(event)

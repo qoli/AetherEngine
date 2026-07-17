@@ -210,6 +210,25 @@ struct HLSVODOriginResourcePayload: Sendable, Equatable {
     let sha256: String
 }
 
+enum HLSVODOriginResourceDeliverySource:
+    Sendable,
+    Equatable
+{
+    /// Already admitted or resident bytes; this analysis request did not
+    /// create a new origin transfer.
+    case reused
+    /// Origin bytes fetched while analysis owned the resource flight.
+    case analysisOriginFetch
+}
+
+struct HLSVODOriginResourceDelivery:
+    Sendable,
+    Equatable
+{
+    let payload: HLSVODOriginResourcePayload
+    let source: HLSVODOriginResourceDeliverySource
+}
+
 struct HLSVODOriginResourceLoaderSnapshot: Sendable, Equatable {
     let cachedResourceCount: Int
     let cachedBytes: Int64
@@ -416,7 +435,7 @@ actor HLSVODOriginResourceLoader {
             let purpose: HLSVODOriginResourcePurpose
             let continuation:
                 CheckedContinuation<
-                    HLSVODOriginResourcePayload,
+                    HLSVODOriginResourceDelivery,
                     Error
                 >
         }
@@ -425,6 +444,7 @@ actor HLSVODOriginResourceLoader {
         var waiters: [UUID: Waiter]
         var task: Task<Void, Never>?
         var taskID: UUID?
+        var taskPurpose: HLSVODOriginResourcePurpose?
         var activePurpose: HLSVODOriginResourcePurpose
         var isPausedForPlayback: Bool
     }
@@ -526,6 +546,16 @@ actor HLSVODOriginResourceLoader {
         for key: HLSVODOriginResourceKey,
         purpose: HLSVODOriginResourcePurpose = .playback
     ) async throws -> HLSVODOriginResourcePayload {
+        try await payloadWithDelivery(
+            for: key,
+            purpose: purpose
+        ).payload
+    }
+
+    nonisolated func payloadWithDelivery(
+        for key: HLSVODOriginResourceKey,
+        purpose: HLSVODOriginResourcePurpose
+    ) async throws -> HLSVODOriginResourceDelivery {
         try Task.checkCancellation()
         let waiterID = UUID()
         let analysisPermitID =
@@ -701,7 +731,7 @@ actor HLSVODOriginResourceLoader {
         _ waiterID: UUID,
         for key: HLSVODOriginResourceKey,
         purpose: HLSVODOriginResourcePurpose
-    ) async throws -> HLSVODOriginResourcePayload {
+    ) async throws -> HLSVODOriginResourceDelivery {
         if let preflightGenerationInvalidation {
             throw HLSVODOriginResourceError
                 .preflightGenerationInvalidated(
@@ -713,7 +743,10 @@ actor HLSVODOriginResourceLoader {
         }
         let resource = try graph.boundOriginResource(for: key)
         if let payload = try cachedPayload(for: key) {
-            return payload
+            return HLSVODOriginResourceDelivery(
+                payload: payload,
+                source: .reused
+            )
         }
 
         return try await withCheckedThrowingContinuation {
@@ -746,6 +779,7 @@ actor HLSVODOriginResourceLoader {
                 ],
                 task: nil,
                 taskID: nil,
+                taskPurpose: nil,
                 activePurpose: purpose,
                 isPausedForPlayback:
                     purpose == .analysis
@@ -834,6 +868,7 @@ actor HLSVODOriginResourceLoader {
         }
         flight.task = task
         flight.taskID = taskID
+        flight.taskPurpose = flight.activePurpose
         flights[key] = flight
     }
 
@@ -857,6 +892,7 @@ actor HLSVODOriginResourceLoader {
         task.cancel()
         flight.task = nil
         flight.taskID = nil
+        flight.taskPurpose = nil
         flight.isPausedForPlayback = true
         flights[key] = flight
         analysisPreemptionCount += 1
@@ -1054,8 +1090,21 @@ actor HLSVODOriginResourceLoader {
                 for: resource
             )
             for waiter in flight.waiters.values {
+                let source:
+                    HLSVODOriginResourceDeliverySource
+                if resource.seededData != nil
+                    || waiter.purpose != .analysis
+                    || flight.taskPurpose != .analysis {
+                    source = .reused
+                } else {
+                    source = .analysisOriginFetch
+                }
                 waiter.continuation.resume(
-                    returning: payload
+                    returning:
+                        HLSVODOriginResourceDelivery(
+                            payload: payload,
+                            source: source
+                        )
                 )
             }
         } catch is CancellationError {

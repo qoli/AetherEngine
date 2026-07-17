@@ -124,6 +124,55 @@ struct HybridPlaybackTelemetryTests {
         )
     }
 
+    @Test("Audio-analysis failures publish stable codes without source text")
+    func audioAnalysisFailureSanitization() {
+        let sourceError = AudioAnalysisError
+            .hlsResourceFailure(
+                "https://signed.example/audio?token=secret Authorization=secret"
+            )
+        let failure =
+            AetherHybridAudioAnalysisTelemetryFailure(
+                sourceError
+            )
+
+        #expect(failure == .hlsResourceFailure)
+        #expect(
+            !String(describing: failure).contains("secret")
+        )
+        #expect(
+            !String(describing: failure)
+                .contains("signed.example")
+        )
+    }
+
+    @MainActor
+    @Test("Typed seek payload survives bounded stream delivery")
+    func typedSeekPayloadDelivery() async throws {
+        let hub = AetherHybridPlaybackTelemetryHub(
+            historyLimit: 2
+        )
+        let point = AetherHybridTimelineTelemetry(
+            generation: 3,
+            targetSeconds: 42,
+            segmentIndex: 10,
+            framePresentationTimeSeconds: 41.96
+        )
+        hub.emit(
+            kind: .seekVideoReady,
+            payload: .seekVideoReady(point),
+            snapshot: makeSnapshot(
+                state: .ready(generation: 3)
+            )
+        )
+
+        var iterator = hub.stream().makeAsyncIterator()
+        let event = try #require(await iterator.next())
+
+        #expect(event.kind == .seekVideoReady)
+        #expect(event.payload == .seekVideoReady(point))
+        hub.finish()
+    }
+
     @MainActor
     private func makeSnapshot(
         state: AetherHybridPlaybackTelemetryState

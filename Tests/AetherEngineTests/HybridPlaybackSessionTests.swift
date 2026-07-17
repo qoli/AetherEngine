@@ -448,8 +448,23 @@ struct HybridPlaybackSessionTests {
         let stream = try session.audioAnalysisStream(
             request: request
         )
-        #expect(
-            telemetry.values == [.audioAnalysisChanged]
+        try await waitUntil {
+            telemetry.values.contains { trigger in
+                guard case .audioAnalysis(let event) =
+                        trigger else {
+                    return false
+                }
+                return event.phase == .started
+            }
+        }
+        session.applyAudioAnalysisPlaybackPressure(
+            .carrierPlaybackStalled,
+            forwardBufferSeconds: 0.25
+        )
+        try await Task.sleep(nanoseconds: 20_000_000)
+        session.applyAudioAnalysisPlaybackPressure(
+            .none,
+            forwardBufferSeconds: 4
         )
 
         var totalFrames: Int64 = 0
@@ -477,12 +492,41 @@ struct HybridPlaybackSessionTests {
         #expect(abs(resolvedFirstPosition - 12_000) <= 120)
         #expect(abs(resolvedFinalPosition - 36_000) <= 120)
         try await waitUntil {
-            telemetry.values
-                == [
-                    .audioAnalysisChanged,
-                    .audioAnalysisChanged,
-                ]
+            telemetry.values.contains { trigger in
+                guard case .audioAnalysis(let event) =
+                        trigger else {
+                    return false
+                }
+                return event.phase == .completed
+            }
         }
+        let analysisEvents = telemetry.values.compactMap {
+            trigger -> AetherHybridAudioAnalysisTelemetry? in
+            guard case .audioAnalysis(let event) = trigger else {
+                return nil
+            }
+            return event
+        }
+        #expect(analysisEvents.first?.phase == .started)
+        #expect(
+            analysisEvents.contains { $0.phase == .progress }
+        )
+        #expect(analysisEvents.last?.phase == .completed)
+        #expect(
+            analysisEvents.last?.decodedUntilSeconds != nil
+        )
+        #expect(
+            analysisEvents.last?.bufferedFrames == 0
+        )
+        #expect(
+            analysisEvents.last?.pausedForPlaybackCount == 1
+        )
+        #expect(
+            try #require(
+                analysisEvents.last?
+                    .pausedForPlaybackDurationSeconds
+            ) > 0
+        )
     }
 
     @MainActor
@@ -826,7 +870,40 @@ struct HybridPlaybackSessionTests {
 
         try await fixture.session.prepare(timeout: 1)
         #expect(
-            telemetry.values.contains(.periodicSample)
+            telemetry.values.contains { trigger in
+                guard case .carrierReady(let point) = trigger else {
+                    return false
+                }
+                return point.generation == 0
+                    && point.segmentIndex == 0
+            }
+        )
+        #expect(
+            telemetry.values.contains { trigger in
+                guard case .videoFirstFrameReady(let point) =
+                        trigger else {
+                    return false
+                }
+                return point.generation == 0
+                    && point.framePresentationTimeSeconds == 0
+            }
+        )
+        #expect(
+            telemetry.values.contains { trigger in
+                guard case .playbackStarted(let point) =
+                        trigger else {
+                    return false
+                }
+                return point.generation == 0
+            }
+        )
+        #expect(
+            telemetry.values.contains { trigger in
+                if case .periodicSample = trigger {
+                    return true
+                }
+                return false
+            }
         )
         telemetry.removeAll()
 
@@ -837,7 +914,12 @@ struct HybridPlaybackSessionTests {
             )
         )
         #expect(
-            !telemetry.values.contains(.periodicSample)
+            !telemetry.values.contains { trigger in
+                if case .periodicSample = trigger {
+                    return true
+                }
+                return false
+            }
         )
 
         fixture.session.handleClockTick(
@@ -848,7 +930,10 @@ struct HybridPlaybackSessionTests {
         )
         #expect(
             telemetry.values.filter {
-                $0 == .periodicSample
+                if case .periodicSample = $0 {
+                    return true
+                }
+                return false
             }.count == 1
         )
 
@@ -863,7 +948,12 @@ struct HybridPlaybackSessionTests {
     func explicitSeekGeneration() async throws {
         let fixture = try makeSession()
         defer { fixture.session.stop() }
+        let telemetry = HybridTelemetryTriggerRecorder()
+        fixture.session.telemetryDidChange = {
+            telemetry.record($0)
+        }
         try await fixture.session.prepare(timeout: 1)
+        telemetry.removeAll()
 
         let target = CMTime(
             seconds: 4.5,
@@ -895,6 +985,33 @@ struct HybridPlaybackSessionTests {
             segmentIndex: 1,
             generation: 1
         ))
+        #expect(
+            telemetry.values.contains { trigger in
+                guard case .seekRequested(let point) = trigger else {
+                    return false
+                }
+                return point.generation == 1
+                    && point.segmentIndex == 1
+                    && point.targetSeconds == 4.5
+            }
+        )
+        #expect(
+            telemetry.values.contains { trigger in
+                guard case .carrierReady(let point) = trigger else {
+                    return false
+                }
+                return point.generation == 1
+            }
+        )
+        #expect(
+            telemetry.values.contains { trigger in
+                guard case .seekVideoReady(let point) = trigger else {
+                    return false
+                }
+                return point.generation == 1
+                    && point.framePresentationTimeSeconds == 4
+            }
+        )
     }
 
     @Test("Decoder failure is terminal and tears down transport and renderer")

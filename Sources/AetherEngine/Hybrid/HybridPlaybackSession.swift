@@ -178,9 +178,15 @@ enum HybridPlaybackTelemetryTrigger:
     Equatable
 {
     case transportChanged
-    case periodicSample
+    case periodicSample(playerTimeSeconds: Double)
     case playbackPressureChanged
-    case audioAnalysisChanged
+    case carrierReady(AetherHybridTimelineTelemetry)
+    case videoFirstFrameReady(AetherHybridTimelineTelemetry)
+    case playbackStarted(AetherHybridTimelineTelemetry)
+    case seekRequested(AetherHybridTimelineTelemetry)
+    case seekVideoReady(AetherHybridTimelineTelemetry)
+    case sessionEnded(AetherHybridSessionEndReason)
+    case audioAnalysis(AetherHybridAudioAnalysisTelemetry)
 }
 
 protocol HybridCarrierTransportProvider:
@@ -419,6 +425,9 @@ final class HybridPlaybackSession {
     private var playbackStallLatched = false
     private var analysisPlaybackPressureSequence: UInt64 = 0
     private var lastTelemetryClockSampleSeconds: Double?
+    private var lastCarrierReadyTelemetryGeneration: UInt64?
+    private var lastVideoReadyTelemetryGeneration: UInt64?
+    private var didEmitPlaybackCompletedTelemetry = false
 
     private var latestDecodeDemand: CMTime?
     private var decodeDemandWorker: Task<Void, Never>?
@@ -687,6 +696,10 @@ final class HybridPlaybackSession {
 
         let generation = classifier.generation
         let target = CMTime.zero
+        guard let startupSegmentIndex =
+                timeline.segmentIndex(containing: target) else {
+            throw HybridPlaybackSessionError.invalidSeekTarget
+        }
         let deadline = ProcessInfo.processInfo.systemUptime + timeout
         state = .preparing(generation: generation, target: target)
 
@@ -738,6 +751,11 @@ final class HybridPlaybackSession {
             _ = readinessGate.markCarrierReady(
                 generation: generation
             )
+            publishCarrierReadyTelemetry(
+                generation: generation,
+                target: target,
+                segmentIndex: startupSegmentIndex
+            )
             try await waitForPresentationReadiness(
                 generation: generation,
                 deadline: deadline,
@@ -750,6 +768,19 @@ final class HybridPlaybackSession {
             }
             state = .ready(generation: generation)
             handleClockTick(initialTime)
+            telemetryDidChange?(
+                .playbackStarted(
+                    AetherHybridTimelineTelemetry(
+                        generation: generation,
+                        targetSeconds: target.seconds,
+                        segmentIndex: startupSegmentIndex,
+                        framePresentationTimeSeconds:
+                            readyFramePresentationTimeSeconds(
+                                generation: generation
+                            )
+                    )
+                )
+            )
             EngineLog.emit(
                 "[HybridPlaybackSession] ready generation=\(generation)",
                 category: .session
@@ -845,13 +876,22 @@ final class HybridPlaybackSession {
             )
         }
 
-        let session = AudioAnalysisSession()
+        let session = AudioAnalysisSession(
+            request: request
+        ) { [weak self] event in
+            Task { @MainActor [weak self] in
+                self?.handleAudioAnalysisTelemetry(event)
+            }
+        }
         let stream = AudioAnalysisStream(
             gate: session.gate,
             cancel: { session.cancel() }
         )
         audioAnalysisSessions[session.id] = session
-        telemetryDidChange?(.audioAnalysisChanged)
+        session.setPlaybackPressureForTelemetry(
+            audioAnalysisPlaybackPressure
+        )
+        session.emitTelemetryStarted()
         let sessionID = session.id
         let task = Task.detached(priority: .utility) {
             [weak self] in
@@ -869,14 +909,10 @@ final class HybridPlaybackSession {
     }
 
     func cancelAudioAnalysisStreams() {
-        let hadSessions = !audioAnalysisSessions.isEmpty
         let sessions = Array(audioAnalysisSessions.values)
         audioAnalysisSessions.removeAll()
         for session in sessions {
             session.cancel()
-        }
-        if hadSessions {
-            telemetryDidChange?(.audioAnalysisChanged)
         }
     }
 
@@ -904,12 +940,21 @@ final class HybridPlaybackSession {
     }
 
     private func removeAudioAnalysisSession(id: UUID) {
-        guard audioAnalysisSessions.removeValue(
-            forKey: id
-        ) != nil else {
-            return
+        audioAnalysisSessions.removeValue(forKey: id)
+    }
+
+    private func handleAudioAnalysisTelemetry(
+        _ event: AetherHybridAudioAnalysisTelemetry
+    ) {
+        switch event.phase {
+        case .completed, .failed:
+            audioAnalysisSessions.removeValue(
+                forKey: event.analysisID
+            )
+        case .started, .progress:
+            break
         }
-        telemetryDidChange?(.audioAnalysisChanged)
+        telemetryDidChange?(.audioAnalysis(event))
     }
 
     func receiveDecodedFrame(_ frame: DecodedVideoFrame) {
@@ -930,7 +975,12 @@ final class HybridPlaybackSession {
             ))
             return
         }
-        _ = readinessGate.considerDecodedFrame(frame)
+        let outcome = readinessGate.considerDecodedFrame(frame)
+        guard outcome == .acceptedWaiting
+                || outcome == .becameReady else {
+            return
+        }
+        publishVideoReadyTelemetryIfNeeded(frame)
     }
 
     func receiveDecoderFailure(
@@ -1014,6 +1064,15 @@ final class HybridPlaybackSession {
         cancelDecodeDemandWorker()
         avPlayer.pause()
         state = .seeking(generation: generation, target: target)
+        telemetryDidChange?(
+            .seekRequested(
+                AetherHybridTimelineTelemetry(
+                    generation: generation,
+                    targetSeconds: target.seconds,
+                    segmentIndex: segmentIndex
+                )
+            )
+        )
 
         do {
             try renderSurface.beginGeneration(
@@ -1025,6 +1084,13 @@ final class HybridPlaybackSession {
                 targetTime: target,
                 carrierAlreadyReady: !issueCarrierSeek
             )
+            if !issueCarrierSeek {
+                publishCarrierReadyTelemetry(
+                    generation: generation,
+                    target: target,
+                    segmentIndex: segmentIndex
+                )
+            }
             let restart = try await coordinator.restart(for: intent)
             switch restart {
             case .applied:
@@ -1072,6 +1138,11 @@ final class HybridPlaybackSession {
                 }
                 _ = readinessGate.markCarrierReady(
                     generation: generation
+                )
+                publishCarrierReadyTelemetry(
+                    generation: generation,
+                    target: target,
+                    segmentIndex: segmentIndex
                 )
             }
 
@@ -1182,6 +1253,28 @@ final class HybridPlaybackSession {
                     }
                 }
             notificationObservers.append(stalledObserver)
+            let endedObserver =
+                NotificationCenter.default.addObserver(
+                    forName:
+                        AVPlayerItem.didPlayToEndTimeNotification,
+                    object: item,
+                    queue: .main
+                ) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        guard let self,
+                              !self
+                                .didEmitPlaybackCompletedTelemetry else {
+                            return
+                        }
+                        self.didEmitPlaybackCompletedTelemetry = true
+                        self.telemetryDidChange?(
+                            .sessionEnded(
+                                .playbackCompleted
+                            )
+                        )
+                    }
+                }
+            notificationObservers.append(endedObserver)
         }
         playerObservations.append(
             avPlayer.observe(
@@ -1260,6 +1353,9 @@ final class HybridPlaybackSession {
         audioAnalysisPlaybackPressure = pressure
         analysisPlaybackPressureSequence &+= 1
         telemetryDidChange?(.playbackPressureChanged)
+        for session in audioAnalysisSessions.values {
+            session.setPlaybackPressureForTelemetry(pressure)
+        }
         let sequence = analysisPlaybackPressureSequence
         let coordinator = coordinator
         Task {
@@ -1332,6 +1428,84 @@ final class HybridPlaybackSession {
         )
     }
 
+    private func publishCarrierReadyTelemetry(
+        generation: UInt64,
+        target: CMTime,
+        segmentIndex: Int
+    ) {
+        guard lastCarrierReadyTelemetryGeneration
+                != generation else {
+            return
+        }
+        lastCarrierReadyTelemetryGeneration = generation
+        telemetryDidChange?(
+            .carrierReady(
+                AetherHybridTimelineTelemetry(
+                    generation: generation,
+                    targetSeconds: target.seconds,
+                    segmentIndex: segmentIndex
+                )
+            )
+        )
+    }
+
+    private func publishVideoReadyTelemetryIfNeeded(
+        _ frame: DecodedVideoFrame
+    ) {
+        guard lastVideoReadyTelemetryGeneration
+                != frame.generation else {
+            return
+        }
+        let target: CMTime
+        let isSeek: Bool
+        switch state {
+        case .preparing(let generation, let candidate)
+            where generation == frame.generation:
+            target = candidate
+            isSeek = false
+        case .seeking(let generation, let candidate)
+            where generation == frame.generation:
+            target = candidate
+            isSeek = true
+        default:
+            return
+        }
+        guard Self.isValidTimelineTime(target),
+              let segmentIndex =
+                timeline.segmentIndex(containing: target) else {
+            terminate(with: .invalidSeekTarget)
+            return
+        }
+        lastVideoReadyTelemetryGeneration = frame.generation
+        let point = AetherHybridTimelineTelemetry(
+            generation: frame.generation,
+            targetSeconds: target.seconds,
+            segmentIndex: segmentIndex,
+            framePresentationTimeSeconds:
+                frame.presentationTime.seconds
+        )
+        telemetryDidChange?(.videoFirstFrameReady(point))
+        if isSeek {
+            telemetryDidChange?(.seekVideoReady(point))
+        }
+    }
+
+    private func readyFramePresentationTimeSeconds(
+        generation: UInt64
+    ) -> Double? {
+        guard case .ready(
+            let readyGeneration,
+            let framePresentationTime
+        ) = readinessGate.state,
+              readyGeneration == generation,
+              Self.isValidTimelineTime(
+                framePresentationTime
+              ) else {
+            return nil
+        }
+        return framePresentationTime.seconds
+    }
+
     private func publishPeriodicTelemetryIfNeeded(
         _ time: CMTime
     ) {
@@ -1344,7 +1518,11 @@ final class HybridPlaybackSession {
             return
         }
         lastTelemetryClockSampleSeconds = seconds
-        telemetryDidChange?(.periodicSample)
+        telemetryDidChange?(
+            .periodicSample(
+                playerTimeSeconds: seconds
+            )
+        )
     }
 
     static func resolveAudioAnalysisPlaybackPressure(

@@ -256,12 +256,10 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                 break
             }
             #endif
-            self.publishTelemetry(.stateChanged)
+            self.publishTelemetry(for: state)
         }
         core.telemetryDidChange = { [weak self] trigger in
-            self?.publishTelemetry(
-                Self.telemetryEventKind(for: trigger)
-            )
+            self?.publishTelemetry(for: trigger)
         }
         publishTelemetry(.sessionCreated)
     }
@@ -641,12 +639,136 @@ public final class AetherHybridPlaybackSession: ObservableObject {
     #endif
 
     private func publishTelemetry(
-        _ kind: AetherHybridPlaybackTelemetryEventKind
+        _ kind: AetherHybridPlaybackTelemetryEventKind,
+        payload: AetherHybridPlaybackTelemetryPayload = .none
     ) {
         telemetryHub.emit(
             kind: kind,
+            payload: payload,
             snapshot: telemetrySnapshot()
         )
+    }
+
+    private func publishTelemetry(
+        for state: HybridPlaybackSessionState
+    ) {
+        switch state {
+        case .failed(let error):
+            publishTelemetry(
+                .sessionFailed,
+                payload: .sessionFailed(
+                    AetherHybridPlaybackTelemetryFailure(error)
+                )
+            )
+        case .stopped:
+            publishTelemetry(
+                .sessionEnded,
+                payload: .sessionEnded(.stoppedByHost)
+            )
+        case .idle, .preparing, .ready, .seeking:
+            publishTelemetry(.stateChanged)
+        }
+    }
+
+    private func publishTelemetry(
+        for trigger: HybridPlaybackTelemetryTrigger
+    ) {
+        switch trigger {
+        case .transportChanged:
+            publishTelemetry(.transportChanged)
+        case .periodicSample(let playerTimeSeconds):
+            let renderer = metalPlayerView.diagnostics
+            let frameTime =
+                renderer.lastPresentedTimeSeconds
+            let driftMilliseconds: Double?
+            if let frameTime, frameTime.isFinite {
+                driftMilliseconds =
+                    (frameTime - playerTimeSeconds) * 1_000
+            } else {
+                driftMilliseconds = nil
+            }
+            publishTelemetry(
+                .avDriftSample,
+                payload: .avDriftSample(
+                    AetherHybridAVDriftTelemetry(
+                        playerTimeSeconds:
+                            playerTimeSeconds,
+                        framePresentationTimeSeconds:
+                            frameTime,
+                        driftMilliseconds:
+                            driftMilliseconds,
+                        rendererQueueDepth:
+                            renderer.queuedFrames
+                    )
+                )
+            )
+        case .playbackPressureChanged:
+            let current = diagnostics
+            publishTelemetry(
+                .bufferStateChanged,
+                payload: .bufferStateChanged(
+                    AetherHybridBufferTelemetry(
+                        pressure:
+                            current
+                                .audioAnalysisPlaybackPressure,
+                        carrierForwardBufferSeconds:
+                            current
+                                .carrierForwardBufferSeconds,
+                        carrierTimeControlStatus:
+                            current
+                                .carrierTimeControlStatus,
+                        carrierRate: current.carrierRate
+                    )
+                )
+            )
+        case .carrierReady(let point):
+            publishTelemetry(
+                .carrierReady,
+                payload: .carrierReady(point)
+            )
+        case .videoFirstFrameReady(let point):
+            publishTelemetry(
+                .videoFirstFrameReady,
+                payload: .videoFirstFrameReady(point)
+            )
+        case .playbackStarted(let point):
+            publishTelemetry(
+                .playbackStarted,
+                payload: .playbackStarted(point)
+            )
+        case .seekRequested(let point):
+            publishTelemetry(
+                .seekRequested,
+                payload: .seekRequested(point)
+            )
+        case .seekVideoReady(let point):
+            publishTelemetry(
+                .seekVideoReady,
+                payload: .seekVideoReady(point)
+            )
+        case .sessionEnded(let reason):
+            publishTelemetry(
+                .sessionEnded,
+                payload: .sessionEnded(reason)
+            )
+        case .audioAnalysis(let event):
+            let kind:
+                AetherHybridPlaybackTelemetryEventKind
+            switch event.phase {
+            case .started:
+                kind = .audioAnalysisStarted
+            case .progress:
+                kind = .audioAnalysisProgress
+            case .completed:
+                kind = .audioAnalysisCompleted
+            case .failed:
+                kind = .audioAnalysisFailed
+            }
+            publishTelemetry(
+                kind,
+                payload: .audioAnalysis(event)
+            )
+        }
     }
 
     private func telemetrySnapshot()
@@ -685,21 +807,6 @@ public final class AetherHybridPlaybackSession: ObservableObject {
             systemFeaturePolicy:
                 current.systemFeaturePolicy
         )
-    }
-
-    private static func telemetryEventKind(
-        for trigger: HybridPlaybackTelemetryTrigger
-    ) -> AetherHybridPlaybackTelemetryEventKind {
-        switch trigger {
-        case .transportChanged:
-            .transportChanged
-        case .periodicSample:
-            .periodicSample
-        case .playbackPressureChanged:
-            .playbackPressureChanged
-        case .audioAnalysisChanged:
-            .audioAnalysisChanged
-        }
     }
 
     private static func validate(
