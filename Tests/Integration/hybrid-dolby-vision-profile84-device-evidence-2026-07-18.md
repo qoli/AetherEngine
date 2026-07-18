@@ -174,6 +174,11 @@ single-layer rendering and carrier-clock ownership. It does not claim that tvOS 
 panel mode or that a human verified tone mapping, clipping, color, black-frame absence or RPU-driven
 visual differences.
 
+A later supplemental run enabled Match Dynamic Range and Match Frame Rate and captured a non-black
+Profile 8.4 framebuffer with the carrier timebase bound and the same renderer active. It still does not
+prove the external television's Dolby Vision mode or human visual correctness. See
+[`hybrid-match-content-framebuffer-evidence-2026-07-18.md`](hybrid-match-content-framebuffer-evidence-2026-07-18.md).
+
 ## Verification
 
 - `bash -n Scripts/generate-hybrid-acceptance-fixture.sh` — pass.

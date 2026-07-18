@@ -13,11 +13,14 @@ presentation, E-AC-3 JOC, styled ASS and PGS bitmap overlay select/seek/off/rese
 sub-matrix. The 2026-07-18 late-HDR10+ row also proves that hardware-decoded ST 2094-40 reaches the
 same display layer at PTS 12.0 without a route, generation, carrier-item, renderer, or timebase change.
 The Dolby Vision Profile 8.4 technical row now passes exact configuration/base-layer admission,
-VideoToolbox metadata-propagation acceptance and 240-frame same-layer enqueue. Human
-display/audio/AVKit-menu confirmation and HDR/Dolby Vision panel-output remain pending. See
+VideoToolbox metadata-propagation acceptance and 240-frame same-layer enqueue. A supplemental
+2026-07-18 physical-device run also records Match Dynamic Range and Match Frame Rate enabled and four
+non-black, bound-timebase framebuffer captures. Human display/audio/AVKit-menu confirmation and actual
+HDR/Dolby Vision panel-output remain pending. See
 [`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md) and
 [`hybrid-hdr10plus-device-evidence-2026-07-18.md`](hybrid-hdr10plus-device-evidence-2026-07-18.md), and
-[`hybrid-dolby-vision-profile84-device-evidence-2026-07-18.md`](hybrid-dolby-vision-profile84-device-evidence-2026-07-18.md).
+[`hybrid-dolby-vision-profile84-device-evidence-2026-07-18.md`](hybrid-dolby-vision-profile84-device-evidence-2026-07-18.md), plus
+[`hybrid-match-content-framebuffer-evidence-2026-07-18.md`](hybrid-match-content-framebuffer-evidence-2026-07-18.md).
 No unverified
 color format may be added to
 `AetherHybridPresentationView.verifiedVideoFormats`.

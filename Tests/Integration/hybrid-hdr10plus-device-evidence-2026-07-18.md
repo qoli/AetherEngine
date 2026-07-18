@@ -13,6 +13,11 @@ This record does **not** admit HDR10 or HDR10+ for production. Match Dynamic Ran
 Rate were disabled on the device, so panel-mode and human visual confirmation remain pending.
 `AetherHybridPresentationView.verifiedVideoFormats` therefore remains `[.sdr]`.
 
+A later supplemental run enabled both Match settings and captured a non-black framebuffer after the
+12-second metadata boundary. It does not prove the external panel's HDR10+ mode, so production
+admission and human visual confirmation remain pending. See
+[`hybrid-match-content-framebuffer-evidence-2026-07-18.md`](hybrid-match-content-framebuffer-evidence-2026-07-18.md).
+
 ## Exact candidate and device
 
 ```text

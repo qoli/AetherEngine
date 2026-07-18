@@ -441,6 +441,13 @@ humanVisualConfirmation: pending
 formatAdmission: pending
 ```
 
+A supplemental 2026-07-18 run enabled Match Dynamic Range and Match Frame Rate in the physical
+device's Settings UI, then captured non-black HDR10, HLG, late-HDR10+ and Dolby Vision Profile 8.4
+framebuffers with the carrier timebase bound and the one display layer rendering. This closes the
+device-settings and composited-framebuffer sub-rows, but a screenshot cannot prove the external
+television's active mode or subjective visual correctness. See
+[`hybrid-match-content-framebuffer-evidence-2026-07-18.md`](hybrid-match-content-framebuffer-evidence-2026-07-18.md).
+
 Both copyright-clean fixtures are 12-second, three-segment local graphs with two AAC renditions and are
 kept in the gitignored `Fixtures/` tree. Their identities are the SHA-256 values of their generated
 `SHA256SUMS` files. During these candidate runs HDR10 and HLG were enabled only in the diagnostic build;
@@ -448,7 +455,8 @@ the source contract was restored to `verifiedVideoFormats == [.sdr]` immediately
 
 ## Pending before the complete row can pass
 
-- Record the actual display model/firmware and Match Dynamic Range / Match Frame Rate settings.
+- Match Dynamic Range / Match Frame Rate settings: closed on 2026-07-18. Record the actual display
+  model/firmware and external-panel mode for each color row.
 - Visually confirm native AVKit controls, audible selected real audio, pause/rate video behavior, and
   absence of the black carrier over the real image; also confirm the automated SAR/rotation/fit-fill
   rows look correct on the panel.
