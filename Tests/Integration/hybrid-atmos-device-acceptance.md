@@ -90,6 +90,49 @@ audible renditions, a bound carrier timebase, the single rendering display layer
 `BANDWIDTH=2000000`. This extends only the observation window; the audible JOC/AAC distinction and
 downstream television/AVR Atmos indicator remain human observations and are not marked passed here.
 
+### Living-room deployment for final human Atmos row — 2026-07-18
+
+The study-room Apple TV remains the source of the automated clock/seek/stall/selection evidence above,
+but it does not have the required downstream Dolby Atmos observation conditions. The release owner
+therefore designated the living-room Apple TV and its connected television/audio chain as the final
+human audible-output and Atmos-indicator target. This is a device-gate correction, not a route or codec
+policy change.
+
+The exact Aether mini acceptance app was built, installed and launched on that device:
+
+```text
+deviceName: 客廳電視
+device: physical Apple TV 4K (3rd generation, AppleTV14,1 / J255AP)
+tvOS: 26.5 (23L471)
+CoreDeviceID: 091555FF-9FE8-5A47-B90A-CBDDC737E052
+XcodeDestinationID: 00008110-000C613A1142801E
+AetherRevision: 1715720
+configuration: Debug; destination-specific signed device build
+build: pass
+install: pass
+launcherSHA256: 56ffcf103acab5a203c6f69de940d8fff5f454f6fda3059c5e42954a9f51ea34
+debugDylibSHA256: 6b96c4efc9649f8ef289e8f4cb8c5de38d8d81a0e48faaf9cd5beaa26b527c9b
+fixtureIdentitySHA256: 99fe05586a520c64a22ececa6ef054d7c6a0635fc5f5e5f855577e329a2ec584
+fixtureDuration: 192 seconds
+preflightRoute: hybridCarrier
+preflightReason: hybridHLSManifestMissingCodecs
+sourceSegments: 48
+audioRenditions: 2
+carrierBudget: 2000000
+selectedStartupRendition: E-AC-3 JOC stream-copy
+carrierTimebaseBound: true
+renderer: rendering
+fallbackRouteCount: 0
+humanJOCToAACAudibleDifference: pending
+humanAACToJOCAudibleReturn: pending
+downstreamAtmosIndicator: pending
+```
+
+The app deliberately exposes AVKit's native Audio panel and no competing custom transport controls.
+Only a human JOC → AAC → JOC observation plus the living-room television/receiver Atmos indicator may
+close the remaining rows. Successful installation, selected-state telemetry or an Apple TV screenshot
+cannot substitute for those observations.
+
 ## Purpose
 
 Validate the primary Hybrid carrier bandwidth policy with a real E-AC-3 JOC / Dolby Atmos

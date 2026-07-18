@@ -36,8 +36,9 @@ bidirectional JOC/AAC selection, recoverable stall and stop/reopen rows pass on 
 The acceptance generator now packet-repeats a shorter licensed JOC vector under stream-copy so the
 requested human-observation duration is not silently truncated; 40-second and 192-second equal-segment
 fixtures pass exact duration/profile/provenance checks.
-The downstream television/AVR Atmos indicator remains a human row, so the complete gate is still
-pending.
+The mini acceptance app is now destination-built, installed and technically running on the living-room
+Apple TV, which owns the final downstream audio-chain row. The audible JOC/AAC distinction and
+television/receiver Atmos indicator remain human observations, so the complete gate is still pending.
 
 ## Hybrid native WebVTT tvOS device gate
 
