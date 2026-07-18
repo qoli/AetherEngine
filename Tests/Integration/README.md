@@ -33,6 +33,9 @@ color format may be added to
 E-AC-3 JOC / Atmos fixture, start/seek/track-switch/stall matrix, privacy-safe telemetry evidence,
 and the rule for reopening the fixed 2 Mbps policy. The automated physical-device startup, seek,
 bidirectional JOC/AAC selection, recoverable stall and stop/reopen rows pass on the study Apple TV.
+The acceptance generator now packet-repeats a shorter licensed JOC vector under stream-copy so the
+requested human-observation duration is not silently truncated; 40-second and 192-second equal-segment
+fixtures pass exact duration/profile/provenance checks.
 The downstream television/AVR Atmos indicator remains a human row, so the complete gate is still
 pending.
 

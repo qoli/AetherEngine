@@ -56,6 +56,40 @@ The focused `HLSVODMediaPumpTests` suite passed 26 tests, and the full package r
 130 suites. The app remains on the original JOC rendition after reopen for the still-pending human
 audible-output and downstream Atmos-indicator observation.
 
+### Human observation window fixture repair — 2026-07-18
+
+Preparing the final human row exposed a fixture-generator defect rather than a playback defect. The
+licensed JOC vector was shorter than `AETHER_ACCEPTANCE_DURATION_SECONDS`; FFmpeg therefore ended the
+whole generated HLS graph when that input ended, despite the requested longer video and AAC alternate.
+The prior 32-second graph was valid for automation but made a Remote-driven human Audio-panel check
+unnecessarily time-limited.
+
+Aether `e6a2111` makes the fixture policy explicit: the user-supplied licensed E-AC-3 JOC input is
+packet-repeated to the requested video duration and remains stream-copy. It is never replaced by AAC,
+transcoded, measured as a startup policy, or used to change route. `PROVENANCE.txt` records the repeat
+policy without recording the source path or bytes. Playlist normalization still permits only the
+bounded 90 kHz `EXTINF` serialization correction and requires equal video/JOC/AAC segment counts.
+
+Two generated-fixture checks passed:
+
+```text
+generatorRevision: e6a2111
+40SecondSmokeIdentitySHA256: 5102d6fb832501908c249493bee3c5730aa5e3d96d1d753990b7546abcf2e8f4
+40SecondSmokeDuration: 40.000000
+40SecondSmokeSegments: video=10, JOC=10, AAC=10
+192SecondHumanIdentitySHA256: 99fe05586a520c64a22ececa6ef054d7c6a0635fc5f5e5f855577e329a2ec584
+192SecondHumanDuration: 192.000000
+192SecondHumanSegments: video=48, JOC=48, AAC=48
+JOCProbe: codec=eac3, profile=Dolby Digital Plus + Dolby Atmos, channels=6
+masterSignal: CHANNELS="16/JOC"
+repeatPolicy: packet-level repeat; E-AC-3 JOC stream-copy
+```
+
+The 192-second graph also reached `.hybridCarrier` on the study Apple TV with 48 source segments, two
+audible renditions, a bound carrier timebase, the single rendering display layer and carrier
+`BANDWIDTH=2000000`. This extends only the observation window; the audible JOC/AAC distinction and
+downstream television/AVR Atmos indicator remain human observations and are not marked passed here.
+
 ## Purpose
 
 Validate the primary Hybrid carrier bandwidth policy with a real E-AC-3 JOC / Dolby Atmos
