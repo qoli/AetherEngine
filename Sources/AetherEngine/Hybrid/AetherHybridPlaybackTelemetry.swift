@@ -471,6 +471,8 @@ public struct AetherHybridPlaybackTelemetrySnapshot:
     public let readinessPrerollFramesRejected: UInt64
     public let carrierBandwidth:
         AetherHybridCarrierBandwidthTelemetry
+    public let realVideoBitrate:
+        AetherHybridRealVideoBitrateTelemetry
     public let renderer: AetherHybridPresentationView.Diagnostics
     public let systemFeaturePolicy:
         HybridPlaybackSystemFeaturePolicy
@@ -496,6 +498,8 @@ public struct AetherHybridPlaybackTelemetrySnapshot:
         readinessPrerollFramesRejected: UInt64,
         carrierBandwidth:
             AetherHybridCarrierBandwidthTelemetry,
+        realVideoBitrate:
+            AetherHybridRealVideoBitrateTelemetry,
         renderer: AetherHybridPresentationView.Diagnostics,
         systemFeaturePolicy:
             HybridPlaybackSystemFeaturePolicy
@@ -524,6 +528,7 @@ public struct AetherHybridPlaybackTelemetrySnapshot:
         self.readinessPrerollFramesRejected =
             readinessPrerollFramesRejected
         self.carrierBandwidth = carrierBandwidth
+        self.realVideoBitrate = realVideoBitrate
         self.renderer = renderer
         self.systemFeaturePolicy = systemFeaturePolicy
     }

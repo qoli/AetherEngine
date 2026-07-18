@@ -427,6 +427,8 @@ final class HybridPlaybackSession {
         [Int: Int]
     private let carrierBandwidthTelemetrySource:
         (any HybridCarrierBandwidthTelemetrySource)?
+    private let realVideoBitrateTelemetrySource:
+        (any HybridRealVideoBitrateTelemetrySource)?
     private let subtitleController:
         HybridSubtitleSessionController?
     private let nativeWebVTTBridge:
@@ -546,6 +548,14 @@ final class HybridPlaybackSession {
             )
     }
 
+    var realVideoBitrateTelemetry:
+        AetherHybridRealVideoBitrateTelemetry
+    {
+        realVideoBitrateTelemetrySource?
+            .realVideoBitrateTelemetry
+            ?? .unavailable()
+    }
+
     var generation: UInt64 {
         classifier.generation
     }
@@ -607,6 +617,9 @@ final class HybridPlaybackSession {
         carrierBandwidthTelemetrySource =
             provider as?
                 any HybridCarrierBandwidthTelemetrySource
+        realVideoBitrateTelemetrySource =
+            provider as?
+                any HybridRealVideoBitrateTelemetrySource
         if let source = provider as?
                 any HybridOverlaySubtitleSource,
            let view = renderSurface as?

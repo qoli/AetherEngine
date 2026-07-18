@@ -1842,6 +1842,7 @@ final class HLSVODMediaPumpTests: XCTestCase {
         let provider =
             try await HLSVODCarrierProvider.make(
                 preflight: fixture.preflight,
+                decodedFrameHandler: { _ in },
                 fetchOverride: { request, _ in
                     try fixture.fetchStore.response(
                         for: request
@@ -1859,6 +1860,10 @@ final class HLSVODMediaPumpTests: XCTestCase {
         XCTAssertEqual(
             provider.carrierBandwidthTelemetry.state,
             .awaitingCarrierSegments
+        )
+        XCTAssertEqual(
+            provider.realVideoBitrateTelemetry.state,
+            .awaitingCompressedPackets
         )
         XCTAssertEqual(
             fixture.fetchStore.count(
@@ -1882,6 +1887,14 @@ final class HLSVODMediaPumpTests: XCTestCase {
         XCTAssertEqual(telemetry.observedSegmentCount, 1)
         XCTAssertNotNil(telemetry.observedPeakBandwidth)
         XCTAssertNotNil(telemetry.observedAverageBandwidth)
+        let realVideo = provider.realVideoBitrateTelemetry
+        XCTAssertEqual(realVideo.state, .partial)
+        XCTAssertNotNil(realVideo.observedAverageBitrate)
+        XCTAssertGreaterThan(
+            realVideo.observedCompressedByteCount,
+            0
+        )
+        XCTAssertGreaterThan(realVideo.observedPacketCount, 0)
     }
 
     func testCarrierProviderForwardsAVPlayerPressureToTheOriginLoader()

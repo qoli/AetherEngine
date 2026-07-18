@@ -850,6 +850,12 @@ actor HLSVODMediaPump {
         worker.isTargetFrameReady
     }
 
+    func realVideoBitrateTelemetry()
+        -> AetherHybridRealVideoBitrateTelemetry
+    {
+        worker.realVideoBitrateTelemetry
+    }
+
     func snapshot() -> HLSVODMediaPumpSnapshot {
         let workerSnapshot = worker.snapshot()
         return HLSVODMediaPumpSnapshot(
@@ -1595,6 +1601,14 @@ private extension HLSVODMediaPump {
         var isTargetFrameReady: Bool {
             videoDecodeSink?.isTargetFrameReady
                 ?? true
+        }
+
+        var realVideoBitrateTelemetry:
+            AetherHybridRealVideoBitrateTelemetry
+        {
+            videoDecodeSink?
+                .realVideoBitrateTelemetry
+                ?? .unavailable()
         }
 
         func restart(

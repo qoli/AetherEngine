@@ -38,6 +38,7 @@ final class HLSVODCarrierProvider:
     HybridAudioAnalysisSource,
     HybridAudioAnalysisPlaybackPressureSink,
     HybridCarrierBandwidthTelemetrySource,
+    HybridRealVideoBitrateTelemetrySource,
     HybridOverlaySubtitleSource,
     @unchecked Sendable
 {
@@ -499,6 +500,19 @@ final class HLSVODCarrierProvider:
                 audioRenditionCount:
                     metadata.count
             )
+        }
+    }
+
+    var realVideoBitrateTelemetry:
+        AetherHybridRealVideoBitrateTelemetry
+    {
+        do {
+            return try BlockingAsyncBridge.wait {
+                await self.pump
+                    .realVideoBitrateTelemetry()
+            }
+        } catch {
+            return .unavailable()
         }
     }
 

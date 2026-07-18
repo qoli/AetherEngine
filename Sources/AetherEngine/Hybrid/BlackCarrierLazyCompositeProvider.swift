@@ -29,6 +29,7 @@ enum BlackCarrierLazyCompositeProviderError:
 final class BlackCarrierLazyCompositeProvider:
     BlackCarrierTransportProvider,
     HybridCarrierBandwidthTelemetrySource,
+    HybridRealVideoBitrateTelemetrySource,
     HybridOverlaySubtitleSource,
     @unchecked Sendable
 {
@@ -302,6 +303,12 @@ final class BlackCarrierLazyCompositeProvider:
                     pump.renditionMetadata.count
             )
         }
+    }
+
+    var realVideoBitrateTelemetry:
+        AetherHybridRealVideoBitrateTelemetry
+    {
+        pump.realVideoBitrateTelemetry
     }
 
     var alternateAudioRenditions: [HLSAudioRenditionInfo] {

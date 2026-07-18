@@ -210,6 +210,7 @@ struct HybridPlaybackTelemetryTests {
             carrierBandwidth: .awaiting(
                 audioRenditionCount: 2
             ),
+            realVideoBitrate: .awaiting(),
             renderer: AetherHybridPresentationView.Diagnostics(
                 generation: 0,
                 pendingSampleBuffers: 0,

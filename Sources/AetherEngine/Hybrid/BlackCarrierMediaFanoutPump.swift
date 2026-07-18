@@ -591,6 +591,14 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             .streamContract.displayFrameRate
     }
 
+    var realVideoBitrateTelemetry:
+        AetherHybridRealVideoBitrateTelemetry
+    {
+        hybridVideoDecodeSink?
+            .realVideoBitrateTelemetry
+            ?? .unavailable()
+    }
+
     func restart(
         for intent: HybridSeekIntent
     ) throws -> BlackCarrierMediaFanoutRestartResult {

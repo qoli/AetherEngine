@@ -136,6 +136,8 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
     public let readinessPrerollFramesRejected: UInt64
     public let carrierBandwidth:
         AetherHybridCarrierBandwidthTelemetry
+    public let realVideoBitrate:
+        AetherHybridRealVideoBitrateTelemetry
     public let renderer: AetherHybridPresentationView.Diagnostics
     public let systemFeaturePolicy: HybridPlaybackSystemFeaturePolicy
 
@@ -160,6 +162,8 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
         readinessPrerollFramesRejected: UInt64,
         carrierBandwidth:
             AetherHybridCarrierBandwidthTelemetry,
+        realVideoBitrate:
+            AetherHybridRealVideoBitrateTelemetry,
         renderer: AetherHybridPresentationView.Diagnostics,
         systemFeaturePolicy: HybridPlaybackSystemFeaturePolicy
     ) {
@@ -185,6 +189,7 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
         self.readinessPrerollFramesRejected =
             readinessPrerollFramesRejected
         self.carrierBandwidth = carrierBandwidth
+        self.realVideoBitrate = realVideoBitrate
         self.renderer = renderer
         self.systemFeaturePolicy = systemFeaturePolicy
     }
@@ -627,6 +632,8 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                 core.readinessPrerollFramesRejected,
             carrierBandwidth:
                 core.carrierBandwidthTelemetry,
+            realVideoBitrate:
+                core.realVideoBitrateTelemetry,
             renderer: presentationView.diagnostics,
             systemFeaturePolicy: Self.systemFeaturePolicy
         )
@@ -964,6 +971,8 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                 current.readinessPrerollFramesRejected,
             carrierBandwidth:
                 current.carrierBandwidth,
+            realVideoBitrate:
+                current.realVideoBitrate,
             renderer: current.renderer,
             systemFeaturePolicy:
                 current.systemFeaturePolicy

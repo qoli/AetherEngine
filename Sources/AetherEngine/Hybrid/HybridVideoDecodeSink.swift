@@ -288,6 +288,8 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
     private var generationTimestampRebase: Int64? = 0
     private var restartDecodeAnchorPTS: Int64?
     private var restartBeyondSourceOrigin = false
+    private var realVideoBitrateAccumulator =
+        HybridRealVideoBitrateAccumulator()
 
     init(
         demuxer: Demuxer,
@@ -382,6 +384,14 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         return targetFrameReady
     }
 
+    var realVideoBitrateTelemetry:
+        AetherHybridRealVideoBitrateTelemetry
+    {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        return realVideoBitrateAccumulator.snapshot()
+    }
+
     func validate(
         demuxer: Demuxer,
         stream: UnsafeMutablePointer<AVStream>,
@@ -408,6 +418,14 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
             recordFailure(error)
             throw error
         }
+        realVideoBitrateAccumulator.record(
+            byteCount: Int(packet.pointee.size),
+            durationTicks: packet.pointee.duration,
+            timeBaseNumerator:
+                streamContract.packetTimeBaseNumerator,
+            timeBaseDenominator:
+                streamContract.packetTimeBaseDenominator
+        )
         if queuedPackets.isEmpty,
            shouldDecode(decodeTime: decodeTime) {
             try decodePacketLocked(packet, decodeTime: decodeTime)
@@ -553,6 +571,7 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         }
         sourceEnded = false
         didFinishDecoder = false
+        realVideoBitrateAccumulator.reset()
     }
 
     func markEndOfStream() throws {
@@ -560,6 +579,7 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         defer { operationLock.unlock() }
         try throwIfUnavailable()
         sourceEnded = true
+        realVideoBitrateAccumulator.markComplete()
         decoder.synchronize()
         try throwIfUnavailable()
         try finishDecoderIfReadyLocked()
@@ -573,6 +593,7 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
             try decodeFirstQueuedPacketLocked()
         }
         sourceEnded = true
+        realVideoBitrateAccumulator.markComplete()
         try finishDecoderIfReadyLocked()
         try throwIfUnavailable()
     }

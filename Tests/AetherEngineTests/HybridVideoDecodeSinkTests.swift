@@ -118,6 +118,11 @@ struct HybridVideoDecodeSinkTests {
 
         try feedVideoPackets(from: firstDemuxer, into: sink)
         try sink.finish()
+        let firstBitrate = sink.realVideoBitrateTelemetry
+        #expect(firstBitrate.state == .complete)
+        #expect(firstBitrate.observedAverageBitrate != nil)
+        #expect(firstBitrate.observedCompressedByteCount > 0)
+        #expect(firstBitrate.observedPacketCount > 0)
         let firstFrame = try #require(frames.snapshot().first)
         #expect(firstFrame.generation == 7)
         #expect(firstFrame.videoFormat == .sdr)
@@ -143,8 +148,20 @@ struct HybridVideoDecodeSinkTests {
             demuxer: secondDemuxer,
             stream: secondStream
         )
+        #expect(
+            sink.realVideoBitrateTelemetry.state
+                == .awaitingCompressedPackets
+        )
         try feedVideoPackets(from: secondDemuxer, into: sink)
         try sink.finish()
+        #expect(
+            sink.realVideoBitrateTelemetry.state
+                == .complete
+        )
+        #expect(
+            sink.realVideoBitrateTelemetry
+                .observedAverageBitrate != nil
+        )
 
         let snapshot = frames.snapshot()
         #expect(snapshot.contains(where: { $0.generation == 7 }))
@@ -600,6 +617,14 @@ struct HybridVideoDecodeSinkTests {
         #expect(frames.snapshot().contains(where: {
             $0.generation == 0
         }))
+        #expect(
+            provider.realVideoBitrateTelemetry.state
+                == .partial
+        )
+        #expect(
+            provider.realVideoBitrateTelemetry
+                .observedAverageBitrate != nil
+        )
 
         var classifier = HybridSeekIntentClassifier(timeline: timeline)
         let intent = try classifier.registerExplicitHostSeek(
@@ -609,6 +634,10 @@ struct HybridVideoDecodeSinkTests {
             generation: 1,
             segmentIndex: 1
         ))
+        #expect(
+            provider.realVideoBitrateTelemetry.state
+                == .awaitingCompressedPackets
+        )
         _ = try #require(provider.alternateAudioMediaSegment(
             ordinal: 0,
             index: 1
@@ -620,6 +649,14 @@ struct HybridVideoDecodeSinkTests {
                     CMTime(seconds: 4, preferredTimescale: 90_000)
                 ) >= 0
         }))
+        #expect(
+            provider.realVideoBitrateTelemetry.state
+                == .complete
+        )
+        #expect(
+            provider.realVideoBitrateTelemetry
+                .observedAverageBitrate != nil
+        )
         #expect(provider.terminalError == nil)
     }
 
