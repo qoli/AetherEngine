@@ -54,6 +54,8 @@ final class HLSVODCarrierProvider:
     private let timeline: BlackCarrierTimeline
     private let codecs: String
     private let resolvedHybridVideoFormat: VideoFormat?
+    private let resolvedHybridDolbyVisionConfiguration:
+        AetherDolbyVisionConfiguration?
     private let resolvedHybridVideoFrameRate: Double?
     private let analysisInput: AudioAnalysisInput
     let hybridSubtitleContracts:
@@ -179,6 +181,8 @@ final class HLSVODCarrierProvider:
         self.timeline = timeline
         resolvedHybridVideoFormat =
             await pump.hybridVideoFormat
+        resolvedHybridDolbyVisionConfiguration =
+            await pump.hybridDolbyVisionConfiguration
         resolvedHybridVideoFrameRate =
             await pump.hybridVideoFrameRate
         hybridSubtitleContracts =
@@ -250,6 +254,12 @@ final class HLSVODCarrierProvider:
 
     var hybridVideoFormat: VideoFormat? {
         resolvedHybridVideoFormat
+    }
+
+    var hybridDolbyVisionConfiguration:
+        AetherDolbyVisionConfiguration?
+    {
+        resolvedHybridDolbyVisionConfiguration
     }
 
     var hybridVideoFrameRate: Double? {

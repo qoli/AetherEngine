@@ -7,7 +7,7 @@
 # generation flush, AVKit media selection, and SDR/HDR device admission.
 #
 # Usage:
-#   AETHER_ACCEPTANCE_VIDEO_FORMAT=sdr|hdr10|hdr10plus|hlg \
+#   AETHER_ACCEPTANCE_VIDEO_FORMAT=sdr|hdr10|hdr10plus|hlg|dolbyvision84 \
 #   AETHER_ACCEPTANCE_GEOMETRY_MODE=standard|clean_aperture|sar_4_3| \
 #     rotation_90|rotation_180|rotation_270|fps_24000_1001|fps_15 \
 #   AETHER_ACCEPTANCE_ATMOS_EC3_INPUT=/path/to/licensed-ddp-joc.ec3 \
@@ -48,6 +48,10 @@ HDR10_PLUS_FIRST_FRAME_SECONDS="${AETHER_ACCEPTANCE_HDR10_PLUS_FIRST_FRAME_SECON
 HDR10_PLUS_FIRST_FRAME_POC=""
 HDR10_PLUS_FIRST_DYNAMIC_SEGMENT=""
 HDR10_PLUS_NALU_FILE=""
+DOVI_TOOL="${AETHER_ACCEPTANCE_DOVI_TOOL:-}"
+DOVI_TOOL_VERSION=""
+DOVI_TOOL_SHA256=""
+DOLBY_VISION_CONFIGURATION_PROBE=""
 
 if [[ "$WEBVTT_SUBTITLES" != "0" && "$WEBVTT_SUBTITLES" != "1" ]]; then
     echo "ERROR: AETHER_ACCEPTANCE_WEBVTT_SUBTITLES must be 0 or 1" >&2
@@ -140,6 +144,15 @@ fi
 AUDIO_DURATION_SECONDS="$(
     awk -v duration="$VIDEO_DURATION_SECONDS" \
         'BEGIN { printf "%.9f", duration - (1024 / 48000) }'
+)"
+VIDEO_FRAME_COUNT="$(
+    awk -v duration="$VIDEO_DURATION_SECONDS" \
+        -v rate="$VIDEO_FRAME_RATE" '
+        BEGIN {
+            split(rate, parts, "/")
+            fps = length(parts) == 2 ? parts[1] / parts[2] : rate
+            printf "%d", int((duration * fps) + 0.5)
+        }'
 )"
 
 if ! command -v ffmpeg >/dev/null 2>&1 \
@@ -254,6 +267,33 @@ case "$VIDEO_FORMAT" in
             -x265-params 'repeat-headers=1:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc'
         )
         ;;
+    dolbyvision84)
+        if [[ "$GEOMETRY_MODE" != "standard" ]]; then
+            echo "ERROR: Dolby Vision P8.4 acceptance currently requires standard geometry" >&2
+            exit 1
+        fi
+        if [[ -z "$DOVI_TOOL" ]]; then
+            DOVI_TOOL="$(command -v dovi_tool || true)"
+        fi
+        if [[ -z "$DOVI_TOOL" || ! -x "$DOVI_TOOL" ]]; then
+            echo "ERROR: AETHER_ACCEPTANCE_DOVI_TOOL must name an executable dovi_tool" >&2
+            exit 1
+        fi
+        DOVI_TOOL_VERSION="$($DOVI_TOOL --version)"
+        DOVI_TOOL_SHA256="$(shasum -a 256 "$DOVI_TOOL" | awk '{print $1}')"
+        VIDEO_DESCRIPTION="Dolby Vision Profile 8.4 HEVC Main10 hev1 HLG BT.2020 with exact dvvC"
+        VIDEO_CODEC_ARGS=(
+            -c:v libx265
+            -preset ultrafast
+            -tune zerolatency
+            -profile:v main10
+            -pix_fmt yuv420p10le
+            -color_primaries bt2020
+            -color_trc arib-std-b67
+            -colorspace bt2020nc
+            -x265-params 'repeat-headers=1:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc'
+        )
+        ;;
     *)
         echo "ERROR: unsupported AETHER_ACCEPTANCE_VIDEO_FORMAT: $VIDEO_FORMAT" >&2
         exit 1
@@ -306,6 +346,60 @@ ffmpeg -hide_banner -loglevel error -y \
     -an \
     "$VIDEO_SOURCE"
 
+if [[ "$VIDEO_FORMAT" == "dolbyvision84" ]]; then
+    DOVI_GENERATOR_CONFIG="$OUTPUT/.dolby-vision-profile84-generator.json"
+    DOVI_BASE_HEVC="$OUTPUT/.dolby-vision-profile84-base.hevc"
+    DOVI_RPU="$OUTPUT/.dolby-vision-profile84.rpu"
+    DOVI_INJECTED_HEVC="$OUTPUT/.dolby-vision-profile84-injected.hevc"
+    DOVI_REMUXED_SOURCE="$OUTPUT/.dolby-vision-profile84-remuxed.mp4"
+    python3 - "$DOVI_GENERATOR_CONFIG" "$VIDEO_FRAME_COUNT" <<'PY'
+import json
+import sys
+
+path, length = sys.argv[1], int(sys.argv[2])
+payload = {
+    "cm_version": "V40",
+    "profile": "8.4",
+    "length": length,
+    "level5": {
+        "active_area_left_offset": 0,
+        "active_area_right_offset": 0,
+        "active_area_top_offset": 0,
+        "active_area_bottom_offset": 0,
+    },
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+    ffmpeg -hide_banner -loglevel error -y \
+        -i "$VIDEO_SOURCE" \
+        -map 0:v:0 -c:v copy \
+        -bsf:v hevc_mp4toannexb \
+        -f hevc "$DOVI_BASE_HEVC"
+    "$DOVI_TOOL" generate \
+        -j "$DOVI_GENERATOR_CONFIG" \
+        -o "$DOVI_RPU"
+    "$DOVI_TOOL" inject-rpu \
+        -i "$DOVI_BASE_HEVC" \
+        --rpu-in "$DOVI_RPU" \
+        -o "$DOVI_INJECTED_HEVC"
+    ffmpeg -hide_banner -loglevel error -y \
+        -r "$VIDEO_FRAME_RATE" \
+        -i "$DOVI_INJECTED_HEVC" \
+        -map 0:v:0 -c:v copy \
+        -bsf:v dovi_rpu=compression=none \
+        -tag:v hev1 \
+        -strict unofficial \
+        -movflags +faststart \
+        "$DOVI_REMUXED_SOURCE"
+    mv "$DOVI_REMUXED_SOURCE" "$VIDEO_SOURCE"
+    rm "$DOVI_GENERATOR_CONFIG" \
+        "$DOVI_BASE_HEVC" \
+        "$DOVI_RPU" \
+        "$DOVI_INJECTED_HEVC"
+fi
+
 if [[ -n "$ATMOS_EC3_INPUT" ]]; then
     ffmpeg -hide_banner -loglevel error -y \
         "${VIDEO_INPUT_ARGS[@]}" -i "$VIDEO_SOURCE" \
@@ -316,6 +410,7 @@ if [[ -n "$ATMOS_EC3_INPUT" ]]; then
         -metadata:s:a:1 language=spa \
         -c:v copy \
         -tag:v hev1 \
+        -strict unofficial \
         -c:a:0 copy \
         -c:a:1 aac \
         -b:a:1 192k \
@@ -342,6 +437,7 @@ else
         -metadata:s:a:1 language=spa \
         -c:v copy \
         -tag:v hev1 \
+        -strict unofficial \
         -c:a aac \
         -b:a 192k \
         -ar 48000 \
@@ -403,6 +499,44 @@ if [[ "$VIDEO_FORMAT" == "hdr10plus" ]]; then
     fi
 fi
 
+if [[ "$VIDEO_FORMAT" == "dolbyvision84" ]]; then
+    VIDEO_INIT="$OUTPUT/video/init_0.mp4"
+    FIRST_VIDEO_SEGMENT="$OUTPUT/video/segment_000.m4s"
+    if [[ ! -f "$VIDEO_INIT" || ! -f "$FIRST_VIDEO_SEGMENT" ]]; then
+        echo "ERROR: Dolby Vision P8.4 verification could not find video init/first segment" >&2
+        exit 1
+    fi
+    DOLBY_VISION_CONFIGURATION_PROBE="$(
+        ffprobe -v error -select_streams v:0 \
+            -show_streams \
+            -of json "concat:$VIDEO_INIT|$FIRST_VIDEO_SEGMENT"
+    )"
+    if [[ "$DOLBY_VISION_CONFIGURATION_PROBE" != *'"codec_tag_string": "hev1"'* \
+            || "$DOLBY_VISION_CONFIGURATION_PROBE" != *'"profile": "Main 10"'* \
+            || "$DOLBY_VISION_CONFIGURATION_PROBE" != *'"color_space": "bt2020nc"'* \
+            || "$DOLBY_VISION_CONFIGURATION_PROBE" != *'"color_transfer": "arib-std-b67"'* \
+            || "$DOLBY_VISION_CONFIGURATION_PROBE" != *'"color_primaries": "bt2020"'* \
+            || "$DOLBY_VISION_CONFIGURATION_PROBE" != *'"dv_profile": 8'* \
+            || "$DOLBY_VISION_CONFIGURATION_PROBE" != *'"rpu_present_flag": 1'* \
+            || "$DOLBY_VISION_CONFIGURATION_PROBE" != *'"el_present_flag": 0'* \
+            || "$DOLBY_VISION_CONFIGURATION_PROBE" != *'"bl_present_flag": 1'* \
+            || "$DOLBY_VISION_CONFIGURATION_PROBE" != *'"dv_bl_signal_compatibility_id": 4'* \
+            || "$DOLBY_VISION_CONFIGURATION_PROBE" != *'"dv_md_compression": "none"'* ]]; then
+        echo "ERROR: generated fixture does not match the exact Dolby Vision Profile 8.4 contract" >&2
+        exit 1
+    fi
+    FIRST_FRAME_PROBE="$(
+        ffprobe -v error -select_streams v:0 \
+            -show_frames -read_intervals '%+#1' \
+            -show_entries frame=side_data_list \
+            -of json "concat:$VIDEO_INIT|$FIRST_VIDEO_SEGMENT"
+    )"
+    if [[ "$FIRST_FRAME_PROBE" != *'"side_data_type": "Dolby Vision RPU Data"'* ]]; then
+        echo "ERROR: Dolby Vision P8.4 first decoded frame has no FFmpeg-recognized RPU" >&2
+        exit 1
+    fi
+fi
+
 if [[ "$WEBVTT_SUBTITLES" == "1" ]]; then
     python3 "$REPO_ROOT/Scripts/add-hybrid-acceptance-webvtt.py" "$OUTPUT"
 fi
@@ -430,6 +564,14 @@ fi
         echo "hdr10PlusFirstDynamicSegment=$HDR10_PLUS_FIRST_DYNAMIC_SEGMENT"
         echo "hdr10PlusT35Base64=tQA8AAEEAUAAH0AAAAAAAAAAAAAAAA=="
         echo "hdr10PlusVerification=first segment has no HDR Dynamic Metadata; named later segment is FFmpeg-recognized SMPTE2094-40"
+    fi
+    if [[ "$VIDEO_FORMAT" == "dolbyvision84" ]]; then
+        echo "dolbyVisionProfile=8.4"
+        echo "dolbyVisionConfiguration=version 1.0,profile 8,compatibility 4,RPU 1,EL 0,BL 1,compression none"
+        echo "dolbyVisionBaseLayer=HEVC Main10,hev1,BT.2020,HLG,bt2020nc"
+        echo "dolbyVisionRPUVerification=first frame has FFmpeg-recognized Dolby Vision RPU Data"
+        echo "doviToolVersion=$DOVI_TOOL_VERSION"
+        echo "doviToolSHA256=$DOVI_TOOL_SHA256"
     fi
     if [[ -n "$ATMOS_EC3_INPUT" ]]; then
         echo "atmosInputSHA256=$ATMOS_INPUT_SHA256"

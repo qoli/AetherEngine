@@ -148,6 +148,8 @@ struct HybridPlaybackSessionTests {
         }
 
         var hybridVideoFormat: VideoFormat? { videoFormat }
+        var hybridDolbyVisionConfiguration:
+            AetherDolbyVisionConfiguration? { nil }
         var hybridVideoFrameRate: Double? { 24 }
         var terminalHybridPlaybackError:
             HybridPlaybackSessionError?

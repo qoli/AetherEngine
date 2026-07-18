@@ -372,6 +372,13 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                     decoded: decoded
                 )
         }
+        guard core.sourceDolbyVisionConfiguration
+                == preflightResult.sourceProfile
+                    .dolbyVisionConfiguration else {
+            core.stop()
+            throw HybridPlaybackSessionError
+                .sourceDolbyVisionConfigurationDiverged
+        }
         guard let presentationView = core.presentationView else {
             core.stop()
             throw HybridPlaybackSessionError.renderSurfaceMissing
@@ -480,6 +487,13 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                             .videoFormat,
                     decoded: decoded
                 )
+        }
+        guard core.sourceDolbyVisionConfiguration
+                == preflight.result.sourceProfile
+                    .dolbyVisionConfiguration else {
+            core.stop()
+            throw HybridPlaybackSessionError
+                .sourceDolbyVisionConfigurationDiverged
         }
         guard let presentationView = core.presentationView else {
             core.stop()

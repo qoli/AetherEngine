@@ -127,6 +127,9 @@ private struct HLSPreflightResolvedMedia: Sendable {
 private struct HLSInspectedVideo: Sendable {
     let codec: AetherVideoCodec
     let format: VideoFormat
+    let dolbyVisionConfiguration:
+        AetherDolbyVisionConfiguration?
+    let hasVerifiedDolbyVisionProfile84BaseLayer: Bool
     let sampleEntry: HLSVideoSampleEntry
     let hdr10PlusEvidence:
         AetherHLSHDR10PlusPreflightEvidence
@@ -281,7 +284,11 @@ struct HLSPreflightInspector {
             sourceKind: .hls,
             isSeekableVOD: sourceIsSeekableVOD,
             videoCodec: inspected.codec,
-            videoFormat: hdr10PlusAdmission.videoFormat
+            videoFormat: hdr10PlusAdmission.videoFormat,
+            dolbyVisionConfiguration:
+                inspected.dolbyVisionConfiguration,
+            hasVerifiedDolbyVisionProfile84BaseLayer:
+                inspected.hasVerifiedDolbyVisionProfile84BaseLayer
         )
         let resolvedResult = PlaybackPreflight.resolve(
             sourceProfile: source,
@@ -1241,6 +1248,10 @@ struct HLSPreflightInspector {
             return HLSInspectedVideo(
                 codec: codec,
                 format: probe.videoFormat,
+                dolbyVisionConfiguration:
+                    probe.dolbyVisionConfiguration,
+                hasVerifiedDolbyVisionProfile84BaseLayer:
+                    probe.hasVerifiedDolbyVisionProfile84BaseLayer,
                 sampleEntry: sampleEntry,
                 hdr10PlusEvidence: hdr10PlusEvidence,
                 overlaySubtitleTracks:

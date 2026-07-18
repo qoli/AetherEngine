@@ -83,6 +83,54 @@ struct DecodedVideoFrameColorMetadataTests {
         #expect(metadata.ambientViewingEnvironment == ambient)
     }
 
+    @Test("Dolby Vision Profile 8.4 requires the exact HLG base layer")
+    func validatesDolbyVisionProfile84BaseLayer() throws {
+        let pixelBuffer = try makePixelBuffer(
+            format: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        )
+        attachHDRColorTriplet(
+            to: pixelBuffer,
+            transfer: kCVImageBufferTransferFunction_ITU_R_2100_HLG
+        )
+
+        let metadata = try DecodedVideoFrameColorMetadata.resolve(
+            pixelBuffer: pixelBuffer,
+            videoFormat: .dolbyVision
+        )
+
+        #expect(metadata.pixelEncoding == .yCbCr420BiPlanar(
+            bitDepth: 10,
+            range: .video
+        ))
+        #expect(metadata.colorPrimaries == .ituR2020)
+        #expect(metadata.transferFunction == .hlg)
+        #expect(metadata.yCbCrMatrix == .ituR2020)
+    }
+
+    @Test("Dolby Vision Profile 8.4 rejects a PQ-labelled base layer")
+    func rejectsContradictoryDolbyVisionBaseLayer() throws {
+        let pixelBuffer = try makePixelBuffer(
+            format: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        )
+        attachHDRColorTriplet(
+            to: pixelBuffer,
+            transfer: kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
+        )
+
+        #expect(throws: DecodedVideoFrameColorMetadataError
+            .mismatchedStaticHDRAttachment(
+                videoFormat: .dolbyVision,
+                field: .transferFunction,
+                expected: "hlg",
+                actual: "pq"
+            )) {
+            try DecodedVideoFrameColorMetadata.resolve(
+                pixelBuffer: pixelBuffer,
+                videoFormat: .dolbyVision
+            )
+        }
+    }
+
     @Test("HDR10 Plus uses the same validated PQ base-layer contract")
     func validatesHDR10PlusBaseLayer() throws {
         let pixelBuffer = try makePixelBuffer(

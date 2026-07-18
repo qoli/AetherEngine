@@ -277,6 +277,10 @@ public struct SourceProbe: Sendable {
     public let isDolbyVision: Bool
     /// Dolby Vision profile number (5, 7, 8, 10) read from the dvcC/dvvC configuration record; nil when not DV.
     public let dvProfile: Int?
+    /// Exact dvcC/dvvC fields. A profile number alone is not sufficient for hybrid admission.
+    public let dolbyVisionConfiguration: AetherDolbyVisionConfiguration?
+    /// Positive HEVC Main10 + HLG/BT.2020 evidence for Profile 8.4 hybrid admission.
+    public let hasVerifiedDolbyVisionProfile84BaseLayer: Bool
     public let audioTracks: [TrackInfo]
     /// Includes both text and bitmap (PGS / DVB) variants.
     public let subtitleTracks: [TrackInfo]
@@ -295,6 +299,8 @@ public struct SourceProbe: Sendable {
         videoFrameRate: Double?,
         isDolbyVision: Bool,
         dvProfile: Int? = nil,
+        dolbyVisionConfiguration: AetherDolbyVisionConfiguration? = nil,
+        hasVerifiedDolbyVisionProfile84BaseLayer: Bool = false,
         audioTracks: [TrackInfo],
         subtitleTracks: [TrackInfo],
         metadata: MediaMetadata = MediaMetadata(title: nil, artist: nil, album: nil, artworkData: nil),
@@ -310,6 +316,9 @@ public struct SourceProbe: Sendable {
         self.videoFrameRate = videoFrameRate
         self.isDolbyVision = isDolbyVision
         self.dvProfile = dvProfile
+        self.dolbyVisionConfiguration = dolbyVisionConfiguration
+        self.hasVerifiedDolbyVisionProfile84BaseLayer =
+            hasVerifiedDolbyVisionProfile84BaseLayer
         self.audioTracks = audioTracks
         self.subtitleTracks = subtitleTracks
         self.metadata = metadata

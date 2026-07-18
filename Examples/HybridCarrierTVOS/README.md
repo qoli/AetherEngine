@@ -114,6 +114,15 @@ Override that point with `AETHER_ACCEPTANCE_HDR10_PLUS_FIRST_FRAME_SECONDS`; it 
 first segment. The generator fails unless `ffprobe` proves the first segment is metadata-free and a
 later segment contains recognized HDR10+ metadata.
 
+Set `AETHER_ACCEPTANCE_VIDEO_FORMAT=dolbyvision84` and point
+`AETHER_ACCEPTANCE_DOVI_TOOL` at a pinned `dovi_tool` executable to generate the first profile-specific
+Dolby Vision fixture. The generator creates an HEVC Main10 BT.2020/HLG base layer, generates P8.4 RPU
+metadata for every frame, emits an `hev1` fMP4 HLS presentation with an exact 24-byte `dvvC`, and fails
+unless FFmpeg reads profile 8, compatibility ID 4, RPU/BL present, EL absent, uncompressed metadata, and
+an RPU on the first frame. Use `AETHER_ACCEPTANCE_COLOR_AUTORUN=1` with
+`AETHER_ACCEPTANCE_EXPECTED_VIDEO_FORMAT=dolbyvision` for the technical device row. Production
+admission remains unchanged until the device and human panel-mode/visual rows are both recorded.
+
 Set `AETHER_ACCEPTANCE_GEOMETRY_MODE` to `clean_aperture`, `sar_4_3`, `rotation_90`,
 `rotation_180`, `rotation_270`, `fps_24000_1001`, or `fps_15` for a deterministic geometry/cadence
 fixture. Rotation mode names are Aether's canonical clockwise values; the generator writes FFmpeg's

@@ -131,6 +131,12 @@ final class BlackCarrierLazyCompositeProvider:
         pump.hybridVideoFormat
     }
 
+    var hybridDolbyVisionConfiguration:
+        AetherDolbyVisionConfiguration?
+    {
+        pump.hybridDolbyVisionConfiguration
+    }
+
     var hybridVideoFrameRate: Double? {
         pump.hybridVideoFrameRate
     }

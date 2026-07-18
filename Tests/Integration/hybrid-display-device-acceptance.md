@@ -73,6 +73,12 @@ Required color rows before expanding `verifiedVideoFormats`:
 - each promised Dolby Vision profile as a separate row with public Apple API support, profile-specific
   fixture, propagated per-frame metadata and panel-mode evidence.
 
+The first Dolby Vision candidate is Profile 8.4 only: HEVC Main10, HLG/BT.2020 base layer, exact `dvvC`
+version/profile/level/flags/compatibility/compression fields, and successful
+`kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata`. P5, P7, P8.1, a missing record, or a
+contradictory record is typed unsupported before provider/session creation; none may be relabelled or
+presented as a base-layer-only success.
+
 Required Atmos row:
 
 - a licensed E-AC-3 JOC vector whose bitstream probe reports Atmos/profile 30;

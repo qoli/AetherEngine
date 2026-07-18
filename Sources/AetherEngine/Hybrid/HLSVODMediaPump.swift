@@ -804,6 +804,12 @@ actor HLSVODMediaPump {
         worker.hybridVideoFormat
     }
 
+    var hybridDolbyVisionConfiguration:
+        AetherDolbyVisionConfiguration?
+    {
+        worker.hybridDolbyVisionConfiguration
+    }
+
     var hybridVideoFrameRate: Double? {
         worker.hybridVideoFrameRate
     }
@@ -1519,6 +1525,14 @@ private extension HLSVODMediaPump {
         var hybridVideoFormat: VideoFormat? {
             videoDecodeSink?
                 .streamContract.videoFormat
+        }
+
+        var hybridDolbyVisionConfiguration:
+            AetherDolbyVisionConfiguration?
+        {
+            videoDecodeSink?
+                .streamContract
+                .dolbyVisionConfiguration
         }
 
         var hybridVideoFrameRate: Double? {

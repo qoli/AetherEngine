@@ -21,6 +21,7 @@ public enum AetherHybridPlaybackTelemetryFailure:
     case preflightRequiresHybrid
     case preflightContractChanged
     case sourceVideoFormatDiverged
+    case sourceDolbyVisionConfigurationDiverged
     case invalidReadinessTimeout
     case invalidSeekTarget
     case invalidRate
@@ -70,6 +71,8 @@ public enum AetherHybridPlaybackTelemetryFailure:
             .preflightContractChanged
         case .sourceVideoFormatDiverged:
             .sourceVideoFormatDiverged
+        case .sourceDolbyVisionConfigurationDiverged:
+            .sourceDolbyVisionConfigurationDiverged
         case .invalidReadinessTimeout:
             .invalidReadinessTimeout
         case .invalidSeekTarget:

@@ -31,6 +31,7 @@ public enum HybridPlaybackSessionError:
         preflight: VideoFormat,
         decoded: VideoFormat
     )
+    case sourceDolbyVisionConfigurationDiverged
     case invalidReadinessTimeout
     case invalidSeekTarget
     case invalidRate
@@ -90,6 +91,8 @@ public enum HybridPlaybackSessionError:
         case .sourceVideoFormatDiverged(let preflight, let decoded):
             return "Hybrid decoded video format \(String(describing: decoded)) diverged from "
                 + "preflight \(String(describing: preflight))"
+        case .sourceDolbyVisionConfigurationDiverged:
+            return "Hybrid decoded Dolby Vision configuration diverged from preflight"
         case .invalidReadinessTimeout:
             return "Hybrid playback readiness timeout must be positive and finite"
         case .invalidSeekTarget:
@@ -195,6 +198,8 @@ protocol HybridCarrierTransportProvider:
     Sendable
 {
     var hybridVideoFormat: VideoFormat? { get }
+    var hybridDolbyVisionConfiguration:
+        AetherDolbyVisionConfiguration? { get }
     var hybridVideoFrameRate: Double? { get }
 
     func restartMedia(
@@ -404,6 +409,8 @@ final class HybridPlaybackSession {
     private let coordinator: HybridPlaybackProviderCoordinator
     private let timeline: BlackCarrierTimeline
     private var videoFormat: VideoFormat
+    private let dolbyVisionConfiguration:
+        AetherDolbyVisionConfiguration?
     private let videoFrameRate: Double?
     private let displayCriteriaController =
         DisplayCriteriaController()
@@ -460,6 +467,12 @@ final class HybridPlaybackSession {
 
     var sourceVideoFormat: VideoFormat {
         videoFormat
+    }
+
+    var sourceDolbyVisionConfiguration:
+        AetherDolbyVisionConfiguration?
+    {
+        dolbyVisionConfiguration
     }
 
     var sourceVideoFrameRate: Double? {
@@ -541,6 +554,8 @@ final class HybridPlaybackSession {
         coordinator = HybridPlaybackProviderCoordinator(provider: provider)
         self.timeline = timeline
         self.videoFormat = videoFormat
+        dolbyVisionConfiguration =
+            provider.hybridDolbyVisionConfiguration
         videoFrameRate = provider.hybridVideoFrameRate
         self.relay = relay
         audioAnalysisSource =

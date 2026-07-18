@@ -5,7 +5,20 @@ final class PlaybackPreflightTests: XCTestCase {
     private let fullHybridCapabilities = HybridPlaybackCapabilities(
         hasDirectVideoDecoder: true,
         hasSampleBufferRenderer: true,
-        supportedVideoFormats: [.sdr, .hdr10, .hdr10Plus, .hlg, .dolbyVision]
+        supportedVideoFormats: [.sdr, .hdr10, .hdr10Plus, .hlg, .dolbyVision],
+        supportedDolbyVisionProfiles: [.profile84]
+    )
+
+    private let profile84 = AetherDolbyVisionConfiguration(
+        versionMajor: 1,
+        versionMinor: 0,
+        profile: 8,
+        level: 1,
+        rpuPresent: true,
+        enhancementLayerPresent: false,
+        baseLayerPresent: true,
+        baseLayerSignalCompatibilityID: 4,
+        metadataCompression: 0
     )
 
     private func source(
@@ -227,16 +240,137 @@ final class PlaybackPreflightTests: XCTestCase {
         let noDolbyVision = HybridPlaybackCapabilities(
             hasDirectVideoDecoder: true,
             hasSampleBufferRenderer: true,
-            supportedVideoFormats: [.sdr, .hdr10, .hdr10Plus, .hlg]
+            supportedVideoFormats: [.sdr, .hdr10, .hdr10Plus, .hlg],
+            supportedDolbyVisionProfiles: [.profile84]
         )
         let result = PlaybackPreflight.resolve(
-            sourceProfile: source(format: .dolbyVision),
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .hls,
+                isSeekableVOD: true,
+                videoCodec: .hevc,
+                videoFormat: .dolbyVision,
+                dolbyVisionConfiguration: profile84,
+                hasVerifiedDolbyVisionProfile84BaseLayer: true
+            ),
             hlsPackaging: hls(sampleEntry: .hev1),
             hybridCapabilities: noDolbyVision
         )
 
         XCTAssertEqual(result.route, .unsupported)
         XCTAssertEqual(result.reason, .unsupportedHybridVideoFormat)
+    }
+
+    func testHybridDolbyVisionRequiresExactConfiguration() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(format: .dolbyVision),
+            hlsPackaging: hls(sampleEntry: .hev1),
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(
+            result.reason,
+            .unsupportedDolbyVisionConfigurationMissing
+        )
+    }
+
+    func testHybridDolbyVisionRejectsUnverifiedProfile() {
+        let profile81 = AetherDolbyVisionConfiguration(
+            versionMajor: 1,
+            versionMinor: 0,
+            profile: 8,
+            level: 1,
+            rpuPresent: true,
+            enhancementLayerPresent: false,
+            baseLayerPresent: true,
+            baseLayerSignalCompatibilityID: 1,
+            metadataCompression: 0
+        )
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .hls,
+                isSeekableVOD: true,
+                videoCodec: .hevc,
+                videoFormat: .dolbyVision,
+                dolbyVisionConfiguration: profile81
+            ),
+            hlsPackaging: hls(sampleEntry: .hev1),
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(result.reason, .unsupportedDolbyVisionProfile)
+    }
+
+    func testHybridDolbyVisionRejectsContradictoryProfile84Flags() {
+        let missingRPU = AetherDolbyVisionConfiguration(
+            versionMajor: 1,
+            versionMinor: 0,
+            profile: 8,
+            level: 1,
+            rpuPresent: false,
+            enhancementLayerPresent: false,
+            baseLayerPresent: true,
+            baseLayerSignalCompatibilityID: 4,
+            metadataCompression: 0
+        )
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .hls,
+                isSeekableVOD: true,
+                videoCodec: .hevc,
+                videoFormat: .dolbyVision,
+                dolbyVisionConfiguration: missingRPU,
+                hasVerifiedDolbyVisionProfile84BaseLayer: true
+            ),
+            hlsPackaging: hls(sampleEntry: .hev1),
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(
+            result.reason,
+            .unsupportedDolbyVisionConfigurationMismatch
+        )
+    }
+
+    func testHybridDolbyVisionProfile84CanBeAdmittedExplicitly() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .hls,
+                isSeekableVOD: true,
+                videoCodec: .hevc,
+                videoFormat: .dolbyVision,
+                dolbyVisionConfiguration: profile84,
+                hasVerifiedDolbyVisionProfile84BaseLayer: true
+            ),
+            hlsPackaging: hls(sampleEntry: .hev1),
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .hybridCarrier)
+        XCTAssertEqual(result.reason, .hybridHEV1SampleEntry)
+    }
+
+    func testHybridDolbyVisionRejectsContradictoryBaseLayerBeforeSession() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .hls,
+                isSeekableVOD: true,
+                videoCodec: .hevc,
+                videoFormat: .dolbyVision,
+                dolbyVisionConfiguration: profile84,
+                hasVerifiedDolbyVisionProfile84BaseLayer: false
+            ),
+            hlsPackaging: hls(sampleEntry: .hev1),
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(
+            result.reason,
+            .unsupportedDolbyVisionConfigurationMismatch
+        )
     }
 
     func testNonAVPlayerProgressiveCodecUsesHybridWhenCapabilityExists() {

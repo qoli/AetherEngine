@@ -108,6 +108,7 @@ final class AcceptanceViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        configureEngineEvidenceLogging()
         configurePlayerController()
         configureSetupPanel()
         configureActionPanel()
@@ -137,9 +138,28 @@ final class AcceptanceViewController: UIViewController {
     }
 
     deinit {
+        EngineLog.handler = nil
         loadTask?.cancel()
         telemetryTask?.cancel()
         diagnosticsTask?.cancel()
+    }
+
+    private func configureEngineEvidenceLogging() {
+        guard ProcessInfo.processInfo.environment[
+            "AETHER_ACCEPTANCE_EXPECTED_VIDEO_FORMAT"
+        ]?.lowercased() == "dolbyvision" else {
+            return
+        }
+        EngineLog.handler = { line in
+            guard line.hasPrefix(
+                "[HardwareVideoDecoder] Dolby Vision P8.4"
+            ) else { return }
+            print(
+                "AETHER_ACCEPTANCE decoderEvidence "
+                    + "dolbyVisionProfile84DVVC=true "
+                    + "videoToolboxPerFrameMetadataPropagationAccepted=true"
+            )
+        }
     }
 
     private func configurePlayerController() {
@@ -298,7 +318,7 @@ final class AcceptanceViewController: UIViewController {
                     "preflight route=\(preflight.result.route.rawValue, privacy: .public) reason=\(preflight.result.reason.rawValue, privacy: .public) segments=\(preflight.mediaSegmentCount) audioRenditions=\(preflight.audioRenditionCount) nativeSubtitles=\(nativeSubtitleCount) unavailableSubtitles=\(unavailableSubtitleCount)"
                 )
                 print(
-                    "AETHER_ACCEPTANCE preflight route=\(preflight.result.route.rawValue) reason=\(preflight.result.reason.rawValue) segments=\(preflight.mediaSegmentCount) audioRenditions=\(preflight.audioRenditionCount) nativeSubtitles=\(nativeSubtitleCount) unavailableSubtitles=\(unavailableSubtitleCount)"
+                    "AETHER_ACCEPTANCE preflight route=\(preflight.result.route.rawValue) reason=\(preflight.result.reason.rawValue) segments=\(preflight.mediaSegmentCount) audioRenditions=\(preflight.audioRenditionCount) nativeSubtitles=\(nativeSubtitleCount) unavailableSubtitles=\(unavailableSubtitleCount) dolbyVisionProfile84BaseLayerVerified=\(preflight.result.sourceProfile.hasVerifiedDolbyVisionProfile84BaseLayer)\(dolbyVisionConfigurationSuffix(preflight.result.sourceProfile.dolbyVisionConfiguration))"
                 )
 
                 print("AETHER_ACCEPTANCE phase=session-create")
@@ -1115,6 +1135,21 @@ final class AcceptanceViewController: UIViewController {
         case .hlg: "hlg"
         case .dolbyVision: "dolbyvision"
         }
+    }
+
+    private func dolbyVisionConfigurationSuffix(
+        _ configuration: AetherDolbyVisionConfiguration?
+    ) -> String {
+        guard let configuration else { return " dolbyVisionConfiguration=none" }
+        return " dolbyVisionConfiguration="
+            + "version\(configuration.versionMajor).\(configuration.versionMinor)"
+            + ",profile\(configuration.profile)"
+            + ",level\(configuration.level)"
+            + ",rpu\(configuration.rpuPresent ? 1 : 0)"
+            + ",el\(configuration.enhancementLayerPresent ? 1 : 0)"
+            + ",bl\(configuration.baseLayerPresent ? 1 : 0)"
+            + ",compat\(configuration.baseLayerSignalCompatibilityID)"
+            + ",compression\(configuration.metadataCompression)"
     }
 
     private func runAutomaticStopAndReopenScenario(

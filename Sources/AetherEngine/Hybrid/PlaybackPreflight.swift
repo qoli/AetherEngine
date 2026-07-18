@@ -56,17 +56,27 @@ public struct AetherSourceProfile: Sendable, Equatable {
     public let isSeekableVOD: Bool
     public let videoCodec: AetherVideoCodec
     public let videoFormat: VideoFormat
+    public let dolbyVisionConfiguration:
+        AetherDolbyVisionConfiguration?
+    public let hasVerifiedDolbyVisionProfile84BaseLayer: Bool
 
     public init(
         sourceKind: AetherMediaSourceKind,
         isSeekableVOD: Bool,
         videoCodec: AetherVideoCodec,
-        videoFormat: VideoFormat
+        videoFormat: VideoFormat,
+        dolbyVisionConfiguration:
+            AetherDolbyVisionConfiguration? = nil,
+        hasVerifiedDolbyVisionProfile84BaseLayer: Bool = false
     ) {
         self.sourceKind = sourceKind
         self.isSeekableVOD = isSeekableVOD
         self.videoCodec = videoCodec
         self.videoFormat = videoFormat
+        self.dolbyVisionConfiguration =
+            dolbyVisionConfiguration
+        self.hasVerifiedDolbyVisionProfile84BaseLayer =
+            hasVerifiedDolbyVisionProfile84BaseLayer
     }
 
     /// Build a profile from a completed probe plus source facts that FFmpeg cannot infer reliably from a
@@ -80,7 +90,11 @@ public struct AetherSourceProfile: Sendable, Equatable {
             sourceKind: sourceKind,
             isSeekableVOD: isSeekableVOD,
             videoCodec: AetherVideoCodec(codecName: probe.videoCodecName),
-            videoFormat: probe.videoFormat
+            videoFormat: probe.videoFormat,
+            dolbyVisionConfiguration:
+                probe.dolbyVisionConfiguration,
+            hasVerifiedDolbyVisionProfile84BaseLayer:
+                probe.hasVerifiedDolbyVisionProfile84BaseLayer
         )
     }
 }
@@ -172,12 +186,16 @@ public struct HybridPlaybackCapabilities: Sendable, Equatable {
     public let hasDirectVideoDecoder: Bool
     public let hasSampleBufferRenderer: Bool
     public let supportedVideoFormats: Set<VideoFormat>
+    public let supportedDolbyVisionProfiles:
+        Set<AetherDolbyVisionProfile>
     public let supportedSourceKinds: Set<AetherMediaSourceKind>
 
     public init(
         hasDirectVideoDecoder: Bool,
         hasSampleBufferRenderer: Bool,
         supportedVideoFormats: Set<VideoFormat>,
+        supportedDolbyVisionProfiles:
+            Set<AetherDolbyVisionProfile> = [],
         supportedSourceKinds: Set<AetherMediaSourceKind> = [
             .hls,
             .progressive,
@@ -187,6 +205,8 @@ public struct HybridPlaybackCapabilities: Sendable, Equatable {
         self.hasDirectVideoDecoder = hasDirectVideoDecoder
         self.hasSampleBufferRenderer = hasSampleBufferRenderer
         self.supportedVideoFormats = supportedVideoFormats
+        self.supportedDolbyVisionProfiles =
+            supportedDolbyVisionProfiles
         self.supportedSourceKinds = supportedSourceKinds
     }
 }
@@ -210,6 +230,9 @@ public enum PlaybackRouteReason: String, Sendable, Equatable {
     case unsupportedHybridDecoderUnavailable
     case unsupportedHybridSampleBufferRendererUnavailable
     case unsupportedHybridVideoFormat
+    case unsupportedDolbyVisionConfigurationMissing
+    case unsupportedDolbyVisionProfile
+    case unsupportedDolbyVisionConfigurationMismatch
     case unsupportedHDR10PlusBaseLayerMismatch
     case unsupportedHDR10PlusCompressedSampleEvidenceMissing
     case unsupportedHDR10PlusCompressedSampleMalformed
@@ -435,6 +458,62 @@ public enum PlaybackPreflight {
                 hlsPackaging,
                 .unsupported,
                 .unsupportedHybridSampleBufferRendererUnavailable
+            )
+        }
+        if sourceProfile.videoFormat == .dolbyVision {
+            guard let configuration =
+                    sourceProfile.dolbyVisionConfiguration else {
+                return result(
+                    sourceProfile,
+                    hlsPackaging,
+                    .unsupported,
+                    .unsupportedDolbyVisionConfigurationMissing
+                )
+            }
+            guard configuration.profile == 8,
+                  configuration.baseLayerSignalCompatibilityID == 4 else {
+                return result(
+                    sourceProfile,
+                    hlsPackaging,
+                    .unsupported,
+                    .unsupportedDolbyVisionProfile
+                )
+            }
+            guard let profile =
+                    configuration.verifiedHybridProfile else {
+                return result(
+                    sourceProfile,
+                    hlsPackaging,
+                    .unsupported,
+                    .unsupportedDolbyVisionConfigurationMismatch
+                )
+            }
+            guard sourceProfile
+                    .hasVerifiedDolbyVisionProfile84BaseLayer else {
+                return result(
+                    sourceProfile,
+                    hlsPackaging,
+                    .unsupported,
+                    .unsupportedDolbyVisionConfigurationMismatch
+                )
+            }
+            guard capabilities.supportedDolbyVisionProfiles
+                    .contains(profile) else {
+                return result(
+                    sourceProfile,
+                    hlsPackaging,
+                    .unsupported,
+                    .unsupportedDolbyVisionProfile
+                )
+            }
+        } else if sourceProfile.dolbyVisionConfiguration != nil
+                    || sourceProfile
+                        .hasVerifiedDolbyVisionProfile84BaseLayer {
+            return result(
+                sourceProfile,
+                hlsPackaging,
+                .unsupported,
+                .unsupportedDolbyVisionConfigurationMismatch
             )
         }
         guard capabilities.supportedVideoFormats.contains(sourceProfile.videoFormat) else {

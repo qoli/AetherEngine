@@ -124,6 +124,19 @@ struct HybridPlaybackTelemetryTests {
         )
     }
 
+    @Test("Dolby Vision source divergence remains a stable failure code")
+    func dolbyVisionDivergenceRemainsTyped() {
+        #expect(
+            AetherHybridPlaybackTelemetryState(
+                .failed(
+                    .sourceDolbyVisionConfigurationDiverged
+                )
+            ) == .failed(
+                .sourceDolbyVisionConfigurationDiverged
+            )
+        )
+    }
+
     @Test("Audio-analysis failures publish stable codes without source text")
     func audioAnalysisFailureSanitization() {
         let sourceError = AudioAnalysisError

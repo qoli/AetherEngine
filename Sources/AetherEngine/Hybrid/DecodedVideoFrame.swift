@@ -192,9 +192,9 @@ public struct DecodedVideoFrameColorMetadata: Sendable, Equatable {
         switch videoFormat {
         case .hdr10, .hdr10Plus:
             expectedTransfer = .pq
-        case .hlg:
+        case .hlg, .dolbyVision:
             expectedTransfer = .hlg
-        case .sdr, .dolbyVision:
+        case .sdr:
             return
         }
 

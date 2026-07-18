@@ -11,6 +11,8 @@ struct HybridVideoStreamContract: Sendable, Equatable {
     let codedHeight: Int
     let codecConfiguration: Data
     let videoFormat: VideoFormat
+    let dolbyVisionConfiguration:
+        AetherDolbyVisionConfiguration?
     let pixelAspectRatioNumerator: Int
     let pixelAspectRatioDenominator: Int
     let rotationDegrees: Int
@@ -41,6 +43,8 @@ struct HybridVideoStreamContract: Sendable, Equatable {
             codecConfiguration = Data()
         }
         videoFormat = AetherEngine.detectVideoFormat(stream: stream)
+        dolbyVisionConfiguration =
+            AetherEngine.dolbyVisionConfiguration(stream: stream)
 
         let parameterSAR = codecParameters.sample_aspect_ratio
         let streamSAR = stream.pointee.sample_aspect_ratio

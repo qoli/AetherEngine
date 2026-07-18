@@ -192,6 +192,10 @@ enum VideoDecoderError: Error, LocalizedError, Sendable, Equatable {
     case noExtradata
     case formatDescriptionFailed(status: OSStatus)
     case sessionCreationFailed(status: OSStatus)
+    case dolbyVisionConfigurationMissing
+    case unsupportedDolbyVisionConfiguration
+    case dolbyVisionBaseLayerMismatch
+    case dolbyVisionMetadataPropagationFailed(status: OSStatus)
     case packetDataMissing
     case blockBufferCreationFailed(status: OSStatus)
     case sampleBufferCreationFailed(status: OSStatus)
@@ -212,6 +216,14 @@ enum VideoDecoderError: Error, LocalizedError, Sendable, Equatable {
         case .noExtradata: "Missing codec extradata"
         case .formatDescriptionFailed(let s): "Format description failed (\(s))"
         case .sessionCreationFailed(let s): "Decoder session failed (\(s))"
+        case .dolbyVisionConfigurationMissing:
+            "Dolby Vision stream is missing an exact dvcC/dvvC configuration"
+        case .unsupportedDolbyVisionConfiguration:
+            "Dolby Vision configuration is not the verified Profile 8.4 contract"
+        case .dolbyVisionBaseLayerMismatch:
+            "Dolby Vision Profile 8.4 requires a Main10 HLG BT.2020 base layer"
+        case .dolbyVisionMetadataPropagationFailed(let status):
+            "VideoToolbox rejected per-frame Dolby Vision metadata propagation (\(status))"
         case .packetDataMissing: "Compressed video packet has no payload"
         case .blockBufferCreationFailed(let s): "Video block buffer creation failed (\(s))"
         case .sampleBufferCreationFailed(let s): "Video sample buffer creation failed (\(s))"

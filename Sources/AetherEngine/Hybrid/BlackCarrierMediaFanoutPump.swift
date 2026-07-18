@@ -579,6 +579,13 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         hybridVideoDecodeSink?.streamContract.videoFormat
     }
 
+    var hybridDolbyVisionConfiguration:
+        AetherDolbyVisionConfiguration?
+    {
+        hybridVideoDecodeSink?
+            .streamContract.dolbyVisionConfiguration
+    }
+
     var hybridVideoFrameRate: Double? {
         hybridVideoDecodeSink?
             .streamContract.displayFrameRate

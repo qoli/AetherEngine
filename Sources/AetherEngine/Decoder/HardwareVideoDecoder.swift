@@ -62,6 +62,8 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             lengthFieldBytes: 4
         )
     private var inspectsCompressedHDR10Plus = false
+    private var dolbyVisionConfiguration:
+        AetherDolbyVisionConfiguration?
 
     /// Color metadata from codecpar, re-applied to every CVPixelBuffer.
     /// VTDecompressionSession should propagate these from SPS+hvcC but has been observed not to;
@@ -120,11 +122,54 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
               hvcCData[0] == 1 else {
             throw VideoDecoderError.noExtradata
         }
+        let detectedFormat = AetherEngine.detectVideoFormat(
+            stream: stream
+        )
+        let parsedDolbyVisionConfiguration =
+            AetherEngine.dolbyVisionConfiguration(
+                stream: stream
+            )
+        if detectedFormat == .dolbyVision {
+            guard let parsedDolbyVisionConfiguration else {
+                throw VideoDecoderError
+                    .dolbyVisionConfigurationMissing
+            }
+            guard parsedDolbyVisionConfiguration
+                    .verifiedHybridProfile == .profile84 else {
+                throw VideoDecoderError
+                    .unsupportedDolbyVisionConfiguration
+            }
+            guard AetherEngine
+                    .hasVerifiedDolbyVisionProfile84BaseLayer(
+                        stream: stream
+                    ) else {
+                throw VideoDecoderError
+                    .dolbyVisionBaseLayerMismatch
+            }
+            dolbyVisionConfiguration =
+                parsedDolbyVisionConfiguration
+        } else if parsedDolbyVisionConfiguration != nil {
+            throw VideoDecoderError
+                .unsupportedDolbyVisionConfiguration
+        } else {
+            dolbyVisionConfiguration = nil
+        }
         compressedSampleFraming = .lengthPrefixed(
             lengthFieldBytes: Int(hvcCData[21] & 0x03) + 1
         )
         var fd: CMVideoFormatDescription?
-        let atomsDict: NSDictionary = ["hvcC": hvcCData]
+        var sampleDescriptionAtoms: [String: Data] = [
+            "hvcC": hvcCData,
+        ]
+        if let dolbyVisionConfiguration {
+            guard let dvvC = dolbyVisionConfiguration
+                    .profile84DVVCData() else {
+                throw VideoDecoderError
+                    .unsupportedDolbyVisionConfiguration
+            }
+            sampleDescriptionAtoms["dvvC"] = dvvC
+        }
+        let atomsDict = sampleDescriptionAtoms as NSDictionary
         let extensions: NSDictionary = [
             kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: atomsDict,
         ]
@@ -196,19 +241,42 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         session = createdSession
 
-        // 5. Pass through per-frame HDR metadata for correct tone mapping; unknown-key set returns -12911 on older OSes (swallowed).
+        // 5. Pass through per-frame HDR metadata for correct tone mapping.
+        // Profile 8.4 admission requires positive VideoToolbox acceptance;
+        // other formats retain the existing best-effort property request.
         if #available(tvOS 17.0, iOS 17.0, *) {
-            VTSessionSetProperty(
+            let propagationStatus = VTSessionSetProperty(
                 createdSession,
                 key: kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
                 value: kCFBooleanTrue
             )
+            if dolbyVisionConfiguration != nil,
+               propagationStatus != noErr {
+                VTDecompressionSessionInvalidate(createdSession)
+                session = nil
+                unmanaged.release()
+                refConBox = nil
+                throw VideoDecoderError
+                    .dolbyVisionMetadataPropagationFailed(
+                        status: propagationStatus
+                    )
+            }
+            if dolbyVisionConfiguration != nil {
+                EngineLog.emit(
+                    "[HardwareVideoDecoder] Dolby Vision P8.4 "
+                    + "dvvC admitted; VT per-frame metadata "
+                    + "propagation accepted",
+                    category: .swPlayback
+                )
+            }
         }
 
         EngineLog.emit(
             "[HardwareVideoDecoder] opened HEVC \(width)x\(height) "
             + "\(use10Bit ? "10-bit" : "8-bit") "
-            + "transfer=\(codecpar.pointee.color_trc.rawValue)",
+            + "transfer=\(codecpar.pointee.color_trc.rawValue) "
+            + "dolbyVisionProfile84="
+            + "\(dolbyVisionConfiguration != nil)",
             category: .swPlayback
         )
     }
