@@ -109,10 +109,14 @@ AAC-to-JOC selection, and stop/reopen. Run the controlled-stall scenario against
 the remaining transport row. Telemetry prints the fixed 2 Mbps carrier budget and the observed
 peak/average without exposing source URLs or track names.
 
-Set `AETHER_ACCEPTANCE_VIDEO_FORMAT=hdr10` or `hlg` to generate a Main10 diagnostic fixture. HDR10
-includes explicit BT.2020/PQ, MDCV, and CLLI signaling; HLG includes BT.2020/ARIB STD-B67 signaling.
-Generating or rendering either fixture is not format admission: the physical-device record still needs
-panel-mode and human visual evidence before `verifiedVideoFormats` can expand.
+Set `AETHER_ACCEPTANCE_VIDEO_FORMAT=hdr10` or `hlg` to generate a Main10 diagnostic fixture. The
+generator creates a deterministic 16-bit BT.2020 nonlinear-RGB reference pattern instead of relabelling
+an SDR test source: HDR10 applies the SMPTE ST 2084 OETF to absolute luminance patches and includes PQ,
+MDCV, and CLLI signaling; HLG applies the ARIB STD-B67 OETF to scene-linear patches. FFmpeg performs
+only the BT.2020 non-constant-luminance matrix conversion to limited-range 10-bit YCbCr. The source
+pattern, generator hash, transfer policy and resulting bytes remain in fixture provenance. Fixture
+generation alone is never format admission. HDR10 is admitted by its separate passing LG C3 panel-mode
+and human visual record; HLG remains unadmitted until it has the corresponding evidence.
 
 Set `AETHER_ACCEPTANCE_VIDEO_FORMAT=hdr10plus` to generate a deterministic PQ fixture whose first HLS
 segment contains no HDR10+ metadata and whose ST 2094-40 T.35 payload begins at 12 seconds by default.

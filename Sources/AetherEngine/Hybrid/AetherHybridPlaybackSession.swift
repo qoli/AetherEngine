@@ -196,14 +196,16 @@ public final class AetherHybridPlaybackSession: ObservableObject {
     /// Capabilities that the current public session can actually admit.
     ///
     /// Clear, finite, seekable HLS VOD is admitted only through an opaque
-    /// `AetherHLSPlaybackPreflight` resource binding. The verified renderer remains SDR-only;
-    /// unsupported color formats are rejected by preflight rather than tone-mapped.
+    /// `AetherHLSPlaybackPreflight` resource binding. The verified renderer admits
+    /// SDR and HDR10; every other color format is rejected by preflight rather
+    /// than tone-mapped.
     public nonisolated static var capabilities: HybridPlaybackCapabilities {
         HybridPlaybackCapabilities(
             hasDirectVideoDecoder: true,
             hasSampleBufferRenderer: true,
             supportedVideoFormats: AetherHybridPresentationView
                 .verifiedVideoFormats,
+            supportedDolbyVisionProfiles: [],
             supportedSourceKinds: [
                 .hls,
                 .progressive,

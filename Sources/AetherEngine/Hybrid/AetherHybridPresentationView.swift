@@ -169,9 +169,13 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         }
     }
 
-    /// Admission remains SDR-only until each additional format has fixture and
-    /// physical Apple TV evidence. The backend itself is never replaced.
-    public nonisolated static let verifiedVideoFormats: Set<VideoFormat> = [.sdr]
+    /// Admission contains only formats with passing fixture, physical Apple TV,
+    /// display-mode, and human visual evidence. The backend itself is never
+    /// replaced.
+    public nonisolated static let verifiedVideoFormats: Set<VideoFormat> = [
+        .sdr,
+        .hdr10,
+    ]
 
     private struct PendingSample {
         let sampleBuffer: CMSampleBuffer

@@ -52,6 +52,10 @@ DOVI_TOOL="${AETHER_ACCEPTANCE_DOVI_TOOL:-}"
 DOVI_TOOL_VERSION=""
 DOVI_TOOL_SHA256=""
 DOLBY_VISION_CONFIGURATION_PROBE=""
+HDR_REFERENCE_TRANSFER=""
+HDR_REFERENCE_PATTERN=""
+HDR_REFERENCE_PATTERN_SHA256=""
+HDR_REFERENCE_GENERATOR_SHA256=""
 
 if [[ "$WEBVTT_SUBTITLES" != "0" && "$WEBVTT_SUBTITLES" != "1" ]]; then
     echo "ERROR: AETHER_ACCEPTANCE_WEBVTT_SUBTITLES must be 0 or 1" >&2
@@ -156,8 +160,9 @@ VIDEO_FRAME_COUNT="$(
 )"
 
 if ! command -v ffmpeg >/dev/null 2>&1 \
-        || ! command -v ffprobe >/dev/null 2>&1; then
-    echo "ERROR: ffmpeg and ffprobe are required" >&2
+        || ! command -v ffprobe >/dev/null 2>&1 \
+        || ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: ffmpeg, ffprobe, and python3 are required" >&2
     exit 1
 fi
 
@@ -193,6 +198,7 @@ case "$VIDEO_FORMAT" in
         ;;
     hdr10)
         VIDEO_DESCRIPTION="HEVC Main10 hev1 HDR10 BT.2020/PQ MDCV/CLLI"
+        HDR_REFERENCE_TRANSFER="pq"
         VIDEO_CODEC_ARGS=(
             -c:v libx265
             -preset ultrafast
@@ -207,6 +213,7 @@ case "$VIDEO_FORMAT" in
         ;;
     hdr10plus)
         VIDEO_DESCRIPTION="HEVC Main10 hev1 HDR10+ BT.2020/PQ MDCV/CLLI with late ST 2094-40 T.35"
+        HDR_REFERENCE_TRANSFER="pq"
         HDR10_PLUS_NALU_FILE="$OUTPUT/HDR10PLUS_NALU.txt"
         HDR10_PLUS_FIRST_FRAME_POC="$(
             awk -v seconds="$HDR10_PLUS_FIRST_FRAME_SECONDS" \
@@ -255,6 +262,7 @@ case "$VIDEO_FORMAT" in
         ;;
     hlg)
         VIDEO_DESCRIPTION="HEVC Main10 hev1 HLG BT.2020/ARIB-STD-B67"
+        HDR_REFERENCE_TRANSFER="hlg"
         VIDEO_CODEC_ARGS=(
             -c:v libx265
             -preset ultrafast
@@ -282,6 +290,7 @@ case "$VIDEO_FORMAT" in
         DOVI_TOOL_VERSION="$($DOVI_TOOL --version)"
         DOVI_TOOL_SHA256="$(shasum -a 256 "$DOVI_TOOL" | awk '{print $1}')"
         VIDEO_DESCRIPTION="Dolby Vision Profile 8.4 HEVC Main10 hev1 HLG BT.2020 with exact dvvC"
+        HDR_REFERENCE_TRANSFER="hlg"
         VIDEO_CODEC_ARGS=(
             -c:v libx265
             -preset ultrafast
@@ -306,6 +315,34 @@ if [[ -e "$OUTPUT" ]]; then
 fi
 
 mkdir -p "$OUTPUT"
+VIDEO_GENERATOR_INPUT_ARGS=(
+    -f lavfi
+    -i "testsrc2=duration=$VIDEO_DURATION_SECONDS:size=$VIDEO_SOURCE_SIZE:rate=$VIDEO_FRAME_RATE"
+)
+VIDEO_FILTER="setsar=$VIDEO_SAMPLE_ASPECT_RATIO"
+if [[ -n "$HDR_REFERENCE_TRANSFER" ]]; then
+    REFERENCE_WIDTH="${VIDEO_SOURCE_SIZE%x*}"
+    REFERENCE_HEIGHT="${VIDEO_SOURCE_SIZE#*x}"
+    HDR_REFERENCE_PATTERN="$OUTPUT/COLOR_REFERENCE.ppm"
+    HDR_REFERENCE_GENERATOR="$REPO_ROOT/Scripts/generate-hybrid-hdr-reference-pattern.py"
+    if [[ ! -f "$HDR_REFERENCE_GENERATOR" ]]; then
+        echo "ERROR: missing HDR reference generator: $HDR_REFERENCE_GENERATOR" >&2
+        exit 1
+    fi
+    python3 "$HDR_REFERENCE_GENERATOR" \
+        --transfer "$HDR_REFERENCE_TRANSFER" \
+        --width "$REFERENCE_WIDTH" \
+        --height "$REFERENCE_HEIGHT" \
+        --output "$HDR_REFERENCE_PATTERN"
+    HDR_REFERENCE_PATTERN_SHA256="$(shasum -a 256 "$HDR_REFERENCE_PATTERN" | awk '{print $1}')"
+    HDR_REFERENCE_GENERATOR_SHA256="$(shasum -a 256 "$HDR_REFERENCE_GENERATOR" | awk '{print $1}')"
+    VIDEO_GENERATOR_INPUT_ARGS=(
+        -loop 1
+        -framerate "$VIDEO_FRAME_RATE"
+        -i "$HDR_REFERENCE_PATTERN"
+    )
+    VIDEO_FILTER="scale=in_range=full:out_range=tv:out_color_matrix=bt2020:flags=accurate_rnd+full_chroma_int,format=yuv420p10le,setsar=$VIDEO_SAMPLE_ASPECT_RATIO"
+fi
 if [[ "$VIDEO_FORMAT" == "hdr10plus" ]]; then
     # x265 consumes one nalu-file row per POC. A benign 18-byte
     # user-data-unregistered payload occupies pre-startup frames. From the
@@ -332,8 +369,9 @@ if [[ "$VIDEO_ROTATION_DEGREES" != "0" ]]; then
 fi
 
 ffmpeg -hide_banner -loglevel error -y \
-    -f lavfi -i "testsrc2=duration=$VIDEO_DURATION_SECONDS:size=$VIDEO_SOURCE_SIZE:rate=$VIDEO_FRAME_RATE" \
-    -vf "setsar=$VIDEO_SAMPLE_ASPECT_RATIO" \
+    "${VIDEO_GENERATOR_INPUT_ARGS[@]}" \
+    -t "$VIDEO_DURATION_SECONDS" \
+    -vf "$VIDEO_FILTER" \
     "${VIDEO_CODEC_ARGS[@]}" \
     -tag:v hev1 \
     -b:v "$VIDEO_BITRATE" \
@@ -550,6 +588,14 @@ fi
     echo "videoMaxrate=$VIDEO_MAXRATE"
     echo "videoFormat=$VIDEO_FORMAT"
     echo "video=$VIDEO_DESCRIPTION"
+    if [[ -n "$HDR_REFERENCE_TRANSFER" ]]; then
+        echo "pixelEncodingPolicy=color-managed BT.2020 nonlinear RGB reference converted only through the BT.2020 non-constant-luminance matrix to limited-range 10-bit YCbCr"
+        echo "hdrReferenceTransfer=$HDR_REFERENCE_TRANSFER"
+        echo "hdrReferencePattern=COLOR_REFERENCE.ppm"
+        echo "hdrReferencePatternSHA256=$HDR_REFERENCE_PATTERN_SHA256"
+        echo "hdrReferenceGenerator=Scripts/generate-hybrid-hdr-reference-pattern.py"
+        echo "hdrReferenceGeneratorSHA256=$HDR_REFERENCE_GENERATOR_SHA256"
+    fi
     echo "geometryMode=$GEOMETRY_MODE"
     echo "sourceSize=$VIDEO_SOURCE_SIZE"
     echo "frameRate=$VIDEO_FRAME_RATE"

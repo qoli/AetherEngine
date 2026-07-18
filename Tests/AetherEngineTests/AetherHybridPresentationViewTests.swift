@@ -46,6 +46,19 @@ struct AetherHybridPresentationViewTests {
         }
     }
 
+    @Test("Renderer admits HDR10 and rejects an unverified HLG generation")
+    func verifiedColorAdmissionIsFailClosed() throws {
+        let view = AetherHybridPresentationView()
+
+        try view.beginGeneration(0, videoFormat: .hdr10)
+        #expect(view.diagnostics.generation == 0)
+        #expect(throws: AetherHybridPresentationError
+            .unsupportedVideoFormat(.hlg)) {
+            try view.beginGeneration(1, videoFormat: .hlg)
+        }
+        #expect(view.diagnostics.generation == 0)
+    }
+
     @Test("Old generations are discarded and a new generation flushes pending samples")
     func generationFlushAndStaleDiscard() throws {
         let view = AetherHybridPresentationView()

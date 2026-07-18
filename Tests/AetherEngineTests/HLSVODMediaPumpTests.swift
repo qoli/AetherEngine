@@ -1631,7 +1631,7 @@ final class HLSVODMediaPumpTests: XCTestCase {
             sourceKind: .hls,
             isSeekableVOD: true,
             videoCodec: .h264,
-            videoFormat: .hdr10
+            videoFormat: .hlg
         )
         let result = PlaybackPreflight.resolve(
             sourceProfile: source,
@@ -1642,7 +1642,7 @@ final class HLSVODMediaPumpTests: XCTestCase {
                 HybridPlaybackCapabilities(
                     hasDirectVideoDecoder: true,
                     hasSampleBufferRenderer: true,
-                    supportedVideoFormats: [.hdr10]
+                    supportedVideoFormats: [.hlg]
                 )
         )
         XCTAssertEqual(
@@ -1674,7 +1674,7 @@ final class HLSVODMediaPumpTests: XCTestCase {
                     }
                 )
             XCTFail(
-                "stale HDR capability unexpectedly created a public session"
+                "stale HLG capability unexpectedly created a public session"
             )
         } catch let error
                 as HybridPlaybackSessionError {

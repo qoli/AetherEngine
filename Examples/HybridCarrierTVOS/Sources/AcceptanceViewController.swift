@@ -764,38 +764,45 @@ final class AcceptanceViewController: UIViewController {
         session: AetherHybridPlaybackSession
     ) async throws {
         let expected = try expectedVideoFormat()
-        try await Task.sleep(for: .seconds(3))
-        try requireClockBound(
-            session,
-            step: "color-startup"
-        )
+        let deadline = ProcessInfo.processInfo.systemUptime + 15
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            if case .failed(let error) = session.state {
+                throw error
+            }
+            let diagnostics = session.diagnostics
+            guard diagnostics.videoFormat == expected else {
+                throw AcceptanceHarnessError.assertionFailed(
+                    step: "color-startup",
+                    detail: "expected \(videoFormatName(expected)), decoded \(videoFormatName(diagnostics.videoFormat))"
+                )
+            }
+            if diagnostics.renderer.carrierTimebaseBound,
+               diagnostics.renderer.rendererStatus == .rendering,
+               diagnostics.renderer.enqueuedSampleBuffers > 0,
+               (diagnostics.carrierTimeSeconds ?? 0) > 1 {
+                try requireClockBound(
+                    session,
+                    step: "color-startup"
+                )
+                print(
+                    "AETHER_ACCEPTANCE colorEvidence videoFormat=\(videoFormatName(expected)) generation=\(diagnostics.generation) timebaseBound=\(diagnostics.renderer.carrierTimebaseBound) renderer=\(diagnostics.renderer.rendererStatus.rawValue) enqueued=\(diagnostics.renderer.enqueuedSampleBuffers)"
+                )
+                recordCheckpoint(
+                    "color-\(videoFormatName(expected))-passed",
+                    session: session
+                )
+                setStatus(
+                    "color \(videoFormatName(expected)) passed",
+                    diagnostics: diagnostics
+                )
+                return
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
         let diagnostics = session.diagnostics
-        guard diagnostics.videoFormat == expected else {
-            throw AcceptanceHarnessError.assertionFailed(
-                step: "color-startup",
-                detail: "expected \(videoFormatName(expected)), decoded \(videoFormatName(diagnostics.videoFormat))"
-            )
-        }
-        guard diagnostics.renderer.rendererStatus
-                == .rendering,
-              diagnostics.renderer
-                .enqueuedSampleBuffers > 0,
-              (diagnostics.carrierTimeSeconds ?? 0) > 1 else {
-            throw AcceptanceHarnessError.assertionFailed(
-                step: "color-startup",
-                detail: "renderer or carrier clock did not advance"
-            )
-        }
-        print(
-            "AETHER_ACCEPTANCE colorEvidence videoFormat=\(videoFormatName(expected)) generation=\(diagnostics.generation) timebaseBound=\(diagnostics.renderer.carrierTimebaseBound) renderer=\(diagnostics.renderer.rendererStatus.rawValue) enqueued=\(diagnostics.renderer.enqueuedSampleBuffers)"
-        )
-        recordCheckpoint(
-            "color-\(videoFormatName(expected))-passed",
-            session: session
-        )
-        setStatus(
-            "color \(videoFormatName(expected)) passed",
-            diagnostics: diagnostics
+        throw AcceptanceHarnessError.assertionFailed(
+            step: "color-startup",
+            detail: "startup timed out after 15s carrierTime=\(diagnostics.carrierTimeSeconds ?? -1) rate=\(diagnostics.carrierRate) timeControl=\(diagnostics.carrierTimeControlStatus.rawValue) forwardBuffer=\(diagnostics.carrierForwardBufferSeconds ?? -1) pending=\(diagnostics.renderer.pendingSampleBuffers) enqueued=\(diagnostics.renderer.enqueuedSampleBuffers) timebaseBound=\(diagnostics.renderer.carrierTimebaseBound) renderer=\(diagnostics.renderer.rendererStatus.rawValue)"
         )
     }
 

@@ -36,7 +36,8 @@ struct PublicHybridPlaybackContractTests {
             .progressive,
             .custom,
         ])
-        #expect(capabilities.supportedVideoFormats == [.sdr])
+        #expect(capabilities.supportedVideoFormats == [.sdr, .hdr10])
+        #expect(capabilities.supportedDolbyVisionProfiles.isEmpty)
         #expect(
             AetherHybridPlaybackSession.systemFeaturePolicy
                 .availability(for: .pictureInPictureVideo)
@@ -58,6 +59,47 @@ struct PublicHybridPlaybackContractTests {
                     .presentationOverlayUnavailableOnExternalDisplay
                 )
         )
+    }
+
+    @Test("Public capabilities admit HDR10 and reject unverified color formats")
+    func publicColorAdmissionMatchesDeviceEvidence() {
+        let packaging = HLSVideoPackaging(
+            container: .fragmentedMP4,
+            sampleEntry: .hev1,
+            manifestCodecs: ["hev1"],
+            actualVideoCodec: .hevc,
+            codecVerification: .verified,
+            contentProtection: .none
+        )
+        let hdr10 = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .hls,
+                isSeekableVOD: true,
+                videoCodec: .hevc,
+                videoFormat: .hdr10
+            ),
+            hlsPackaging: packaging,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+        #expect(hdr10.route == .hybridCarrier)
+        #expect(hdr10.reason == .hybridHEV1SampleEntry)
+
+        for format in [VideoFormat.hlg, .hdr10Plus] {
+            let result = PlaybackPreflight.resolve(
+                sourceProfile: AetherSourceProfile(
+                    sourceKind: .hls,
+                    isSeekableVOD: true,
+                    videoCodec: .hevc,
+                    videoFormat: format
+                ),
+                hlsPackaging: packaging,
+                hybridCapabilities:
+                    AetherHybridPlaybackSession.capabilities
+            )
+            #expect(result.route == .unsupported)
+            #expect(result.reason == .unsupportedHybridVideoFormat)
+        }
     }
 
     @Test("Public capabilities admit graph-bound SDR HLS hybrid")
