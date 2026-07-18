@@ -9,8 +9,8 @@ geometry, AVPlayerViewController writer, Match Frame Rate, HDR/HLG/Dolby Vision 
 The source-level sample-buffer timing and metadata contract is implemented. A 2026-07-17 physical-device
 run passes the automated SDR clock, seek, pre-roll admission, bidirectional audio selection,
 recoverable origin-stall, geometry/cadence, host-negative, native WebVTT selection and visible-cue
-presentation, E-AC-3 JOC and styled ASS overlay select/seek/off/reselect, plus stop/reopen sub-matrix.
-Human display/audio/AVKit-menu confirmation, bitmap physical-fixture coverage, HDR panel-output, HDR10+ and Dolby
+presentation, E-AC-3 JOC, styled ASS and PGS bitmap overlay select/seek/off/reselect, plus stop/reopen
+sub-matrix. Human display/audio/AVKit-menu confirmation, HDR panel-output, HDR10+ and Dolby
 Vision remain pending. See
 [`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md). No unverified
 color format may be added to
@@ -35,7 +35,8 @@ sample-buffer renderer. HLS source `DEFAULT`/`AUTOSELECT`/`FORCED` values and pr
 selection semantics are preserved by the carrier master. The 2026-07-18 exact `78b6418` run also proves
 that Aether's presentation-only legible-output bridge places the selected common-format cue above the
 real-video layer; AVKit still owns the menu and carrier selection. AVKit menu visibility remains a
-separate UI check; bitmap/styled overlay selection is not covered by this row. See
+separate UI check; bitmap/styled overlay selection is not covered by this row. Progressive visible-cue
+placement also passes on the study Apple TV. See
 [`hybrid-native-webvtt-device-evidence-2026-07-18.md`](hybrid-native-webvtt-device-evidence-2026-07-18.md).
 
 ## Hybrid styled subtitle overlay tvOS device gate
@@ -43,8 +44,18 @@ separate UI check; bitmap/styled overlay selection is not covered by this row. S
 The standalone app's progressive VP9 + ASS mode exercises Aether's public overlay-track contract,
 AVKit custom-menu installation, real libass pixel output, explicit Off/reselect, and an exact seek
 generation on the same carrier timebase and real-video display layer. The 2026-07-17 study Apple TV run
-passes the automated row. Human-visible menu/cue confirmation and a legal bitmap-subtitle physical
-fixture remain pending.
+passes the automated row. Human-visible menu/cue confirmation and a copyright-clean bitmap-subtitle physical
+fixture were originally pending; the deterministic fixture and physical decoded-pixel row now pass in
+[`hybrid-progressive-subtitle-device-evidence-2026-07-18.md`](hybrid-progressive-subtitle-device-evidence-2026-07-18.md).
+
+## Hybrid bitmap subtitle overlay tvOS device gate
+
+The standalone app's copyright-clean VP9 + PGS mode verifies the public overlay-track contract, the
+AVKit `Aether Subtitles` custom menu, cue-off before its authored start, decoded bitmap pixels, exact
+composition placement, seek-generation rebuild, explicit Off/reselect, and the same carrier timebase and
+real-video display layer. The 2026-07-18 study Apple TV automated and XCUITest visual rows pass. No text
+conversion, host parser, second clock, second video renderer, or playback fallback is involved. See
+[`hybrid-progressive-subtitle-device-evidence-2026-07-18.md`](hybrid-progressive-subtitle-device-evidence-2026-07-18.md).
 
 ## `avplayer-open-check.swift` (#15, E8)
 

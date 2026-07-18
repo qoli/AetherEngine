@@ -9,11 +9,13 @@ generation replacement, clean aperture/SAR/quarter-turn rotation/source-cadence 
 all five host-contract negative cases, E-AC-3 JOC stream-copy startup/seek/selection/stall, and complete
 stop/reopen teardown. Native WebVTT also passes graph-bound preflight and AVFoundation
 select/deselect/reselect on the carrier. Styled ASS passes Aether overlay select/seek/off/reselect and
-AVKit custom-menu installation on the same carrier clock; bitmap physical-fixture evidence remains
-pending. HDR10 and HLG also have
+AVKit custom-menu installation on the same carrier clock. A deterministic PGS fixture also passes
+cue timing, decoded-pixel placement, seek-generation rebuild and select/off/reselect on the physical
+device. HDR10 and HLG also have
 engine/device candidate evidence, but remain unadmitted without human panel-mode and visual confirmation.
 See
-[`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md).
+[`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md) and
+[`hybrid-progressive-subtitle-device-evidence-2026-07-18.md`](hybrid-progressive-subtitle-device-evidence-2026-07-18.md).
 
 The complete physical gate remains pending. Source tests prove the bounded no-drop pending queue,
 monotonic timing, format-description propagation, HDR10+ per-frame attachment, and absence of

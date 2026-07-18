@@ -311,7 +311,8 @@ proves AVFoundation exposure and selection. A later exact `78b6418` study-device
 common-format cue presentation above the real-video layer; see
 [`hybrid-native-webvtt-device-evidence-2026-07-18.md`](hybrid-native-webvtt-device-evidence-2026-07-18.md).
 Human confirmation of the AVKit menu and panel appearance remains separate. Styled ASS selection is
-covered below; bitmap overlay remains pending.
+covered below. Progressive visible-cue and bitmap-overlay rows were subsequently closed by
+[`hybrid-progressive-subtitle-device-evidence-2026-07-18.md`](hybrid-progressive-subtitle-device-evidence-2026-07-18.md).
 
 ### Progressive plain-text source
 
@@ -347,8 +348,10 @@ finalCheckpoint: native-webvtt-selection-passed
 ```
 
 The automated row proves AVFoundation exposure and selection through a real progressive source. The
-presentation-only bridge is covered by the later HLS WebVTT visible-cue evidence; progressive-source
-visible-cue placement and human AVKit-menu confirmation remain pending.
+presentation-only bridge is covered by the later HLS WebVTT visible-cue evidence. A subsequent physical
+XCUITest also captured the progressive cue above real video; human AVKit-menu confirmation remains
+pending. See
+[`hybrid-progressive-subtitle-device-evidence-2026-07-18.md`](hybrid-progressive-subtitle-device-evidence-2026-07-18.md).
 
 ## Styled ASS overlay result
 
@@ -390,8 +393,9 @@ finalCheckpoint: styled-overlay-selection-passed at carrierTime 16.5660 seconds
 
 The automated row proves real decoded libass pixels on the presentation canvas, selection lifecycle,
 seek-generation rebuild, and AVKit menu installation through the public tvOS API. It does not substitute
-for a human confirming the menu and cue appearance on the attached display. Bitmap decode/composition
-has source-level coverage but still needs its own legal physical-device fixture.
+for a human confirming the menu and cue appearance on the attached display. The later deterministic PGS
+physical-device row closes bitmap decode/composition evidence; see
+[`hybrid-progressive-subtitle-device-evidence-2026-07-18.md`](hybrid-progressive-subtitle-device-evidence-2026-07-18.md).
 
 ## Source verification
 
@@ -454,8 +458,8 @@ the source contract was restored to `verifiedVideoFormats == [.sdr]` immediately
   presentation and styled ASS overlay lifecycle also pass; record both AVKit menus and human panel
   appearance. Record the downstream
   Atmos indicator for the JOC row.
-- Complete the bitmap subtitle physical-fixture row. Source-level composition evidence does not replace
-  physical decoded-pixel, placement, seek and selection evidence.
+- Bitmap subtitle physical-fixture row: closed on 2026-07-18 with decoded-pixel, placement, seek and
+  selection evidence.
 - Run independently identified HDR10, HLG, late-metadata HDR10+, and every promised Dolby Vision profile
   with panel-mode and metadata evidence. HDR10 and HLG already have engine/device candidates but still
   require human panel-mode and visual confirmation.

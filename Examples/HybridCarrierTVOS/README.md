@@ -56,6 +56,22 @@ seek-generation rebuild, the single `AVSampleBufferDisplayLayer`, and the bound 
 final checkpoint is `styled-overlay-selection-passed`. The fixture, provenance, and hashes are local and
 gitignored; the script refuses to overwrite them.
 
+To exercise Aether-owned bitmap subtitles, generate the deterministic VP9 + AAC + PGS fixture. The PGS
+pixels use a local 5x7 glyph generator, so no third-party font or media is embedded:
+
+```bash
+./Scripts/generate-hybrid-bitmap-subtitle-fixture.sh
+python3 Scripts/serve-hybrid-acceptance-fixture.py \
+  Fixtures/hybrid-vp9-pgs-overlay.mkv --port 8090
+```
+
+Launch with `AETHER_ACCEPTANCE_BITMAP_SUBTITLE_AUTORUN=1`. The generator fails if FFmpeg reports any
+PGS decode/mux warning or if the resulting stream, 1920x1080 composition canvas, or first-cue PTS differs
+from the exact fixture contract. The device row proves cue-off before 1.0 seconds, visible decoded pixels
+after the cue begins, a generation-changing seek to 16.5 seconds, explicit Off/reselect, the AVKit
+`Aether Subtitles` menu, the single display layer, and the exact carrier timebase. Its final checkpoint is
+`bitmap-overlay-selection-passed`.
+
 To verify that a progressive plain-text subtitle remains native to AVKit,
 generate the VP9 + AAC + SubRip fixture and serve that single file:
 
