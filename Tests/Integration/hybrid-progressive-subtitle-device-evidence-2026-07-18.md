@@ -102,6 +102,11 @@ study Apple TV bitmap console acceptance: pass
 study Apple TV progressive/bitmap XCUITest visible-cue screenshots: pass
 ```
 
+The later exact `1709459` physical Remote/XCUITest run also opens the public AVKit `Aether Subtitles`
+custom menu and verifies styled Off/reselect state while the same generation, carrier timebase and
+sample-buffer renderer remain healthy. See
+[`hybrid-avkit-media-selection-ui-device-evidence-2026-07-18.md`](hybrid-avkit-media-selection-ui-device-evidence-2026-07-18.md).
+
 Fallback added: **no**. Explicit failures include fixture-contract mismatch, subtitle decoder/renderer
 unavailability, carrier-item/timebase drift and terminal Hybrid session failure. A failed overlay track may
 turn that track Off under the approved subtitle-local graceful-degradation policy; it cannot start another

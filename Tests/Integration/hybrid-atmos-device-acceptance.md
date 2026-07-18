@@ -2,9 +2,14 @@
 
 ## Status
 
-Pending. Source-level routing and mux tests exist, but this gate is not passed until the exact
-fixture and evidence below have been exercised on physical tvOS hardware. Simulator or macOS
-AVPlayer results are not substitutes.
+Partial physical-device pass. The exact JOC fixture now passes startup, forward/backward seek,
+bidirectional JOC/AAC selection, controlled stall recovery, stop/reopen and privacy-safe bandwidth
+telemetry on the study Apple TV. A later Remote-driven physical XCUITest also proves both renditions are
+available through AVKit's native Audio panel and that JOC → AAC → JOC updates AVKit's selected state.
+The complete gate remains pending only for human audible-output confirmation and the downstream
+television/AVR Atmos indicator. Simulator or macOS AVPlayer results are not substitutes. See
+[`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md) and
+[`hybrid-avkit-media-selection-ui-device-evidence-2026-07-18.md`](hybrid-avkit-media-selection-ui-device-evidence-2026-07-18.md).
 
 ## Purpose
 

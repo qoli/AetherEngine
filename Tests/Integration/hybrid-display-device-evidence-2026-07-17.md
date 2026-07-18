@@ -62,7 +62,7 @@ build before installation. The physical-device run then passed startup, pause, 0
 forward/backward seek generation rebuilds, bidirectional audio selection, teardown and reopen on the
 single sample-buffer renderer. Console attachment was ended with SIGINT only after the final
 checkpoint. This is an ABI/playback smoke for the rebuilt dependencies, not legal approval for static
-App Store distribution and not a replacement for the pending human HDR/AVKit/Atmos rows.
+App Store distribution and not a replacement for the pending human HDR-panel/audible-Atmos rows.
 
 An initial launch against the stale local `Fixtures/hybrid-sdr-hev1-hls` directory ended in typed
 `hlsUnsupportedSeekableVODResourceGraph`. No provider, playback session, fallback route or renderer was
@@ -310,7 +310,8 @@ subtitle-only graceful degradation; it is not a playback fallback. The original 
 proves AVFoundation exposure and selection. A later exact `78b6418` study-device run also proves public
 common-format cue presentation above the real-video layer; see
 [`hybrid-native-webvtt-device-evidence-2026-07-18.md`](hybrid-native-webvtt-device-evidence-2026-07-18.md).
-Human confirmation of the AVKit menu and panel appearance remains separate. Styled ASS selection is
+The later exact `1709459` physical XCUITest closes AVKit native menu visibility and Remote-driven
+Off/On/Off/On selection; panel appearance is captured in the same result. Styled ASS selection is
 covered below. Progressive visible-cue and bitmap-overlay rows were subsequently closed by
 [`hybrid-progressive-subtitle-device-evidence-2026-07-18.md`](hybrid-progressive-subtitle-device-evidence-2026-07-18.md).
 
@@ -349,8 +350,8 @@ finalCheckpoint: native-webvtt-selection-passed
 
 The automated row proves AVFoundation exposure and selection through a real progressive source. The
 presentation-only bridge is covered by the later HLS WebVTT visible-cue evidence. A subsequent physical
-XCUITest also captured the progressive cue above real video; human AVKit-menu confirmation remains
-pending. See
+XCUITest also captured the progressive cue above real video; the exact `1709459` HLS-carrier XCUITest
+closes native AVKit menu visibility and Remote selection for the same carrier legible-group contract. See
 [`hybrid-progressive-subtitle-device-evidence-2026-07-18.md`](hybrid-progressive-subtitle-device-evidence-2026-07-18.md).
 
 ## Styled ASS overlay result
@@ -392,9 +393,9 @@ finalCheckpoint: styled-overlay-selection-passed at carrierTime 16.5660 seconds
 ```
 
 The automated row proves real decoded libass pixels on the presentation canvas, selection lifecycle,
-seek-generation rebuild, and AVKit menu installation through the public tvOS API. It does not substitute
-for a human confirming the menu and cue appearance on the attached display. The later deterministic PGS
-physical-device row closes bitmap decode/composition evidence; see
+seek-generation rebuild, and AVKit menu installation through the public tvOS API. The later exact
+`1709459` Remote XCUITest closes custom-menu visibility and Off/reselect state. The later deterministic
+PGS physical-device row closes bitmap decode/composition evidence; see
 [`hybrid-progressive-subtitle-device-evidence-2026-07-18.md`](hybrid-progressive-subtitle-device-evidence-2026-07-18.md).
 
 ## Source verification
@@ -457,15 +458,11 @@ the source contract was restored to `verifiedVideoFormats == [.sdr]` immediately
 
 - Match Dynamic Range / Match Frame Rate settings: closed on 2026-07-18. Record the actual display
   model/firmware and external-panel mode for each color row.
-- Visually confirm native AVKit controls, audible selected real audio, pause/rate video behavior, and
-  absence of the black carrier over the real image; also confirm the automated SAR/rotation/fit-fill
-  rows look correct on the panel.
-- Run AVKit-UI media selection. Programmatic bidirectional carrier media selection, controlled carrier
-  stall, E-AC-3 JOC stream-copy selection, automated geometry/rotation/cadence, and host-contract
-  negative cases already pass. Native WebVTT programmatic select/deselect/reselect, HLS visible-cue
-  presentation and styled ASS overlay lifecycle also pass; record both AVKit menus and human panel
-  appearance. Record the downstream
-  Atmos indicator for the JOC row.
+- Native AVKit controls, non-black real video and the audio/native-WebVTT/styled custom menus are closed
+  by physical XCUITest. Confirm audible selected real audio and the automated SAR/rotation/fit-fill rows
+  on the attached panel.
+- AVKit UI media selection is closed on 2026-07-18, including JOC → AAC → JOC, native WebVTT
+  Off/On/Off/On and styled Off/reselect. Record the downstream Atmos indicator for the JOC row.
 - Bitmap subtitle physical-fixture row: closed on 2026-07-18 with decoded-pixel, placement, seek and
   selection evidence.
 - Run independently identified HDR10, HLG, late-metadata HDR10+, and every promised Dolby Vision profile

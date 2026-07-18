@@ -76,6 +76,16 @@ hierarchy SHA256: 0616b4c1fe1494081777a62f60459c302e8f4e10015c5baf0daea7b6d8fb90
 
 The result bundle is local release evidence and is not a source dependency.
 
+## Supplemental native AVKit UI evidence
+
+The later exact `1709459` acceptance build adds an evidence-only mode that hides the sample app's
+custom transport buttons so they cannot compete with AVKit's focus environment. On the same physical
+Apple TV, a Remote-driven XCUITest opened `AVLegibleSettings`, verified On, Off and Language: English,
+then completed Off → On → Off → On. AVKit's selected state, the visible cue, route, generation,
+timebase and renderer were captured after every action. This closes the previously separate AVKit menu
+visibility row. See
+[`hybrid-avkit-media-selection-ui-device-evidence-2026-07-18.md`](hybrid-avkit-media-selection-ui-device-evidence-2026-07-18.md).
+
 ## Verification
 
 ```text

@@ -37,8 +37,8 @@ visible in Aether's presentation diagnostics, and prove that the exact carrier c
 renderer remain healthy. AVKit remains the selection UI; a presentation-only
 `AVPlayerItemLegibleOutput` bridge draws its public common-format attributed strings above Aether's real
 video because `contentOverlayView` necessarily sits above AVKit's own caption layer. This bridge does not
-fetch, parse, independently clock, or select another subtitle source. Human confirmation of the AVKit
-menu remains a separate UI row.
+fetch, parse, independently clock, or select another subtitle source. The physical Remote/XCUITest menu
+row is recorded in `Tests/Integration/hybrid-avkit-media-selection-ui-device-evidence-2026-07-18.md`.
 
 To exercise Aether-owned styled subtitles over the same carrier clock, generate the progressive VP9 +
 AAC + ASS fixture and serve the `Fixtures` directory from the Mac:

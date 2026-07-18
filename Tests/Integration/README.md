@@ -15,12 +15,14 @@ same display layer at PTS 12.0 without a route, generation, carrier-item, render
 The Dolby Vision Profile 8.4 technical row now passes exact configuration/base-layer admission,
 VideoToolbox metadata-propagation acceptance and 240-frame same-layer enqueue. A supplemental
 2026-07-18 physical-device run also records Match Dynamic Range and Match Frame Rate enabled and four
-non-black, bound-timebase framebuffer captures. Human display/audio/AVKit-menu confirmation and actual
-HDR/Dolby Vision panel-output remain pending. See
+non-black, bound-timebase framebuffer captures. Native AVKit Audio and WebVTT menu visibility plus
+Remote-driven bidirectional selection now pass on the same device. Human audible/Atmos confirmation and
+actual HDR/Dolby Vision panel-output remain pending. See
 [`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md) and
 [`hybrid-hdr10plus-device-evidence-2026-07-18.md`](hybrid-hdr10plus-device-evidence-2026-07-18.md), and
 [`hybrid-dolby-vision-profile84-device-evidence-2026-07-18.md`](hybrid-dolby-vision-profile84-device-evidence-2026-07-18.md), plus
-[`hybrid-match-content-framebuffer-evidence-2026-07-18.md`](hybrid-match-content-framebuffer-evidence-2026-07-18.md).
+[`hybrid-match-content-framebuffer-evidence-2026-07-18.md`](hybrid-match-content-framebuffer-evidence-2026-07-18.md) and
+[`hybrid-avkit-media-selection-ui-device-evidence-2026-07-18.md`](hybrid-avkit-media-selection-ui-device-evidence-2026-07-18.md).
 No unverified
 color format may be added to
 `AetherHybridPresentationView.verifiedVideoFormats`.
@@ -43,9 +45,10 @@ Apple TV runs pass select/deselect/reselect while retaining the same route, carr
 sample-buffer renderer. HLS source `DEFAULT`/`AUTOSELECT`/`FORCED` values and progressive container
 selection semantics are preserved by the carrier master. The 2026-07-18 exact `78b6418` run also proves
 that Aether's presentation-only legible-output bridge places the selected common-format cue above the
-real-video layer; AVKit still owns the menu and carrier selection. AVKit menu visibility remains a
-separate UI check; bitmap/styled overlay selection is not covered by this row. Progressive visible-cue
-placement also passes on the study Apple TV. See
+real-video layer; AVKit still owns the menu and carrier selection. The later exact `1709459` physical
+XCUITest closes AVKit menu visibility and Remote-driven Off/On/Off/On selection. Bitmap/styled overlay
+selection is not covered by this row. Progressive visible-cue placement also passes on the study Apple
+TV. See
 [`hybrid-native-webvtt-device-evidence-2026-07-18.md`](hybrid-native-webvtt-device-evidence-2026-07-18.md).
 
 ## Hybrid styled subtitle overlay tvOS device gate
@@ -53,9 +56,11 @@ placement also passes on the study Apple TV. See
 The standalone app's progressive VP9 + ASS mode exercises Aether's public overlay-track contract,
 AVKit custom-menu installation, real libass pixel output, explicit Off/reselect, and an exact seek
 generation on the same carrier timebase and real-video display layer. The 2026-07-17 study Apple TV run
-passes the automated row. Human-visible menu/cue confirmation and a copyright-clean bitmap-subtitle physical
-fixture were originally pending; the deterministic fixture and physical decoded-pixel row now pass in
-[`hybrid-progressive-subtitle-device-evidence-2026-07-18.md`](hybrid-progressive-subtitle-device-evidence-2026-07-18.md).
+passes the automated row. The later exact `1709459` Remote XCUITest also proves the visible `Aether
+Subtitles` custom menu and Off/reselect states. A copyright-clean bitmap-subtitle physical fixture was
+originally pending; the deterministic fixture and physical decoded-pixel row now pass in
+[`hybrid-progressive-subtitle-device-evidence-2026-07-18.md`](hybrid-progressive-subtitle-device-evidence-2026-07-18.md) and
+[`hybrid-avkit-media-selection-ui-device-evidence-2026-07-18.md`](hybrid-avkit-media-selection-ui-device-evidence-2026-07-18.md).
 
 ## Hybrid bitmap subtitle overlay tvOS device gate
 
