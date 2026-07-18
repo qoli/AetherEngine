@@ -22,14 +22,16 @@ unsupported before provider/session creation.
 ```text
 status: technical-pass; panel-mode-and-visual-pending
 localRunDate: 2026-07-18 Asia/Shanghai
-aetherCandidateCommit: aaa2eb038405798b8497181e3ef45cc4bf6554ce
-aetherCandidateParent: 600f715
+aetherFeatureCommit: aaa2eb038405798b8497181e3ef45cc4bf6554ce
+aetherCorrectedCandidateCommit: 606efb19c01c17e3d6a516f516ee5e134fce9815
+aetherFeatureParent: 600f715
 branch: feat/syncnext-hybrid-carrier
 xcode: 26.4.1 (17E202)
 sdk: AppleTVOS 26.4
 configuration: Debug
 acceptanceLauncherSHA256: e36578ec6814162b85a6e6d15226056255c3f4767d4c04f57b9101dc1a2358ed
 acceptanceDebugDylibSHA256: db25790a36af7c3e803559d2bcf1f855fec35d7bd31063db819045ba6a907dca
+correctedCandidateDiagnosticDylibSHA256: 81a36829cc4fd5e0393ad8a7888f4e53df541f930f6007153e0862be1cb98381
 deviceName: 書房 Apple TV
 deviceReality: physical
 appleTVModel: AppleTV6,2
@@ -50,6 +52,41 @@ commit plus exactly two temporary admission edits: `.dolbyVision` was added to
 `verifiedVideoFormats`, and `.profile84` was added to `supportedDolbyVisionProfiles`. Both edits were
 restored after the run and are absent from the candidate commit. They did not add another player,
 route, decoder, renderer, audio owner or clock.
+
+## Plain-HLG regression correction
+
+The first feature commit exposed a negative cross-format interaction during preparation of the longer
+human-observation fixtures: any plain HEVC Main10 HLG/BT.2020 stream satisfied the P8.4-compatible base
+layer check even when it carried no Dolby Vision configuration. The probe therefore published a
+Dolby Vision base-layer fact with `dolbyVisionConfiguration=none`, and preflight correctly rejected the
+contradictory fact pair as `unsupportedDolbyVisionConfigurationMismatch`.
+
+Corrected candidate `606efb19c01c17e3d6a516f516ee5e134fce9815` scopes the compatible-base-layer fact to streams that
+also carry an explicit Dolby Vision configuration record. It does not relax the P8.4 checks. New unit
+tests require both sides of the boundary: plain HLG has no Dolby Vision fact, while a configured P8.4
+stream can retain the positive base-layer fact. A separate route test requires plain HLG `hev1` VOD to
+remain `.hybridCarrier`.
+
+The corrected diagnostic app was rebuilt, reinstalled and exercised against independent 60-second HLG
+and P8.4 fixtures on the same study-room Apple TV:
+
+```text
+HLG fixture SHA256SUMS file: 69ae905c2ee2689fc649f7afb5bae15800156ef57a4cc79571986deb8bf5bd6c
+HLG preflight: hybridCarrier; configuration none; P8.4 base-layer fact false
+HLG checkpoint: color-hlg-passed; generation 0; timebase bound; renderer rendering; enqueued 74
+HLG console SHA256: 0d7e954a42df0c2c3a656355447c1a17f9f917543261456a0352a983835e3cdf
+
+P8.4 fixture SHA256SUMS file: e23b93464f870a820b949b32ed43c7aed527aad8a5e296cb231a39d494ba9c88
+P8.4 preflight: hybridCarrier; exact configuration present; P8.4 base-layer fact true
+P8.4 decoder: dvvC admitted; VideoToolbox metadata propagation accepted
+P8.4 checkpoint: color-dolbyvision-passed; generation 0; timebase bound; renderer rendering; enqueued 74
+P8.4 console SHA256: 09cb3d5de348750627ad52081e473dbdf904f4e059d55a0a79b4fb04b965343c
+```
+
+Both runs used the same diagnostic admission delta described above. It was again removed after the
+build; the corrected production tree remains SDR-only. Full `swift test` and the Release generic tvOS
+build pass on the corrected candidate. This corrected commit supersedes `aaa2eb0` for any later
+Syncnext pin or release review.
 
 ## Public API and profile contract
 
