@@ -2,6 +2,15 @@ import XCTest
 @testable import AetherEngine
 
 final class DolbyVisionConfigurationTests: XCTestCase {
+    func testPlainHLGBaseLayerIsNotDolbyVisionEvidenceWithoutConfiguration() {
+        XCTAssertFalse(
+            AetherEngine.scopedDolbyVisionProfile84BaseLayerEvidence(
+                configuration: nil,
+                baseLayerMatches: true
+            )
+        )
+    }
+
     func testProfile84SerializesExact24ByteDVVCRecord() throws {
         let configuration = AetherDolbyVisionConfiguration(
             versionMajor: 1,
@@ -16,6 +25,12 @@ final class DolbyVisionConfigurationTests: XCTestCase {
         )
 
         XCTAssertEqual(configuration.verifiedHybridProfile, .profile84)
+        XCTAssertTrue(
+            AetherEngine.scopedDolbyVisionProfile84BaseLayerEvidence(
+                configuration: configuration,
+                baseLayerMatches: true
+            )
+        )
         let bytes = try XCTUnwrap(configuration.profile84DVVCData())
         XCTAssertEqual(bytes.count, 24)
         XCTAssertEqual(

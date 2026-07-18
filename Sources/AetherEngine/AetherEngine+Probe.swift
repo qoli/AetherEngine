@@ -66,8 +66,12 @@ extension AetherEngine {
             dolbyVisionConfiguration =
                 Self.dolbyVisionConfiguration(stream: stream)
             hasVerifiedDolbyVisionProfile84BaseLayer =
-                Self.hasVerifiedDolbyVisionProfile84BaseLayer(
-                    stream: stream
+                Self.scopedDolbyVisionProfile84BaseLayerEvidence(
+                    configuration: dolbyVisionConfiguration,
+                    baseLayerMatches: dolbyVisionConfiguration != nil
+                        && Self.hasVerifiedDolbyVisionProfile84BaseLayer(
+                            stream: stream
+                        )
                 )
         }
         let codecName: String? = {

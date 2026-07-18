@@ -96,6 +96,16 @@ public struct AetherDolbyVisionConfiguration:
 }
 
 extension AetherEngine {
+    /// A Main10 HLG/BT.2020 stream is not Dolby Vision evidence by itself.
+    /// Scope the compatible-base-layer fact to a stream that also carries an
+    /// explicit Dolby Vision configuration record.
+    nonisolated static func scopedDolbyVisionProfile84BaseLayerEvidence(
+        configuration: AetherDolbyVisionConfiguration?,
+        baseLayerMatches: Bool
+    ) -> Bool {
+        configuration != nil && baseLayerMatches
+    }
+
     /// Read the authoritative Dolby Vision configuration from FFmpeg coded
     /// side data. Missing or truncated data is not inferred from an RPU NAL or
     /// a manifest codec token.

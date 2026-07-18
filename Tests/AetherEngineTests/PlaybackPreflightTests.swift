@@ -85,6 +85,17 @@ final class PlaybackPreflightTests: XCTestCase {
         XCTAssertEqual(result.reason, .hybridHEV1SampleEntry)
     }
 
+    func testPlainHLGWithoutDolbyVisionConfigurationUsesHybridCarrier() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(format: .hlg),
+            hlsPackaging: hls(sampleEntry: .hev1),
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .hybridCarrier)
+        XCTAssertEqual(result.reason, .hybridHEV1SampleEntry)
+    }
+
     func testHEVCInMPEGTransportVODUsesHybridCarrier() {
         let result = PlaybackPreflight.resolve(
             sourceProfile: source(),
