@@ -18,7 +18,8 @@ Profile 8.4 now has exact configuration/base-layer admission, VideoToolbox metad
 acceptance, plus a 60-second living-room Apple TV/LG C3 pass with explicit Dolby Vision panel mode,
 correct human-observed color, 1440 frames and a bound renderer through end of stream. Profile 8.4 is
 production-admitted; HDR10+ remains unadmitted until a compatible display supplies its panel-mode and
-visual confirmation.
+visual confirmation. The final Syncnext integration pin `c17a8f56` also reruns the late-T.35 technical
+row through end of stream on the study-room Apple TV; this does not substitute for a compatible panel.
 See
 [`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md),
 [`hybrid-hdr10-device-evidence-2026-07-18.md`](hybrid-hdr10-device-evidence-2026-07-18.md),
@@ -27,14 +28,15 @@ See
 [`hybrid-dolby-vision-profile84-device-evidence-2026-07-18.md`](hybrid-dolby-vision-profile84-device-evidence-2026-07-18.md), and
 [`hybrid-progressive-subtitle-device-evidence-2026-07-18.md`](hybrid-progressive-subtitle-device-evidence-2026-07-18.md).
 
-The complete physical gate remains pending for HDR10+ and the remaining visual sub-rows. Source tests
-prove the bounded no-drop pending queue,
+The promised-format physical gate remains pending only for the HDR10+ compatible-panel positive row.
+The household equipment cannot supply that row, so production keeps HDR10+ typed unsupported. Source
+tests prove the bounded no-drop pending queue,
 monotonic timing, format-description propagation, HDR10+ per-frame attachment, and absence of
 `DisplayImmediately`. The physical late-HDR10+ run also proves first attachment after startup without
 changing the Hybrid graph. The Profile 8.4 run proves exact candidate admission, VideoToolbox property
 acceptance, same-layer enqueue, explicit Dolby Vision panel mode and human visual correctness. The
-remaining partial runs do not prove the outstanding visual/audio rows. Automated geometry passes, but its final human
-visible-orientation/crop confirmation remains part of the visual row.
+automated geometry/cadence rows establish the locked Syncnext cutover geometry contract; they do not
+make an HDR10+ display-mode claim.
 
 `AetherHybridPresentationView.verifiedVideoFormats` is
 `[.sdr, .hdr10, .hlg, .dolbyVision]`, and public Dolby Vision capability is exactly `[.profile84]`.

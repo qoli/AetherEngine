@@ -24,7 +24,9 @@ Profile 8.4 fixture activates the LG C3's explicit Dolby Vision mode, looks corr
 observer, and reaches end of stream with 1440 frames on the same bound display layer. Production
 admission is therefore `[.sdr, .hdr10, .hlg, .dolbyVision]`, with Dolby Vision restricted to
 `[.profile84]`. HDR10+ remains pending on a compatible display; the LG C3 cannot provide that positive
-panel row. See
+panel row and the owner has confirmed that no household display can provide it. A final-pin
+`c17a8f56` study-device rerun nevertheless closes the exact-source late-T.35 technical row through end
+of stream; it does not change production admission. See
 [`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md) and
 [`hybrid-hdr10-device-evidence-2026-07-18.md`](hybrid-hdr10-device-evidence-2026-07-18.md),
 [`hybrid-hlg-device-evidence-2026-07-18.md`](hybrid-hlg-device-evidence-2026-07-18.md),
