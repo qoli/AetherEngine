@@ -16,8 +16,8 @@ The Dolby Vision Profile 8.4 technical row now passes exact configuration/base-l
 VideoToolbox metadata-propagation acceptance and 240-frame same-layer enqueue. A supplemental
 2026-07-18 physical-device run also records Match Dynamic Range and Match Frame Rate enabled and four
 non-black, bound-timebase framebuffer captures. Native AVKit Audio and WebVTT menu visibility plus
-Remote-driven bidirectional selection now pass on the same device. Human audible/Atmos confirmation and
-actual HDR/Dolby Vision panel-output remain pending. See
+Remote-driven bidirectional selection now passes on the same device, and the living-room JOC → AAC → JOC
+Atmos-output round trip passes. Actual HDR/Dolby Vision panel-output remains pending. See
 [`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md) and
 [`hybrid-hdr10plus-device-evidence-2026-07-18.md`](hybrid-hdr10plus-device-evidence-2026-07-18.md), and
 [`hybrid-dolby-vision-profile84-device-evidence-2026-07-18.md`](hybrid-dolby-vision-profile84-device-evidence-2026-07-18.md), plus
@@ -36,9 +36,18 @@ bidirectional JOC/AAC selection, recoverable stall and stop/reopen rows pass on 
 The acceptance generator now packet-repeats a shorter licensed JOC vector under stream-copy so the
 requested human-observation duration is not silently truncated; 40-second and 192-second equal-segment
 fixtures pass exact duration/profile/provenance checks.
-The mini acceptance app is now destination-built, installed and technically running on the living-room
-Apple TV, which owns the final downstream audio-chain row. The audible JOC/AAC distinction and
-television/receiver Atmos indicator remain human observations, so the complete gate is still pending.
+The mini acceptance app is destination-built, installed and technically running on the living-room
+Apple TV, which owns the final downstream audio-chain row. The first 2026-07-18 human observation did
+not activate Atmos; after rebuilding, reinstalling and relaunching the same dual-rendition stream-copy
+graph, the LG C3 activated Dolby Atmos normally. A private-fixture diagnostic also proves byte-identical
+JOC access units and `dec3` across the source/carrier remux. The same relaunched run closes the human
+round trip: `audio_2` did not present as Atmos and returning to `audio_1` restored Atmos, matching the
+recorded JOC generation 0 → AAC generation 1 → JOC generation 2 selection sequence. The Atmos device
+sub-gate therefore passes. A one-time end-of-stream presentation failure near 185.557 seconds did not
+recur in three controlled study-Apple-TV runs: 24-second generation 0, 24-second generation 4, and the
+exact 192-second generation-4 graph all reached `sessionEnded` with the renderer still `rendering`. The
+exact long rerun completed all 48 carrier segments at 192.039728 seconds with no fallback. Aether retains
+privacy-safe renderer-failure boundary diagnostics, but no unproved recovery or functional fix was added.
 
 ## Hybrid native WebVTT tvOS device gate
 

@@ -2,12 +2,17 @@
 
 ## Status
 
-Partial physical-device pass. The exact JOC fixture now passes startup, forward/backward seek,
-bidirectional JOC/AAC selection, controlled stall recovery, stop/reopen and privacy-safe bandwidth
-telemetry on the study Apple TV. A later Remote-driven physical XCUITest also proves both renditions are
-available through AVKit's native Audio panel and that JOC → AAC → JOC updates AVKit's selected state.
-The complete gate remains pending only for human audible-output confirmation and the downstream
-television/AVR Atmos indicator. Simulator or macOS AVPlayer results are not substitutes. See
+Technical physical-device rows and the final living-room downstream Atmos indicator pass. The exact JOC
+fixture passes startup, forward/backward seek, bidirectional JOC/AAC selection, controlled stall recovery,
+stop/reopen and privacy-safe bandwidth telemetry on the study Apple TV. A later Remote-driven physical
+XCUITest also proves both renditions are available through AVKit's native Audio panel and that JOC → AAC
+→ JOC updates AVKit's selected state. On the designated living-room Apple TV and LG C3 output chain, the
+first human observation reported no Atmos activation; after the acceptance app was rebuilt, reinstalled
+and relaunched with the same dual-rendition fixture and production carrier policy, the observer confirmed
+normal Dolby Atmos activation. That later result is the final downstream-indicator outcome, while the
+same uninterrupted human observation also confirms the complete JOC → AAC → JOC output transition:
+the second rendition did not present as Atmos, and returning to the first rendition restored Atmos.
+Technical selection state, simulator or macOS AVPlayer results are not substitutes. See
 [`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md) and
 [`hybrid-avkit-media-selection-ui-device-evidence-2026-07-18.md`](hybrid-avkit-media-selection-ui-device-evidence-2026-07-18.md).
 
@@ -106,7 +111,7 @@ device: physical Apple TV 4K (3rd generation, AppleTV14,1 / J255AP)
 tvOS: 26.5 (23L471)
 CoreDeviceID: 091555FF-9FE8-5A47-B90A-CBDDC737E052
 XcodeDestinationID: 00008110-000C613A1142801E
-AetherRevision: 1715720
+AetherRevision: 01a2224
 configuration: Debug; destination-specific signed device build
 build: pass
 install: pass
@@ -123,15 +128,87 @@ selectedStartupRendition: E-AC-3 JOC stream-copy
 carrierTimebaseBound: true
 renderer: rendering
 fallbackRouteCount: 0
-humanJOCToAACAudibleDifference: pending
-humanAACToJOCAudibleReturn: pending
-downstreamAtmosIndicator: pending
+humanJOCToAACAtmosTransition: pass — audio_2 did not present as Atmos
+humanAACToJOCAtmosReturn: pass — audio_1 restored Atmos
+downstreamAtmosIndicatorFirstObservation: fail — LG C3 did not activate Dolby Atmos
+downstreamAtmosIndicatorFinalObservation: pass — LG C3 activated Dolby Atmos normally
+audioSelectionGenerations: JOC generation 0 -> AAC generation 1 -> JOC generation 2
+atmosDeviceGate: pass
 ```
 
 The app deliberately exposes AVKit's native Audio panel and no competing custom transport controls.
-Only a human JOC → AAC → JOC observation plus the living-room television/receiver Atmos indicator may
-close the remaining rows. Successful installation, selected-state telemetry or an Apple TV screenshot
-cannot substitute for those observations.
+The first human result was negative, but the final repeated observation is positive: the LG C3 activated
+Dolby Atmos normally on the exact stream-copy JOC rendition. Both observations remain recorded because
+the intervening rebuild/reinstall/relaunch means no root cause may be inferred from the recovery. During
+the relaunched run, the observer then selected `audio_2`,
+confirmed that output was no longer Atmos, and selected `audio_1`, which restored Atmos. The loopback
+requests and provider generations independently recorded JOC generation 0 → AAC generation 1 → JOC
+generation 2. This closes the human Atmos round trip without adding audio transcode, automatic track
+selection, route switching or another runtime fallback.
+
+### End-of-stream presentation incident follow-up — 2026-07-18
+
+The first 192-second living-room observation run exposed an independent long-play failure after all 48
+carrier segments had completed. At carrier time approximately 185.557 seconds, the sample-buffer
+presentation path failed closed with `AVFoundationErrorDomain(-11847): Operation Interrupted`, surfaced
+as typed `presentationFailed`. No fallback route, player, renderer or audio pipeline started. This does
+not negate the successful Atmos and bidirectional audio-selection evidence.
+
+Aether `c61dae6` adds privacy-safe failure-boundary fields for renderer status, flush requirement,
+generation, queue counts, carrier time/duration and last accepted/enqueued video time. It also adds two
+acceptance-only EOS modes: a generation-0 baseline and a generation-4 run after two JOC/AAC round trips.
+Neither mode changes the player, route, renderer or failure policy.
+
+Three controlled follow-up runs on the designated study Apple TV did not reproduce the incident:
+
+```text
+deviceName: 書房電視
+device: physical Apple TV 4K (AppleTV6,2)
+tvOS: 26.5 (23L471)
+CoreDeviceID: 4F403AE1-B129-5248-BC6E-31DFDD75B422
+AetherRevision: c61dae6
+24SecondGeneration0: pass — sessionEnded=24.056883, renderer=rendering
+24SecondGeneration4: pass — sessionEnded=24.056847, renderer=rendering
+192SecondGeneration4: pass — sessionEnded=192.039728, renderer=rendering
+192SecondCarrierSegments: 48/48 complete
+192SecondEnqueuedSampleBuffers: 4640
+192SecondPendingSampleBuffersAtEnd: 0
+fallbackRouteCount: 0
+swiftTest: 738 tests / 130 suites pass
+```
+
+The incident is therefore classified as a non-reproduced single observation rather than a fixed defect.
+No special-case `-11847` suppression, flush/retry, renderer replacement or other runtime fallback was
+added. The exact-length generation-4 rerun closes this EOS follow-up for Gate 1A while retaining the new
+diagnostics for any recurrence.
+
+### Licensed JOC carrier-integrity diagnostic — 2026-07-18
+
+The initial negative observation exposed a real automated-evidence gap: the earlier JOC unit test set
+`codecpar.profile = 30` on a synthetic E-AC-3 stream and therefore proved routing and master metadata,
+but not that a licensed JOC access unit survived the carrier remux. Aether `01a2224` adds a private-fixture
+integration diagnostic that skips unless the caller explicitly supplies the licensed fixture URL and
+local directory. It prints no URL, path or compressed bytes.
+
+The exact 192-second fixture produced this result:
+
+```text
+sourceProfile: 30
+carrierProfile: 30
+accessUnitsCompared: 125
+compressedBytesCompared: 224000
+compressedPayloadIdentity: true
+sourceDEC3Bytes: 15
+carrierDEC3Bytes: 15
+dec3Identity: true
+carrierSampleEntry: ec-3
+```
+
+This bounds the carrier remux: its first output fragment retains the source JOC compressed payload and
+the same `EC3SpecificBox`. It does not prove the HDMI/eARC render by itself. The acceptance app also
+records `AVAudioSession.renderingMode` without activating or reconfiguring the session; Apple documents
+that property as `notApplicable` on HDMI, so it is diagnostic only and never overrides the LG C3 human
+indicator.
 
 ## Purpose
 
