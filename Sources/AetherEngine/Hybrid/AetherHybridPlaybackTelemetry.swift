@@ -176,7 +176,7 @@ public enum AetherHybridPlaybackTelemetryState:
 /// Error descriptions remain local diagnostics because transport and decoder
 /// messages can contain source details. Track and segment identities are
 /// carried by the typed event fields when they are part of the admitted graph.
-public enum AetherHybridAudioAnalysisTelemetryFailure:
+public enum AetherAudioAnalysisTelemetryFailure:
     String,
     Sendable,
     Equatable
@@ -187,6 +187,7 @@ public enum AetherHybridAudioAnalysisTelemetryFailure:
     case sourceNotSeekable
     case sourceCannotCreateIndependentReader
     case audioTrackUnavailable
+    case sourceTrackContractChanged
     case rangeOutsideSource
     case contentProtectionUnsupported
     case hlsResourceFailure
@@ -211,6 +212,8 @@ public enum AetherHybridAudioAnalysisTelemetryFailure:
             .sourceCannotCreateIndependentReader
         case .audioTrackUnavailable:
             .audioTrackUnavailable
+        case .sourceTrackContractChanged:
+            .sourceTrackContractChanged
         case .rangeOutsideSource:
             .rangeOutsideSource
         case .contentProtectionUnsupported:
@@ -233,14 +236,14 @@ public enum AetherHybridAudioAnalysisTelemetryFailure:
     }
 }
 
-public enum AetherHybridAudioAnalysisTelemetryPhase:
+public enum AetherAudioAnalysisTelemetryPhase:
     Sendable,
     Equatable
 {
     case started
     case progress
     case completed
-    case failed(AetherHybridAudioAnalysisTelemetryFailure)
+    case failed(AetherAudioAnalysisTelemetryFailure)
 }
 
 /// Privacy-safe lifecycle snapshot for one independent analysis cursor.
@@ -249,7 +252,7 @@ public enum AetherHybridAudioAnalysisTelemetryPhase:
 /// includes validated immutable-byte reuse and admitted HLS payload reuse;
 /// `sourceFetchedBytes` includes origin bytes fetched by this request. Neither
 /// counter is used to select a route, track, decoder or recovery action.
-public struct AetherHybridAudioAnalysisTelemetry:
+public struct AetherAudioAnalysisTelemetry:
     Sendable,
     Equatable
 {
@@ -257,7 +260,7 @@ public struct AetherHybridAudioAnalysisTelemetry:
     public let audioTrackID: Int
     public let rangeStartSeconds: Double
     public let rangeEndSeconds: Double
-    public let phase: AetherHybridAudioAnalysisTelemetryPhase
+    public let phase: AetherAudioAnalysisTelemetryPhase
     public let decodedUntilSeconds: Double?
     public let bufferedFrames: Int64
     public let sourceCacheHitBytes: Int64
@@ -270,7 +273,7 @@ public struct AetherHybridAudioAnalysisTelemetry:
         audioTrackID: Int,
         rangeStartSeconds: Double,
         rangeEndSeconds: Double,
-        phase: AetherHybridAudioAnalysisTelemetryPhase,
+        phase: AetherAudioAnalysisTelemetryPhase,
         decodedUntilSeconds: Double?,
         bufferedFrames: Int64,
         sourceCacheHitBytes: Int64,
@@ -292,6 +295,16 @@ public struct AetherHybridAudioAnalysisTelemetry:
             pausedForPlaybackDurationSeconds
     }
 }
+
+/// Source-compatible aliases for the original Hybrid-prefixed names. Audio
+/// analysis is backend-neutral and is now shared by native and Hybrid
+/// sessions; the aliases avoid breaking existing package clients.
+public typealias AetherHybridAudioAnalysisTelemetryFailure =
+    AetherAudioAnalysisTelemetryFailure
+public typealias AetherHybridAudioAnalysisTelemetryPhase =
+    AetherAudioAnalysisTelemetryPhase
+public typealias AetherHybridAudioAnalysisTelemetry =
+    AetherAudioAnalysisTelemetry
 
 /// Generation-bound timeline point for carrier, decoded-frame and seek events.
 public struct AetherHybridTimelineTelemetry:
@@ -398,7 +411,7 @@ public enum AetherHybridPlaybackTelemetryPayload:
     case bufferStateChanged(AetherHybridBufferTelemetry)
     case sessionEnded(AetherHybridSessionEndReason)
     case sessionFailed(AetherHybridPlaybackTelemetryFailure)
-    case audioAnalysis(AetherHybridAudioAnalysisTelemetry)
+    case audioAnalysis(AetherAudioAnalysisTelemetry)
 }
 
 /// Why a structured snapshot was emitted.

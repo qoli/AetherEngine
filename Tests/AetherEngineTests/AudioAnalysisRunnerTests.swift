@@ -110,4 +110,71 @@ final class AudioAnalysisRunnerTests: XCTestCase {
         XCTAssertEqual(reader.accessCount(), 0)
         XCTAssertEqual(reader.closeCount(), 1)
     }
+
+    func testBoundURLRejectsChangedSourceTrackContract() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("source.wav")
+        try makeWAV(
+            sampleRate: 48_000,
+            channels: 1,
+            seconds: 1
+        ).write(to: url)
+        let probe = try AetherEngine.probe(url: url)
+        let actual = try XCTUnwrap(probe.audioTracks.first)
+        let changed = TrackInfo(
+            id: actual.id,
+            name: actual.name + " changed",
+            codec: actual.codec,
+            language: actual.language,
+            channels: actual.channels,
+            bitrate: actual.bitrate,
+            isDefault: actual.isDefault,
+            isForced: actual.isForced,
+            isHearingImpaired: actual.isHearingImpaired,
+            isCommentary: actual.isCommentary,
+            isAtmos: actual.isAtmos,
+            assHeader: actual.assHeader,
+            isExternal: actual.isExternal
+        )
+        let request = try AudioAnalysisRequest(
+            audioTrackID: 99,
+            range: 0 ..< 0.5
+        )
+        let session = AudioAnalysisSession()
+        let stream = AudioAnalysisStream(
+            gate: session.gate,
+            cancel: { session.cancel() }
+        )
+        let task = Task.detached {
+            await AudioAnalysisRunner.run(
+                session: session,
+                input: .boundURL(
+                    url,
+                    httpHeaders: [:],
+                    sourceByteStore: nil,
+                    sourceTrack: changed
+                ),
+                request: request
+            )
+        }
+        session.install(task: task)
+
+        var iterator = stream.makeAsyncIterator()
+        do {
+            _ = try await iterator.next()
+            XCTFail("changed track contract produced PCM")
+        } catch let error as AudioAnalysisError {
+            XCTAssertEqual(
+                error,
+                .sourceTrackContractChanged(audioTrackID: 99)
+            )
+        }
+        await task.value
+    }
 }

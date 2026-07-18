@@ -21,7 +21,9 @@ extension AetherEngine {
         guard let loadedURL else {
             throw AudioAnalysisError.noActiveSession
         }
-        guard audioTracks.contains(where: { $0.id == request.audioTrackID }) else {
+        guard let sourceTrack = audioTracks.first(
+            where: { $0.id == request.audioTrackID }
+        ) else {
             throw AudioAnalysisError.audioTrackUnavailable(request.audioTrackID)
         }
 
@@ -35,10 +37,11 @@ extension AetherEngine {
             }
             input = .reader(reader, formatHint: customFormatHint)
         } else {
-            input = .url(
+            input = .boundURL(
                 loadedURL,
                 httpHeaders: loadedOptions.httpHeaders,
-                sourceByteStore: nil
+                sourceByteStore: nil,
+                sourceTrack: sourceTrack
             )
         }
 

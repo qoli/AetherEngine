@@ -62,11 +62,18 @@ public enum AetherPlaybackSessionFactory {
             )
             switch preflight.result.route {
             case .nativeAVPlayer:
+                let analysisBinding = try await
+                    makeNativeHLSAudioAnalysisBinding(
+                        url: url,
+                        options: options,
+                        preflight: preflight
+                    )
                 return .native(
                     try AetherNativePlaybackSession.make(
                         url: url,
                         options: options,
-                        preflightResult: preflight.result
+                        preflightResult: preflight.result,
+                        audioAnalysisBinding: analysisBinding
                     )
                 )
             case .hybridCarrier:
@@ -108,7 +115,12 @@ public enum AetherPlaybackSessionFactory {
                     try AetherNativePlaybackSession.make(
                         url: url,
                         options: options,
-                        preflightResult: result
+                        preflightResult: result,
+                        audioAnalysisBinding: .progressive(
+                            sourceURL: url,
+                            httpHeaders: options.httpHeaders,
+                            probe: probe
+                        )
                     )
                 )
             case .hybridCarrier:
@@ -137,5 +149,48 @@ public enum AetherPlaybackSessionFactory {
         case .custom:
             throw AetherPlaybackSessionFactoryError.invalidURLSourceKind
         }
+    }
+
+    private static func makeNativeHLSAudioAnalysisBinding(
+        url: URL,
+        options: LoadOptions,
+        preflight: AetherHLSPlaybackPreflight
+    ) async throws -> AetherNativeAudioAnalysisBinding {
+        guard AetherNativeAudioAnalysisBinding
+                .hlsRequiresSourceProbe(preflight) else {
+            return .hls(
+                sourceURL: url,
+                httpHeaders: options.httpHeaders,
+                preflight: preflight,
+                probe: nil
+            )
+        }
+
+        var probe: SourceProbe?
+        do {
+            try Task.checkCancellation()
+            probe = try await Task.detached(
+                priority: .userInitiated
+            ) {
+                try AetherEngine.probe(
+                    url: url,
+                    options: options
+                )
+            }.value
+            try Task.checkCancellation()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            // Audio analysis is an optional, separately typed capability.
+            // A failed independent source probe never changes the already
+            // resolved native playback route.
+            probe = nil
+        }
+        return .hls(
+            sourceURL: url,
+            httpHeaders: options.httpHeaders,
+            preflight: preflight,
+            probe: probe
+        )
     }
 }

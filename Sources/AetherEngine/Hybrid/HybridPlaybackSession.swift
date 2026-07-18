@@ -190,7 +190,7 @@ enum HybridPlaybackTelemetryTrigger:
     case seekRequested(AetherHybridTimelineTelemetry)
     case seekVideoReady(AetherHybridTimelineTelemetry)
     case sessionEnded(AetherHybridSessionEndReason)
-    case audioAnalysis(AetherHybridAudioAnalysisTelemetry)
+    case audioAnalysis(AetherAudioAnalysisTelemetry)
 }
 
 protocol HybridCarrierTransportProvider:
@@ -1093,7 +1093,7 @@ final class HybridPlaybackSession {
     }
 
     private func handleAudioAnalysisTelemetry(
-        _ event: AetherHybridAudioAnalysisTelemetry
+        _ event: AetherAudioAnalysisTelemetry
     ) {
         switch event.phase {
         case .completed, .failed:

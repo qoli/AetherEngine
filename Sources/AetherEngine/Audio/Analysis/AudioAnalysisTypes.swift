@@ -10,6 +10,7 @@ public enum AudioAnalysisError: Error, Sendable, Equatable, LocalizedError {
     case sourceNotSeekable
     case sourceCannotCreateIndependentReader
     case audioTrackUnavailable(Int)
+    case sourceTrackContractChanged(audioTrackID: Int)
     case rangeOutsideSource
     case contentProtectionUnsupported
     case hlsResourceFailure(String)
@@ -37,6 +38,8 @@ public enum AudioAnalysisError: Error, Sendable, Equatable, LocalizedError {
         case .sourceNotSeekable: "Source cannot seek independently for audio analysis"
         case .sourceCannotCreateIndependentReader: "Source cannot create an independent analysis reader"
         case .audioTrackUnavailable(let id): "Audio track \(id) is not available in this source"
+        case .sourceTrackContractChanged(let audioTrackID):
+            "Audio track \(audioTrackID) changed after source preflight"
         case .rangeOutsideSource: "Audio analysis range is outside the admitted source timeline"
         case .contentProtectionUnsupported: "Content protection prevents clear audio analysis"
         case .hlsResourceFailure(let reason): "HLS audio-analysis resource failed: \(reason)"

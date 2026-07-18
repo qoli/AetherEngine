@@ -39,6 +39,7 @@ public enum AetherNativePlaybackSessionError:
         reason: PlaybackRouteReason
     )
     case assetNotPlayable
+    case audioAnalysisBindingSourceMismatch
     case stopped
     case invalidRate
     case invalidSeekTarget
@@ -49,6 +50,8 @@ public enum AetherNativePlaybackSessionError:
             "Native playback session requires a native preflight route, found \(route.rawValue) (\(reason.rawValue))"
         case .assetNotPlayable:
             "The native playback asset is not playable"
+        case .audioAnalysisBindingSourceMismatch:
+            "The native audio-analysis binding does not match the playback source"
         case .stopped:
             "The native playback session has stopped"
         case .invalidRate:
@@ -57,6 +60,20 @@ public enum AetherNativePlaybackSessionError:
             "The native playback seek target is invalid"
         }
     }
+}
+
+/// Privacy-safe Native-session diagnostics. Source URLs, headers, decoder
+/// strings and media-option display names are intentionally excluded.
+public struct AetherNativePlaybackDiagnostics:
+    Sendable,
+    Equatable
+{
+    public let preflightResult: PlaybackPreflightResult
+    public let state: AetherNativePlaybackSessionState
+    public let audioAnalysisDurationSeconds: Double?
+    public let audioAnalysisTrackIDs: [Int]
+    public let selectedAudioAnalysisTrackID: Int?
+    public let activeAudioAnalysisRequestCount: Int
 }
 
 /// Aether-owned AVPlayer lifecycle for a preflight-admitted `.nativeAVPlayer` route.
@@ -72,17 +89,60 @@ public final class AetherNativePlaybackSession: ObservableObject {
 
     @Published public private(set) var state:
         AetherNativePlaybackSessionState = .idle
+    /// Stable Aether track identity corresponding to AVKit's current audible
+    /// selection. `nil` means the option-to-source mapping is not proven.
+    @Published public private(set) var selectedAudioAnalysisTrackID:
+        Int?
+
+    public var audioAnalysisTrackIDs: [Int] {
+        audioAnalysisBinding.publicTrackIDs
+    }
+
+    public var audioAnalysisDurationSeconds: Double? {
+        audioAnalysisBinding.durationSeconds
+    }
+
+    public var activeAudioAnalysisRequestCount: Int {
+        audioAnalysisSessions.count
+    }
+
+    public var diagnostics: AetherNativePlaybackDiagnostics {
+        AetherNativePlaybackDiagnostics(
+            preflightResult: preflightResult,
+            state: state,
+            audioAnalysisDurationSeconds:
+                audioAnalysisDurationSeconds,
+            audioAnalysisTrackIDs: audioAnalysisTrackIDs,
+            selectedAudioAnalysisTrackID:
+                selectedAudioAnalysisTrackID,
+            activeAudioAnalysisRequestCount:
+                activeAudioAnalysisRequestCount
+        )
+    }
 
     private var itemStatusObservation: NSKeyValueObservation?
     private var timeControlObservation: NSKeyValueObservation?
     private var endObserver: NSObjectProtocol?
+    private var mediaSelectionObserver: NSObjectProtocol?
+    private var audioAnalysisSelectionResolutionTask:
+        Task<Void, Never>?
+    private var audioAnalysisSessions: [
+        UUID: AudioAnalysisSession
+    ] = [:]
+    private let audioAnalysisBinding:
+        AetherNativeAudioAnalysisBinding
+    private let audioAnalysisTelemetryHub =
+        AetherAudioAnalysisTelemetryHub()
     private var isStopped = false
 
     private init(
         preflightResult: PlaybackPreflightResult,
-        asset: AVURLAsset
+        asset: AVURLAsset,
+        audioAnalysisBinding:
+            AetherNativeAudioAnalysisBinding
     ) {
         self.preflightResult = preflightResult
+        self.audioAnalysisBinding = audioAnalysisBinding
         avPlayerItem = AVPlayerItem(asset: asset)
         avPlayer = AVPlayer(playerItem: avPlayerItem)
         avPlayer.actionAtItemEnd = .pause
@@ -96,12 +156,39 @@ public final class AetherNativePlaybackSession: ObservableObject {
         options: LoadOptions = .init(),
         preflightResult: PlaybackPreflightResult
     ) throws -> AetherNativePlaybackSession {
+        try make(
+            url: url,
+            options: options,
+            preflightResult: preflightResult,
+            audioAnalysisBinding: .unavailable(
+                sourceURL: url,
+                httpHeaders: options.httpHeaders,
+                error: .analysisFailed(
+                    "native session requires factory-bound audio analysis"
+                )
+            )
+        )
+    }
+
+    static func make(
+        url: URL,
+        options: LoadOptions = .init(),
+        preflightResult: PlaybackPreflightResult,
+        audioAnalysisBinding:
+            AetherNativeAudioAnalysisBinding
+    ) throws -> AetherNativePlaybackSession {
         guard preflightResult.route == .nativeAVPlayer else {
             throw AetherNativePlaybackSessionError
                 .preflightRequiresNative(
                     route: preflightResult.route,
                     reason: preflightResult.reason
                 )
+        }
+        guard audioAnalysisBinding.sourceURL == url,
+              audioAnalysisBinding.httpHeaders
+                == options.httpHeaders else {
+            throw AetherNativePlaybackSessionError
+                .audioAnalysisBindingSourceMismatch
         }
         var assetOptions: [String: Any] = [:]
         if !options.httpHeaders.isEmpty {
@@ -110,7 +197,8 @@ public final class AetherNativePlaybackSession: ObservableObject {
         }
         return AetherNativePlaybackSession(
             preflightResult: preflightResult,
-            asset: AVURLAsset(url: url, options: assetOptions)
+            asset: AVURLAsset(url: url, options: assetOptions),
+            audioAnalysisBinding: audioAnalysisBinding
         )
     }
 
@@ -125,6 +213,7 @@ public final class AetherNativePlaybackSession: ObservableObject {
                 state = .failed(.assetNotPlayable)
                 throw AetherNativePlaybackSessionError.assetNotPlayable
             }
+            await refreshSelectedAudioAnalysisTrackIDFromPlayer()
             if avPlayerItem.status == .readyToPlay {
                 state = .ready
             }
@@ -201,6 +290,84 @@ public final class AetherNativePlaybackSession: ObservableObject {
     }
     #endif
 
+    /// Bounded, privacy-safe lifecycle telemetry for Native independent audio
+    /// analysis. Playback state and source identity never enter this stream.
+    public func audioAnalysisTelemetryEvents()
+        -> AsyncStream<AetherAudioAnalysisTelemetry>
+    {
+        audioAnalysisTelemetryHub.stream()
+    }
+
+    public func audioAnalysisAvailability(
+        for audioTrackID: Int
+    ) -> AudioAnalysisTrackAvailability {
+        switch state {
+        case .failed, .stopped:
+            return .unavailable(.noActiveSession)
+        case .idle, .preparing, .ready, .playing, .paused,
+             .seeking, .ended:
+            break
+        }
+        return audioAnalysisBinding.availability(
+            for: audioTrackID
+        )
+    }
+
+    public func audioAnalysisStream(
+        request: AudioAnalysisRequest
+    ) throws -> AudioAnalysisStream {
+        switch audioAnalysisAvailability(
+            for: request.audioTrackID
+        ) {
+        case .available:
+            break
+        case .unavailable(let error):
+            throw error
+        }
+        if let duration = audioAnalysisDurationSeconds,
+           request.range.upperBound > duration {
+            throw AudioAnalysisError.rangeOutsideSource
+        }
+        let input = try audioAnalysisBinding.input(
+            for: request.audioTrackID
+        )
+        let session = AudioAnalysisSession(
+            request: request
+        ) { [weak self] event in
+            Task { @MainActor [weak self] in
+                self?.audioAnalysisTelemetryHub.emit(event)
+            }
+        }
+        let stream = AudioAnalysisStream(
+            gate: session.gate,
+            cancel: { session.cancel() }
+        )
+        audioAnalysisSessions[session.id] = session
+        session.emitTelemetryStarted()
+        let sessionID = session.id
+        let task = Task.detached(priority: .utility) {
+            [weak self] in
+            await AudioAnalysisRunner.run(
+                session: session,
+                input: input,
+                request: request
+            )
+            await self?.removeAudioAnalysisSession(
+                id: sessionID
+            )
+        }
+        session.install(task: task)
+        return stream
+    }
+
+    public func cancelAudioAnalysisStreams() {
+        let sessions = Array(audioAnalysisSessions.values)
+        audioAnalysisSessions.removeAll()
+        for session in sessions {
+            session.cancel()
+        }
+    }
+
     public func stop() {
         guard !isStopped else { return }
         isStopped = true
@@ -208,10 +375,20 @@ public final class AetherNativePlaybackSession: ObservableObject {
         itemStatusObservation = nil
         timeControlObservation?.invalidate()
         timeControlObservation = nil
+        audioAnalysisSelectionResolutionTask?.cancel()
+        audioAnalysisSelectionResolutionTask = nil
         if let endObserver {
             NotificationCenter.default.removeObserver(endObserver)
             self.endObserver = nil
         }
+        if let mediaSelectionObserver {
+            NotificationCenter.default.removeObserver(
+                mediaSelectionObserver
+            )
+            self.mediaSelectionObserver = nil
+        }
+        cancelAudioAnalysisStreams()
+        audioAnalysisTelemetryHub.finish()
         avPlayer.pause()
         avPlayer.replaceCurrentItem(with: nil)
         state = .stopped
@@ -230,6 +407,7 @@ public final class AetherNativePlaybackSession: ObservableObject {
                         || self.state == .preparing {
                         self.state = .ready
                     }
+                    self.handleMediaSelectionChange()
                 case .failed:
                     self.state = .failed(.playerItemFailed)
                 case .unknown:
@@ -269,6 +447,98 @@ public final class AetherNativePlaybackSession: ObservableObject {
                 self.state = .ended
             }
         }
+        mediaSelectionObserver = NotificationCenter.default
+            .addObserver(
+                forName: AVPlayerItem
+                    .mediaSelectionDidChangeNotification,
+                object: avPlayerItem,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.handleMediaSelectionChange()
+                }
+            }
+    }
+
+    private func handleMediaSelectionChange() {
+        audioAnalysisSelectionResolutionTask?.cancel()
+        audioAnalysisSelectionResolutionTask = Task {
+            @MainActor [weak self] in
+            guard let self else { return }
+            await refreshSelectedAudioAnalysisTrackIDFromPlayer()
+            audioAnalysisSelectionResolutionTask = nil
+        }
+    }
+
+    /// Deterministic internal seam for source-level selection/cancellation
+    /// tests. Production selection is always read from the AVPlayer item.
+    func handleMediaSelectionChange(
+        selectedAudioOptionIndex: Int?
+    ) {
+        let trackID = selectedAudioOptionIndex.flatMap {
+            index -> Int? in
+            guard audioAnalysisBinding.optionTrackIDs.indices
+                    .contains(index) else {
+                return nil
+            }
+            return audioAnalysisBinding.optionTrackIDs[index]
+        }
+        applySelectedAudioAnalysisTrackID(trackID)
+    }
+
+    private func refreshSelectedAudioAnalysisTrackIDFromPlayer()
+        async
+    {
+        guard !Task.isCancelled, !isStopped else { return }
+        do {
+            guard let group = try await avPlayerItem.asset
+                    .loadMediaSelectionGroup(for: .audible) else {
+                applySelectedAudioAnalysisTrackID(
+                    audioAnalysisBinding.optionTrackIDs.count == 1
+                        ? audioAnalysisBinding.optionTrackIDs[0]
+                        : nil
+                )
+                return
+            }
+            guard group.options.count
+                    == audioAnalysisBinding.optionTrackIDs.count,
+                  let selected = avPlayerItem.currentMediaSelection
+                    .selectedMediaOption(in: group),
+                  let selectedIndex = group.options.firstIndex(
+                    where: { $0.isEqual(selected) }
+                  ),
+                  !Task.isCancelled,
+                  !isStopped else {
+                applySelectedAudioAnalysisTrackID(nil)
+                return
+            }
+            applySelectedAudioAnalysisTrackID(
+                audioAnalysisBinding.optionTrackIDs[
+                    selectedIndex
+                ]
+            )
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled, !isStopped else { return }
+            applySelectedAudioAnalysisTrackID(nil)
+        }
+    }
+
+    private func applySelectedAudioAnalysisTrackID(
+        _ trackID: Int?
+    ) {
+        guard trackID != selectedAudioAnalysisTrackID else {
+            return
+        }
+        // A request pins one source track. Cancellation must be observable by
+        // the old consumer before the replacement identity is published.
+        cancelAudioAnalysisStreams()
+        selectedAudioAnalysisTrackID = trackID
+    }
+
+    private func removeAudioAnalysisSession(id: UUID) {
+        audioAnalysisSessions.removeValue(forKey: id)
     }
 
     private func requireActive() throws {

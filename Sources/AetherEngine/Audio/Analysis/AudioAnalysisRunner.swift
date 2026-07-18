@@ -13,6 +13,16 @@ enum AudioAnalysisInput: Sendable {
         httpHeaders: [String: String],
         sourceByteStore: SourceByteStore?
     )
+    /// URL input whose source-track contract was positively bound before the
+    /// analysis cursor was created. The public request ID may be a stable HLS
+    /// rendition ordinal while `sourceTrack.id` remains the concrete FFmpeg
+    /// stream selected by the independent demuxer.
+    case boundURL(
+        URL,
+        httpHeaders: [String: String],
+        sourceByteStore: SourceByteStore?,
+        sourceTrack: TrackInfo
+    )
     case reader(IOReader, formatHint: String?)
     case hlsVOD(HLSVODAudioAnalysisInput)
 }
@@ -33,7 +43,7 @@ final class AudioAnalysisSession: @unchecked Sendable {
     private let telemetryRequest: AudioAnalysisRequest?
     private let telemetryHandler:
         (@Sendable (
-            AetherHybridAudioAnalysisTelemetry
+            AetherAudioAnalysisTelemetry
         ) -> Void)?
     private var cancelled = false
     private var ownedReader: IOReader?
@@ -59,7 +69,7 @@ final class AudioAnalysisSession: @unchecked Sendable {
         request: AudioAnalysisRequest,
         telemetryHandler:
             @escaping @Sendable (
-                AetherHybridAudioAnalysisTelemetry
+                AetherAudioAnalysisTelemetry
             ) -> Void
     ) {
         telemetryRequest = request
@@ -115,7 +125,7 @@ final class AudioAnalysisSession: @unchecked Sendable {
     func recordTelemetryFailed(_ error: AudioAnalysisError) {
         recordTelemetryTerminal(
             phase: .failed(
-                AetherHybridAudioAnalysisTelemetryFailure(error)
+                AetherAudioAnalysisTelemetryFailure(error)
             )
         )
     }
@@ -146,7 +156,7 @@ final class AudioAnalysisSession: @unchecked Sendable {
     }
 
     private func emitTelemetry(
-        phase: AetherHybridAudioAnalysisTelemetryPhase
+        phase: AetherAudioAnalysisTelemetryPhase
     ) {
         lock.lock()
         let event = telemetryEventLocked(phase: phase)
@@ -158,7 +168,7 @@ final class AudioAnalysisSession: @unchecked Sendable {
     }
 
     private func recordTelemetryTerminal(
-        phase: AetherHybridAudioAnalysisTelemetryPhase
+        phase: AetherAudioAnalysisTelemetryPhase
     ) {
         let now = ProcessInfo.processInfo.systemUptime
         lock.lock()
@@ -185,9 +195,9 @@ final class AudioAnalysisSession: @unchecked Sendable {
     }
 
     private func telemetryEventLocked(
-        phase: AetherHybridAudioAnalysisTelemetryPhase,
+        phase: AetherAudioAnalysisTelemetryPhase,
         now: TimeInterval = ProcessInfo.processInfo.systemUptime
-    ) -> AetherHybridAudioAnalysisTelemetry? {
+    ) -> AetherAudioAnalysisTelemetry? {
         guard let telemetryRequest else {
             return nil
         }
@@ -197,7 +207,7 @@ final class AudioAnalysisSession: @unchecked Sendable {
         } else {
             activePausedDuration = 0
         }
-        return AetherHybridAudioAnalysisTelemetry(
+        return AetherAudioAnalysisTelemetry(
             analysisID: id,
             audioTrackID: telemetryRequest.audioTrackID,
             rangeStartSeconds:
@@ -289,6 +299,8 @@ enum AudioAnalysisRunner {
             // stream and then abandoned it; the first `next()` is the first unit of demand for the entire path.
             try await session.gate.waitForDemand()
             try session.throwIfCancelled()
+            let sourceTrackID: Int
+            let expectedSourceTrack: TrackInfo?
             switch input {
             case .url(
                 let url,
@@ -301,8 +313,26 @@ enum AudioAnalysisRunner {
                     isLive: false,
                     sourceByteStore: sourceByteStore
                 )
+                sourceTrackID = request.audioTrackID
+                expectedSourceTrack = nil
+            case .boundURL(
+                let url,
+                let httpHeaders,
+                let sourceByteStore,
+                let sourceTrack
+            ):
+                try session.demuxer.open(
+                    url: url,
+                    extraHeaders: httpHeaders,
+                    isLive: false,
+                    sourceByteStore: sourceByteStore
+                )
+                sourceTrackID = sourceTrack.id
+                expectedSourceTrack = sourceTrack
             case .reader(let reader, let formatHint):
                 try session.demuxer.open(reader: reader, formatHint: formatHint, isLive: false)
+                sourceTrackID = request.audioTrackID
+                expectedSourceTrack = nil
             case .hlsVOD(let source):
                 try await pumpHLS(
                     source: source,
@@ -319,17 +349,25 @@ enum AudioAnalysisRunner {
             guard session.demuxer.isSourceSeekable else {
                 throw AudioAnalysisError.sourceNotSeekable
             }
-            guard session.demuxer.audioTrackInfos().contains(where: { $0.id == request.audioTrackID }),
-                  let stream = session.demuxer.stream(at: Int32(request.audioTrackID)),
+            guard let actualSourceTrack = session.demuxer
+                    .audioTrackInfos()
+                    .first(where: { $0.id == sourceTrackID }),
+                  let stream = session.demuxer.stream(at: Int32(sourceTrackID)),
                   stream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_AUDIO else {
                 throw AudioAnalysisError.audioTrackUnavailable(request.audioTrackID)
+            }
+            if let expectedSourceTrack,
+               actualSourceTrack != expectedSourceTrack {
+                throw AudioAnalysisError.sourceTrackContractChanged(
+                    audioTrackID: request.audioTrackID
+                )
             }
             guard session.demuxer.seek(to: request.range.lowerBound) else {
                 throw AudioAnalysisError.analysisFailed(
                     "cannot seek independent reader to \(request.range.lowerBound)s"
                 )
             }
-            session.demuxer.discardAllStreamsExcept([Int32(request.audioTrackID)])
+            session.demuxer.discardAllStreamsExcept([Int32(sourceTrackID)])
 
             let decoder = AudioTapDecoder()
             defer { decoder.close() }
@@ -339,7 +377,11 @@ enum AudioAnalysisRunner {
                 throw AudioAnalysisError.analysisFailed("cannot open audio decoder: \(error)")
             }
 
-            try await pump(decoder: decoder, session: session, request: request,
+            try await pump(
+                decoder: decoder,
+                session: session,
+                request: request,
+                sourceTrackID: sourceTrackID,
                            hasOutstandingDemand: true)
             session.recordTelemetryCompleted()
             await session.gate.finish()
@@ -360,6 +402,7 @@ enum AudioAnalysisRunner {
 
     private static func pump(decoder: AudioTapDecoder, session: AudioAnalysisSession,
                              request: AudioAnalysisRequest,
+                             sourceTrackID: Int,
                              hasOutstandingDemand: Bool) async throws {
         var pendingChunks: [AudioTapChunk] = []
         var inputEOF = false
@@ -396,7 +439,7 @@ enum AudioAnalysisRunner {
                     }
                     var packetToFree: UnsafeMutablePointer<AVPacket>? = packet
                     defer { trackedPacketFree(&packetToFree) }
-                    guard packet.pointee.stream_index == request.audioTrackID else { continue }
+                    guard packet.pointee.stream_index == sourceTrackID else { continue }
                     try append(decoder.decode(packet: packet), to: &pendingChunks)
                     continue
                 }
