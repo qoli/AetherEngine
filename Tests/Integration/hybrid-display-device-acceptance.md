@@ -15,8 +15,10 @@ device. HDR10 and HLG now have passing LG C3 panel-mode and human visual evidenc
 fixtures and are production-admitted. Late HDR10+ now has a deterministic
 bitstream, complete Apple T.35 attachment, and physical-device same-layer technical pass. Dolby Vision
 Profile 8.4 now has exact configuration/base-layer admission, VideoToolbox metadata-propagation
-acceptance, and a 240-frame physical-device technical pass. HDR10+ and Profile 8.4 remain unadmitted
-without their own human panel-mode and visual confirmation.
+acceptance, plus a 60-second living-room Apple TV/LG C3 pass with explicit Dolby Vision panel mode,
+correct human-observed color, 1440 frames and a bound renderer through end of stream. Profile 8.4 is
+production-admitted; HDR10+ remains unadmitted until a compatible display supplies its panel-mode and
+visual confirmation.
 See
 [`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md),
 [`hybrid-hdr10-device-evidence-2026-07-18.md`](hybrid-hdr10-device-evidence-2026-07-18.md),
@@ -25,17 +27,19 @@ See
 [`hybrid-dolby-vision-profile84-device-evidence-2026-07-18.md`](hybrid-dolby-vision-profile84-device-evidence-2026-07-18.md), and
 [`hybrid-progressive-subtitle-device-evidence-2026-07-18.md`](hybrid-progressive-subtitle-device-evidence-2026-07-18.md).
 
-The complete physical gate remains pending. Source tests prove the bounded no-drop pending queue,
+The complete physical gate remains pending for HDR10+ and the remaining visual sub-rows. Source tests
+prove the bounded no-drop pending queue,
 monotonic timing, format-description propagation, HDR10+ per-frame attachment, and absence of
 `DisplayImmediately`. The physical late-HDR10+ run also proves first attachment after startup without
 changing the Hybrid graph. The Profile 8.4 run proves exact candidate admission, VideoToolbox property
-acceptance and same-layer enqueue, but the partial runs do not prove the remaining visual/audio or
-panel-mode rows. Automated geometry passes, but its final human
+acceptance, same-layer enqueue, explicit Dolby Vision panel mode and human visual correctness. The
+remaining partial runs do not prove the outstanding visual/audio rows. Automated geometry passes, but its final human
 visible-orientation/crop confirmation remains part of the visual row.
 
-`AetherHybridPresentationView.verifiedVideoFormats` is `[.sdr, .hdr10, .hlg]`. It must not expand again until
-each additional format row below has its own fixture and passing physical-device record. There is no
-Metal or second Hybrid renderer.
+`AetherHybridPresentationView.verifiedVideoFormats` is
+`[.sdr, .hdr10, .hlg, .dolbyVision]`, and public Dolby Vision capability is exactly `[.profile84]`.
+It must not expand again until each additional format/profile row below has its own fixture and passing
+physical-device record. There is no Metal or second Hybrid renderer.
 
 ## Architecture under test
 

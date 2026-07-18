@@ -9,8 +9,9 @@ observer confirmed that the LG C3 activated its HDR indicator and that the refer
 neutral grayscale looked correct.
 
 `AetherHybridPresentationView.verifiedVideoFormats` is therefore `[.sdr, .hdr10, .hlg]` at candidate
-`a9a94696cbbb281a7d2e16c0ab894fe736daeef2`. HDR10+, Dolby Vision, and every unverified Dolby Vision
-profile remain typed unsupported before provider/session creation. This record does not admit them.
+`a9a94696cbbb281a7d2e16c0ab894fe736daeef2`. At that exact candidate HDR10+, Dolby Vision, and every
+unverified Dolby Vision profile remained typed unsupported before provider/session creation. A later
+independent LG C3 row admits Dolby Vision Profile 8.4 only; this HLG record does not supply that evidence.
 
 ## Exact candidate and environment
 
@@ -108,5 +109,6 @@ was independently verified as ARIB STD-B67.
   to fail before any origin fetch.
 - Physical-destination Debug build, install, startup checkpoint, 60-second end of stream, HDR indicator,
   and human visual row — pass.
-- No fallback was added. HDR10+ and Dolby Vision remain typed unsupported; HLG never changed route,
-  renderer, player, generation, or clock.
+- No fallback was added. At this HLG candidate HDR10+ and Dolby Vision remained typed unsupported; HLG
+  never changed route, renderer, player, generation, or clock. The later Profile 8.4 admission does not
+  alter this run.

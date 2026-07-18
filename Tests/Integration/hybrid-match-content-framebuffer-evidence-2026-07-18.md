@@ -15,8 +15,9 @@ Vision mode, and it cannot establish subjective tone mapping, clipping, color or
 The television model/firmware, television OSD and human visual confirmation therefore remained pending
 for this capture. At the time, production admission was
 `AetherHybridPresentationView.verifiedVideoFormats == [.sdr]`. Later independent LG C3 panel-mode and
-human visual rows admit HDR10 and HLG, so current production admission is `[.sdr, .hdr10, .hlg]`; this
-framebuffer-only record still does not admit HDR10+ or Dolby Vision.
+human visual rows admit HDR10 and HLG, and a later profile-specific LG C3 row admits Dolby Vision 8.4,
+so current production admission is `[.sdr, .hdr10, .hlg, .dolbyVision]` with Profile 8.4 only; this
+framebuffer-only record itself supplies no HDR10+ or Dolby Vision admission evidence.
 
 ## Exact candidate and device
 

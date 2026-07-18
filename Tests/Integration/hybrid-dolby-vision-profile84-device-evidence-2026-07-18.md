@@ -1,24 +1,120 @@
 # Hybrid Dolby Vision Profile 8.4 physical-device evidence — 2026-07-18
 
-## Result
+## Decision
 
-The Dolby Vision Profile 8.4 technical row passes on the physical study-room Apple TV. A generated
-HEVC Main10 HLG/BT.2020 HLS fixture carried uncompressed RPU metadata and an exact `dvvC`. Preflight
-verified every configuration field and the compatible base layer before provider/session creation.
-The hardware decoder repeated those checks, constructed the sample-buffer format description with
-`hvcC` plus `dvvC`, and received `noErr` when enabling VideoToolbox per-frame HDR display-metadata
-propagation. The existing `AVSampleBufferDisplayLayer` then accepted all 240 decoded frames on
-generation 0 while remaining bound to the carrier timebase.
+Dolby Vision Profile 8.4 passes the complete production-admission row. A color-managed HEVC Main10
+HLG/BT.2020 fixture carried uncompressed RPU metadata on every frame and an exact `dvvC`. On the
+living-room Apple TV and LG C3, preflight verified the exact Profile 8.4 configuration and compatible
+base layer before provider/session creation; VideoToolbox accepted per-frame HDR metadata propagation;
+the existing `AVSampleBufferDisplayLayer` rendered all 1440 frames through end of stream while remaining
+bound to the carrier timebase. The human observer confirmed that the LG C3 activated its explicit
+Dolby Vision indicator and that the reference color bars and neutral grayscale looked correct.
 
-This is a **technical pass**, not production admission. Match Dynamic Range, observed panel mode and
-human visual quality were not recorded for this run. The temporary diagnostic admission was removed
-immediately after the device build. At that time
-`AetherHybridPresentationView.verifiedVideoFormats` remained `[.sdr]`; later independent HDR10 and HLG
-rows make current admission `[.sdr, .hdr10, .hlg]` without admitting Dolby Vision. Profile 5, Profile 7, Profile
-8.1, missing/contradictory configuration and every other unverified Dolby Vision shape remain typed
-unsupported before provider/session creation.
+Production candidate `2ac2dd96cc7ffd2cc37a181f87a921ad99599d6c` therefore admits
+`.dolbyVision` with exactly `[.profile84]`. Profile 5, Profile 7, Profile 8.1, every other Profile 8
+compatibility shape, missing/contradictory configuration, and an unverified base layer remain typed
+unsupported before provider/session creation. This decision does not admit HDR10+.
 
-## Exact candidate and device
+## Living-room production-admission candidate and environment
+
+```text
+status: pass; Dolby Vision Profile 8.4 production admission
+localRunDate: 2026-07-18 Asia/Shanghai
+aetherProductionAdmissionCommit: 2ac2dd96cc7ffd2cc37a181f87a921ad99599d6c
+candidateParent: 73f3dfc
+branch: feat/syncnext-hybrid-carrier
+xcode: 26.4.1 (17E202)
+sdk: AppleTVOS 26.4 (23L236)
+configuration: Debug, signed physical arm64 tvOS destination
+acceptanceLauncherSHA256: da4855ff44c8a9047a422c865691583556315ddcc5ab06cc404cad021c4dcea0
+acceptanceDebugDylibSHA256: e3422e410f2a599fb291489d876ebedca87129db82a8994fe73782268f018db2
+deviceName: 客廳電視
+deviceReality: physical
+appleTVModel: Apple TV 4K (3rd generation), AppleTV14,1, J255AP
+coreDeviceID: 091555FF-9FE8-5A47-B90A-CBDDC737E052
+xcodeDestinationUDID: 00008110-000C613A1142801E
+tvOS: 26.5 (23L471), Beta
+displayModel: LG C3
+displayFirmware: not recorded
+matchDynamicRangeSetting: enabled in the earlier 2026-07-18 settings row; not re-read immediately before this run
+observedDisplayMode: LG C3 activated its explicit Dolby Vision indicator
+humanVisualConfirmation: pass; color bars and neutral grayscale reported correct
+```
+
+The Debug product keeps app code in `AetherHybridAcceptance.debug.dylib`, so both executable hashes are
+recorded. It was built from parent `73f3dfc` plus exactly the two source lines that became commit
+`2ac2dd9`: `.dolbyVision` in `verifiedVideoFormats` and `.profile84` in
+`supportedDolbyVisionProfiles`. The remaining commit delta is source tests and cannot change the app
+binary. No player, route, decoder, renderer, audio owner or clock was added.
+
+## Color-managed Profile 8.4 fixture identity
+
+The fixture is generated locally from copyright-clean deterministic code. Its retained 16-bit PPM
+stores nonlinear BT.2020 R'G'B' values produced by the ARIB STD-B67 OETF. FFmpeg performs only the
+BT.2020 non-constant-luminance matrix conversion to video-range 10-bit YCbCr before x265. A pinned
+`dovi_tool` then adds uncompressed Profile 8.4 RPU metadata to every frame. Generation fails unless
+FFmpeg reads profile 8, compatibility ID 4, RPU and base layer present, enhancement layer absent,
+uncompressed metadata, the exact HLG base layer, and an RPU on the first frame.
+
+```text
+generationCommand: AETHER_ACCEPTANCE_VIDEO_FORMAT=dolbyvision84 AETHER_ACCEPTANCE_DURATION_SECONDS=60 AETHER_ACCEPTANCE_HLS_SEGMENT_SECONDS=4 AETHER_ACCEPTANCE_DOVI_TOOL=/tmp/dovi_tool-4b36af9/target/release/dovi_tool bash Scripts/generate-hybrid-acceptance-fixture.sh /tmp/aether-dolbyvision84-reference-v2-20260718
+fixtureFormat: Dolby Vision Profile 8.4; HEVC Main10 hev1; HLG/BT.2020 non-constant base layer; exact dvvC
+fixtureDurationSeconds: 60
+fixtureFrameCount: 1440
+fixtureSegmentCount: 15 video; 15 in each of two AAC stereo renditions
+fixtureByteCount: 16341982
+fixtureSHA256SUMSFileSHA256: 6f80cfb62fb97ca7b4a0fc8f35153c8917f0be7572bed92e6383dc23dc2391ad
+masterPlaylistSHA256: eeffdc45abbaf9f1c561f9b0f549512f6a2101e2583b70dcab651c6ffa63af10
+videoInitSHA256: e5addc4a2a135c51efc1fac93447bbd62b363eac4adba0b400f9d7f1b3f4439d
+videoSegment000SHA256: 30ecbe91e2257d945af04bfc0479d6cf563367c51ba395aa41f1acb60400e7b3
+colorReferencePPMSHA256: a7d924d43f811f59116f03ce710e683174eea9420c97381b9f84b073ee3b9763
+colorReferenceGeneratorSHA256: c6800dfa8a6065d9f101d78ea31bd7e45a17c96390467628fbba6973efc4e69f
+provenanceSHA256: 67d02581bbf9915319c2ba277515d6a4540472fdb6b6f5a0d83adc730cac1344
+doviToolSourceCommit: 4b36af992a54182f4f8e11198c884d53d5fb5054
+doviToolVersion: dovi_tool 2.3.3-2-g4b36af9
+doviToolSHA256: 1ae8b0f0e0f9c1e3e43c9a4a2be06eb31c50ed0f5573c6e8eb2aea1943d8bbc1
+doviToolBuildRust: isolated Rust 1.95.0 toolchain
+redistribution: generated pattern and sine-wave test media; no third-party audiovisual asset
+```
+
+## Living-room device result
+
+The formal technical replay is local at
+`/tmp/AetherHybridDolbyVision84-LivingRoom-20260718-1754-console.log`; it contains 91 lines and has
+SHA-256 `c3c1262308fde46995e8efb4fc664c282d52f37d06f989e1b73aa95ce845e105`. It contains no Aether
+session failure or terminal-failure event. The immediately preceding run used the same fixture and app
+hashes and supplied the human panel-mode and visual confirmation.
+
+```text
+preflightRoute: hybridCarrier
+preflightReason: hybridHLSManifestMissingCodecs
+preflightProfile84BaseLayerVerified: true
+preflightConfiguration: version 1.0; profile 8; level 3; RPU 1; EL 0; BL 1; compatibility 4; compression 0
+decoderDVVCAdmission: true
+videoToolboxPerFrameMetadataPropagationAccepted: true
+decodedVideoFormat: dolbyvision
+startupCheckpoint: color-dolbyvision-passed
+startupCarrierTimeSeconds: 1.013241467
+startupEnqueuedSampleBuffers: 31
+generation: 0 throughout
+carrierTimebaseBound: true throughout
+renderer: rendering throughout
+sessionEndedCarrierTimeSeconds: 60.021194873
+sessionEndedEnqueuedSampleBuffers: 1440
+carrierSegmentsObserved: 15 of 15
+carrierBandwidthState: complete
+carrierDeclaredTransportBudget: 2000000
+carrierObservedPeakBytesPerSecond: 201740
+carrierObservedAverageBytesPerSecond: 200202
+routeSwitchCount: 0
+rendererSwitchCount: 0
+generationChangeCount: 0
+terminalFailureCount: 0
+observedPanelMode: Dolby Vision
+humanVisualResult: correct color and grayscale
+```
+
+## Earlier study-room technical candidate and device
 
 ```text
 status: technical-pass; panel-mode-and-visual-pending
@@ -47,7 +143,8 @@ observedDisplayMode: not recorded
 humanVisualConfirmation: pending
 ```
 
-The Debug product keeps app code in `AetherHybridAcceptance.debug.dylib`, so its SHA-256 is recorded in
+For this earlier study-room run, the Debug product kept app code in
+`AetherHybridAcceptance.debug.dylib`, so its SHA-256 is recorded in
 addition to the stable launcher executable. The signed diagnostic app was built from the candidate
 commit plus exactly two temporary admission edits: `.dolbyVision` was added to
 `verifiedVideoFormats`, and `.profile84` was added to `supportedDolbyVisionProfiles`. Both edits were
@@ -84,10 +181,10 @@ P8.4 checkpoint: color-dolbyvision-passed; generation 0; timebase bound; rendere
 P8.4 console SHA256: 09cb3d5de348750627ad52081e473dbdf904f4e059d55a0a79b4fb04b965343c
 ```
 
-Both runs used the same diagnostic admission delta described above. It was again removed after the
-build; the corrected production tree remains SDR-only. Full `swift test` and the Release generic tvOS
-build pass on the corrected candidate. This corrected commit supersedes `aaa2eb0` for any later
-Syncnext pin or release review.
+Both runs used the same diagnostic admission delta described above. It was again removed after that
+build; the corrected production tree was SDR-only at that point. Full `swift test` and the Release
+generic tvOS build passed on the corrected candidate. The later living-room row and production commit
+`2ac2dd9` supersede this historical admission state for any Syncnext pin or release review.
 
 ## Public API and profile contract
 
@@ -115,7 +212,7 @@ base-layer color: BT.2020 primaries, HLG transfer, BT.2020 non-constant matrix
 Container labels, an RPU NAL alone, a profile number alone, or a successful base-layer decode do not
 satisfy admission.
 
-## Fixture identity
+## Earlier 10-second fixture identity
 
 The fixture contains generated `testsrc2` video and generated AAC sine-wave audio only. It is a local,
 gitignored release-evidence artifact. Generation is fail-closed: the script refuses a missing/unpinned
@@ -141,7 +238,7 @@ videoSegment000SHA256: ed7e0ba66c7ce5ce16880c13ceab045532eaba89402c2018d25fbd127
 redistribution: generated test media; no third-party audiovisual asset
 ```
 
-## Automated physical-device observations
+## Earlier study-room automated observations
 
 The formal console record is local at
 `/tmp/AetherHybridDolbyVision84-20260718-1223-console.log`; it contains 41 lines and has SHA-256
@@ -170,32 +267,37 @@ carrierObservedAverage: 200742
 carrierObservedSegments: 3
 ```
 
-This evidence proves exact source admission, VideoToolbox property acceptance, decoded-frame enqueue,
+This earlier evidence proves exact source admission, VideoToolbox property acceptance, decoded-frame enqueue,
 single-layer rendering and carrier-clock ownership. It does not claim that tvOS entered Dolby Vision
 panel mode or that a human verified tone mapping, clipping, color, black-frame absence or RPU-driven
 visual differences.
 
 A later supplemental run enabled Match Dynamic Range and Match Frame Rate and captured a non-black
-Profile 8.4 framebuffer with the carrier timebase bound and the same renderer active. It still does not
-prove the external television's Dolby Vision mode or human visual correctness. See
+Profile 8.4 framebuffer with the carrier timebase bound and the same renderer active. That supplemental
+record alone did not prove the external television's Dolby Vision mode or human visual correctness; the
+later living-room row above supplies those missing observations. See
 [`hybrid-match-content-framebuffer-evidence-2026-07-18.md`](hybrid-match-content-framebuffer-evidence-2026-07-18.md).
 
 ## Verification
 
 - `bash -n Scripts/generate-hybrid-acceptance-fixture.sh` — pass.
-- `swift test` — 738 tests in 130 suites, pass.
-- AetherEngine Release generic tvOS build — pass.
-- Signed diagnostic build/install on the physical study-room Apple TV — pass.
-- Profile 8.4 color-path automatic row — pass; 240 frames, one generation, bound carrier timebase,
-  one rendering `AVSampleBufferDisplayLayer`, no terminal failure.
-- Post-run production-admission diff — clean; `verifiedVideoFormats` is `[.sdr]`.
+- Full `swift test --quiet` — 421 XCTest tests with 2 skipped and no failures; 740 Swift Testing tests in
+  130 suites pass.
+- AetherEngine acceptance app Release generic tvOS build — pass.
+- Signed Debug build/install on the physical living-room Apple TV — pass.
+- Color-managed Profile 8.4 row — pass; explicit LG C3 Dolby Vision indicator, correct human-observed
+  color, 1440 frames, one generation, bound carrier timebase, one rendering
+  `AVSampleBufferDisplayLayer`, 15/15 carrier segments and no terminal failure.
+- Public capability tests admit the exact Profile 8.4 configuration/base layer and continue to reject
+  HDR10+, missing/contradictory Dolby Vision configuration and every other unverified profile.
+- Production admission commit — `2ac2dd96cc7ffd2cc37a181f87a921ad99599d6c`.
 
-## Remaining gate
+## Production admission boundary
 
-Before adding `.dolbyVision` and `.profile84` to production capabilities, enable Match Dynamic Range,
-record the connected display model/firmware and observed Dolby Vision mode, and obtain human visual
-confirmation for the real picture. A failure must remain typed unsupported or terminal; it must not
-start a base-layer-only presentation, tone-map/relabel the stream, or change route/renderer.
+The Profile 8.4 device and human gate is closed. No other Dolby Vision profile or compatibility shape is
+implied by `.dolbyVision`; `supportedDolbyVisionProfiles` remains exactly `[.profile84]`. Any failure must
+remain typed unsupported or terminal and must not start a base-layer-only presentation, tone-map/relabel
+the stream, or change route/renderer.
 
 Fallback added: **no**. Explicit failures cover missing, unsupported or contradictory configuration,
 P8.4 base-layer mismatch, VideoToolbox metadata-propagation rejection, preflight/decoder configuration

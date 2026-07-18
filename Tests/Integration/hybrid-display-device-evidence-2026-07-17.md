@@ -11,8 +11,8 @@ display device gate. Human visual/AVKit/audio confirmation, display-mode, HDR10+
 remain pending. At the time of this run, HDR10 and HLG had engine/device candidate evidence but
 remained unadmitted without matching panel-mode and human visual confirmation, so
 `AetherHybridPresentationView.verifiedVideoFormats` remained `[.sdr]`. The later color-managed LG C3
-rows close HDR10 and HLG and supersede only those parts of this record; current admission is
-`[.sdr, .hdr10, .hlg]`. See
+rows close HDR10 and HLG, and the later profile-specific row closes Dolby Vision Profile 8.4. Current
+admission is `[.sdr, .hdr10, .hlg, .dolbyVision]` with Dolby Vision restricted to `[.profile84]`. See
 [`hybrid-hdr10-device-evidence-2026-07-18.md`](hybrid-hdr10-device-evidence-2026-07-18.md).
 
 ## Environment and fixture

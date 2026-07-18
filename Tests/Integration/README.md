@@ -12,15 +12,19 @@ recoverable origin-stall, geometry/cadence, host-negative, native WebVTT selecti
 presentation, E-AC-3 JOC, styled ASS and PGS bitmap overlay select/seek/off/reselect, plus stop/reopen
 sub-matrix. The 2026-07-18 late-HDR10+ row also proves that hardware-decoded ST 2094-40 reaches the
 same display layer at PTS 12.0 without a route, generation, carrier-item, renderer, or timebase change.
-The Dolby Vision Profile 8.4 technical row now passes exact configuration/base-layer admission,
-VideoToolbox metadata-propagation acceptance and 240-frame same-layer enqueue. A supplemental
+The Dolby Vision Profile 8.4 row now passes exact configuration/base-layer admission,
+VideoToolbox metadata-propagation acceptance and same-layer enqueue. A supplemental
 2026-07-18 physical-device run also records Match Dynamic Range and Match Frame Rate enabled and four
 non-black, bound-timebase framebuffer captures. Native AVKit Audio and WebVTT menu visibility plus
 Remote-driven bidirectional selection now passes on the same device, and the living-room JOC → AAC → JOC
 Atmos-output round trip passes. The living-room LG C3 HDR10 row now also passes panel-mode and human
 visual confirmation with a color-managed BT.2020/PQ reference. The following color-managed HLG row
-also passes the LG C3 HDR indicator and human visual check, so production admission is
-`[.sdr, .hdr10, .hlg]`. HDR10+ and Dolby Vision panel-output remain pending. See
+also passes the LG C3 HDR indicator and human visual check. Finally, the 60-second color-managed
+Profile 8.4 fixture activates the LG C3's explicit Dolby Vision mode, looks correct to the human
+observer, and reaches end of stream with 1440 frames on the same bound display layer. Production
+admission is therefore `[.sdr, .hdr10, .hlg, .dolbyVision]`, with Dolby Vision restricted to
+`[.profile84]`. HDR10+ remains pending on a compatible display; the LG C3 cannot provide that positive
+panel row. See
 [`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md) and
 [`hybrid-hdr10-device-evidence-2026-07-18.md`](hybrid-hdr10-device-evidence-2026-07-18.md),
 [`hybrid-hlg-device-evidence-2026-07-18.md`](hybrid-hlg-device-evidence-2026-07-18.md),
