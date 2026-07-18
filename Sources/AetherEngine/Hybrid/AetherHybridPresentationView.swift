@@ -512,6 +512,39 @@ public final class AetherHybridPresentationView: PlatformBaseView {
     private func throwIfRendererFailed() throws {
         guard currentRendererStatus != .failed else {
             let error = currentRendererError as NSError?
+            let carrierTime = boundCarrierItem?.currentTime().seconds
+            let carrierDuration = boundCarrierItem?.duration.seconds
+            let lastAcceptedEnd = lastAcceptedPresentationTime.map {
+                CMTimeAdd(
+                    $0,
+                    CMTime(
+                        seconds: lastAcceptedFrameDurationSeconds ?? 0,
+                        preferredTimescale: 600
+                    )
+                ).seconds
+            }
+            let requiresFlush: Bool
+            if #available(tvOS 17.0, iOS 17.0, macOS 14.0, *) {
+                requiresFlush = displayLayer.sampleBufferRenderer
+                    .requiresFlushToResumeDecoding
+            } else {
+                requiresFlush = displayLayer
+                    .requiresFlushToResumeDecoding
+            }
+            EngineLog.emit(
+                "[AetherHybridPresentationView] renderer failure "
+                    + "domain=\(error?.domain ?? "AVFoundation") "
+                    + "code=\(error?.code ?? -1) "
+                    + "requiresFlush=\(requiresFlush) "
+                    + "generation=\(activeGeneration) "
+                    + "pending=\(pendingSamples.count) "
+                    + "enqueued=\(enqueuedSampleBuffers) "
+                    + "carrierTime=\(Self.diagnosticTime(carrierTime)) "
+                    + "carrierDuration=\(Self.diagnosticTime(carrierDuration)) "
+                    + "lastAcceptedEnd=\(Self.diagnosticTime(lastAcceptedEnd)) "
+                    + "lastEnqueuedPTS=\(Self.diagnosticTime(lastEnqueuedPresentationTime?.seconds))",
+                category: .session
+            )
             throw AetherHybridPresentationError.rendererFailed(
                 domain: error?.domain ?? "AVFoundation",
                 code: error?.code ?? -1,
@@ -519,6 +552,11 @@ public final class AetherHybridPresentationView: PlatformBaseView {
                     ?? "renderer failed without an NSError"
             )
         }
+    }
+
+    private static func diagnosticTime(_ seconds: Double?) -> String {
+        guard let seconds, seconds.isFinite else { return "unknown" }
+        return String(format: "%.6f", seconds)
     }
 
     private var currentRendererStatus: AVQueuedSampleBufferRenderingStatus {

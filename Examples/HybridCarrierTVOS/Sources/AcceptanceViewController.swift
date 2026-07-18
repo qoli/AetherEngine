@@ -53,6 +53,18 @@ final class AcceptanceViewController: UIViewController {
         ProcessInfo.processInfo.environment["AETHER_ACCEPTANCE_AUTORUN"] == "1"
     }
 
+    private var automaticEndOfStreamRunEnabled: Bool {
+        ProcessInfo.processInfo.environment[
+            "AETHER_ACCEPTANCE_END_OF_STREAM_AUTORUN"
+        ] == "1"
+    }
+
+    private var automaticEndOfStreamAudioSwitchRunEnabled: Bool {
+        ProcessInfo.processInfo.environment[
+            "AETHER_ACCEPTANCE_END_OF_STREAM_AUDIO_SWITCH_AUTORUN"
+        ] == "1"
+    }
+
     private var automaticStallRunEnabled: Bool {
         ProcessInfo.processInfo.environment[
             "AETHER_ACCEPTANCE_STALL_AUTORUN"
@@ -131,6 +143,8 @@ final class AcceptanceViewController: UIViewController {
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         guard automaticRunEnabled
+                || automaticEndOfStreamRunEnabled
+                || automaticEndOfStreamAudioSwitchRunEnabled
                 || automaticStallRunEnabled
                 || automaticColorRunEnabled
                 || automaticLateHDR10PlusRunEnabled
@@ -354,7 +368,24 @@ final class AcceptanceViewController: UIViewController {
                 setSessionControlsEnabled(true)
                 setupPanel.isHidden = true
                 setStatus("playing", diagnostics: session.diagnostics)
-                if automaticStallRunEnabled {
+                if automaticEndOfStreamAudioSwitchRunEnabled {
+                    try await Task.sleep(for: .seconds(2))
+                    try await runAutomaticAudioTrackSwitchScenario(
+                        session: session
+                    )
+                    try await runAutomaticAudioTrackSwitchScenario(
+                        session: session
+                    )
+                    print(
+                        "AETHER_ACCEPTANCE checkpoint=end-of-stream-generation-4-observation-started"
+                    )
+                    return
+                } else if automaticEndOfStreamRunEnabled {
+                    print(
+                        "AETHER_ACCEPTANCE checkpoint=end-of-stream-observation-started"
+                    )
+                    return
+                } else if automaticStallRunEnabled {
                     try await runAutomaticStallScenario(session: session)
                 } else if automaticNegativeRunEnabled {
                     try await runAutomaticNegativeScenario(

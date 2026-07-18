@@ -169,6 +169,12 @@ xcrun devicectl device process launch \
 Do not set `AETHER_ACCEPTANCE_LOCAL_DIAGNOSTICS` during a formal run. That opt-in switch can reveal a
 local resource-graph rejection reason and exists only for fixture construction.
 
+Set `AETHER_ACCEPTANCE_END_OF_STREAM_AUTORUN=1` to start playback and leave the item uninterrupted until
+AVPlayer emits its terminal lifecycle event. Set
+`AETHER_ACCEPTANCE_END_OF_STREAM_AUDIO_SWITCH_AUTORUN=1` to perform two JOC/AAC round trips first, enter
+generation 4, and then leave playback uninterrupted through the same end-of-stream observation. These
+modes add no renderer recovery, route switch or player fallback; a typed failure remains terminal.
+
 For a physical-remote or XCUITest pass through AVPlayerViewController's native audio/subtitle menus,
 also set `AETHER_ACCEPTANCE_AVKIT_UI_EVIDENCE=1`. This hides only the acceptance harness's custom
 pause/rate/seek/stop button row so it cannot compete with AVKit's focus environment. It does not change
