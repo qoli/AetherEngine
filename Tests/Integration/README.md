@@ -10,9 +10,11 @@ The source-level sample-buffer timing and metadata contract is implemented. A 20
 run passes the automated SDR clock, seek, pre-roll admission, bidirectional audio selection,
 recoverable origin-stall, geometry/cadence, host-negative, native WebVTT selection and visible-cue
 presentation, E-AC-3 JOC, styled ASS and PGS bitmap overlay select/seek/off/reselect, plus stop/reopen
-sub-matrix. Human display/audio/AVKit-menu confirmation, HDR panel-output, HDR10+ and Dolby
-Vision remain pending. See
-[`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md). No unverified
+sub-matrix. The 2026-07-18 late-HDR10+ row also proves that hardware-decoded ST 2094-40 reaches the
+same display layer at PTS 12.0 without a route, generation, carrier-item, renderer, or timebase change.
+Human display/audio/AVKit-menu confirmation, HDR panel-output, and Dolby Vision remain pending. See
+[`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md) and
+[`hybrid-hdr10plus-device-evidence-2026-07-18.md`](hybrid-hdr10plus-device-evidence-2026-07-18.md). No unverified
 color format may be added to
 `AetherHybridPresentationView.verifiedVideoFormats`.
 

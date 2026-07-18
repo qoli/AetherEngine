@@ -11,16 +11,19 @@ stop/reopen teardown. Native WebVTT also passes graph-bound preflight and AVFoun
 select/deselect/reselect on the carrier. Styled ASS passes Aether overlay select/seek/off/reselect and
 AVKit custom-menu installation on the same carrier clock. A deterministic PGS fixture also passes
 cue timing, decoded-pixel placement, seek-generation rebuild and select/off/reselect on the physical
-device. HDR10 and HLG also have
-engine/device candidate evidence, but remain unadmitted without human panel-mode and visual confirmation.
+device. HDR10 and HLG also have engine/device candidate evidence. Late HDR10+ now has a deterministic
+bitstream, complete Apple T.35 attachment, and physical-device same-layer technical pass. All three
+remain unadmitted without human panel-mode and visual confirmation.
 See
-[`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md) and
+[`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md),
+[`hybrid-hdr10plus-device-evidence-2026-07-18.md`](hybrid-hdr10plus-device-evidence-2026-07-18.md), and
 [`hybrid-progressive-subtitle-device-evidence-2026-07-18.md`](hybrid-progressive-subtitle-device-evidence-2026-07-18.md).
 
 The complete physical gate remains pending. Source tests prove the bounded no-drop pending queue,
 monotonic timing, format-description propagation, HDR10+ per-frame attachment, and absence of
-`DisplayImmediately`, but neither those tests nor the partial runs prove the remaining visual/audio,
-panel-mode, HDR10+, or Dolby Vision rows. Automated geometry passes, but its final human
+`DisplayImmediately`. The physical late-HDR10+ run also proves first attachment after startup without
+changing the Hybrid graph, but the partial runs do not prove the remaining visual/audio, panel-mode,
+or Dolby Vision rows. Automated geometry passes, but its final human
 visible-orientation/crop confirmation remains part of the visual row.
 
 `AetherHybridPresentationView.verifiedVideoFormats` must remain `[.sdr]` until each additional format row
