@@ -797,6 +797,8 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         switch trigger {
         case .transportChanged:
             publishTelemetry(.transportChanged)
+        case .videoFormatChanged:
+            publishTelemetry(.videoFormatChanged)
         case .periodicSample(let playerTimeSeconds):
             let renderer = presentationView.diagnostics
             let lastEnqueuedTime =

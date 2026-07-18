@@ -7,7 +7,7 @@
 # generation flush, AVKit media selection, and SDR/HDR device admission.
 #
 # Usage:
-#   AETHER_ACCEPTANCE_VIDEO_FORMAT=sdr|hdr10|hlg \
+#   AETHER_ACCEPTANCE_VIDEO_FORMAT=sdr|hdr10|hdr10plus|hlg \
 #   AETHER_ACCEPTANCE_GEOMETRY_MODE=standard|clean_aperture|sar_4_3| \
 #     rotation_90|rotation_180|rotation_270|fps_24000_1001|fps_15 \
 #   AETHER_ACCEPTANCE_ATMOS_EC3_INPUT=/path/to/licensed-ddp-joc.ec3 \
@@ -44,6 +44,10 @@ ATMOS_EC3_INPUT="${AETHER_ACCEPTANCE_ATMOS_EC3_INPUT:-}"
 ATMOS_INPUT_SHA256=""
 ATMOS_INPUT_PROBE=""
 WEBVTT_SUBTITLES="${AETHER_ACCEPTANCE_WEBVTT_SUBTITLES:-0}"
+HDR10_PLUS_FIRST_FRAME_SECONDS="${AETHER_ACCEPTANCE_HDR10_PLUS_FIRST_FRAME_SECONDS:-12}"
+HDR10_PLUS_FIRST_FRAME_POC=""
+HDR10_PLUS_FIRST_DYNAMIC_SEGMENT=""
+HDR10_PLUS_NALU_FILE=""
 
 if [[ "$WEBVTT_SUBTITLES" != "0" && "$WEBVTT_SUBTITLES" != "1" ]]; then
     echo "ERROR: AETHER_ACCEPTANCE_WEBVTT_SUBTITLES must be 0 or 1" >&2
@@ -138,8 +142,9 @@ AUDIO_DURATION_SECONDS="$(
         'BEGIN { printf "%.9f", duration - (1024 / 48000) }'
 )"
 
-if ! command -v ffmpeg >/dev/null 2>&1; then
-    echo "ERROR: ffmpeg is required" >&2
+if ! command -v ffmpeg >/dev/null 2>&1 \
+        || ! command -v ffprobe >/dev/null 2>&1; then
+    echo "ERROR: ffmpeg and ffprobe are required" >&2
     exit 1
 fi
 
@@ -187,6 +192,54 @@ case "$VIDEO_FORMAT" in
             -x265-params 'repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:hdr10=1:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400'
         )
         ;;
+    hdr10plus)
+        VIDEO_DESCRIPTION="HEVC Main10 hev1 HDR10+ BT.2020/PQ MDCV/CLLI with late ST 2094-40 T.35"
+        HDR10_PLUS_NALU_FILE="$OUTPUT/HDR10PLUS_NALU.txt"
+        HDR10_PLUS_FIRST_FRAME_POC="$(
+            awk -v seconds="$HDR10_PLUS_FIRST_FRAME_SECONDS" \
+                -v rate="$VIDEO_FRAME_RATE" '
+                BEGIN {
+                    split(rate, parts, "/")
+                    fps = length(parts) == 2 ? parts[1] / parts[2] : rate
+                    value = seconds * fps
+                    poc = int(value)
+                    if (poc < value - 0.000000001) {
+                        poc += 1
+                    }
+                    printf "%d", poc
+                }'
+        )"
+        VIDEO_FRAME_COUNT="$(
+            awk -v duration="$VIDEO_DURATION_SECONDS" \
+                -v rate="$VIDEO_FRAME_RATE" '
+                BEGIN {
+                    split(rate, parts, "/")
+                    fps = length(parts) == 2 ? parts[1] / parts[2] : rate
+                    printf "%d", int((duration * fps) + 0.5)
+                }'
+        )"
+        if ! awk -v first="$HDR10_PLUS_FIRST_FRAME_SECONDS" \
+                -v segment="$HLS_SEGMENT_SECONDS" \
+                'BEGIN { exit !(first > segment) }'; then
+            echo "ERROR: HDR10+ first-frame time must be after the first HLS segment" >&2
+            exit 1
+        fi
+        if (( HDR10_PLUS_FIRST_FRAME_POC >= VIDEO_FRAME_COUNT )); then
+            echo "ERROR: HDR10+ first-frame time is outside the fixture duration" >&2
+            exit 1
+        fi
+        VIDEO_CODEC_ARGS=(
+            -c:v libx265
+            -preset ultrafast
+            -tune zerolatency
+            -profile:v main10
+            -pix_fmt yuv420p10le
+            -color_primaries bt2020
+            -color_trc smpte2084
+            -colorspace bt2020nc
+            -x265-params "repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:hdr10=1:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400:nalu-file=$HDR10_PLUS_NALU_FILE"
+        )
+        ;;
     hlg)
         VIDEO_DESCRIPTION="HEVC Main10 hev1 HLG BT.2020/ARIB-STD-B67"
         VIDEO_CODEC_ARGS=(
@@ -213,6 +266,21 @@ if [[ -e "$OUTPUT" ]]; then
 fi
 
 mkdir -p "$OUTPUT"
+if [[ "$VIDEO_FORMAT" == "hdr10plus" ]]; then
+    # x265 consumes one nalu-file row per POC. A benign 18-byte
+    # user-data-unregistered payload occupies pre-startup frames. From the
+    # selected POC onward, each frame carries one deterministic,
+    # FFmpeg-validated HDR10+ T.35 payload. The base64 representation has
+    # padding; x265's reader writes a 24-byte payload, whose two trailing zero
+    # bytes are accepted by the ST 2094-40 parser.
+    for ((poc = 0; poc < VIDEO_FRAME_COUNT; poc += 1)); do
+        if (( poc < HDR10_PLUS_FIRST_FRAME_POC )); then
+            echo "$poc PREFIX 39/5 AAECAwQFBgcICQoLDA0OD3h4"
+        else
+            echo "$poc PREFIX 39/4 tQA8AAEEAUAAH0AAAAAAAAAAAAAAAA=="
+        fi
+    done > "$HDR10_PLUS_NALU_FILE"
+fi
 VIDEO_SOURCE="$OUTPUT/.encoded-video.mp4"
 VIDEO_INPUT_ARGS=(-noautorotate)
 if [[ "$VIDEO_ROTATION_DEGREES" != "0" ]]; then
@@ -299,6 +367,42 @@ fi
 python3 "$REPO_ROOT/Scripts/normalize-hybrid-acceptance-playlist-durations.py" \
     "${NORMALIZER_ARGS[@]}"
 
+if [[ "$VIDEO_FORMAT" == "hdr10plus" ]]; then
+    VIDEO_INIT="$OUTPUT/video/init_0.mp4"
+    FIRST_VIDEO_SEGMENT="$OUTPUT/video/segment_000.m4s"
+    if [[ ! -f "$VIDEO_INIT" || ! -f "$FIRST_VIDEO_SEGMENT" ]]; then
+        echo "ERROR: HDR10+ verification could not find the video init/first segment" >&2
+        exit 1
+    fi
+    FIRST_SEGMENT_PROBE="$(
+        ffprobe -v error -select_streams v:0 -show_frames \
+            -show_entries frame=side_data_list -of json \
+            "concat:$VIDEO_INIT|$FIRST_VIDEO_SEGMENT"
+    )"
+    if [[ "$FIRST_SEGMENT_PROBE" == *"HDR Dynamic Metadata SMPTE2094-40"* ]]; then
+        echo "ERROR: HDR10+ metadata appeared in the first segment; fixture is not late-metadata evidence" >&2
+        exit 1
+    fi
+    for segment in "$OUTPUT"/video/segment_*.m4s; do
+        if [[ "$segment" == "$FIRST_VIDEO_SEGMENT" ]]; then
+            continue
+        fi
+        SEGMENT_PROBE="$(
+            ffprobe -v error -select_streams v:0 -show_frames \
+                -show_entries frame=side_data_list -of json \
+                "concat:$VIDEO_INIT|$segment"
+        )"
+        if [[ "$SEGMENT_PROBE" == *"HDR Dynamic Metadata SMPTE2094-40"* ]]; then
+            HDR10_PLUS_FIRST_DYNAMIC_SEGMENT="$(basename "$segment")"
+            break
+        fi
+    done
+    if [[ -z "$HDR10_PLUS_FIRST_DYNAMIC_SEGMENT" ]]; then
+        echo "ERROR: no post-startup segment contains FFmpeg-validated HDR10+ metadata" >&2
+        exit 1
+    fi
+fi
+
 if [[ "$WEBVTT_SUBTITLES" == "1" ]]; then
     python3 "$REPO_ROOT/Scripts/add-hybrid-acceptance-webvtt.py" "$OUTPUT"
 fi
@@ -320,6 +424,13 @@ fi
     echo "containerCounterClockwiseRotationDegrees=-$VIDEO_ROTATION_DEGREES"
     echo "audioRenditions=$AUDIO_RENDITIONS"
     echo "nativeWebVTTRenditions=$WEBVTT_SUBTITLES"
+    if [[ "$VIDEO_FORMAT" == "hdr10plus" ]]; then
+        echo "hdr10PlusFirstFrameSeconds=$HDR10_PLUS_FIRST_FRAME_SECONDS"
+        echo "hdr10PlusFirstFramePOC=$HDR10_PLUS_FIRST_FRAME_POC"
+        echo "hdr10PlusFirstDynamicSegment=$HDR10_PLUS_FIRST_DYNAMIC_SEGMENT"
+        echo "hdr10PlusT35Base64=tQA8AAEEAUAAH0AAAAAAAAAAAAAAAA=="
+        echo "hdr10PlusVerification=first segment has no HDR Dynamic Metadata; named later segment is FFmpeg-recognized SMPTE2094-40"
+    fi
     if [[ -n "$ATMOS_EC3_INPUT" ]]; then
         echo "atmosInputSHA256=$ATMOS_INPUT_SHA256"
         while IFS= read -r line; do

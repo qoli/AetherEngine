@@ -26,9 +26,8 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         set { skipLock.lock(); _onFailure = newValue; skipLock.unlock() }
     }
     private var _onFailure: VideoDecoderFailureHandler?
-    /// Not yet wired on the VT side (follow-up: read AV_PKT_DATA_DYNAMIC_HDR10_PLUS before decode,
-    /// mirror SoftwareVideoDecoder.extractHDR10PlusBytes). Flag kept so host wiring stays identical to SW path.
     var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
+    private var seenHDR10Plus = false
 
     /// Skip pre-seek RASL frames to avoid the "fast forward" effect; decoded for reference but not delivered.
     /// Guarded by `skipLock` not `lock`: close() holds `lock` across VTDecompressionSessionWaitForAsynchronousFrames,
@@ -58,6 +57,11 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var height: Int32 = 0
     private var framePresentationMetadata:
         DecodedFramePresentationMetadata?
+    private var compressedSampleFraming:
+        HEVCCompressedSampleFraming = .lengthPrefixed(
+            lengthFieldBytes: 4
+        )
+    private var inspectsCompressedHDR10Plus = false
 
     /// Color metadata from codecpar, re-applied to every CVPixelBuffer.
     /// VTDecompressionSession should propagate these from SPS+hvcC but has been observed not to;
@@ -77,6 +81,14 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     fileprivate final class RefConBox {
         weak var decoder: HardwareVideoDecoder?
         init(_ decoder: HardwareVideoDecoder) { self.decoder = decoder }
+    }
+
+    fileprivate final class FrameRefConBox {
+        let hdr10PlusT35: Data?
+
+        init(hdr10PlusT35: Data?) {
+            self.hdr10PlusT35 = hdr10PlusT35
+        }
     }
 
     // MARK: - Lifecycle
@@ -104,6 +116,13 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             throw VideoDecoderError.noExtradata
         }
         let hvcCData = Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size))
+        guard hvcCData.count > 21,
+              hvcCData[0] == 1 else {
+            throw VideoDecoderError.noExtradata
+        }
+        compressedSampleFraming = .lengthPrefixed(
+            lengthFieldBytes: Int(hvcCData[21] & 0x03) + 1
+        )
         var fd: CMVideoFormatDescription?
         let atomsDict: NSDictionary = ["hvcC": hvcCData]
         let extensions: NSDictionary = [
@@ -135,6 +154,8 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         // 3. Pixel buffer attributes: 10-bit biplanar for HDR, 8-bit for SDR; IOSurface-backed for sample-buffer presentation.
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
         let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
+        inspectsCompressedHDR10Plus =
+            codecpar.pointee.color_trc == AVCOL_TRC_SMPTE2084
         let use10Bit = bitsPerSample > 8 || isHDRTransfer
 
         self.colorPrimaries = ColorAttachments.primaries(codecpar.pointee.color_primaries)
@@ -246,6 +267,38 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             ? CMTimeMake(value: durRaw * Int64(timeBase.num), timescale: timescale)
             : CMTime.invalid
 
+        let hdr10PlusT35: Data?
+        do {
+            if let sideData = try HDR10PlusMetadataSerializer
+                    .fromPacket(packet) {
+                hdr10PlusT35 = sideData
+            } else if inspectsCompressedHDR10Plus {
+                switch HDR10PlusCompressedSampleInspector.extract(
+                    Data(bytes: data, count: size),
+                    framing: compressedSampleFraming
+                ) {
+                case .notDetected:
+                    hdr10PlusT35 = nil
+                case .validated(let t35Payload):
+                    hdr10PlusT35 = t35Payload
+                case .malformedHDR10PlusMetadata,
+                     .malformedCompressedSample,
+                     .validatorUnavailable:
+                    throw HDR10PlusMetadataSerializationError
+                        .emptyPayload
+                }
+            } else {
+                hdr10PlusT35 = nil
+            }
+        } catch {
+            onFailure?(.dynamicHDR10PlusSerializationFailed)
+            return
+        }
+        if hdr10PlusT35 != nil, !seenHDR10Plus {
+            seenHDR10Plus = true
+            onFirstHDR10PlusDetected?()
+        }
+
         var timing = CMSampleTimingInfo(duration: dur, presentationTimeStamp: pts, decodeTimeStamp: dts)
         var sampleSize = size
 
@@ -286,15 +339,19 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
 
         // Async decode with temporal queueing; callback fires on VT's internal queue.
+        let frameRefCon = Unmanaged.passRetained(
+            FrameRefConBox(hdr10PlusT35: hdr10PlusT35)
+        )
         var infoFlags = VTDecodeInfoFlags()
         let decodeStatus = VTDecompressionSessionDecodeFrame(
             session,
             sampleBuffer: sb,
             flags: [._EnableAsynchronousDecompression, ._EnableTemporalProcessing],
-            frameRefcon: nil,
+            frameRefcon: frameRefCon.toOpaque(),
             infoFlagsOut: &infoFlags
         )
         if decodeStatus != noErr {
+            frameRefCon.release()
             onFailure?(.decodeFrameFailed(status: decodeStatus))
             EngineLog.emit(
                 "[HardwareVideoDecoder] decode error \(decodeStatus) at pts=\(ptsRaw)",
@@ -354,7 +411,8 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     fileprivate func handleDecodedFrame(
         imageBuffer: CVImageBuffer,
         pts: CMTime,
-        duration: CMTime
+        duration: CMTime,
+        hdr10PlusT35: Data?
     ) {
         if let threshold = skipUntilPTS {
             if CMTimeCompare(pts, threshold) < 0 {
@@ -383,7 +441,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             imageBuffer,
             pts,
             duration,
-            nil,
+            hdr10PlusT35,
             framePresentationMetadata
         )
     }
@@ -411,6 +469,10 @@ private func hwDecoderOutputCallback(
     presentationTimeStamp: CMTime,
     presentationDuration: CMTime
 ) {
+    let frameMetadata = sourceFrameRefCon.map {
+        Unmanaged<HardwareVideoDecoder.FrameRefConBox>
+            .fromOpaque($0).takeRetainedValue()
+    }
     guard let refCon = decompressionOutputRefCon else { return }
     let box = Unmanaged<HardwareVideoDecoder.RefConBox>
         .fromOpaque(refCon).takeUnretainedValue()
@@ -424,6 +486,7 @@ private func hwDecoderOutputCallback(
     box.decoder?.handleDecodedFrame(
         imageBuffer: imageBuffer,
         pts: presentationTimeStamp,
-        duration: presentationDuration
+        duration: presentationDuration,
+        hdr10PlusT35: frameMetadata?.hdr10PlusT35
     )
 }

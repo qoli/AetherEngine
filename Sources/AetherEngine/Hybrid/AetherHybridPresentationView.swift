@@ -107,6 +107,11 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         public let staleGenerationDrops: Int
         public let backPressureObservations: Int
         public let enqueuedSampleBuffers: Int
+        /// Samples actually enqueued into the active generation's
+        /// AVSampleBufferDisplayLayer with the Apple HDR10+ attachment.
+        public let hdr10PlusAttachedSampleBuffers: Int
+        /// PTS of the first enqueued HDR10+ sample in the active generation.
+        public let firstHDR10PlusAttachmentTimeSeconds: Double?
         public let lastEnqueuedTimeSeconds: Double?
         /// Source-derived duration of the newest frame admitted in the active generation.
         public let lastAcceptedFrameDurationSeconds: Double?
@@ -127,6 +132,8 @@ public final class AetherHybridPresentationView: PlatformBaseView {
             staleGenerationDrops: Int,
             backPressureObservations: Int,
             enqueuedSampleBuffers: Int,
+            hdr10PlusAttachedSampleBuffers: Int,
+            firstHDR10PlusAttachmentTimeSeconds: Double?,
             lastEnqueuedTimeSeconds: Double?,
             lastAcceptedFrameDurationSeconds: Double?,
             lastAcceptedGeometry:
@@ -143,6 +150,10 @@ public final class AetherHybridPresentationView: PlatformBaseView {
             self.staleGenerationDrops = staleGenerationDrops
             self.backPressureObservations = backPressureObservations
             self.enqueuedSampleBuffers = enqueuedSampleBuffers
+            self.hdr10PlusAttachedSampleBuffers =
+                hdr10PlusAttachedSampleBuffers
+            self.firstHDR10PlusAttachmentTimeSeconds =
+                firstHDR10PlusAttachmentTimeSeconds
             self.lastEnqueuedTimeSeconds = lastEnqueuedTimeSeconds
             self.lastAcceptedFrameDurationSeconds =
                 lastAcceptedFrameDurationSeconds
@@ -165,6 +176,7 @@ public final class AetherHybridPresentationView: PlatformBaseView {
     private struct PendingSample {
         let sampleBuffer: CMSampleBuffer
         let presentationTime: CMTime
+        let hasHDR10PlusAttachment: Bool
     }
 
     static let maximumPendingSampleBuffers = 24
@@ -185,6 +197,8 @@ public final class AetherHybridPresentationView: PlatformBaseView {
     private var staleGenerationDrops = 0
     private var backPressureObservations = 0
     private var enqueuedSampleBuffers = 0
+    private var hdr10PlusAttachedSampleBuffers = 0
+    private var firstHDR10PlusAttachmentTime: CMTime?
 
     public var videoGravity: AetherHybridVideoGravity = .resizeAspect {
         didSet {
@@ -281,6 +295,8 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         lastAcceptedFrameDurationSeconds = nil
         lastAcceptedGeometry = nil
         lastEnqueuedPresentationTime = nil
+        hdr10PlusAttachedSampleBuffers = 0
+        firstHDR10PlusAttachmentTime = nil
         subtitleCanvas.clear()
     }
 
@@ -382,7 +398,8 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         let sampleBuffer = try makeSampleBuffer(frame)
         pendingSamples.append(PendingSample(
             sampleBuffer: sampleBuffer,
-            presentationTime: frame.presentationTime
+            presentationTime: frame.presentationTime,
+            hasHDR10PlusAttachment: frame.hdr10PlusT35 != nil
         ))
         lastAcceptedPresentationTime = frame.presentationTime
         lastAcceptedFrameDurationSeconds = frame.duration.seconds
@@ -418,6 +435,10 @@ public final class AetherHybridPresentationView: PlatformBaseView {
             staleGenerationDrops: staleGenerationDrops,
             backPressureObservations: backPressureObservations,
             enqueuedSampleBuffers: enqueuedSampleBuffers,
+            hdr10PlusAttachedSampleBuffers:
+                hdr10PlusAttachedSampleBuffers,
+            firstHDR10PlusAttachmentTimeSeconds:
+                firstHDR10PlusAttachmentTime?.seconds,
             lastEnqueuedTimeSeconds:
                 lastEnqueuedPresentationTime?.seconds,
             lastAcceptedFrameDurationSeconds:
@@ -526,6 +547,12 @@ public final class AetherHybridPresentationView: PlatformBaseView {
             let pending = pendingSamples.removeFirst()
             target.enqueue(pending.sampleBuffer)
             enqueuedSampleBuffers += 1
+            if pending.hasHDR10PlusAttachment {
+                hdr10PlusAttachedSampleBuffers += 1
+                firstHDR10PlusAttachmentTime =
+                    firstHDR10PlusAttachmentTime
+                    ?? pending.presentationTime
+            }
             lastEnqueuedPresentationTime =
                 pending.presentationTime
             try throwIfRendererFailed()

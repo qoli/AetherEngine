@@ -407,6 +407,7 @@ public enum AetherHybridPlaybackTelemetryEventKind:
     case sessionCreated
     case stateChanged
     case transportChanged
+    case videoFormatChanged
     case periodicSample
     case playbackPressureChanged
     case audioAnalysisChanged

@@ -108,6 +108,12 @@ includes explicit BT.2020/PQ, MDCV, and CLLI signaling; HLG includes BT.2020/ARI
 Generating or rendering either fixture is not format admission: the physical-device record still needs
 panel-mode and human visual evidence before `verifiedVideoFormats` can expand.
 
+Set `AETHER_ACCEPTANCE_VIDEO_FORMAT=hdr10plus` to generate a deterministic PQ fixture whose first HLS
+segment contains no HDR10+ metadata and whose ST 2094-40 T.35 payload begins at 12 seconds by default.
+Override that point with `AETHER_ACCEPTANCE_HDR10_PLUS_FIRST_FRAME_SECONDS`; it must remain after the
+first segment. The generator fails unless `ffprobe` proves the first segment is metadata-free and a
+later segment contains recognized HDR10+ metadata.
+
 Set `AETHER_ACCEPTANCE_GEOMETRY_MODE` to `clean_aperture`, `sar_4_3`, `rotation_90`,
 `rotation_180`, `rotation_270`, `fps_24000_1001`, or `fps_15` for a deterministic geometry/cadence
 fixture. Rotation mode names are Aether's canonical clockwise values; the generator writes FFmpeg's
@@ -180,6 +186,12 @@ Use `AETHER_ACCEPTANCE_COLOR_AUTORUN=1` together with
 format, the single rendering display layer, a bound carrier timebase, enqueued samples, and an advancing
 carrier clock. Its final checkpoint is `color-<format>-passed`. This proves an engine/device candidate
 only; it does not replace the panel-mode and human visual rows.
+
+For the late-metadata row, launch the HDR10+ fixture with
+`AETHER_ACCEPTANCE_LATE_HDR10_PLUS_AUTORUN=1`. The harness requires an initial metadata-free HDR10
+state, followed by a nonzero display-layer attachment count and `.hdr10Plus` on the same generation,
+carrier item, presentation view, renderer, and carrier timebase binding. Its final checkpoint is
+`late-hdr10plus-same-layer-passed`.
 
 ## Host-contract negative run
 

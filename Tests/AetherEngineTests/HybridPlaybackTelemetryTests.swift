@@ -202,6 +202,8 @@ struct HybridPlaybackTelemetryTests {
                 staleGenerationDrops: 0,
                 backPressureObservations: 0,
                 enqueuedSampleBuffers: 0,
+                hdr10PlusAttachedSampleBuffers: 0,
+                firstHDR10PlusAttachmentTimeSeconds: nil,
                 lastEnqueuedTimeSeconds: nil,
                 lastAcceptedFrameDurationSeconds: nil,
                 lastAcceptedGeometry: nil,

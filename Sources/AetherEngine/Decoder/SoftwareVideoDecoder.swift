@@ -266,7 +266,14 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
         // HDR10+: read dynamic metadata from post-decode AVFrame side data (T.35 SEI bytes).
         // Can't reuse the VT path's packet-side stash; this decoder owns its own packet flow.
-        let hdr10PlusData = extractHDR10PlusBytes(from: f)
+        let hdr10PlusData: Data?
+        do {
+            hdr10PlusData = try HDR10PlusMetadataSerializer
+                .fromFrame(f)
+        } catch {
+            onFailure?(.dynamicHDR10PlusSerializationFailed)
+            return
+        }
         if hdr10PlusData != nil, !seenHDR10Plus {
             seenHDR10Plus = true
             onFirstHDR10PlusDetected?()
@@ -338,35 +345,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         av_frame_free(&frame)
         lock.unlock()
-    }
-
-    /// Serialise HDR10+ dynamic metadata from AVFrame side data to T.35 SEI bytes (kCMSampleAttachmentKey_HDR10PlusPerFrameData).
-    /// Returns nil when the frame carries no AV_FRAME_DATA_DYNAMIC_HDR_PLUS side data.
-    private func extractHDR10PlusBytes(
-        from frame: UnsafeMutablePointer<AVFrame>
-    ) -> Data? {
-        let count = Int(frame.pointee.nb_side_data)
-        guard count > 0, let sideData = frame.pointee.side_data else {
-            return nil
-        }
-        for i in 0..<count {
-            guard let entry = sideData[i] else { continue }
-            guard entry.pointee.type == AV_FRAME_DATA_DYNAMIC_HDR_PLUS else { continue }
-            guard let raw = entry.pointee.data, entry.pointee.size > 0 else { continue }
-            return raw.withMemoryRebound(
-                to: AVDynamicHDRPlus.self,
-                capacity: 1
-            ) { recordPtr -> Data? in
-                var dataPtr: UnsafeMutablePointer<UInt8>? = nil
-                var size: Int = 0
-                let result = av_dynamic_hdr_plus_to_t35(recordPtr, &dataPtr, &size)
-                guard result >= 0, let buf = dataPtr, size > 0 else { return nil }
-                let data = Data(bytes: buf, count: size)
-                av_free(buf)  // use av_free, not plain free(): libavutil allocator contract
-                return data
-            }
-        }
-        return nil
     }
 
     func close() {

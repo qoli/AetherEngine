@@ -31,14 +31,18 @@ private final class HybridPresentationContractState {
 private func makeHybridPlaybackSessionFrame(
     time: Double,
     duration: Double = 1,
-    generation: UInt64
+    generation: UInt64,
+    videoFormat: VideoFormat = .sdr,
+    hdr10PlusT35: Data? = nil
 ) throws -> DecodedVideoFrame {
     var pixelBuffer: CVPixelBuffer?
     let status = CVPixelBufferCreate(
         kCFAllocatorDefault,
         16,
         16,
-        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        videoFormat == .sdr
+            ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
         [
             kCVPixelBufferIOSurfacePropertiesKey: NSDictionary(),
         ] as CFDictionary,
@@ -47,6 +51,26 @@ private func makeHybridPlaybackSessionFrame(
     guard status == kCVReturnSuccess, let pixelBuffer else {
         throw HybridPlaybackSessionFixtureError
             .pixelBufferCreationFailed
+    }
+    if videoFormat == .hdr10 || videoFormat == .hdr10Plus {
+        CVBufferSetAttachment(
+            pixelBuffer,
+            kCVImageBufferColorPrimariesKey,
+            kCVImageBufferColorPrimaries_ITU_R_2020,
+            .shouldPropagate
+        )
+        CVBufferSetAttachment(
+            pixelBuffer,
+            kCVImageBufferTransferFunctionKey,
+            kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,
+            .shouldPropagate
+        )
+        CVBufferSetAttachment(
+            pixelBuffer,
+            kCVImageBufferYCbCrMatrixKey,
+            kCVImageBufferYCbCrMatrix_ITU_R_2020,
+            .shouldPropagate
+        )
     }
     return try DecodedVideoFrame(
         pixelBuffer: pixelBuffer,
@@ -58,7 +82,7 @@ private func makeHybridPlaybackSessionFrame(
             seconds: duration,
             preferredTimescale: 600
         ),
-        videoFormat: .sdr,
+        videoFormat: videoFormat,
         geometry: DecodedVideoFrameGeometry(
             codedWidth: 16,
             codedHeight: 16,
@@ -72,7 +96,7 @@ private func makeHybridPlaybackSessionFrame(
             pixelAspectRatioDenominator: 1,
             rotationDegrees: 0
         ),
-        hdr10PlusT35: nil,
+        hdr10PlusT35: hdr10PlusT35,
         generation: generation
     )
 }
@@ -89,6 +113,7 @@ struct HybridPlaybackSessionTests {
         private let relay: HybridPlaybackFrameRelay
         private let timeline: BlackCarrierTimeline
         private let analysisData: Data?
+        private let videoFormat: VideoFormat
         private let lock = NSLock()
 
         private(set) var didPrepareInitial = false
@@ -113,14 +138,16 @@ struct HybridPlaybackSessionTests {
         init(
             relay: HybridPlaybackFrameRelay,
             timeline: BlackCarrierTimeline,
-            analysisData: Data? = nil
+            analysisData: Data? = nil,
+            videoFormat: VideoFormat = .sdr
         ) {
             self.relay = relay
             self.timeline = timeline
             self.analysisData = analysisData
+            self.videoFormat = videoFormat
         }
 
-        var hybridVideoFormat: VideoFormat? { .sdr }
+        var hybridVideoFormat: VideoFormat? { videoFormat }
         var hybridVideoFrameRate: Double? { 24 }
         var terminalHybridPlaybackError:
             HybridPlaybackSessionError?
@@ -181,7 +208,8 @@ struct HybridPlaybackSessionTests {
             lock.unlock()
             relay.emit(try makeHybridPlaybackSessionFrame(
                 time: 0,
-                generation: 0
+                generation: 0,
+                videoFormat: videoFormat
             ))
         }
 
@@ -221,7 +249,8 @@ struct HybridPlaybackSessionTests {
                     relay.emit(try makeHybridPlaybackSessionFrame(
                         time: time,
                         duration: 1 / 24,
-                        generation: generation
+                        generation: generation,
+                        videoFormat: videoFormat
                     ))
                 }
                 return
@@ -230,7 +259,8 @@ struct HybridPlaybackSessionTests {
             relay.emit(try makeHybridPlaybackSessionFrame(
                 time: segment.startTime.seconds,
                 duration: segment.duration.seconds,
-                generation: generation
+                generation: generation,
+                videoFormat: videoFormat
             ))
         }
 
@@ -854,6 +884,39 @@ struct HybridPlaybackSessionTests {
         )
     }
 
+    @Test("Late HDR10 Plus metadata upgrades format without changing generation")
+    @MainActor
+    func lateHDR10PlusUpgradeKeepsGeneration() async throws {
+        let fixture = try makeSession(videoFormat: .hdr10)
+        defer { fixture.session.stop() }
+        let telemetry = HybridTelemetryTriggerRecorder()
+        fixture.session.telemetryDidChange = {
+            telemetry.record($0)
+        }
+
+        try await fixture.session.prepare(timeout: 1)
+        #expect(fixture.session.sourceVideoFormat == .hdr10)
+        #expect(fixture.renderSurface.generation == 0)
+        telemetry.removeAll()
+
+        fixture.relay.emit(try makeHybridPlaybackSessionFrame(
+            time: 1,
+            generation: 0,
+            videoFormat: .hdr10Plus,
+            hdr10PlusT35: Data([
+                0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04, 0x01,
+            ])
+        ))
+        try await waitUntil {
+            fixture.session.sourceVideoFormat == .hdr10Plus
+        }
+
+        #expect(fixture.session.sourceVideoFormat == .hdr10Plus)
+        #expect(fixture.renderSurface.generation == 0)
+        #expect(fixture.renderSurface.frames.last?.videoFormat == .hdr10Plus)
+        #expect(telemetry.values.contains(.videoFormatChanged))
+    }
+
     @Test("Presentation drift before provider prewarm is terminal and never starts carrier")
     @MainActor
     func presentationDriftBeforeProviderPrewarm() async throws {
@@ -1378,7 +1441,9 @@ struct HybridPlaybackSessionTests {
     }
 
     @MainActor
-    private func makeSession() throws -> (
+    private func makeSession(
+        videoFormat: VideoFormat = .sdr
+    ) throws -> (
         session: HybridPlaybackSession,
         provider: Provider,
         transport: Transport,
@@ -1394,7 +1459,8 @@ struct HybridPlaybackSessionTests {
         let relay = HybridPlaybackFrameRelay()
         let provider = Provider(
             relay: relay,
-            timeline: timeline
+            timeline: timeline,
+            videoFormat: videoFormat
         )
         let transport = Transport()
         let renderSurface = RenderSurface()

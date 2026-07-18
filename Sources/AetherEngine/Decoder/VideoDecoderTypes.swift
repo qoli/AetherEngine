@@ -198,6 +198,7 @@ enum VideoDecoderError: Error, LocalizedError, Sendable, Equatable {
     case decodeFrameFailed(status: OSStatus)
     case asynchronousDecodeFailed(status: OSStatus)
     case asynchronousFrameMissing
+    case dynamicHDR10PlusSerializationFailed
     case frameAllocationFailed
     case invalidFrameGeometry
     case softwareSendPacketFailed(code: Int32)
@@ -217,6 +218,8 @@ enum VideoDecoderError: Error, LocalizedError, Sendable, Equatable {
         case .decodeFrameFailed(let s): "VideoToolbox decode submission failed (\(s))"
         case .asynchronousDecodeFailed(let s): "VideoToolbox asynchronous decode failed (\(s))"
         case .asynchronousFrameMissing: "VideoToolbox completed decode without an image buffer"
+        case .dynamicHDR10PlusSerializationFailed:
+            "HDR10+ dynamic metadata could not be serialized for presentation"
         case .frameAllocationFailed: "Software video decoder could not allocate a frame"
         case .invalidFrameGeometry: "Decoded video frame geometry is invalid"
         case .softwareSendPacketFailed(let c): "Software video decoder rejected packet (\(c))"

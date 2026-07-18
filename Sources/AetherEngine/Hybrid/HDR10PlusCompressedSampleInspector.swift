@@ -14,6 +14,14 @@ enum HDR10PlusCompressedSampleInspection: Sendable, Equatable {
     case validatorUnavailable
 }
 
+enum HDR10PlusCompressedSampleExtraction: Sendable, Equatable {
+    case notDetected
+    case validated(t35Payload: Data)
+    case malformedHDR10PlusMetadata
+    case malformedCompressedSample
+    case validatorUnavailable
+}
+
 /// Bounded, decoder-free inspection of one compressed HEVC sample.
 ///
 /// The scanner recognizes only `user_data_registered_itu_t_t35` SEI messages whose registered
@@ -32,6 +40,26 @@ enum HDR10PlusCompressedSampleInspector {
         _ sample: Data,
         framing: HEVCCompressedSampleFraming
     ) -> HDR10PlusCompressedSampleInspection {
+        switch extract(sample, framing: framing) {
+        case .notDetected:
+            return .notDetected
+        case .validated(let payload):
+            return .validated(
+                t35PayloadByteCount: payload.count
+            )
+        case .malformedHDR10PlusMetadata:
+            return .malformedHDR10PlusMetadata
+        case .malformedCompressedSample:
+            return .malformedCompressedSample
+        case .validatorUnavailable:
+            return .validatorUnavailable
+        }
+    }
+
+    static func extract(
+        _ sample: Data,
+        framing: HEVCCompressedSampleFraming
+    ) -> HDR10PlusCompressedSampleExtraction {
         let bytes = [UInt8](sample)
         guard !bytes.isEmpty else {
             return .malformedCompressedSample
@@ -64,7 +92,7 @@ enum HDR10PlusCompressedSampleInspector {
                     || nalUnitType == suffixSEINALUnitType else {
                 continue
             }
-            let inspection = inspectSEIRBSP(
+            let inspection = extractSEIRBSP(
                 removingEmulationPrevention(from: unit.dropFirst(2))
             )
             switch inspection {
@@ -186,9 +214,9 @@ enum HDR10PlusCompressedSampleInspector {
         return result
     }
 
-    private static func inspectSEIRBSP(
+    private static func extractSEIRBSP(
         _ bytes: [UInt8]
-    ) -> HDR10PlusCompressedSampleInspection {
+    ) -> HDR10PlusCompressedSampleExtraction {
         var cursor = 0
         while cursor < bytes.count {
             if bytes[cursor] == 0x80,
@@ -223,7 +251,7 @@ enum HDR10PlusCompressedSampleInspector {
             ) {
             case .valid:
                 return .validated(
-                    t35PayloadByteCount: payload.count
+                    t35Payload: Data(payload)
                 )
             case .invalid:
                 return .malformedHDR10PlusMetadata

@@ -39,6 +39,16 @@ struct HDR10PlusCompressedSampleInspectorTests {
                 t35PayloadByteCount: payload.count
             )
         )
+        #expect(
+            HDR10PlusCompressedSampleInspector.extract(
+                sample,
+                framing: .lengthPrefixed(
+                    lengthFieldBytes: 4
+                )
+            ) == .validated(
+                t35Payload: Data(payload)
+            )
+        )
     }
 
     @Test("Identifier bytes inside slice data are not HDR10+ evidence")

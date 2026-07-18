@@ -64,6 +64,12 @@ final class AcceptanceViewController: UIViewController {
         ] == "1"
     }
 
+    private var automaticLateHDR10PlusRunEnabled: Bool {
+        ProcessInfo.processInfo.environment[
+            "AETHER_ACCEPTANCE_LATE_HDR10_PLUS_AUTORUN"
+        ] == "1"
+    }
+
     private var automaticGeometryRunEnabled: Bool {
         ProcessInfo.processInfo.environment[
             "AETHER_ACCEPTANCE_GEOMETRY_AUTORUN"
@@ -115,6 +121,7 @@ final class AcceptanceViewController: UIViewController {
         guard automaticRunEnabled
                 || automaticStallRunEnabled
                 || automaticColorRunEnabled
+                || automaticLateHDR10PlusRunEnabled
                 || automaticGeometryRunEnabled
                 || automaticSubtitleRunEnabled
                 || automaticOverlaySubtitleRunEnabled
@@ -325,6 +332,10 @@ final class AcceptanceViewController: UIViewController {
                     try await runAutomaticColorScenario(
                         session: session
                     )
+                } else if automaticLateHDR10PlusRunEnabled {
+                    try await runAutomaticLateHDR10PlusScenario(
+                        session: session
+                    )
                 } else if automaticGeometryRunEnabled {
                     try await runAutomaticGeometryScenario(
                         session: session
@@ -517,10 +528,10 @@ final class AcceptanceViewController: UIViewController {
                     self?.observedCarrierStallPressure = true
                 }
                 Self.logger.notice(
-                    "event sequence=\(event.sequence) kind=\(event.kind.rawValue, privacy: .public) route=\(event.snapshot.route.rawValue, privacy: .public) generation=\(event.snapshot.generation) carrierTime=\(event.snapshot.carrierTimeSeconds ?? -1, format: .fixed(precision: 3)) pending=\(event.snapshot.renderer.pendingSampleBuffers) enqueued=\(event.snapshot.renderer.enqueuedSampleBuffers) prerollRejected=\(event.snapshot.readinessPrerollFramesRejected) timebaseBound=\(event.snapshot.renderer.carrierTimebaseBound) renderer=\(event.snapshot.renderer.rendererStatus.rawValue, privacy: .public)"
+                    "event sequence=\(event.sequence) kind=\(event.kind.rawValue, privacy: .public) route=\(event.snapshot.route.rawValue, privacy: .public) generation=\(event.snapshot.generation) carrierTime=\(event.snapshot.carrierTimeSeconds ?? -1, format: .fixed(precision: 3)) pending=\(event.snapshot.renderer.pendingSampleBuffers) enqueued=\(event.snapshot.renderer.enqueuedSampleBuffers) hdr10PlusAttached=\(event.snapshot.renderer.hdr10PlusAttachedSampleBuffers) prerollRejected=\(event.snapshot.readinessPrerollFramesRejected) timebaseBound=\(event.snapshot.renderer.carrierTimebaseBound) renderer=\(event.snapshot.renderer.rendererStatus.rawValue, privacy: .public)"
                 )
                 print(
-                    "AETHER_ACCEPTANCE event sequence=\(event.sequence) kind=\(event.kind.rawValue) route=\(event.snapshot.route.rawValue) generation=\(event.snapshot.generation) carrierTime=\(event.snapshot.carrierTimeSeconds ?? -1) rate=\(event.snapshot.carrierRate) timeControl=\(event.snapshot.carrierTimeControlStatus.rawValue) forwardBuffer=\(event.snapshot.carrierForwardBufferSeconds ?? -1) pressure=\(event.snapshot.audioAnalysisPlaybackPressure.rawValue) pending=\(event.snapshot.renderer.pendingSampleBuffers) enqueued=\(event.snapshot.renderer.enqueuedSampleBuffers) prerollRejected=\(event.snapshot.readinessPrerollFramesRejected) timebaseBound=\(event.snapshot.renderer.carrierTimebaseBound) renderer=\(event.snapshot.renderer.rendererStatus.rawValue) carrierBudget=\(event.snapshot.carrierBandwidth.declaredTransportBudget) carrierObservedPeak=\(event.snapshot.carrierBandwidth.observedPeakBandwidth ?? -1) carrierObservedAverage=\(event.snapshot.carrierBandwidth.observedAverageBandwidth ?? -1) carrierObservedSegments=\(event.snapshot.carrierBandwidth.observedSegmentCount) carrierBandwidthState=\(event.snapshot.carrierBandwidth.state.rawValue)\(self?.telemetryFailureSuffix(event.payload) ?? "")"
+                    "AETHER_ACCEPTANCE event sequence=\(event.sequence) kind=\(event.kind.rawValue) route=\(event.snapshot.route.rawValue) generation=\(event.snapshot.generation) carrierTime=\(event.snapshot.carrierTimeSeconds ?? -1) rate=\(event.snapshot.carrierRate) timeControl=\(event.snapshot.carrierTimeControlStatus.rawValue) forwardBuffer=\(event.snapshot.carrierForwardBufferSeconds ?? -1) pressure=\(event.snapshot.audioAnalysisPlaybackPressure.rawValue) pending=\(event.snapshot.renderer.pendingSampleBuffers) enqueued=\(event.snapshot.renderer.enqueuedSampleBuffers) hdr10PlusAttached=\(event.snapshot.renderer.hdr10PlusAttachedSampleBuffers) hdr10PlusFirstPTS=\(event.snapshot.renderer.firstHDR10PlusAttachmentTimeSeconds ?? -1) prerollRejected=\(event.snapshot.readinessPrerollFramesRejected) timebaseBound=\(event.snapshot.renderer.carrierTimebaseBound) renderer=\(event.snapshot.renderer.rendererStatus.rawValue) carrierBudget=\(event.snapshot.carrierBandwidth.declaredTransportBudget) carrierObservedPeak=\(event.snapshot.carrierBandwidth.observedPeakBandwidth ?? -1) carrierObservedAverage=\(event.snapshot.carrierBandwidth.observedAverageBandwidth ?? -1) carrierObservedSegments=\(event.snapshot.carrierBandwidth.observedSegmentCount) carrierBandwidthState=\(event.snapshot.carrierBandwidth.state.rawValue)\(self?.telemetryFailureSuffix(event.payload) ?? "")"
                 )
                 self?.setStatus("event \(event.kind.rawValue)", diagnostics: session.diagnostics)
             }
@@ -690,6 +701,71 @@ final class AcceptanceViewController: UIViewController {
         setStatus(
             "color \(videoFormatName(expected)) passed",
             diagnostics: diagnostics
+        )
+    }
+
+    private func runAutomaticLateHDR10PlusScenario(
+        session: AetherHybridPlaybackSession
+    ) async throws {
+        let presentationView = session.presentationView
+        let carrierItem = session.avPlayer.currentItem
+        let startup = session.diagnostics
+        guard startup.videoFormat == .hdr10,
+              startup.renderer.hdr10PlusAttachedSampleBuffers == 0,
+              startup.renderer.firstHDR10PlusAttachmentTimeSeconds == nil,
+              startup.renderer.carrierTimebaseBound,
+              startup.renderer.rendererStatus == .rendering,
+              carrierItem != nil else {
+            throw AcceptanceHarnessError.assertionFailed(
+                step: "late-hdr10plus-startup",
+                detail: "startup was not metadata-free HDR10 on the bound sample-buffer renderer"
+            )
+        }
+        let generation = startup.generation
+        print(
+            "AETHER_ACCEPTANCE checkpoint=late-hdr10plus-startup videoFormat=hdr10 generation=\(generation) attached=0 timebaseBound=true renderer=\(startup.renderer.rendererStatus.rawValue)"
+        )
+
+        let deadline = ProcessInfo.processInfo.systemUptime + 35
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            if case .failed(let error) = session.state {
+                throw error
+            }
+            let current = session.diagnostics
+            if current.renderer.hdr10PlusAttachedSampleBuffers > 0 {
+                guard current.videoFormat == .hdr10Plus,
+                      current.generation == generation,
+                      session.presentationView === presentationView,
+                      session.avPlayer.currentItem === carrierItem,
+                      current.renderer.carrierTimebaseBound,
+                      current.renderer.rendererStatus == .rendering,
+                      let firstAttachmentTime = current.renderer
+                        .firstHDR10PlusAttachmentTimeSeconds,
+                      firstAttachmentTime > 0 else {
+                    throw AcceptanceHarnessError.assertionFailed(
+                        step: "late-hdr10plus-detected",
+                        detail: "metadata changed the generation, carrier item, presentation view, or clock binding"
+                    )
+                }
+                print(
+                    "AETHER_ACCEPTANCE colorEvidence videoFormat=hdr10plus generation=\(current.generation) firstAttachmentTime=\(firstAttachmentTime) attached=\(current.renderer.hdr10PlusAttachedSampleBuffers) samePresentationView=true sameCarrierItem=true timebaseBound=true renderer=\(current.renderer.rendererStatus.rawValue)"
+                )
+                recordCheckpoint(
+                    "late-hdr10plus-same-layer-passed",
+                    session: session
+                )
+                setStatus(
+                    "late HDR10+ same-layer passed",
+                    diagnostics: current
+                )
+                return
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        let final = session.diagnostics
+        throw AcceptanceHarnessError.assertionFailed(
+            step: "late-hdr10plus-detected",
+            detail: "no HDR10+ sample reached the display layer; carrierTime=\(final.carrierTimeSeconds ?? -1) attached=\(final.renderer.hdr10PlusAttachedSampleBuffers)"
         )
     }
 
@@ -1648,10 +1724,10 @@ final class AcceptanceViewController: UIViewController {
     ) {
         let diagnostics = session.diagnostics
         Self.logger.notice(
-            "checkpoint=\(step, privacy: .public) generation=\(diagnostics.generation) carrierTime=\(diagnostics.carrierTimeSeconds ?? -1, format: .fixed(precision: 3)) rate=\(diagnostics.carrierRate) timebaseBound=\(diagnostics.renderer.carrierTimebaseBound) pending=\(diagnostics.renderer.pendingSampleBuffers) enqueued=\(diagnostics.renderer.enqueuedSampleBuffers)"
+            "checkpoint=\(step, privacy: .public) generation=\(diagnostics.generation) carrierTime=\(diagnostics.carrierTimeSeconds ?? -1, format: .fixed(precision: 3)) rate=\(diagnostics.carrierRate) timebaseBound=\(diagnostics.renderer.carrierTimebaseBound) pending=\(diagnostics.renderer.pendingSampleBuffers) enqueued=\(diagnostics.renderer.enqueuedSampleBuffers) hdr10PlusAttached=\(diagnostics.renderer.hdr10PlusAttachedSampleBuffers)"
         )
         print(
-            "AETHER_ACCEPTANCE checkpoint=\(step) generation=\(diagnostics.generation) carrierTime=\(diagnostics.carrierTimeSeconds ?? -1) rate=\(diagnostics.carrierRate) timebaseBound=\(diagnostics.renderer.carrierTimebaseBound) pending=\(diagnostics.renderer.pendingSampleBuffers) enqueued=\(diagnostics.renderer.enqueuedSampleBuffers)"
+            "AETHER_ACCEPTANCE checkpoint=\(step) generation=\(diagnostics.generation) carrierTime=\(diagnostics.carrierTimeSeconds ?? -1) rate=\(diagnostics.carrierRate) timebaseBound=\(diagnostics.renderer.carrierTimebaseBound) pending=\(diagnostics.renderer.pendingSampleBuffers) enqueued=\(diagnostics.renderer.enqueuedSampleBuffers) hdr10PlusAttached=\(diagnostics.renderer.hdr10PlusAttachedSampleBuffers) hdr10PlusFirstPTS=\(diagnostics.renderer.firstHDR10PlusAttachmentTimeSeconds ?? -1)"
         )
     }
 

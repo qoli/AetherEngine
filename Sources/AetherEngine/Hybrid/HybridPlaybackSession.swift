@@ -178,6 +178,7 @@ enum HybridPlaybackTelemetryTrigger:
     Equatable
 {
     case transportChanged
+    case videoFormatChanged
     case periodicSample(playerTimeSeconds: Double)
     case playbackPressureChanged
     case carrierReady(AetherHybridTimelineTelemetry)
@@ -402,7 +403,7 @@ final class HybridPlaybackSession {
     private let renderSurface: any HybridPlaybackRenderSurface
     private let coordinator: HybridPlaybackProviderCoordinator
     private let timeline: BlackCarrierTimeline
-    private let videoFormat: VideoFormat
+    private var videoFormat: VideoFormat
     private let videoFrameRate: Double?
     private let displayCriteriaController =
         DisplayCriteriaController()
@@ -1072,6 +1073,11 @@ final class HybridPlaybackSession {
                 reason: String(describing: error)
             ))
             return
+        }
+        if videoFormat == .hdr10,
+           frame.videoFormat == .hdr10Plus {
+            videoFormat = .hdr10Plus
+            telemetryDidChange?(.videoFormatChanged)
         }
         guard outcome == .acceptedWaiting
                 || outcome == .becameReady else {
