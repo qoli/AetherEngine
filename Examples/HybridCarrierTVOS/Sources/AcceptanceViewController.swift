@@ -47,6 +47,7 @@ final class AcceptanceViewController: UIViewController {
     private var diagnosticsTask: Task<Void, Never>?
     private var didStartAutomaticRun = false
     private var observedCarrierStallPressure = false
+    private var lastAudioRenderingModeRawValue: Int?
 
     private var automaticRunEnabled: Bool {
         ProcessInfo.processInfo.environment["AETHER_ACCEPTANCE_AUTORUN"] == "1"
@@ -347,6 +348,7 @@ final class AcceptanceViewController: UIViewController {
                 try await session.prepare(timeout: 30)
                 print("AETHER_ACCEPTANCE phase=play")
                 try session.play()
+                recordAudioRenderingModeIfChanged()
                 startTelemetry(for: session)
                 startDiagnosticsSampling()
                 setSessionControlsEnabled(true)
@@ -599,9 +601,41 @@ final class AcceptanceViewController: UIViewController {
                       let session = self.session else {
                     return
                 }
+                self.recordAudioRenderingModeIfChanged()
                 self.setStatus("running", diagnostics: session.diagnostics)
             }
         }
+    }
+
+    /// Read-only, privacy-safe rendering diagnostic. Apple documents HDMI as
+    /// an ineligible route for this property, so `notApplicable` is expected
+    /// there and never substitutes for the downstream Atmos indicator. The
+    /// probe does not activate or reconfigure AVAudioSession.
+    private func recordAudioRenderingModeIfChanged() {
+        guard #available(tvOS 17.2, *) else { return }
+        let audioSession = AVAudioSession.sharedInstance()
+        let rawValue = audioSession.renderingMode.rawValue
+        guard rawValue != lastAudioRenderingModeRawValue else { return }
+        lastAudioRenderingModeRawValue = rawValue
+        let modeName: String
+        switch rawValue {
+        case 0: modeName = "notApplicable"
+        case 1: modeName = "monoStereo"
+        case 2: modeName = "surround"
+        case 3: modeName = "spatialAudio"
+        case 4: modeName = "dolbyAudio"
+        case 5: modeName = "dolbyAtmos"
+        default: modeName = "unknown"
+        }
+        let output = audioSession.currentRoute.outputs.first
+        let portType = output?.portType.rawValue ?? "none"
+        let channelCount = output?.channels?.count ?? 0
+        print(
+            "AETHER_ACCEPTANCE audioRenderingMode "
+                + "raw=\(rawValue) mode=\(modeName) "
+                + "outputPortType=\(portType) "
+                + "outputChannels=\(channelCount)"
+        )
     }
 
     private func runAutomaticClockScenario(
@@ -1848,6 +1882,7 @@ final class AcceptanceViewController: UIViewController {
         telemetryTask = nil
         diagnosticsTask?.cancel()
         diagnosticsTask = nil
+        lastAudioRenderingModeRawValue = nil
         session?.stop()
         session = nil
         playerViewController.player = nil
@@ -1861,6 +1896,7 @@ final class AcceptanceViewController: UIViewController {
         telemetryTask = nil
         diagnosticsTask?.cancel()
         diagnosticsTask = nil
+        lastAudioRenderingModeRawValue = nil
         setSessionControlsEnabled(false)
         setupPanel.isHidden = false
         setStatus("terminal failure", detail: error.localizedDescription)
