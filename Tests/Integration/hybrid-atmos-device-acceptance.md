@@ -11,6 +11,51 @@ television/AVR Atmos indicator. Simulator or macOS AVPlayer results are not subs
 [`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md) and
 [`hybrid-avkit-media-selection-ui-device-evidence-2026-07-18.md`](hybrid-avkit-media-selection-ui-device-evidence-2026-07-18.md).
 
+### Retired loopback request regression closure — 2026-07-18
+
+The Remote-driven UI build exposed a seek race while preparing the final human audio row. After a
+forward seek moved the HLS pump to generation 1 / carrier segment 5, an already-issued AVPlayer
+loopback request for segment 4 arrived late. The replacement generation was healthy, but the provider
+incorrectly promoted that retired URI request to terminal
+`requestedSegmentUnavailable(4)`. Formal runs failed closed with `providerFailed`; no route, player,
+renderer, codec, or audio rendition fallback started.
+
+Aether `bc488a0` classifies only this exact `target < generationStart` condition as a typed
+`retiredSegmentRequest`. The individual stale loopback request remains unavailable, while the provider
+stays healthy and serves the replacement generation. A current-generation production failure remains
+terminal. A three-segment source test proves that startup segment 0 can be followed by a restart at
+segment 2, a late unavailable segment 1 request, and successful segment 2 production without recording
+a provider terminal error.
+
+The corrected formal run used the study Apple TV and the same exact JOC graph:
+
+```text
+deviceName: 書房電視
+device: physical Apple TV 4K (AppleTV6,2)
+tvOS: 26.5 (23L471)
+CoreDeviceID: 4F403AE1-B129-5248-BC6E-31DFDD75B422
+AetherRevision: bc488a0
+fixtureGraphIdentitySHA256: 5c2880748e03d2d59b621be4f69bc11f08c31331903e79b1d63ed30bc606dcf2
+launcherSHA256: 144ecfa499b5b485766103a0ba14ff76a81cafbeed8a7a7177579313774f2b75
+debugDylibSHA256: 15414653ed48ecd60bbbb00113bc70dc871228af0104a69e462403e07b122135
+preflightRoute: hybridCarrier
+preflightReason: hybridHLSManifestMissingCodecs
+carrierBudget: 2000000
+forwardSeek: pass, generation 0 -> 1
+backwardSeek: pass, generation 1 -> 2
+JOCToAAC: pass, generation 2 -> 3
+AACToJOC: pass, generation 3 -> 4
+audioTrackSwitchCheckpoint: pass
+stopAndReopenCheckpoint: pass, new generation 0
+renderer: rendering
+carrierTimebaseBound: true
+fallbackRouteCount: 0
+```
+
+The focused `HLSVODMediaPumpTests` suite passed 26 tests, and the full package run passed 738 tests in
+130 suites. The app remains on the original JOC rendition after reopen for the still-pending human
+audible-output and downstream Atmos-indicator observation.
+
 ## Purpose
 
 Validate the primary Hybrid carrier bandwidth policy with a real E-AC-3 JOC / Dolby Atmos
