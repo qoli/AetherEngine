@@ -96,6 +96,12 @@ records only the source SHA-256 and codec probe in provenance; it never copies t
 into the fixture. Both the source vector and generated HLS remain gitignored and must not be
 redistributed unless their license separately permits it.
 
+The licensed JOC input is packet-repeated when it is shorter than the requested fixture duration.
+This is an explicit acceptance-fixture construction rule: FFmpeg still stream-copies the E-AC-3 JOC
+packets, the generated audio/video playlists must have the same segment count and 90 kHz duration,
+and `PROVENANCE.txt` records the repeat policy. The generator must not silently shorten the requested
+observation window or replace the selected JOC rendition with AAC.
+
 The generator rewrites FFmpeg's generic six-channel master declaration to `CHANNELS="16/JOC"` only
 after the bitstream probe passes. Aether then verifies that declaration against the actual profile-30
 descriptor. The normal automatic scenario covers startup, forward/backward seek, JOC-to-AAC and

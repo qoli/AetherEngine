@@ -403,7 +403,7 @@ fi
 if [[ -n "$ATMOS_EC3_INPUT" ]]; then
     ffmpeg -hide_banner -loglevel error -y \
         "${VIDEO_INPUT_ARGS[@]}" -i "$VIDEO_SOURCE" \
-        -i "$ATMOS_EC3_INPUT" \
+        -stream_loop -1 -i "$ATMOS_EC3_INPUT" \
         -f lavfi -i "sine=frequency=880:sample_rate=48000:duration=$AUDIO_DURATION_SECONDS" \
         -map 0:v:0 -map 1:a:0 -map 2:a:0 \
         -metadata:s:a:0 language=eng \
@@ -579,6 +579,7 @@ fi
             echo "atmosInputProbe=$line"
         done <<< "$ATMOS_INPUT_PROBE"
         echo "atmosInputPolicy=user-supplied licensed test vector; source path and source bytes excluded"
+        echo "atmosInputRepeatPolicy=packet-level repeat to exact video duration; E-AC-3 JOC remains stream-copy"
     fi
     echo "playlistDurationNormalization=bounded 90kHz EXTINF rounding only"
     echo "ffmpegVersion=$(ffmpeg -version | head -n 1)"
