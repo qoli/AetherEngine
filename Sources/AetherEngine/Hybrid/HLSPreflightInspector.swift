@@ -229,21 +229,17 @@ struct HLSPreflightInspector {
             let response = try await fetch(initURL)
             initSegment = response.data
             initSegmentEffectiveURL = response.effectiveURL
-        } else if Self.isMPEGTransport(segment.data) {
+        } else {
+            // RFC 8216 fragmented-MP4 media requires EXT-X-MAP. A video
+            // rendition without a map is therefore admitted through the
+            // MPEG-TS demux probe. FFmpeg, not a byte-zero magic check,
+            // establishes whether the selected segment is actually usable;
+            // this also accepts transport streams with recoverable leading
+            // data while preserving a typed unsupported result on probe
+            // failure.
             container = .mpegTransport
             initSegment = nil
             initSegmentEffectiveURL = nil
-        } else {
-            return AetherHLSPlaybackPreflight(
-                result: unresolvedResult(
-                    isSeekableVOD: sourceIsSeekableVOD,
-                    manifestCodecs: manifestCodecs,
-                    contentProtection: .none,
-                    hybridCapabilities: hybridCapabilities
-                ),
-                resourceGraph: nil,
-                httpHeaders: httpHeaders
-            )
         }
 
         guard let inspected = Self.inspectVideo(
@@ -1482,11 +1478,4 @@ struct HLSPreflightInspector {
         }
     }
 
-    private static func isMPEGTransport(_ data: Data) -> Bool {
-        // Three 188-byte sync markers reject arbitrary data that happens to begin with 0x47.
-        data.count >= 376
-            && data[0] == 0x47
-            && data[188] == 0x47
-            && (data.count < 564 || data[376] == 0x47)
-    }
 }

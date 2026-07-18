@@ -48,6 +48,199 @@ final class HLSPreflightInspectorTests: XCTestCase {
         )
     }
 
+    func testMPEGTransportSegmentUsesFFmpegProbe() async throws {
+        let inspected = try await inspectMPEGTransportSegment(
+            try mpegTransportFixture(),
+            segmentName: "segment.ts"
+        )
+
+        assertHybridMPEGTransportInspection(inspected)
+    }
+
+    func testPNGPrefixedMPEGTransportUsesFFmpegProbe() async throws {
+        var segment = try XCTUnwrap(
+            Data(
+                base64Encoded: Self.onePixelPNGBase64,
+                options: .ignoreUnknownCharacters
+            )
+        )
+        XCTAssertNotEqual(segment.first, 0x47)
+        segment.append(try mpegTransportFixture())
+
+        let inspected = try await inspectMPEGTransportSegment(
+            segment,
+            segmentName: "segment.png"
+        )
+
+        assertHybridMPEGTransportInspection(inspected)
+        XCTAssertEqual(
+            inspected.resourceGraph?
+                .inspectedFirstMediaSegmentData,
+            segment
+        )
+    }
+
+    func testUnparseableMPEGTransportSegmentIsTypedUnsupported()
+        async throws
+    {
+        let inspected = try await inspectMPEGTransportSegment(
+            Data("not a media segment".utf8),
+            segmentName: "segment.bin"
+        )
+
+        XCTAssertEqual(inspected.result.route, .unsupported)
+        XCTAssertEqual(
+            inspected.result.reason,
+            .unsupportedHLSSegmentNotInspected
+        )
+        XCTAssertEqual(
+            inspected.result.hlsPackaging?.container,
+            .mpegTransport
+        )
+        XCTAssertEqual(
+            inspected.result.hlsPackaging?.codecVerification,
+            .segmentNotInspected
+        )
+        XCTAssertNil(inspected.resourceGraph)
+    }
+
+    private func inspectMPEGTransportSegment(
+        _ segmentData: Data,
+        segmentName: String
+    ) async throws -> AetherHLSPlaybackPreflight {
+        let rootURL = URL(
+            string: "https://example.com/media.m3u8"
+        )!
+        let segmentURL = URL(
+            string: "https://example.com/\(segmentName)"
+        )!
+        let responses: [URL: HLSPreflightFetchResponse] = [
+            rootURL: HLSPreflightFetchResponse(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-VERSION:3
+                    #EXT-X-TARGETDURATION:1
+                    #EXT-X-PLAYLIST-TYPE:VOD
+                    #EXTINF:0.2,
+                    \(segmentName)
+                    #EXT-X-ENDLIST
+                    """.utf8
+                ),
+                effectiveURL: rootURL
+            ),
+            segmentURL: HLSPreflightFetchResponse(
+                data: segmentData,
+                effectiveURL: segmentURL
+            ),
+        ]
+        return try await HLSPreflightInspector(
+            httpHeaders: [:],
+            fetchOverride: { url, _ in
+                guard let response = responses[url] else {
+                    throw HLSPreflightError.httpStatus(404)
+                }
+                return response
+            }
+        ).inspect(
+            rootURL: rootURL,
+            sourceIsSeekableVOD: true,
+            variantSelection: .highestBandwidth,
+            hybridCapabilities: HybridPlaybackCapabilities(
+                hasDirectVideoDecoder: true,
+                hasSampleBufferRenderer: true,
+                supportedVideoFormats: [.sdr]
+            )
+        )
+    }
+
+    private func assertHybridMPEGTransportInspection(
+        _ inspected: AetherHLSPlaybackPreflight,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(
+            inspected.result.route,
+            .hybridCarrier,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            inspected.result.reason,
+            .hybridHLSManifestMissingCodecs,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            inspected.result.sourceProfile.videoCodec,
+            .h264,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            inspected.result.hlsPackaging?.container,
+            .mpegTransport,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
+            inspected.result.hlsPackaging?.codecVerification,
+            .manifestMissingButSegmentVerified,
+            file: file,
+            line: line
+        )
+        XCTAssertNotNil(
+            inspected.resourceGraph,
+            file: file,
+            line: line
+        )
+    }
+
+    private func mpegTransportFixture() throws -> Data {
+        try XCTUnwrap(
+            Data(
+                base64Encoded: Self.mpegTransportFixtureBase64,
+                options: .ignoreUnknownCharacters
+            )
+        )
+    }
+
+    private static let onePixelPNGBase64 = """
+        iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAAEElEQVR4nGL6//8/IAAA//8GBgMAt2YRIQAAAABJRU5ErkJggg==
+        """
+
+    private static let mpegTransportFixtureBase64 = """
+        R0AREABC8CUAAcEAAP8B/wAB/IAUSBIBBkZGbXBlZwlTZXJ2aWNlMDF3fEPK////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////////////////
+        //////////////////////////////////////////////////////////////////////////9HQAAQAACwDQAB
+        wQAAAAHwACqxBLL/////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////////////////
+        /////////////////////////////////////////////////////////////0dQABAAArASAAHBAADhAPAAG+EA
+        8AAVvU1W////////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////R0EAMAdQAAB7DH4AAAAB4AAAgIAFIQAH2GEAAAAB
+        CfAAAAABZ0LACt3sBEAAAAMAQAAABQPEieAAAAABaM4PLIAAAAEGBf//WtxF6b3m2Ui3lizYINkj7u94MjY0IC0g
+        Y29yZSAxNjUgcjMyMjIgYjM1NjA1YSAtIEguMjY0L01QRUctNCBBVkMgY29kZWMgLSBDb3B5bGVmdCAyMDAzLTIw
+        MjUgLSBodHRwOi8vd3d3LnZpZGVvbGFuLm9HAQARcmcveDI2NC5odG1sIC0gb3B0aW9uczogY2FiYWM9MCByZWY9
+        MSBkZWJsb2NrPTE6MDowIGFuYWx5c2U9MHgxOjB4MTExIG1lPWhleCBzdWJtZT03IHBzeT0xIHBzeV9yZD0xLjAw
+        OjAuMDAgbWl4ZWRfcmVmPTAgbWVfcmFuZ2U9MTYgY2hyb21hX21lPTEgdHJlbGxpcz0xIDh4OGRjdD0wIGNxbT0w
+        IGRlYWR6b25lPTIxLDExIEcBABJmYXN0X3Bza2lwPTEgY2hyb21hX3FwX29mZnNldD0tMiB0aHJlYWRzPTEgbG9v
+        a2FoZWFkX3RocmVhZHM9MSBzbGljZWRfdGhyZWFkcz0wIG5yPTAgZGVjaW1hdGU9MSBpbnRlcmxhY2VkPTAgYmx1
+        cmF5X2NvbXBhdD0wIGNvbnN0cmFpbmVkX2ludHJhPTAgYmZyYW1lcz0wIHdlaWdodHA9MCBrZXlpbnQ9MSBrZXlp
+        bnRfbWluRwEAMzMA//////////////////////////////////////////////////////////////////89MSBz
+        Y2VuZWN1dD00MCBpbnRyYV9yZWZyZXNoPTAgcmM9Y3JmIG1idHJlZT0wIGNyZj0yMy4wIHFjb21wPTAuNjAgcXBt
+        aW49MCBxcG1heD02OSBxcHN0ZXA9NCBpcF9yYXRpbz0xLjQwIGFxPTE6MS4wMACAAAABZYiEBLyYoAA4o4BHQAAR
+        AACwDQABwQAAAAHwACqxBLL/////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////////////////
+        /////////////////////////////////////////////////////////////////////0dQABEAArASAAHBAADh
+        APAAG+EA8AAVvU1W////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////R0EANHRQAACMoH4A////////////////
+        ////////////////////////////////////////////////////////////////////////////////////////
+        /////////////////////////////////////////wAAAeAAAICABSEACR6xAAAAAQnwAAAAAWdCwArd7ARAAAAD
+        AEAAAAUDxIngAAAAAWjODyyAAAABZYiCAU8mKAAP7+A=
+        """
+
     func testProtectedNativeHLSUsesManifestContractWithoutFetchingMedia()
         async throws
     {
