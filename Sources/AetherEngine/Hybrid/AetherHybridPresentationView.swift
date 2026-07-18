@@ -175,6 +175,7 @@ public final class AetherHybridPresentationView: PlatformBaseView {
     public nonisolated static let verifiedVideoFormats: Set<VideoFormat> = [
         .sdr,
         .hdr10,
+        .hlg,
     ]
 
     private struct PendingSample {

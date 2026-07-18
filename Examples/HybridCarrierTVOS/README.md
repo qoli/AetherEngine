@@ -115,8 +115,8 @@ an SDR test source: HDR10 applies the SMPTE ST 2084 OETF to absolute luminance p
 MDCV, and CLLI signaling; HLG applies the ARIB STD-B67 OETF to scene-linear patches. FFmpeg performs
 only the BT.2020 non-constant-luminance matrix conversion to limited-range 10-bit YCbCr. The source
 pattern, generator hash, transfer policy and resulting bytes remain in fixture provenance. Fixture
-generation alone is never format admission. HDR10 is admitted by its separate passing LG C3 panel-mode
-and human visual record; HLG remains unadmitted until it has the corresponding evidence.
+generation alone is never format admission. HDR10 and HLG are admitted only by their separate passing
+LG C3 panel-mode and human visual records.
 
 Set `AETHER_ACCEPTANCE_VIDEO_FORMAT=hdr10plus` to generate a deterministic PQ fixture whose first HLS
 segment contains no HDR10+ metadata and whose ST 2094-40 T.35 payload begins at 12 seconds by default.
