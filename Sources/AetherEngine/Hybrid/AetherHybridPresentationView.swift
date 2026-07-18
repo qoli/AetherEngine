@@ -176,6 +176,7 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         .sdr,
         .hdr10,
         .hlg,
+        .dolbyVision,
     ]
 
     private struct PendingSample {

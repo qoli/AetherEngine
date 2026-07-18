@@ -205,7 +205,7 @@ public final class AetherHybridPlaybackSession: ObservableObject {
             hasSampleBufferRenderer: true,
             supportedVideoFormats: AetherHybridPresentationView
                 .verifiedVideoFormats,
-            supportedDolbyVisionProfiles: [],
+            supportedDolbyVisionProfiles: [.profile84],
             supportedSourceKinds: [
                 .hls,
                 .progressive,
