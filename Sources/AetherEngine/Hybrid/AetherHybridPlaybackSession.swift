@@ -750,7 +750,7 @@ public final class AetherHybridPlaybackSession: ObservableObject {
             return action
         }
         let menu = UIMenu(
-            title: "Styled Subtitles",
+            title: "Aether Subtitles",
             image: UIImage(systemName: "captions.bubble"),
             children: [off] + actions
         )

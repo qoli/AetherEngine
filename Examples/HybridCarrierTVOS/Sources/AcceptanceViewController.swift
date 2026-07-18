@@ -88,6 +88,12 @@ final class AcceptanceViewController: UIViewController {
         ] == "1"
     }
 
+    private var automaticBitmapSubtitleRunEnabled: Bool {
+        ProcessInfo.processInfo.environment[
+            "AETHER_ACCEPTANCE_BITMAP_SUBTITLE_AUTORUN"
+        ] == "1"
+    }
+
     private var automaticNegativeRunEnabled: Bool {
         ProcessInfo.processInfo.environment[
             "AETHER_ACCEPTANCE_NEGATIVE_CASE"
@@ -113,6 +119,7 @@ final class AcceptanceViewController: UIViewController {
                 || automaticSubtitleRunEnabled
                 || automaticOverlaySubtitleRunEnabled
                 || automaticProgressiveNativeSubtitleRunEnabled
+                || automaticBitmapSubtitleRunEnabled
                 || automaticNegativeRunEnabled,
               !didStartAutomaticRun,
               fixtureURLField.text?.isEmpty == false else {
@@ -241,7 +248,8 @@ final class AcceptanceViewController: UIViewController {
                 setStatus("preflight running", detail: "route not yet selected")
 
                 if automaticOverlaySubtitleRunEnabled
-                    || automaticProgressiveNativeSubtitleRunEnabled {
+                    || automaticProgressiveNativeSubtitleRunEnabled
+                    || automaticBitmapSubtitleRunEnabled {
                     try await runAutomaticProgressiveSubtitleFixture(
                         fixtureURL
                     )
@@ -449,6 +457,10 @@ final class AcceptanceViewController: UIViewController {
         setupPanel.isHidden = true
         if automaticProgressiveNativeSubtitleRunEnabled {
             try await runAutomaticSubtitleScenario(
+                session: session
+            )
+        } else if automaticBitmapSubtitleRunEnabled {
+            try await runAutomaticBitmapSubtitleScenario(
                 session: session
             )
         } else {
@@ -1260,7 +1272,7 @@ final class AcceptanceViewController: UIViewController {
             )
         }
         guard playerViewController.transportBarCustomMenuItems
-                .contains(where: { $0.title == "Styled Subtitles" }) else {
+                .contains(where: { $0.title == "Aether Subtitles" }) else {
             throw AcceptanceHarnessError.assertionFailed(
                 step: "overlay-avkit-menu",
                 detail: "Aether subtitle menu is not installed in AVKit"
@@ -1327,6 +1339,161 @@ final class AcceptanceViewController: UIViewController {
         setStatus(
             "styled overlay selection passed",
             diagnostics: session.diagnostics
+        )
+    }
+
+    private func runAutomaticBitmapSubtitleScenario(
+        session: AetherHybridPlaybackSession
+    ) async throws {
+        guard session.activeOverlaySubtitleTrackID == nil else {
+            throw AcceptanceHarnessError.assertionFailed(
+                step: "bitmap-initial-selection",
+                detail: "bitmap track was selected without a host action"
+            )
+        }
+        guard session.overlaySubtitleTracks.count == 1,
+              let track = session.overlaySubtitleTracks.first,
+              track.kind == .bitmap,
+              track.availability == .available else {
+            throw AcceptanceHarnessError.assertionFailed(
+                step: "bitmap-track-contract",
+                detail: "expected one available bitmap track"
+            )
+        }
+        guard playerViewController.transportBarCustomMenuItems
+                .contains(where: { $0.title == "Aether Subtitles" }) else {
+            throw AcceptanceHarnessError.assertionFailed(
+                step: "bitmap-avkit-menu",
+                detail: "Aether subtitle menu is not installed in AVKit"
+            )
+        }
+
+        try session.selectOverlaySubtitleTrack(track.id)
+        let initialTime = try carrierTime(
+            session,
+            step: "bitmap-before-first-cue"
+        )
+        guard initialTime < 1 else {
+            throw AcceptanceHarnessError.assertionFailed(
+                step: "bitmap-before-first-cue",
+                detail: "fixture setup did not complete before the first cue"
+            )
+        }
+        try await waitForBitmapSubtitle(
+            visible: false,
+            session: session,
+            step: "bitmap-before-first-cue"
+        )
+        try await waitForCarrierTime(
+            atLeast: 1.1,
+            session: session,
+            step: "bitmap-first-cue-time"
+        )
+        try await waitForBitmapSubtitle(
+            visible: true,
+            session: session,
+            step: "bitmap-startup"
+        )
+        try requireClockBound(session, step: "bitmap-startup")
+        recordCheckpoint("bitmap-overlay-startup", session: session)
+
+        let generation = session.diagnostics.generation
+        _ = try await session.seek(
+            to: CMTime(
+                seconds: 16.5,
+                preferredTimescale: 90_000
+            ),
+            timeout: 30
+        )
+        guard session.diagnostics.generation > generation else {
+            throw AcceptanceHarnessError.assertionFailed(
+                step: "bitmap-seek",
+                detail: "presentation generation did not advance"
+            )
+        }
+        try await waitForBitmapSubtitle(
+            visible: true,
+            session: session,
+            step: "bitmap-seek"
+        )
+        try requireClockBound(session, step: "bitmap-seek")
+        recordCheckpoint("bitmap-overlay-seek", session: session)
+
+        try session.selectOverlaySubtitleTrack(nil)
+        try await waitForBitmapSubtitle(
+            visible: false,
+            session: session,
+            step: "bitmap-off"
+        )
+        guard session.activeOverlaySubtitleTrackID == nil else {
+            throw AcceptanceHarnessError.assertionFailed(
+                step: "bitmap-off",
+                detail: "active track survived explicit Off"
+            )
+        }
+        try session.selectOverlaySubtitleTrack(track.id)
+        try await waitForBitmapSubtitle(
+            visible: true,
+            session: session,
+            step: "bitmap-reselect"
+        )
+        try requireClockBound(session, step: "bitmap-reselect")
+        print(
+            "AETHER_ACCEPTANCE subtitleOverlayEvidence kind=bitmap initialSelection=off menuInstalled=true select=true seek=true deselect=true reselect=true visible=true"
+        )
+        recordCheckpoint(
+            "bitmap-overlay-selection-passed",
+            session: session
+        )
+        setStatus(
+            "bitmap overlay selection passed",
+            diagnostics: session.diagnostics
+        )
+    }
+
+    private func waitForCarrierTime(
+        atLeast target: Double,
+        session: AetherHybridPlaybackSession,
+        step: String
+    ) async throws {
+        let deadline = ProcessInfo.processInfo.systemUptime + 12
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            if case .failed(let error) = session.state {
+                throw error
+            }
+            if let time = session.diagnostics.carrierTimeSeconds,
+               time >= target {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw AcceptanceHarnessError.assertionFailed(
+            step: step,
+            detail: "carrier time did not reach \(target)"
+        )
+    }
+
+    private func waitForBitmapSubtitle(
+        visible: Bool,
+        session: AetherHybridPlaybackSession,
+        step: String
+    ) async throws {
+        let deadline = ProcessInfo.processInfo.systemUptime + 12
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            if case .failed(let error) = session.state {
+                throw error
+            }
+            let visibleCount = session.diagnostics.renderer
+                .visibleBitmapSubtitleCount
+            if (visibleCount > 0) == visible {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw AcceptanceHarnessError.assertionFailed(
+            step: step,
+            detail:
+                "bitmap subtitle visibility did not become \(visible)"
         )
     }
 
