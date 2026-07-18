@@ -18,10 +18,12 @@ VideoToolbox metadata-propagation acceptance and 240-frame same-layer enqueue. A
 non-black, bound-timebase framebuffer captures. Native AVKit Audio and WebVTT menu visibility plus
 Remote-driven bidirectional selection now passes on the same device, and the living-room JOC → AAC → JOC
 Atmos-output round trip passes. The living-room LG C3 HDR10 row now also passes panel-mode and human
-visual confirmation with a color-managed BT.2020/PQ reference, so production admission is
-`[.sdr, .hdr10]`. HLG, HDR10+, and Dolby Vision panel-output remain pending. See
+visual confirmation with a color-managed BT.2020/PQ reference. The following color-managed HLG row
+also passes the LG C3 HDR indicator and human visual check, so production admission is
+`[.sdr, .hdr10, .hlg]`. HDR10+ and Dolby Vision panel-output remain pending. See
 [`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md) and
 [`hybrid-hdr10-device-evidence-2026-07-18.md`](hybrid-hdr10-device-evidence-2026-07-18.md),
+[`hybrid-hlg-device-evidence-2026-07-18.md`](hybrid-hlg-device-evidence-2026-07-18.md),
 [`hybrid-hdr10plus-device-evidence-2026-07-18.md`](hybrid-hdr10plus-device-evidence-2026-07-18.md), and
 [`hybrid-dolby-vision-profile84-device-evidence-2026-07-18.md`](hybrid-dolby-vision-profile84-device-evidence-2026-07-18.md), plus
 [`hybrid-match-content-framebuffer-evidence-2026-07-18.md`](hybrid-match-content-framebuffer-evidence-2026-07-18.md) and

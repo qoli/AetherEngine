@@ -9,9 +9,10 @@ explicit player restart, the human observer confirmed both that the LG C3 HDR in
 that the reference color bars and neutral grayscale looked correct.
 
 `AetherHybridPresentationView.verifiedVideoFormats` is therefore `[.sdr, .hdr10]` at candidate
-`057e1e7f0b306c19fce59713eeedb5c8b355295d`. HLG, HDR10+, Dolby Vision, and every unverified Dolby
-Vision profile remain typed unsupported before provider/session creation. This record does not admit
-any of them.
+`057e1e7f0b306c19fce59713eeedb5c8b355295d`. At that exact candidate HLG, HDR10+, Dolby Vision, and
+every unverified Dolby Vision profile remained typed unsupported. A later independent LG C3 row admits
+HLG, making current admission `[.sdr, .hdr10, .hlg]`; this HDR10 record itself does not admit any other
+format.
 
 ## Why the first visual run was rejected
 

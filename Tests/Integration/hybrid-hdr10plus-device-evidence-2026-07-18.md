@@ -12,8 +12,9 @@ renderer, or carrier-timebase binding.
 This record does **not** admit HDR10+ for production. Match Dynamic Range and Match Frame Rate were
 disabled on the device, so its HDR10+ panel-mode and human visual confirmation remain pending. At the
 time of this run `AetherHybridPresentationView.verifiedVideoFormats` remained `[.sdr]`. A later
-color-managed LG C3 row independently admits base HDR10, making current admission `[.sdr, .hdr10]`,
-but the C3 cannot provide an HDR10+ positive panel row and this document still does not admit HDR10+.
+color-managed LG C3 rows independently admit base HDR10 and HLG, making current admission
+`[.sdr, .hdr10, .hlg]`, but the C3 cannot provide an HDR10+ positive panel row and this document still
+does not admit HDR10+.
 See [`hybrid-hdr10-device-evidence-2026-07-18.md`](hybrid-hdr10-device-evidence-2026-07-18.md).
 
 A later supplemental run enabled both Match settings and captured a non-black framebuffer after the
@@ -128,8 +129,9 @@ callback, or an attachment created but never submitted to the display layer.
 
 ## Remaining gate
 
-Before production admission, run HDR10 and late-HDR10+ with Match Dynamic Range enabled and record
-the connected display model/firmware, the display's observed HDR mode, and human confirmation that
-the real picture is visible with no black frame, incorrect tone map, clipping, color shift, stale
-generation, or carrier-video leak. Until that evidence is appended, both formats remain typed
+Base HDR10 now has separate passing LG C3 panel-mode and human visual evidence. Before HDR10+
+production admission, rerun the late-metadata row on a confirmed HDR10+-capable display and record its
+model/firmware, observed HDR10+ mode, and human confirmation that the real picture is visible with no
+black frame, incorrect tone map, clipping, color shift, stale generation, or carrier-video leak. The LG
+C3 cannot close that positive row. Until compatible-panel evidence is appended, HDR10+ remains typed
 unsupported by the production Hybrid presentation gate.

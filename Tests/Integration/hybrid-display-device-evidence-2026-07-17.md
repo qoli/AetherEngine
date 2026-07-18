@@ -11,8 +11,8 @@ display device gate. Human visual/AVKit/audio confirmation, display-mode, HDR10+
 remain pending. At the time of this run, HDR10 and HLG had engine/device candidate evidence but
 remained unadmitted without matching panel-mode and human visual confirmation, so
 `AetherHybridPresentationView.verifiedVideoFormats` remained `[.sdr]`. The later color-managed LG C3
-row closes HDR10 and supersedes only that part of this record; current admission is
-`[.sdr, .hdr10]`. See
+rows close HDR10 and HLG and supersede only those parts of this record; current admission is
+`[.sdr, .hdr10, .hlg]`. See
 [`hybrid-hdr10-device-evidence-2026-07-18.md`](hybrid-hdr10-device-evidence-2026-07-18.md).
 
 ## Environment and fixture
@@ -456,8 +456,9 @@ Both copyright-clean fixtures are 12-second, three-segment local graphs with two
 kept in the gitignored `Fixtures/` tree. Their identities are the SHA-256 values of their generated
 `SHA256SUMS` files. During these candidate runs HDR10 and HLG were enabled only in the diagnostic build;
 the source contract was restored to `verifiedVideoFormats == [.sdr]` immediately afterward. The later
-HDR10 evidence replaces the SDR-relabeled visual fixture with a color-managed BT.2020/PQ reference and
-admits HDR10; it does not alter the historical result of these earlier diagnostic runs.
+HDR10 and HLG evidence replaces the SDR-relabeled visual fixtures with color-managed BT.2020/PQ and
+BT.2020/HLG references and admits both; it does not alter the historical result of these earlier
+diagnostic runs.
 
 ## Pending before the complete row can pass
 
@@ -470,7 +471,7 @@ admits HDR10; it does not alter the historical result of these earlier diagnosti
   Off/On/Off/On and styled Off/reselect. Record the downstream Atmos indicator for the JOC row.
 - Bitmap subtitle physical-fixture row: closed on 2026-07-18 with decoded-pixel, placement, seek and
   selection evidence.
-- HDR10 panel-mode and human visual confirmation: closed by the 2026-07-18 LG C3 color-managed row.
-  HLG, late-metadata HDR10+, and every promised Dolby Vision profile still require their own independent
-  panel-mode and human visual evidence.
+- HDR10 and HLG panel-mode and human visual confirmation: closed by the 2026-07-18 LG C3
+  color-managed rows. Late-metadata HDR10+ and every promised Dolby Vision profile still require their
+  own independent panel-mode and human visual evidence.
 - Replace the worktree revision above with the committed Aether revision in the final archive.

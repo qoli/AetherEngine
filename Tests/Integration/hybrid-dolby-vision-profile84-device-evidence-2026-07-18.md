@@ -13,8 +13,8 @@ generation 0 while remaining bound to the carrier timebase.
 This is a **technical pass**, not production admission. Match Dynamic Range, observed panel mode and
 human visual quality were not recorded for this run. The temporary diagnostic admission was removed
 immediately after the device build. At that time
-`AetherHybridPresentationView.verifiedVideoFormats` remained `[.sdr]`; a later independent HDR10 row
-makes current admission `[.sdr, .hdr10]` without admitting Dolby Vision. Profile 5, Profile 7, Profile
+`AetherHybridPresentationView.verifiedVideoFormats` remained `[.sdr]`; later independent HDR10 and HLG
+rows make current admission `[.sdr, .hdr10, .hlg]` without admitting Dolby Vision. Profile 5, Profile 7, Profile
 8.1, missing/contradictory configuration and every other unverified Dolby Vision shape remain typed
 unsupported before provider/session creation.
 

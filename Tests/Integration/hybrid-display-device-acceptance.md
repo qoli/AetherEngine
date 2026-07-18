@@ -11,15 +11,16 @@ stop/reopen teardown. Native WebVTT also passes graph-bound preflight and AVFoun
 select/deselect/reselect on the carrier. Styled ASS passes Aether overlay select/seek/off/reselect and
 AVKit custom-menu installation on the same carrier clock. A deterministic PGS fixture also passes
 cue timing, decoded-pixel placement, seek-generation rebuild and select/off/reselect on the physical
-device. HDR10 now has passing LG C3 panel-mode and human visual evidence from a color-managed fixture
-and is production-admitted. HLG has engine/device candidate evidence. Late HDR10+ now has a deterministic
+device. HDR10 and HLG now have passing LG C3 panel-mode and human visual evidence from color-managed
+fixtures and are production-admitted. Late HDR10+ now has a deterministic
 bitstream, complete Apple T.35 attachment, and physical-device same-layer technical pass. Dolby Vision
 Profile 8.4 now has exact configuration/base-layer admission, VideoToolbox metadata-propagation
-acceptance, and a 240-frame physical-device technical pass. HLG, HDR10+, and Profile 8.4 remain
-unadmitted without their own human panel-mode and visual confirmation.
+acceptance, and a 240-frame physical-device technical pass. HDR10+ and Profile 8.4 remain unadmitted
+without their own human panel-mode and visual confirmation.
 See
 [`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md),
 [`hybrid-hdr10-device-evidence-2026-07-18.md`](hybrid-hdr10-device-evidence-2026-07-18.md),
+[`hybrid-hlg-device-evidence-2026-07-18.md`](hybrid-hlg-device-evidence-2026-07-18.md),
 [`hybrid-hdr10plus-device-evidence-2026-07-18.md`](hybrid-hdr10plus-device-evidence-2026-07-18.md),
 [`hybrid-dolby-vision-profile84-device-evidence-2026-07-18.md`](hybrid-dolby-vision-profile84-device-evidence-2026-07-18.md), and
 [`hybrid-progressive-subtitle-device-evidence-2026-07-18.md`](hybrid-progressive-subtitle-device-evidence-2026-07-18.md).
@@ -32,7 +33,7 @@ acceptance and same-layer enqueue, but the partial runs do not prove the remaini
 panel-mode rows. Automated geometry passes, but its final human
 visible-orientation/crop confirmation remains part of the visual row.
 
-`AetherHybridPresentationView.verifiedVideoFormats` is `[.sdr, .hdr10]`. It must not expand again until
+`AetherHybridPresentationView.verifiedVideoFormats` is `[.sdr, .hdr10, .hlg]`. It must not expand again until
 each additional format row below has its own fixture and passing physical-device record. There is no
 Metal or second Hybrid renderer.
 
