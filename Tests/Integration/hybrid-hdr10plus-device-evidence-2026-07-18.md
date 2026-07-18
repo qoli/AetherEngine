@@ -9,9 +9,12 @@ T.35 payload at source PTS 12.0 seconds. The hardware-decoded sample reached the
 `.hdr10Plus` without changing the Hybrid route, generation, carrier item, presentation view,
 renderer, or carrier-timebase binding.
 
-This record does **not** admit HDR10 or HDR10+ for production. Match Dynamic Range and Match Frame
-Rate were disabled on the device, so panel-mode and human visual confirmation remain pending.
-`AetherHybridPresentationView.verifiedVideoFormats` therefore remains `[.sdr]`.
+This record does **not** admit HDR10+ for production. Match Dynamic Range and Match Frame Rate were
+disabled on the device, so its HDR10+ panel-mode and human visual confirmation remain pending. At the
+time of this run `AetherHybridPresentationView.verifiedVideoFormats` remained `[.sdr]`. A later
+color-managed LG C3 row independently admits base HDR10, making current admission `[.sdr, .hdr10]`,
+but the C3 cannot provide an HDR10+ positive panel row and this document still does not admit HDR10+.
+See [`hybrid-hdr10-device-evidence-2026-07-18.md`](hybrid-hdr10-device-evidence-2026-07-18.md).
 
 A later supplemental run enabled both Match settings and captured a non-black framebuffer after the
 12-second metadata boundary. It does not prove the external panel's HDR10+ mode, so production

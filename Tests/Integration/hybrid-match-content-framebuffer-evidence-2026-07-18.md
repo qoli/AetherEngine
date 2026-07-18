@@ -12,10 +12,11 @@ after the fixture's first ST 2094-40 metadata at PTS 12.0 seconds.
 This is supplemental device and framebuffer evidence. It is **not panel-mode evidence**: a tvOS
 framebuffer screenshot cannot prove that the attached television entered HDR10, HLG, HDR10+ or Dolby
 Vision mode, and it cannot establish subjective tone mapping, clipping, color or black-level quality.
-The television model/firmware, television OSD and human visual confirmation therefore remain pending.
-Production admission remains unchanged:
-`AetherHybridPresentationView.verifiedVideoFormats == [.sdr]` and no unverified Dolby Vision profile is
-advertised.
+The television model/firmware, television OSD and human visual confirmation therefore remained pending
+for this capture. At the time, production admission was
+`AetherHybridPresentationView.verifiedVideoFormats == [.sdr]`. A later independent LG C3 panel-mode and
+human visual row admits HDR10, so current production admission is `[.sdr, .hdr10]`; this
+framebuffer-only record still does not admit HLG, HDR10+, or Dolby Vision.
 
 ## Exact candidate and device
 
