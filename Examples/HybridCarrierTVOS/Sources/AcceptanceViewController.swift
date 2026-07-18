@@ -100,6 +100,16 @@ final class AcceptanceViewController: UIViewController {
         ] == "1"
     }
 
+    /// Removes only the acceptance harness's custom transport buttons so a physical-remote or
+    /// XCUITest run can exercise AVPlayerViewController's native media-selection UI without a
+    /// competing focus environment. The player, session, carrier, presentation view and diagnostics
+    /// are unchanged.
+    private var avKitUIEvidenceModeEnabled: Bool {
+        ProcessInfo.processInfo.environment[
+            "AETHER_ACCEPTANCE_AVKIT_UI_EVIDENCE"
+        ] == "1"
+    }
+
     private var automaticNegativeRunEnabled: Bool {
         ProcessInfo.processInfo.environment[
             "AETHER_ACCEPTANCE_NEGATIVE_CASE"
@@ -1858,8 +1868,11 @@ final class AcceptanceViewController: UIViewController {
     }
 
     private func setSessionControlsEnabled(_ enabled: Bool) {
-        actionPanel.isHidden = !enabled
-        actionPanel.arrangedSubviews.forEach { $0.isUserInteractionEnabled = enabled }
+        let customControlsEnabled = enabled && !avKitUIEvidenceModeEnabled
+        actionPanel.isHidden = !customControlsEnabled
+        actionPanel.arrangedSubviews.forEach {
+            $0.isUserInteractionEnabled = customControlsEnabled
+        }
     }
 
     private func setStatus(_ title: String, detail: String) {
