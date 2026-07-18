@@ -208,7 +208,9 @@ struct HybridPlaybackTelemetryTests {
                 carrierTimebaseBound: true,
                 rendererStatus: .unknown,
                 styledSubtitleVisible: false,
-                visibleBitmapSubtitleCount: 0
+                visibleBitmapSubtitleCount: 0,
+                nativeWebVTTVisible: false,
+                visibleNativeWebVTTCueCount: 0
             ),
             systemFeaturePolicy:
                 AetherHybridPlaybackSession

@@ -413,6 +413,8 @@ final class HybridPlaybackSession {
         (any HybridCarrierBandwidthTelemetrySource)?
     private let subtitleController:
         HybridSubtitleSessionController?
+    private let nativeWebVTTBridge:
+        HybridNativeWebVTTOverlayBridge?
 
     private var classifier: HybridSeekIntentClassifier
     private var readinessGate = HybridPresentationReadinessGate()
@@ -557,6 +559,18 @@ final class HybridPlaybackSession {
         } else {
             subtitleController = nil
         }
+        if let view = renderSurface as?
+                AetherHybridPresentationView,
+           !provider.nativeSubtitleRenditions.isEmpty {
+            nativeWebVTTBridge =
+                HybridNativeWebVTTOverlayBridge(
+                    presentationView: view,
+                    expectedRenditionCount:
+                        provider.nativeSubtitleRenditions.count
+                )
+        } else {
+            nativeWebVTTBridge = nil
+        }
         classifier = HybridSeekIntentClassifier(
             timeline: timeline,
             initialGeneration: initialGeneration
@@ -570,6 +584,12 @@ final class HybridPlaybackSession {
                 selectedTrackID
             )
         }
+        nativeWebVTTBridge?
+            .nativeSelectionDidActivate = {
+                [weak self] in
+                self?
+                    .deactivateOverlaySubtitleForNativeSelection()
+            }
         if let terminalErrorSource =
                 provider as?
                 any HybridPlaybackTerminalErrorSource {
@@ -781,6 +801,13 @@ final class HybridPlaybackSession {
             try presentationValidation()
             try transport.startPrepared()
             try bindCarrierClock()
+            if let nativeWebVTTBridge {
+                guard let item = avPlayer.currentItem else {
+                    throw HybridPlaybackSessionError
+                        .carrierItemMissing
+                }
+                try nativeWebVTTBridge.attach(to: item)
+            }
             installClockObservers()
             try await transport.prepare(
                 timeout: try remainingTime(
@@ -970,6 +997,9 @@ final class HybridPlaybackSession {
             return
         }
         try subtitleController.select(trackID: trackID)
+        nativeWebVTTBridge?.setOverlaySubtitleActive(
+            trackID != nil
+        )
     }
 
     func stop() {
@@ -984,6 +1014,7 @@ final class HybridPlaybackSession {
         managedTimeJumpSuppressionDeadline = nil
         pendingResumeIntent = nil
         cancelAudioAnalysisStreams()
+        nativeWebVTTBridge?.detach()
         subtitleController?.stop()
         relay.detach()
         avPlayer.pause()
@@ -1449,7 +1480,17 @@ final class HybridPlaybackSession {
     }
 
     func handleCarrierMediaSelectionChange() {
+        nativeWebVTTBridge?.mediaSelectionDidChange()
         rebuildPresentationAtCarrierTime()
+    }
+
+    private func deactivateOverlaySubtitleForNativeSelection() {
+        guard subtitleController?.selectedTrackID != nil else {
+            return
+        }
+        subtitleController?.deselect()
+        nativeWebVTTBridge?
+            .setOverlaySubtitleActive(false)
     }
 
     private func rebuildPresentationAtCarrierTime() {
@@ -1981,6 +2022,7 @@ final class HybridPlaybackSession {
         pendingResumeIntent = nil
         decodeDemandSuspended = true
         cancelAudioAnalysisStreams()
+        nativeWebVTTBridge?.detach()
         subtitleController?.stop()
         relay.detach()
         avPlayer.pause()

@@ -1203,13 +1203,41 @@ final class AcceptanceViewController: UIViewController {
             )
         }
         try requireClockBound(session, step: "subtitle-reselect")
+        try await waitForNativeWebVTT(
+            visible: true,
+            session: session,
+            step: "subtitle-presentation"
+        )
         print(
-            "AETHER_ACCEPTANCE subtitleEvidence legibleOptions=\(group.options.count) initiallySelected=\(wasInitiallySelected) select=true deselect=true reselect=true"
+            "AETHER_ACCEPTANCE subtitleEvidence legibleOptions=\(group.options.count) initiallySelected=\(wasInitiallySelected) select=true deselect=true reselect=true aetherPresentation=true"
         )
         recordCheckpoint("native-webvtt-selection-passed", session: session)
         setStatus(
             "native WebVTT selection passed",
             diagnostics: session.diagnostics
+        )
+    }
+
+    private func waitForNativeWebVTT(
+        visible: Bool,
+        session: AetherHybridPlaybackSession,
+        step: String
+    ) async throws {
+        let deadline = ProcessInfo.processInfo.systemUptime + 8
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            if case .failed(let error) = session.state {
+                throw error
+            }
+            if session.diagnostics.renderer
+                    .nativeWebVTTVisible == visible {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        throw AcceptanceHarnessError.assertionFailed(
+            step: step,
+            detail:
+                "Aether native WebVTT overlay visibility did not become \(visible)"
         )
     }
 

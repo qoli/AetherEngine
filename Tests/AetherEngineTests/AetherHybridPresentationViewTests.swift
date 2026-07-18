@@ -105,6 +105,76 @@ struct AetherHybridPresentationViewTests {
         #expect(view.diagnostics.pendingSampleBuffers == 24)
     }
 
+    @Test("Native WebVTT common-format text is owned by the Aether overlay and clears explicitly")
+    func nativeWebVTTOverlayContract() {
+        let view = AetherHybridPresentationView(
+            frame: CGRect(
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080
+            )
+        )
+        #if canImport(UIKit)
+        view.layoutIfNeeded()
+        #elseif canImport(AppKit)
+        view.layoutSubtreeIfNeeded()
+        #endif
+        let cue = NSAttributedString(
+            string: "Aether WebVTT",
+            attributes: [
+                NSAttributedString.Key(
+                    rawValue:
+                        kCMTextMarkupAttribute_ForegroundColorARGB
+                            as String
+                ): [1, 1, 1, 1] as [NSNumber],
+                NSAttributedString.Key(
+                    rawValue:
+                        kCMTextMarkupAttribute_BackgroundColorARGB
+                            as String
+                ): [0.5, 0, 0, 0] as [NSNumber],
+                NSAttributedString.Key(
+                    rawValue:
+                        kCMTextMarkupAttribute_BaseFontSizePercentageRelativeToVideoHeight
+                            as String
+                ): NSNumber(value: 4.25),
+                NSAttributedString.Key(
+                    rawValue:
+                        kCMTextMarkupAttribute_TextPositionPercentageRelativeToWritingDirection
+                            as String
+                ): NSNumber(value: 50),
+                NSAttributedString.Key(
+                    rawValue:
+                        kCMTextMarkupAttribute_OrthogonalLinePositionPercentageRelativeToWritingDirection
+                            as String
+                ): NSNumber(value: 100),
+                NSAttributedString.Key(
+                    rawValue:
+                        kCMTextMarkupAttribute_WritingDirectionSizePercentage
+                            as String
+                ): NSNumber(value: 100),
+            ]
+        )
+
+        view.showNativeWebVTTCues([cue])
+
+        #expect(view.diagnostics.nativeWebVTTVisible)
+        #expect(
+            view.diagnostics.visibleNativeWebVTTCueCount == 1
+        )
+        #expect(!view.diagnostics.styledSubtitleVisible)
+        #expect(
+            view.diagnostics.visibleBitmapSubtitleCount == 0
+        )
+
+        view.clearNativeWebVTTCues()
+
+        #expect(!view.diagnostics.nativeWebVTTVisible)
+        #expect(
+            view.diagnostics.visibleNativeWebVTTCueCount == 0
+        )
+    }
+
     @Test("Regressing or duplicate PTS fails instead of being displayed immediately")
     func nonMonotonicPTSIsTerminal() throws {
         let view = AetherHybridPresentationView()

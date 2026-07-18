@@ -118,6 +118,8 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         public let rendererStatus: RendererStatus
         public let styledSubtitleVisible: Bool
         public let visibleBitmapSubtitleCount: Int
+        public let nativeWebVTTVisible: Bool
+        public let visibleNativeWebVTTCueCount: Int
 
         init(
             generation: UInt64,
@@ -132,7 +134,9 @@ public final class AetherHybridPresentationView: PlatformBaseView {
             carrierTimebaseBound: Bool,
             rendererStatus: RendererStatus,
             styledSubtitleVisible: Bool,
-            visibleBitmapSubtitleCount: Int
+            visibleBitmapSubtitleCount: Int,
+            nativeWebVTTVisible: Bool,
+            visibleNativeWebVTTCueCount: Int
         ) {
             self.generation = generation
             self.pendingSampleBuffers = pendingSampleBuffers
@@ -148,6 +152,9 @@ public final class AetherHybridPresentationView: PlatformBaseView {
             self.styledSubtitleVisible = styledSubtitleVisible
             self.visibleBitmapSubtitleCount =
                 visibleBitmapSubtitleCount
+            self.nativeWebVTTVisible = nativeWebVTTVisible
+            self.visibleNativeWebVTTCueCount =
+                visibleNativeWebVTTCueCount
         }
     }
 
@@ -423,7 +430,11 @@ public final class AetherHybridPresentationView: PlatformBaseView {
             styledSubtitleVisible:
                 subtitleCanvas.styledSubtitleVisible,
             visibleBitmapSubtitleCount:
-                subtitleCanvas.visibleBitmapSubtitleCount
+                subtitleCanvas.visibleBitmapSubtitleCount,
+            nativeWebVTTVisible:
+                subtitleCanvas.nativeWebVTTVisible,
+            visibleNativeWebVTTCueCount:
+                subtitleCanvas.visibleNativeWebVTTCueCount
         )
     }
 
@@ -443,6 +454,18 @@ public final class AetherHybridPresentationView: PlatformBaseView {
 
     func showBitmapSubtitles(_ images: [SubtitleImage]) {
         subtitleCanvas.showBitmaps(images)
+    }
+
+    func showNativeWebVTTCues(
+        _ attributedStrings: [NSAttributedString]
+    ) {
+        subtitleCanvas.showNativeWebVTT(
+            attributedStrings
+        )
+    }
+
+    func clearNativeWebVTTCues() {
+        subtitleCanvas.clearNativeWebVTT()
     }
 
     func clearSubtitleOverlay() {

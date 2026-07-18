@@ -1,10 +1,17 @@
 import CoreGraphics
+import CoreMedia
 import Foundation
 import Libavcodec
 import Libavformat
 import Libavutil
 import QuartzCore
 @preconcurrency import SwiftLibass
+
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 /// Why an Aether-owned subtitle track needs the Hybrid overlay instead of an
 /// AVPlayer WebVTT rendition.
@@ -363,9 +370,19 @@ final class HybridStyledSubtitleRenderer {
 final class HybridSubtitleOverlayCanvas {
     private let rootLayer = CALayer()
     private let styledLayer = CALayer()
+    private let nativeWebVTTRenderer:
+        HybridNativeWebVTTOverlayRenderer
     private var bitmapLayers: [CALayer] = []
     private(set) var styledSubtitleVisible = false
     private(set) var visibleBitmapSubtitleCount = 0
+
+    var nativeWebVTTVisible: Bool {
+        nativeWebVTTRenderer.visibleCueCount > 0
+    }
+
+    var visibleNativeWebVTTCueCount: Int {
+        nativeWebVTTRenderer.visibleCueCount
+    }
 
     init(parent: CALayer) {
         rootLayer.masksToBounds = true
@@ -374,6 +391,10 @@ final class HybridSubtitleOverlayCanvas {
         #endif
         styledLayer.contentsGravity = .resize
         rootLayer.addSublayer(styledLayer)
+        nativeWebVTTRenderer =
+            HybridNativeWebVTTOverlayRenderer(
+                parent: rootLayer
+            )
         parent.addSublayer(rootLayer)
     }
 
@@ -384,6 +405,9 @@ final class HybridSubtitleOverlayCanvas {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         rootLayer.frame = videoRect
+        nativeWebVTTRenderer.layout(
+            in: rootLayer.bounds
+        )
         CATransaction.commit()
     }
 
@@ -397,6 +421,7 @@ final class HybridSubtitleOverlayCanvas {
         styledLayer.isHidden = frame == nil
         styledSubtitleVisible = frame != nil
         visibleBitmapSubtitleCount = 0
+        nativeWebVTTRenderer.clear()
         clearBitmapLayers()
         CATransaction.commit()
     }
@@ -408,6 +433,7 @@ final class HybridSubtitleOverlayCanvas {
         styledLayer.isHidden = true
         styledSubtitleVisible = false
         visibleBitmapSubtitleCount = images.count
+        nativeWebVTTRenderer.clear()
         while bitmapLayers.count < images.count {
             let layer = CALayer()
             layer.contentsGravity = .resize
@@ -431,6 +457,24 @@ final class HybridSubtitleOverlayCanvas {
         CATransaction.commit()
     }
 
+    func showNativeWebVTT(
+        _ attributedStrings: [NSAttributedString]
+    ) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        styledLayer.contents = nil
+        styledLayer.isHidden = true
+        styledSubtitleVisible = false
+        visibleBitmapSubtitleCount = 0
+        clearBitmapLayers()
+        nativeWebVTTRenderer.show(attributedStrings)
+        CATransaction.commit()
+    }
+
+    func clearNativeWebVTT() {
+        nativeWebVTTRenderer.clear()
+    }
+
     func clear() {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -438,6 +482,7 @@ final class HybridSubtitleOverlayCanvas {
         styledLayer.isHidden = true
         styledSubtitleVisible = false
         visibleBitmapSubtitleCount = 0
+        nativeWebVTTRenderer.clear()
         clearBitmapLayers()
         CATransaction.commit()
     }
@@ -480,6 +525,621 @@ final class HybridSubtitleOverlayCanvas {
             height: height
         ).integral
     }
+}
+
+/// Draws the common-format attributed strings emitted by
+/// `AVPlayerItemLegibleOutput` above Aether's real-video display layer.
+///
+/// AVFoundation's common format uses the public CoreMedia text-markup keys,
+/// not UIKit/AppKit drawing keys. This renderer translates those keys while
+/// retaining the source cue geometry and the user's Media Accessibility
+/// styling that `AVPlayerItemLegibleOutput.TextStylingResolution.default`
+/// has already resolved. It never parses or independently clocks WebVTT.
+@MainActor
+private final class HybridNativeWebVTTOverlayRenderer {
+    private struct CueLayout {
+        let attributedText: NSAttributedString
+        let containerColor: CGColor?
+        let positionPercent: CGFloat
+        let linePercent: CGFloat
+        let maximumWidthPercent: CGFloat
+        let alignment: CATextLayerAlignmentMode
+        let edgeStyle: String?
+    }
+
+    private final class CueLayer {
+        let container = CALayer()
+        let text = CATextLayer()
+
+        init(parent: CALayer, contentsScale: CGFloat) {
+            container.masksToBounds = false
+            text.contentsScale = contentsScale
+            text.isWrapped = true
+            text.truncationMode = .none
+            container.addSublayer(text)
+            parent.addSublayer(container)
+        }
+
+        func remove() {
+            container.removeFromSuperlayer()
+        }
+    }
+
+    private let rootLayer = CALayer()
+    private var cueLayers: [CueLayer] = []
+    private var cues: [NSAttributedString] = []
+    private(set) var visibleCueCount = 0
+
+    init(parent: CALayer) {
+        rootLayer.masksToBounds = true
+        parent.addSublayer(rootLayer)
+    }
+
+    func layout(in bounds: CGRect) {
+        rootLayer.frame = bounds
+        render()
+    }
+
+    func show(_ attributedStrings: [NSAttributedString]) {
+        cues = attributedStrings.filter {
+            !$0.string.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).isEmpty
+        }
+        render()
+    }
+
+    func clear() {
+        cues.removeAll(keepingCapacity: true)
+        visibleCueCount = 0
+        for cueLayer in cueLayers {
+            cueLayer.container.isHidden = true
+            cueLayer.text.string = nil
+        }
+    }
+
+    private func render() {
+        let bounds = rootLayer.bounds
+        guard bounds.width > 0,
+              bounds.height > 0,
+              !cues.isEmpty else {
+            clear()
+            return
+        }
+        while cueLayers.count < cues.count {
+            cueLayers.append(CueLayer(
+                parent: rootLayer,
+                contentsScale: Self.contentsScale
+            ))
+        }
+        var renderedCount = 0
+        for (index, cueLayer) in cueLayers.enumerated() {
+            guard cues.indices.contains(index),
+                  let layout = makeLayout(
+                    cues[index],
+                    canvasHeight: bounds.height
+                  ) else {
+                cueLayer.container.isHidden = true
+                cueLayer.text.string = nil
+                continue
+            }
+            apply(
+                layout,
+                to: cueLayer,
+                in: bounds
+            )
+            renderedCount += 1
+        }
+        visibleCueCount = renderedCount
+    }
+
+    private func makeLayout(
+        _ source: NSAttributedString,
+        canvasHeight: CGFloat
+    ) -> CueLayout? {
+        guard source.length > 0 else { return nil }
+        let wholeRange = NSRange(
+            location: 0,
+            length: source.length
+        )
+        let whole = source.attributes(
+            at: 0,
+            effectiveRange: nil
+        )
+        // Vertical WebVTT requires glyph rotation and vertical line stacking.
+        // It remains a track-local graceful degradation, never a route or
+        // subtitle-backend switch.
+        guard whole[Self.verticalLayoutKey] == nil else {
+            EngineLog.emit(
+                "[HybridNativeWebVTTOverlayRenderer] vertical cue omitted",
+                category: .session
+            )
+            return nil
+        }
+
+        let baseFontPercent = Self.number(
+            whole[Self.baseFontSizeKey]
+        ) ?? 4.25
+        let baseFontSize = max(
+            16,
+            canvasHeight * baseFontPercent / 100
+        )
+        let output = NSMutableAttributedString(
+            attributedString: source
+        )
+        let paragraph = NSMutableParagraphStyle()
+        let alignment = Self.alignment(
+            whole[Self.alignmentKey]
+        )
+        paragraph.alignment = Self.textAlignment(alignment)
+        output.addAttribute(
+            .paragraphStyle,
+            value: paragraph,
+            range: wholeRange
+        )
+        source.enumerateAttributes(
+            in: wholeRange
+        ) { attributes, range, _ in
+            let relativeSize = Self.number(
+                attributes[Self.relativeFontSizeKey]
+            ) ?? 100
+            let pointSize = max(
+                1,
+                baseFontSize * relativeSize / 100
+            )
+            let font = Self.font(
+                family: attributes[Self.fontFamilyKey]
+                    as? String,
+                genericFamily:
+                    attributes[Self.genericFontFamilyKey]
+                        as? String,
+                pointSize: pointSize,
+                bold: Self.boolean(
+                    attributes[Self.boldKey]
+                ),
+                italic: Self.boolean(
+                    attributes[Self.italicKey]
+                )
+            )
+            output.addAttribute(
+                .font,
+                value: font,
+                range: range
+            )
+            if let color = Self.platformColor(
+                attributes[Self.foregroundColorKey]
+            ) {
+                output.addAttribute(
+                    .foregroundColor,
+                    value: color,
+                    range: range
+                )
+            } else {
+                output.addAttribute(
+                    .foregroundColor,
+                    value: Self.defaultForegroundColor,
+                    range: range
+                )
+            }
+            if let color = Self.platformColor(
+                attributes[Self.characterBackgroundColorKey]
+            ), color.cgColor.alpha > 0 {
+                output.addAttribute(
+                    .backgroundColor,
+                    value: color,
+                    range: range
+                )
+            }
+            if Self.boolean(
+                attributes[Self.underlineKey]
+            ) {
+                output.addAttribute(
+                    .underlineStyle,
+                    value: NSUnderlineStyle.single.rawValue,
+                    range: range
+                )
+            }
+        }
+        let edgeStyle = whole[Self.edgeStyleKey]
+            as? String
+        if edgeStyle
+            == (kCMTextMarkupCharacterEdgeStyle_Uniform as String) {
+            output.addAttribute(
+                .strokeColor,
+                value: Self.defaultEdgeColor,
+                range: wholeRange
+            )
+            output.addAttribute(
+                .strokeWidth,
+                value: NSNumber(value: -3),
+                range: wholeRange
+            )
+        }
+
+        return CueLayout(
+            attributedText: output,
+            containerColor: Self.platformColor(
+                whole[Self.backgroundColorKey]
+            )?.cgColor,
+            positionPercent: Self.clampedPercent(
+                Self.number(whole[Self.positionKey]) ?? 50
+            ),
+            linePercent: Self.clampedPercent(
+                Self.number(whole[Self.linePositionKey]) ?? 95
+            ),
+            maximumWidthPercent: max(
+                1,
+                Self.clampedPercent(
+                    Self.number(whole[Self.writingSizeKey])
+                        ?? 100
+                )
+            ),
+            alignment: alignment,
+            edgeStyle: edgeStyle
+        )
+    }
+
+    private func apply(
+        _ layout: CueLayout,
+        to cueLayer: CueLayer,
+        in canvas: CGRect
+    ) {
+        let horizontalPadding = max(12, canvas.height * 0.012)
+        let verticalPadding = max(6, canvas.height * 0.006)
+        let maximumWidth = max(
+            1,
+            canvas.width * layout.maximumWidthPercent / 100
+        )
+        let drawingWidth = max(
+            1,
+            maximumWidth - horizontalPadding * 2
+        )
+        let measured = layout.attributedText.boundingRect(
+            with: CGSize(
+                width: drawingWidth,
+                height: .greatestFiniteMagnitude
+            ),
+            options: [
+                .usesLineFragmentOrigin,
+                .usesFontLeading,
+            ],
+            context: nil
+        ).integral
+        let width = min(
+            maximumWidth,
+            max(1, measured.width + horizontalPadding * 2)
+        )
+        let height = min(
+            canvas.height,
+            max(1, measured.height + verticalPadding * 2)
+        )
+        let anchorX = canvas.width
+            * layout.positionPercent / 100
+        let originX: CGFloat
+        switch layout.alignment {
+        case .left:
+            originX = anchorX
+        case .right:
+            originX = anchorX - width
+        default:
+            originX = anchorX - width / 2
+        }
+        // AVFoundation resolves 0...100 cue positions inside a caption-safe
+        // region so captions remain above AVKit's transport controls. Mirror
+        // that public presentation behavior without inspecting AVKit's
+        // private caption hierarchy.
+        let captionSafeLinePercent = 10
+            + layout.linePercent * 0.7
+        let unclampedY = canvas.height
+            * captionSafeLinePercent / 100 - height
+        let frame = CGRect(
+            x: min(
+                max(0, originX),
+                max(0, canvas.width - width)
+            ),
+            y: min(
+                max(0, unclampedY),
+                max(0, canvas.height - height)
+            ),
+            width: width,
+            height: height
+        ).integral
+
+        cueLayer.container.frame = frame
+        cueLayer.container.backgroundColor =
+            layout.containerColor
+        cueLayer.container.isHidden = false
+        cueLayer.text.frame = cueLayer.container.bounds.insetBy(
+            dx: horizontalPadding,
+            dy: verticalPadding
+        )
+        cueLayer.text.string = layout.attributedText
+        cueLayer.text.alignmentMode = layout.alignment
+        Self.applyEdgeStyle(
+            layout.edgeStyle,
+            to: cueLayer.text
+        )
+    }
+
+    private static func applyEdgeStyle(
+        _ value: String?,
+        to layer: CATextLayer
+    ) {
+        layer.shadowOpacity = 0
+        layer.shadowRadius = 0
+        layer.shadowOffset = .zero
+        guard let value else { return }
+        if value == kCMTextMarkupCharacterEdgeStyle_DropShadow
+            as String {
+            layer.shadowColor = CGColor(
+                gray: 0,
+                alpha: 1
+            )
+            layer.shadowOpacity = 1
+            layer.shadowRadius = 2
+            layer.shadowOffset = CGSize(width: 2, height: 2)
+        } else if value
+            == kCMTextMarkupCharacterEdgeStyle_Raised as String {
+            layer.shadowColor = CGColor(
+                gray: 1,
+                alpha: 0.8
+            )
+            layer.shadowOpacity = 1
+            layer.shadowRadius = 1
+            layer.shadowOffset = CGSize(width: -1, height: -1)
+        } else if value
+            == kCMTextMarkupCharacterEdgeStyle_Depressed as String {
+            layer.shadowColor = CGColor(
+                gray: 0,
+                alpha: 0.9
+            )
+            layer.shadowOpacity = 1
+            layer.shadowRadius = 1
+            layer.shadowOffset = CGSize(width: 1, height: 1)
+        }
+    }
+
+    private static func alignment(
+        _ value: Any?
+    ) -> CATextLayerAlignmentMode {
+        guard let value = value as? String else {
+            return .center
+        }
+        if value == kCMTextMarkupAlignmentType_Start as String
+            || value == kCMTextMarkupAlignmentType_Left as String {
+            return .left
+        }
+        if value == kCMTextMarkupAlignmentType_End as String
+            || value == kCMTextMarkupAlignmentType_Right as String {
+            return .right
+        }
+        return .center
+    }
+
+    private static func textAlignment(
+        _ alignment: CATextLayerAlignmentMode
+    ) -> NSTextAlignment {
+        switch alignment {
+        case .left: .left
+        case .right: .right
+        default: .center
+        }
+    }
+
+    private static func number(_ value: Any?) -> CGFloat? {
+        if let number = value as? NSNumber {
+            return CGFloat(number.doubleValue)
+        }
+        return nil
+    }
+
+    private static func boolean(_ value: Any?) -> Bool {
+        (value as? NSNumber)?.boolValue ?? false
+    }
+
+    private static func clampedPercent(_ value: CGFloat) -> CGFloat {
+        min(100, max(0, value))
+    }
+
+    #if canImport(UIKit)
+    private static var contentsScale: CGFloat {
+        UIScreen.main.scale
+    }
+
+    private static var defaultForegroundColor: UIColor {
+        .white
+    }
+
+    private static var defaultEdgeColor: UIColor {
+        .black
+    }
+
+    private static func platformColor(_ value: Any?) -> UIColor? {
+        guard let components = value as? [NSNumber],
+              components.count == 4 else {
+            return nil
+        }
+        return UIColor(
+            red: CGFloat(components[1].doubleValue),
+            green: CGFloat(components[2].doubleValue),
+            blue: CGFloat(components[3].doubleValue),
+            alpha: CGFloat(components[0].doubleValue)
+        )
+    }
+
+    private static func font(
+        family: String?,
+        genericFamily: String?,
+        pointSize: CGFloat,
+        bold: Bool,
+        italic: Bool
+    ) -> UIFont {
+        let resolvedFamily = concreteFontFamily(
+            family: family,
+            genericFamily: genericFamily
+        )
+        var font = resolvedFamily.flatMap {
+            UIFont(name: $0, size: pointSize)
+        } ?? UIFont.systemFont(ofSize: pointSize)
+        var traits = font.fontDescriptor.symbolicTraits
+        if bold { traits.insert(.traitBold) }
+        if italic { traits.insert(.traitItalic) }
+        if let descriptor = font.fontDescriptor
+            .withSymbolicTraits(traits) {
+            font = UIFont(
+                descriptor: descriptor,
+                size: pointSize
+            )
+        }
+        return font
+    }
+    #elseif canImport(AppKit)
+    private static var contentsScale: CGFloat {
+        NSScreen.main?.backingScaleFactor ?? 2
+    }
+
+    private static var defaultForegroundColor: NSColor {
+        .white
+    }
+
+    private static var defaultEdgeColor: NSColor {
+        .black
+    }
+
+    private static func platformColor(_ value: Any?) -> NSColor? {
+        guard let components = value as? [NSNumber],
+              components.count == 4 else {
+            return nil
+        }
+        return NSColor(
+            srgbRed: CGFloat(components[1].doubleValue),
+            green: CGFloat(components[2].doubleValue),
+            blue: CGFloat(components[3].doubleValue),
+            alpha: CGFloat(components[0].doubleValue)
+        )
+    }
+
+    private static func font(
+        family: String?,
+        genericFamily: String?,
+        pointSize: CGFloat,
+        bold: Bool,
+        italic: Bool
+    ) -> NSFont {
+        let resolvedFamily = concreteFontFamily(
+            family: family,
+            genericFamily: genericFamily
+        )
+        var font = resolvedFamily.flatMap {
+            NSFont(name: $0, size: pointSize)
+        } ?? NSFont.systemFont(ofSize: pointSize)
+        var traits: NSFontTraitMask = []
+        if bold { traits.insert(.boldFontMask) }
+        if italic { traits.insert(.italicFontMask) }
+        if !traits.isEmpty {
+            font = NSFontManager.shared.convert(
+                font,
+                toHaveTrait: traits
+            )
+        }
+        return font
+    }
+    #endif
+
+    private static func concreteFontFamily(
+        family: String?,
+        genericFamily: String?
+    ) -> String? {
+        if let family,
+           !family.isEmpty,
+           !family.hasPrefix(".") {
+            return family
+        }
+        guard let genericFamily else { return nil }
+        if genericFamily
+            == (kCMTextMarkupGenericFontName_Serif as String)
+            || genericFamily
+                == (kCMTextMarkupGenericFontName_ProportionalSerif
+                    as String) {
+            return "Times New Roman"
+        }
+        if genericFamily
+            == (kCMTextMarkupGenericFontName_Monospace as String)
+            || genericFamily
+                == (kCMTextMarkupGenericFontName_MonospaceSerif
+                    as String)
+            || genericFamily
+                == (kCMTextMarkupGenericFontName_MonospaceSansSerif
+                    as String) {
+            return "Courier"
+        }
+        if genericFamily
+            == (kCMTextMarkupGenericFontName_Cursive as String)
+            || genericFamily
+                == (kCMTextMarkupGenericFontName_Casual as String) {
+            return "Snell Roundhand"
+        }
+        return nil
+    }
+
+    private static let foregroundColorKey = NSAttributedString.Key(
+        rawValue: kCMTextMarkupAttribute_ForegroundColorARGB as String
+    )
+    private static let backgroundColorKey = NSAttributedString.Key(
+        rawValue: kCMTextMarkupAttribute_BackgroundColorARGB as String
+    )
+    private static let characterBackgroundColorKey = NSAttributedString.Key(
+        rawValue:
+            kCMTextMarkupAttribute_CharacterBackgroundColorARGB
+                as String
+    )
+    private static let boldKey = NSAttributedString.Key(
+        rawValue: kCMTextMarkupAttribute_BoldStyle as String
+    )
+    private static let italicKey = NSAttributedString.Key(
+        rawValue: kCMTextMarkupAttribute_ItalicStyle as String
+    )
+    private static let underlineKey = NSAttributedString.Key(
+        rawValue: kCMTextMarkupAttribute_UnderlineStyle as String
+    )
+    private static let fontFamilyKey = NSAttributedString.Key(
+        rawValue: kCMTextMarkupAttribute_FontFamilyName as String
+    )
+    private static let genericFontFamilyKey = NSAttributedString.Key(
+        rawValue: kCMTextMarkupAttribute_GenericFontFamilyName as String
+    )
+    private static let baseFontSizeKey = NSAttributedString.Key(
+        rawValue:
+            kCMTextMarkupAttribute_BaseFontSizePercentageRelativeToVideoHeight
+                as String
+    )
+    private static let relativeFontSizeKey = NSAttributedString.Key(
+        rawValue: kCMTextMarkupAttribute_RelativeFontSize as String
+    )
+    private static let verticalLayoutKey = NSAttributedString.Key(
+        rawValue: kCMTextMarkupAttribute_VerticalLayout as String
+    )
+    private static let alignmentKey = NSAttributedString.Key(
+        rawValue: kCMTextMarkupAttribute_Alignment as String
+    )
+    private static let positionKey = NSAttributedString.Key(
+        rawValue:
+            kCMTextMarkupAttribute_TextPositionPercentageRelativeToWritingDirection
+                as String
+    )
+    private static let linePositionKey = NSAttributedString.Key(
+        rawValue:
+            kCMTextMarkupAttribute_OrthogonalLinePositionPercentageRelativeToWritingDirection
+                as String
+    )
+    private static let writingSizeKey = NSAttributedString.Key(
+        rawValue:
+            kCMTextMarkupAttribute_WritingDirectionSizePercentage
+                as String
+    )
+    private static let edgeStyleKey = NSAttributedString.Key(
+        rawValue: kCMTextMarkupAttribute_CharacterEdgeStyle as String
+    )
 }
 
 final class HybridSubtitleDecodeContract: @unchecked Sendable {
@@ -632,24 +1292,24 @@ final class HybridSubtitleSessionController {
     }
 
     func select(trackID: Int?) throws {
-        presentationView.clearSubtitleOverlay()
-        if let trackID {
-            guard let contract = contractsByID[trackID] else {
-                throw AetherHybridSubtitleSelectionError
-                    .unknownTrack(trackID)
-            }
-            if let track = tracks.first(where: { $0.id == trackID }),
-               case .unavailable(let reason) = track.availability {
-                throw AetherHybridSubtitleSelectionError
-                    .trackUnavailable(
-                        trackID: trackID,
-                        reason: reason
-                    )
-            }
-            selectedContract = contract
-        } else {
-            selectedContract = nil
+        guard let trackID else {
+            deselect()
+            return
         }
+        presentationView.clearSubtitleOverlay()
+        guard let contract = contractsByID[trackID] else {
+            throw AetherHybridSubtitleSelectionError
+                .unknownTrack(trackID)
+        }
+        if let track = tracks.first(where: { $0.id == trackID }),
+           case .unavailable(let reason) = track.availability {
+            throw AetherHybridSubtitleSelectionError
+                .trackUnavailable(
+                    trackID: trackID,
+                    reason: reason
+                )
+        }
+        selectedContract = contract
         selectedTrackID = trackID
         decoder = nil
         cursor = nil
@@ -681,6 +1341,20 @@ final class HybridSubtitleSessionController {
                 return
             }
         }
+        publish()
+    }
+
+    func deselect() {
+        presentationView.clearSubtitleOverlay()
+        selectedContract = nil
+        selectedTrackID = nil
+        decoder = nil
+        cursor = nil
+        cues.removeAll(keepingCapacity: true)
+        assBuilder = nil
+        assRenderer = nil
+        styledScriptDirty = false
+        pgsGate.reset()
         publish()
     }
 
