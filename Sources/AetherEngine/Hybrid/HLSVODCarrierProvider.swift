@@ -732,6 +732,11 @@ final class HLSVODCarrierProvider:
         ) = error {
             return
         }
+        if case .pump(
+            .retiredSegmentRequest
+        ) = error {
+            return
+        }
         record(error)
     }
 

@@ -83,6 +83,10 @@ enum HLSVODMediaPumpError:
         renditionOrdinal: Int,
         error: BlackCarrierAudioRenditionStoreError
     )
+    case retiredSegmentRequest(
+        index: Int,
+        generationStart: Int
+    )
     case requestedSegmentUnavailable(Int)
     case unexpected(reason: String)
 
@@ -154,6 +158,11 @@ enum HLSVODMediaPumpError:
             "HLS VOD audio rendition \(ordinal) failed: \(error.localizedDescription)"
         case .audioStoreFailed(let ordinal, let error):
             "HLS VOD audio rendition \(ordinal) storage failed: \(error.localizedDescription)"
+        case .retiredSegmentRequest(
+            let index,
+            let generationStart
+        ):
+            "HLS VOD carrier request for retired segment \(index) precedes generation start \(generationStart)"
         case .requestedSegmentUnavailable(let index):
             "HLS VOD carrier segment \(index) was not produced"
         case .unexpected(let reason):
@@ -452,9 +461,24 @@ actor HLSVODMediaPump {
                 guard worker.cachedSegmentExists(
                     target
                 ) else {
+                    let workerSnapshot = worker.snapshot()
+                    EngineLog.emit(
+                        "[HLSVODMediaPump] requested retired segment unavailable "
+                            + "operationGeneration=\(operationGeneration) "
+                            + "currentGeneration=\(currentGeneration) "
+                            + "generationStart=\(generationStartSegmentIndex) "
+                            + "target=\(target) "
+                            + "nextVideo=\(nextVideoInputSegmentIndex) "
+                            + "nextAudio=\(nextAudioInputSegmentIndices) "
+                            + "highestVideo=\(workerSnapshot.highestProducedVideoSegmentIndex) "
+                            + "highestAudio=\(workerSnapshot.highestFinalizedAudioSegmentIndices)",
+                        category: .session
+                    )
                     throw HLSVODMediaPumpError
-                        .requestedSegmentUnavailable(
-                            target
+                        .retiredSegmentRequest(
+                            index: target,
+                            generationStart:
+                                generationStartSegmentIndex
                         )
                 }
                 return
@@ -617,6 +641,14 @@ actor HLSVODMediaPump {
                 requestedGeneration
             generationStartSegmentIndex =
                 expectedSegmentIndex
+            EngineLog.emit(
+                "[HLSVODMediaPump] restart applied "
+                    + "generation=\(currentGeneration) "
+                    + "generationStart=\(generationStartSegmentIndex) "
+                    + "nextVideo=\(nextVideoInputSegmentIndex) "
+                    + "nextAudio=\(nextAudioInputSegmentIndices)",
+                category: .session
+            )
             didRestart = true
             requestedRestartGeneration = nil
             restartInProgress = false
@@ -1010,6 +1042,20 @@ actor HLSVODMediaPump {
         }
 
         guard worker.hasProduced(segment: target) else {
+            let workerSnapshot = worker.snapshot()
+            EngineLog.emit(
+                "[HLSVODMediaPump] requested segment unavailable "
+                    + "generation=\(generation) "
+                    + "generationStart=\(generationStartSegmentIndex) "
+                    + "target=\(target) "
+                    + "nextVideo=\(nextVideoInputSegmentIndex) "
+                    + "nextAudio=\(nextAudioInputSegmentIndices) "
+                    + "highestVideo=\(workerSnapshot.highestProducedVideoSegmentIndex) "
+                    + "highestAudio=\(workerSnapshot.highestFinalizedAudioSegmentIndices) "
+                    + "videoPackets=\(workerSnapshot.videoPacketCount) "
+                    + "audioPackets=\(workerSnapshot.audioPacketCounts)",
+                category: .session
+            )
             throw HLSVODMediaPumpError
                 .requestedSegmentUnavailable(target)
         }

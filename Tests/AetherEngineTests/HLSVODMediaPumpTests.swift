@@ -1408,6 +1408,67 @@ final class HLSVODMediaPumpTests: XCTestCase {
         XCTAssertNil(provider.terminalError)
     }
 
+    func testRetiredLoopbackRequestDoesNotPoisonReplacementGeneration()
+        async throws
+    {
+        let fixture = try makeFixture(
+            segmentCount: 3
+        )
+        let provider =
+            try await HLSVODCarrierProvider.make(
+                preflight: fixture.preflight,
+                fetchOverride: { request, _ in
+                    try fixture.fetchStore.response(
+                        for: request
+                    )
+                }
+            )
+        defer { provider.close() }
+        try provider.prepareForTransportStart()
+
+        var classifier =
+            HybridSeekIntentClassifier(
+                timeline:
+                    try XCTUnwrap(
+                        fixture.preflight
+                            .hybridTimeline
+                    )
+            )
+        let intent =
+            try classifier.registerExplicitHostSeek(
+                to: CMTime(
+                    seconds: 2.5,
+                    preferredTimescale: 90_000
+                )
+            )
+        XCTAssertEqual(
+            try provider.restartMedia(for: intent),
+            .applied(
+                generation: 1,
+                segmentIndex: 2
+            )
+        )
+
+        XCTAssertNil(
+            provider.alternateAudioMediaSegmentURL(
+                ordinal: 0,
+                index: 1
+            )
+        )
+        XCTAssertNil(provider.terminalError)
+
+        try provider.prepareHybridGeneration(
+            segmentIndex: 2
+        )
+        XCTAssertNotNil(
+            provider.alternateAudioMediaSegmentURL(
+                ordinal: 0,
+                index: 2
+            )
+        )
+        XCTAssertNil(provider.terminalError)
+    }
+
     @MainActor
     func testPublicHybridSessionComposesHLSProviderIntoAVPlayerAndSampleBufferPresentation()
         async throws
@@ -2136,6 +2197,7 @@ final class HLSVODMediaPumpTests: XCTestCase {
     }
 
     private func makeFixture(
+        segmentCount: Int = 2,
         declaredAudioChannels: String = "2",
         omitSecondAudioSegment: Bool = false,
         includeWebVTTSubtitles: Bool = false,
@@ -2143,16 +2205,14 @@ final class HLSVODMediaPumpTests: XCTestCase {
     ) throws -> Fixture {
         let timeline =
             try BlackCarrierTimeline.mirroredHLSVOD(
-                segmentDurations: [
+                segmentDurations: Array(
+                    repeating:
                     CMTime(
                         value: 90_000,
                         timescale: 90_000
                     ),
-                    CMTime(
-                        value: 90_000,
-                        timescale: 90_000
-                    ),
-                ]
+                    count: segmentCount
+                )
             )
         let videoProvider =
             try BlackCarrierVideoProvider(
@@ -2190,16 +2250,12 @@ final class HLSVODMediaPumpTests: XCTestCase {
             string:
                 "https://cdn.example/video/init.mp4"
         )!
-        let videoSegmentURLs = [
+        let videoSegmentURLs = (0..<segmentCount).map {
             URL(
                 string:
-                    "https://cdn.example/video/v0.m4s"
-            )!,
-            URL(
-                string:
-                    "https://cdn.example/video/v1.m4s"
-            )!,
-        ]
+                    "https://cdn.example/video/v\($0).m4s"
+            )!
+        }
         let audioPlaylistURL = URL(
             string:
                 "https://cdn.example/audio/en.m3u8"
@@ -2208,40 +2264,48 @@ final class HLSVODMediaPumpTests: XCTestCase {
             string:
                 "https://cdn.example/audio/init.mp4"
         )!
-        let audioSegmentURLs = [
+        let audioSegmentURLs = (0..<segmentCount).map {
             URL(
                 string:
-                    "https://cdn.example/audio/a0.m4s"
-            )!,
-            URL(
-                string:
-                    "https://cdn.example/audio/a1.m4s"
-            )!,
-        ]
+                    "https://cdn.example/audio/a\($0).m4s"
+            )!
+        }
         let subtitlePlaylistURL = URL(
             string:
                 "https://cdn.example/subtitles/en.m3u8"
         )!
-        let subtitleSegmentURLs = [
+        let subtitleSegmentURLs = (0..<segmentCount).map {
             URL(
                 string:
-                    "https://cdn.example/subtitles/s0.vtt"
-            )!,
-            URL(
-                string:
-                    "https://cdn.example/subtitles/s1.vtt"
-            )!,
-        ]
-        let subtitleSegments = [
-            Data(
-                "WEBVTT\n\n00:00:00.100 --> 00:00:00.900\nfirst\n"
-                    .utf8
-            ),
-            Data(
-                "WEBVTT\n\n00:00:01.100 --> 00:00:01.900\nsecond\n"
-                    .utf8
-            ),
-        ]
+                    "https://cdn.example/subtitles/s\($0).vtt"
+            )!
+        }
+        let subtitleSegments = (0..<segmentCount).map {
+            index in
+            if index == 0 {
+                return Data(
+                    "WEBVTT\n\n00:00:00.100 --> 00:00:00.900\nfirst\n"
+                        .utf8
+                )
+            }
+            if index == 1 {
+                return Data(
+                    "WEBVTT\n\n00:00:01.100 --> 00:00:01.900\nsecond\n"
+                        .utf8
+                )
+            }
+            let start = Double(index) + 0.1
+            let end = Double(index) + 0.9
+            return Data(
+                String(
+                    format:
+                        "WEBVTT\n\n00:00:%04.1f --> 00:00:%04.1f\nsegment-%d\n",
+                    start,
+                    end,
+                    index
+                ).utf8
+            )
+        }
         let videoMedia = HLSMediaPlaylist(
             targetDuration: 1,
             mediaSequence: 17,
@@ -2405,11 +2469,13 @@ final class HLSVODMediaPumpTests: XCTestCase {
         var responses: [
             URL: HLSVODOriginFetchResponse
         ] = [:]
-        responses[videoSegmentURLs[1]] =
-            response(
-                data: videoSegments[1],
-                url: videoSegmentURLs[1]
-            )
+        for index in videoSegmentURLs.indices.dropFirst() {
+            responses[videoSegmentURLs[index]] =
+                response(
+                    data: videoSegments[index],
+                    url: videoSegmentURLs[index]
+                )
+        }
         responses[audioInitURL] = response(
             data: audio.initData,
             url: audioInitURL
@@ -2422,12 +2488,14 @@ final class HLSVODMediaPumpTests: XCTestCase {
                     url: audioSegmentURLs[index]
                 )
         }
-        if includeWebVTTSubtitles,
-           !omitSecondSubtitleSegment {
-            responses[subtitleSegmentURLs[1]] = response(
-                data: subtitleSegments[1],
-                url: subtitleSegmentURLs[1]
-            )
+        if includeWebVTTSubtitles {
+            for index in subtitleSegmentURLs.indices.dropFirst()
+            where !omitSecondSubtitleSegment || index != 1 {
+                responses[subtitleSegmentURLs[index]] = response(
+                    data: subtitleSegments[index],
+                    url: subtitleSegmentURLs[index]
+                )
+            }
         }
         return Fixture(
             preflight: AetherHLSPlaybackPreflight(
