@@ -12,18 +12,22 @@ select/deselect/reselect on the carrier. Styled ASS passes Aether overlay select
 AVKit custom-menu installation on the same carrier clock. A deterministic PGS fixture also passes
 cue timing, decoded-pixel placement, seek-generation rebuild and select/off/reselect on the physical
 device. HDR10 and HLG also have engine/device candidate evidence. Late HDR10+ now has a deterministic
-bitstream, complete Apple T.35 attachment, and physical-device same-layer technical pass. All three
-remain unadmitted without human panel-mode and visual confirmation.
+bitstream, complete Apple T.35 attachment, and physical-device same-layer technical pass. Dolby Vision
+Profile 8.4 now has exact configuration/base-layer admission, VideoToolbox metadata-propagation
+acceptance, and a 240-frame physical-device technical pass. All four remain unadmitted without human
+panel-mode and visual confirmation.
 See
 [`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md),
-[`hybrid-hdr10plus-device-evidence-2026-07-18.md`](hybrid-hdr10plus-device-evidence-2026-07-18.md), and
+[`hybrid-hdr10plus-device-evidence-2026-07-18.md`](hybrid-hdr10plus-device-evidence-2026-07-18.md),
+[`hybrid-dolby-vision-profile84-device-evidence-2026-07-18.md`](hybrid-dolby-vision-profile84-device-evidence-2026-07-18.md), and
 [`hybrid-progressive-subtitle-device-evidence-2026-07-18.md`](hybrid-progressive-subtitle-device-evidence-2026-07-18.md).
 
 The complete physical gate remains pending. Source tests prove the bounded no-drop pending queue,
 monotonic timing, format-description propagation, HDR10+ per-frame attachment, and absence of
 `DisplayImmediately`. The physical late-HDR10+ run also proves first attachment after startup without
-changing the Hybrid graph, but the partial runs do not prove the remaining visual/audio, panel-mode,
-or Dolby Vision rows. Automated geometry passes, but its final human
+changing the Hybrid graph. The Profile 8.4 run proves exact candidate admission, VideoToolbox property
+acceptance and same-layer enqueue, but the partial runs do not prove the remaining visual/audio or
+panel-mode rows. Automated geometry passes, but its final human
 visible-orientation/crop confirmation remains part of the visual row.
 
 `AetherHybridPresentationView.verifiedVideoFormats` must remain `[.sdr]` until each additional format row
