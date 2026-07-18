@@ -32,9 +32,13 @@ Do not reuse an older gitignored directory merely because it has the expected na
 
 Set `AETHER_ACCEPTANCE_WEBVTT_SUBTITLES=1` while generating to add one deterministic, timeline-aligned
 WebVTT rendition. Launch with `AETHER_ACCEPTANCE_SUBTITLE_AUTORUN=1` to require AVFoundation's native
-`.legible` media-selection group, select/deselect/reselect that option, and prove that the exact carrier
-clock and sample-buffer renderer remain healthy. This automated row does not replace the separate human
-check that the AVKit subtitle menu and visible cue text are correct on the physical display.
+`.legible` media-selection group, select/deselect/reselect that option, require the selected cue to become
+visible in Aether's presentation diagnostics, and prove that the exact carrier clock and sample-buffer
+renderer remain healthy. AVKit remains the selection UI; a presentation-only
+`AVPlayerItemLegibleOutput` bridge draws its public common-format attributed strings above Aether's real
+video because `contentOverlayView` necessarily sits above AVKit's own caption layer. This bridge does not
+fetch, parse, independently clock, or select another subtitle source. Human confirmation of the AVKit
+menu remains a separate UI row.
 
 To exercise Aether-owned styled subtitles over the same carrier clock, generate the progressive VP9 +
 AAC + ASS fixture and serve the `Fixtures` directory from the Mac:
@@ -63,9 +67,11 @@ python3 Scripts/serve-hybrid-acceptance-fixture.py \
 
 Launch with `AETHER_ACCEPTANCE_PROGRESSIVE_NATIVE_SUBTITLE_AUTORUN=1`.
 The row requires one AVFoundation `.legible` option, explicit
-select/deselect/reselect, a moving carrier clock, and the exact same carrier
-timebase. An Aether overlay does not satisfy this plain-text row. Its final
-checkpoint is `native-webvtt-selection-passed`.
+select/deselect/reselect, a moving carrier clock, the exact same carrier
+timebase, and visible Aether presentation of the carrier item's selected
+common-format cue. A host-parsed or independently scheduled text overlay does
+not satisfy this plain-text row. Its final checkpoint is
+`native-webvtt-selection-passed`.
 
 For local Atmos acceptance, set `AETHER_ACCEPTANCE_ATMOS_EC3_INPUT` to a licensed E-AC-3 JOC
 elementary stream. The generator first requires FFmpeg to identify the input as E-AC-3 Atmos, then

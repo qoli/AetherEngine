@@ -8,9 +8,9 @@ Checks that need a running engine + a real media file, so they cannot run under 
 geometry, AVPlayerViewController writer, Match Frame Rate, HDR/HLG/Dolby Vision and teardown evidence.
 The source-level sample-buffer timing and metadata contract is implemented. A 2026-07-17 physical-device
 run passes the automated SDR clock, seek, pre-roll admission, bidirectional audio selection,
-recoverable origin-stall, geometry/cadence, host-negative, native WebVTT selection, E-AC-3 JOC and
-styled ASS overlay select/seek/off/reselect, plus stop/reopen sub-matrix. Human display/audio/AVKit
-confirmation, bitmap physical-fixture coverage, HDR panel-output, HDR10+ and Dolby
+recoverable origin-stall, geometry/cadence, host-negative, native WebVTT selection and visible-cue
+presentation, E-AC-3 JOC and styled ASS overlay select/seek/off/reselect, plus stop/reopen sub-matrix.
+Human display/audio/AVKit-menu confirmation, bitmap physical-fixture coverage, HDR panel-output, HDR10+ and Dolby
 Vision remain pending. See
 [`hybrid-display-device-evidence-2026-07-17.md`](hybrid-display-device-evidence-2026-07-17.md). No unverified
 color format may be added to
@@ -32,8 +32,11 @@ HLS WebVTT through graph-bound preflight and a progressive VP9 Matroska source c
 are republished through the carrier's AVFoundation `.legible` selection group. The 2026-07-17 study
 Apple TV runs pass select/deselect/reselect while retaining the same route, carrier clock and
 sample-buffer renderer. HLS source `DEFAULT`/`AUTOSELECT`/`FORCED` values and progressive container
-selection semantics are preserved by the carrier master. AVKit menu visibility and visible cue
-placement remain separate human checks; bitmap/styled overlay selection is not covered by this row.
+selection semantics are preserved by the carrier master. The 2026-07-18 exact `78b6418` run also proves
+that Aether's presentation-only legible-output bridge places the selected common-format cue above the
+real-video layer; AVKit still owns the menu and carrier selection. AVKit menu visibility remains a
+separate UI check; bitmap/styled overlay selection is not covered by this row. See
+[`hybrid-native-webvtt-device-evidence-2026-07-18.md`](hybrid-native-webvtt-device-evidence-2026-07-18.md).
 
 ## Hybrid styled subtitle overlay tvOS device gate
 

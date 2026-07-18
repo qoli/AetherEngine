@@ -306,10 +306,12 @@ finalCheckpoint: native-webvtt-selection-passed
 Focused tests also prove that malformed/non-WebVTT source tracks become typed unavailable policies,
 and that a subtitle segment failing after startup disables only that rendition while later video and
 audio carrier segments continue and the provider remains non-terminal. This is the explicitly approved
-subtitle-only graceful degradation; it is not a playback fallback. The physical automated row proves
-AVFoundation exposure and selection, not human-visible AVKit menu/cue placement. Bitmap/styled overlay
-selection is covered below for styled ASS. Bitmap overlay and the human-visible AVKit/cue rows remain
-pending.
+subtitle-only graceful degradation; it is not a playback fallback. The original physical automated row
+proves AVFoundation exposure and selection. A later exact `78b6418` study-device run also proves public
+common-format cue presentation above the real-video layer; see
+[`hybrid-native-webvtt-device-evidence-2026-07-18.md`](hybrid-native-webvtt-device-evidence-2026-07-18.md).
+Human confirmation of the AVKit menu and panel appearance remains separate. Styled ASS selection is
+covered below; bitmap overlay remains pending.
 
 ### Progressive plain-text source
 
@@ -344,8 +346,9 @@ typedSessionFailureCount: 0
 finalCheckpoint: native-webvtt-selection-passed
 ```
 
-The automated row proves AVFoundation exposure and selection through a real progressive source. It
-does not replace the pending human confirmation of the AVKit menu and visible cue text.
+The automated row proves AVFoundation exposure and selection through a real progressive source. The
+presentation-only bridge is covered by the later HLS WebVTT visible-cue evidence; progressive-source
+visible-cue placement and human AVKit-menu confirmation remain pending.
 
 ## Styled ASS overlay result
 
@@ -447,8 +450,9 @@ the source contract was restored to `verifiedVideoFormats == [.sdr]` immediately
   rows look correct on the panel.
 - Run AVKit-UI media selection. Programmatic bidirectional carrier media selection, controlled carrier
   stall, E-AC-3 JOC stream-copy selection, automated geometry/rotation/cadence, and host-contract
-  negative cases already pass. Native WebVTT programmatic select/deselect/reselect and styled ASS
-  overlay lifecycle also pass; record both AVKit menus and visible cue appearance. Record the downstream
+  negative cases already pass. Native WebVTT programmatic select/deselect/reselect, HLS visible-cue
+  presentation and styled ASS overlay lifecycle also pass; record both AVKit menus and human panel
+  appearance. Record the downstream
   Atmos indicator for the JOC row.
 - Complete the bitmap subtitle physical-fixture row. Source-level composition evidence does not replace
   physical decoded-pixel, placement, seek and selection evidence.
