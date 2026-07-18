@@ -130,6 +130,7 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
     public let audioAnalysisForwardBufferPressureThresholdSeconds:
         Double
     public let audioAnalysisTrackIDs: [Int]
+    public let selectedAudioAnalysisTrackID: Int?
     public let activeAudioAnalysisRequestCount: Int
     /// Decoder pre-roll rejected before renderer admission in the current generation.
     public let readinessPrerollFramesRejected: UInt64
@@ -154,6 +155,7 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
         audioAnalysisForwardBufferPressureThresholdSeconds:
             Double,
         audioAnalysisTrackIDs: [Int],
+        selectedAudioAnalysisTrackID: Int?,
         activeAudioAnalysisRequestCount: Int,
         readinessPrerollFramesRejected: UInt64,
         carrierBandwidth:
@@ -177,6 +179,8 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
         self.audioAnalysisForwardBufferPressureThresholdSeconds =
             audioAnalysisForwardBufferPressureThresholdSeconds
         self.audioAnalysisTrackIDs = audioAnalysisTrackIDs
+        self.selectedAudioAnalysisTrackID =
+            selectedAudioAnalysisTrackID
         self.activeAudioAnalysisRequestCount = activeAudioAnalysisRequestCount
         self.readinessPrerollFramesRejected =
             readinessPrerollFramesRejected
@@ -229,6 +233,11 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         [AetherHybridOverlaySubtitleTrack]
     @Published public private(set) var activeOverlaySubtitleTrackID:
         Int?
+    /// Stable Aether source-track identity corresponding to AVKit's current
+    /// audible selection. `nil` means the selection cannot be proven and
+    /// independent analysis must stay unavailable.
+    @Published public private(set) var selectedAudioAnalysisTrackID:
+        Int?
 
     private let core: HybridPlaybackSession
     private let telemetryHub:
@@ -260,6 +269,8 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         overlaySubtitleTracks = core.overlaySubtitleTracks
         activeOverlaySubtitleTrackID =
             core.activeOverlaySubtitleTrackID
+        selectedAudioAnalysisTrackID =
+            core.selectedAudioAnalysisTrackID
         core.stateDidChange = { [weak self] state in
             guard let self else { return }
             self.state = state
@@ -284,6 +295,10 @@ public final class AetherHybridPlaybackSession: ObservableObject {
             #if os(tvOS)
             self.installOverlaySubtitleMenuIfNeeded()
             #endif
+        }
+        core.selectedAudioAnalysisTrackIDDidChange = {
+            [weak self] trackID in
+            self?.selectedAudioAnalysisTrackID = trackID
         }
         #if os(tvOS)
         core.runtimePresentationValidation = {
@@ -604,6 +619,8 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                 HybridPlaybackSession
                     .analysisForwardBufferPressureThresholdSeconds,
             audioAnalysisTrackIDs: core.audioAnalysisTrackIDs,
+            selectedAudioAnalysisTrackID:
+                core.selectedAudioAnalysisTrackID,
             activeAudioAnalysisRequestCount:
                 core.activeAudioAnalysisRequestCount,
             readinessPrerollFramesRejected:
@@ -939,6 +956,8 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                 current.audioAnalysisPlaybackPressure,
             audioAnalysisTrackIDs:
                 current.audioAnalysisTrackIDs,
+            selectedAudioAnalysisTrackID:
+                current.selectedAudioAnalysisTrackID,
             activeAudioAnalysisRequestCount:
                 current.activeAudioAnalysisRequestCount,
             readinessPrerollFramesRejected:

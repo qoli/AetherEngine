@@ -201,6 +201,9 @@ protocol HybridCarrierTransportProvider:
     var hybridDolbyVisionConfiguration:
         AetherDolbyVisionConfiguration? { get }
     var hybridVideoFrameRate: Double? { get }
+    func sourceTrackID(
+        forAudioOrdinal ordinal: Int
+    ) -> Int?
 
     func restartMedia(
         for intent: HybridSeekIntent
@@ -417,6 +420,11 @@ final class HybridPlaybackSession {
     private let relay: HybridPlaybackFrameRelay
     private let audioAnalysisSource:
         (any HybridAudioAnalysisSource)?
+    /// Stable source-track identities in the exact EXT-X-MEDIA order emitted
+    /// by the Aether-owned carrier. AVFoundation option identity never escapes
+    /// this engine boundary.
+    private let audioAnalysisTrackIDByCarrierOrdinal:
+        [Int: Int]
     private let carrierBandwidthTelemetrySource:
         (any HybridCarrierBandwidthTelemetrySource)?
     private let subtitleController:
@@ -453,6 +461,9 @@ final class HybridPlaybackSession {
     private var audioAnalysisSessions: [
         UUID: AudioAnalysisSession
     ] = [:]
+    private var audioAnalysisSelectionResolutionTask:
+        Task<Void, Never>?
+    private(set) var selectedAudioAnalysisTrackID: Int?
     var stateDidChange:
         (@MainActor @Sendable (HybridPlaybackSessionState) -> Void)?
     var telemetryDidChange:
@@ -462,6 +473,8 @@ final class HybridPlaybackSession {
             [AetherHybridOverlaySubtitleTrack],
             Int?
         ) -> Void)?
+    var selectedAudioAnalysisTrackIDDidChange:
+        (@MainActor @Sendable (Int?) -> Void)?
     var runtimePresentationValidation:
         (@MainActor () throws -> Void) = {}
 
@@ -560,6 +573,37 @@ final class HybridPlaybackSession {
         self.relay = relay
         audioAnalysisSource =
             provider as? any HybridAudioAnalysisSource
+        let analysisTrackIDs =
+            (provider as? any HybridAudioAnalysisSource)?
+                .audioAnalysisTrackIDs ?? []
+        audioAnalysisTrackIDByCarrierOrdinal = Dictionary(
+            uniqueKeysWithValues:
+                provider.alternateAudioRenditions.compactMap {
+                    rendition in
+                    guard let trackID = provider
+                        .sourceTrackID(
+                            forAudioOrdinal: rendition.ordinal
+                        ),
+                        analysisTrackIDs.contains(trackID) else {
+                        return nil
+                    }
+                    return (rendition.ordinal, trackID)
+                }
+        )
+        if let defaultRendition = provider
+            .alternateAudioRenditions
+            .first(where: \.isDefault),
+           let trackID = audioAnalysisTrackIDByCarrierOrdinal[
+               defaultRendition.ordinal
+           ] {
+            selectedAudioAnalysisTrackID = trackID
+        } else if analysisTrackIDs.count == 1 {
+            // A single analysis track has no selection ambiguity even when a
+            // test/custom transport does not expose an audible option group.
+            selectedAudioAnalysisTrackID = analysisTrackIDs[0]
+        } else {
+            selectedAudioAnalysisTrackID = nil
+        }
         carrierBandwidthTelemetrySource =
             provider as?
                 any HybridCarrierBandwidthTelemetrySource
@@ -831,6 +875,7 @@ final class HybridPlaybackSession {
                     originalTimeout: timeout
                 )
             )
+            await refreshSelectedAudioAnalysisTrackIDFromCarrier()
             try ensureActiveGeneration(generation)
             try validateCarrierClock()
             _ = readinessGate.markCarrierReady(
@@ -1502,7 +1547,91 @@ final class HybridPlaybackSession {
 
     func handleCarrierMediaSelectionChange() {
         nativeWebVTTBridge?.mediaSelectionDidChange()
+        audioAnalysisSelectionResolutionTask?.cancel()
+        audioAnalysisSelectionResolutionTask = Task {
+            @MainActor [weak self] in
+            guard let self else { return }
+            await self
+                .refreshSelectedAudioAnalysisTrackIDFromCarrier()
+            self.audioAnalysisSelectionResolutionTask = nil
+        }
         rebuildPresentationAtCarrierTime()
+    }
+
+    /// Deterministic internal seam used by source-level tests. Production
+    /// selection is always read from the current Aether-owned carrier item.
+    func handleCarrierMediaSelectionChange(
+        selectedAudioOptionIndex: Int?
+    ) {
+        applySelectedAudioAnalysisTrackID(
+            carrierOptionIndex: selectedAudioOptionIndex
+        )
+        nativeWebVTTBridge?.mediaSelectionDidChange()
+        rebuildPresentationAtCarrierTime()
+    }
+
+    private func refreshSelectedAudioAnalysisTrackIDFromCarrier()
+        async
+    {
+        guard !Task.isCancelled else { return }
+        guard let item = avPlayer.currentItem else {
+            applySelectedAudioAnalysisTrackID(
+                carrierOptionIndex: nil
+            )
+            return
+        }
+        do {
+            guard let group = try await item.asset
+                .loadMediaSelectionGroup(for: .audible),
+                let selected = item.currentMediaSelection
+                    .selectedMediaOption(in: group) else {
+                applySelectedAudioAnalysisTrackID(
+                    carrierOptionIndex: nil
+                )
+                return
+            }
+            let selectedIndex = group.options.firstIndex {
+                $0.isEqual(selected)
+            }
+            guard !Task.isCancelled else { return }
+            applySelectedAudioAnalysisTrackID(
+                carrierOptionIndex: selectedIndex
+            )
+        } catch {
+            guard !Task.isCancelled else { return }
+            // Selection identity is optional-feature evidence. If AVKit cannot
+            // expose it, analysis becomes unavailable; playback is unchanged.
+            applySelectedAudioAnalysisTrackID(
+                carrierOptionIndex: nil
+            )
+        }
+    }
+
+    private func applySelectedAudioAnalysisTrackID(
+        carrierOptionIndex: Int?
+    ) {
+        let resolvedTrackID: Int?
+        if let carrierOptionIndex {
+            resolvedTrackID =
+                audioAnalysisTrackIDByCarrierOrdinal[
+                    carrierOptionIndex
+                ]
+        } else if audioAnalysisTrackIDs.count == 1,
+                  audioAnalysisTrackIDByCarrierOrdinal.isEmpty {
+            resolvedTrackID = audioAnalysisTrackIDs[0]
+        } else {
+            resolvedTrackID = nil
+        }
+        guard resolvedTrackID
+                != selectedAudioAnalysisTrackID else {
+            return
+        }
+        cancelAudioAnalysisStreams()
+        selectedAudioAnalysisTrackID = resolvedTrackID
+        selectedAudioAnalysisTrackIDDidChange?(
+            resolvedTrackID
+        )
+        telemetryDidChange?(.transportChanged)
     }
 
     private func deactivateOverlaySubtitleForNativeSelection() {
@@ -1824,6 +1953,8 @@ final class HybridPlaybackSession {
     }
 
     private func teardownObservers() {
+        audioAnalysisSelectionResolutionTask?.cancel()
+        audioAnalysisSelectionResolutionTask = nil
         if let periodicTimeObserver {
             avPlayer.removeTimeObserver(periodicTimeObserver)
             self.periodicTimeObserver = nil

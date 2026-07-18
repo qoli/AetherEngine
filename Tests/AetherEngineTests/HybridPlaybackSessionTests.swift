@@ -113,6 +113,7 @@ struct HybridPlaybackSessionTests {
         private let relay: HybridPlaybackFrameRelay
         private let timeline: BlackCarrierTimeline
         private let analysisData: Data?
+        private let analysisTrackIDs: [Int]
         private let videoFormat: VideoFormat
         private let lock = NSLock()
 
@@ -139,11 +140,15 @@ struct HybridPlaybackSessionTests {
             relay: HybridPlaybackFrameRelay,
             timeline: BlackCarrierTimeline,
             analysisData: Data? = nil,
+            analysisTrackIDs: [Int]? = nil,
             videoFormat: VideoFormat = .sdr
         ) {
             self.relay = relay
             self.timeline = timeline
             self.analysisData = analysisData
+            self.analysisTrackIDs = analysisData == nil
+                ? []
+                : (analysisTrackIDs ?? [0])
             self.videoFormat = videoFormat
         }
 
@@ -159,7 +164,31 @@ struct HybridPlaybackSessionTests {
             return terminalError
         }
         var audioAnalysisTrackIDs: [Int] {
-            analysisData == nil ? [] : [0]
+            analysisTrackIDs
+        }
+        var alternateAudioRenditions:
+            [HLSAudioRenditionInfo]
+        {
+            analysisTrackIDs.enumerated().map {
+                ordinal, _ in
+                HLSAudioRenditionInfo(
+                    ordinal: ordinal,
+                    language: nil,
+                    name: "Audio \(ordinal + 1)",
+                    isDefault: ordinal == 0,
+                    isAutoselect: true,
+                    channels: "1"
+                )
+            }
+        }
+        func sourceTrackID(
+            forAudioOrdinal ordinal: Int
+        ) -> Int? {
+            guard analysisTrackIDs.indices
+                    .contains(ordinal) else {
+                return nil
+            }
+            return analysisTrackIDs[ordinal]
         }
 
         func makeAudioAnalysisInput() throws
@@ -606,6 +635,65 @@ struct HybridPlaybackSessionTests {
                     .pausedForPlaybackDurationSeconds
             ) > 0
         )
+    }
+
+    @MainActor
+    @Test("Carrier audio selection publishes the stable track and cancels the old analysis cursor")
+    func audioSelectionCancelsAnalysisCursor() async throws {
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(
+                seconds: 2,
+                preferredTimescale: 90_000
+            )
+        )
+        let relay = HybridPlaybackFrameRelay()
+        let provider = Provider(
+            relay: relay,
+            timeline: timeline,
+            analysisData: makeAnalysisWAV(seconds: 2),
+            analysisTrackIDs: [11, 22]
+        )
+        let session = try HybridPlaybackSession(
+            provider: provider,
+            transport: Transport(),
+            renderSurface: RenderSurface(),
+            timeline: timeline,
+            relay: relay
+        )
+        defer { session.stop() }
+
+        var selections: [Int?] = []
+        session.selectedAudioAnalysisTrackIDDidChange = {
+            selections.append($0)
+        }
+        session.handleCarrierMediaSelectionChange(
+            selectedAudioOptionIndex: 0
+        )
+        #expect(session.selectedAudioAnalysisTrackID == 11)
+
+        let request = try AudioAnalysisRequest(
+            audioTrackID: 11,
+            range: 0..<1
+        )
+        let stream = try session.audioAnalysisStream(
+            request: request
+        )
+        #expect(session.activeAudioAnalysisRequestCount == 1)
+
+        session.handleCarrierMediaSelectionChange(
+            selectedAudioOptionIndex: 1
+        )
+        #expect(session.selectedAudioAnalysisTrackID == 22)
+        #expect(session.activeAudioAnalysisRequestCount == 0)
+        #expect(selections == [22])
+
+        var iterator = stream.makeAsyncIterator()
+        do {
+            _ = try await iterator.next()
+            Issue.record("retired analysis cursor unexpectedly produced PCM")
+        } catch let error as AudioAnalysisError {
+            #expect(error == .cancelled)
+        }
     }
 
     @MainActor

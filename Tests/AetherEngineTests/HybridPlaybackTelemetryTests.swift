@@ -204,6 +204,7 @@ struct HybridPlaybackTelemetryTests {
             carrierForwardBufferSeconds: nil,
             audioAnalysisPlaybackPressure: .none,
             audioAnalysisTrackIDs: [0, 1],
+            selectedAudioAnalysisTrackID: 0,
             activeAudioAnalysisRequestCount: 0,
             readinessPrerollFramesRejected: 0,
             carrierBandwidth: .awaiting(

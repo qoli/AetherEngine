@@ -452,6 +452,7 @@ public struct AetherHybridPlaybackTelemetrySnapshot:
     public let audioAnalysisPlaybackPressure:
         HybridAudioAnalysisPlaybackPressure
     public let audioAnalysisTrackIDs: [Int]
+    public let selectedAudioAnalysisTrackID: Int?
     public let activeAudioAnalysisRequestCount: Int
     /// Decoder pre-roll rejected before renderer admission in the current generation.
     public let readinessPrerollFramesRejected: UInt64
@@ -477,6 +478,7 @@ public struct AetherHybridPlaybackTelemetrySnapshot:
         audioAnalysisPlaybackPressure:
             HybridAudioAnalysisPlaybackPressure,
         audioAnalysisTrackIDs: [Int],
+        selectedAudioAnalysisTrackID: Int?,
         activeAudioAnalysisRequestCount: Int,
         readinessPrerollFramesRejected: UInt64,
         carrierBandwidth:
@@ -502,6 +504,8 @@ public struct AetherHybridPlaybackTelemetrySnapshot:
         self.audioAnalysisPlaybackPressure =
             audioAnalysisPlaybackPressure
         self.audioAnalysisTrackIDs = audioAnalysisTrackIDs
+        self.selectedAudioAnalysisTrackID =
+            selectedAudioAnalysisTrackID
         self.activeAudioAnalysisRequestCount =
             activeAudioAnalysisRequestCount
         self.readinessPrerollFramesRejected =
