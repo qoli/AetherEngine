@@ -1300,6 +1300,10 @@ private extension HLSVODMediaPump {
         private let videoContract:
             HybridVideoStreamContract
         private let videoStreamIndex: Int32
+        /// MPEG-TS timestamps continue across unmarked HLS segments. Keep
+        /// their first demuxer's source origin instead of independently
+        /// rebasing every segment to its EXTINF boundary.
+        private let continuousVideoSourceStartPTS: Int64?
         private let videoPacketSink: VideoPacketSink?
         private let videoDecodeSink:
             HybridVideoDecodeSink?
@@ -1364,6 +1368,13 @@ private extension HLSVODMediaPump {
                     stream: videoStream,
                     sourceStartPTSOverride: 0
                 )
+            continuousVideoSourceStartPTS =
+                videoInitData == nil
+                ? BlackCarrierSourceAxis.sourceStartPTS(
+                    demuxer: videoDemuxer,
+                    streamIndex: videoStreamIndex
+                )
+                : nil
             self.videoPacketSink = videoPacketSink
             if let decodedFrameHandler {
                 videoDecodeSink =
@@ -2137,7 +2148,9 @@ private extension HLSVODMediaPump {
                                 graph.timeline.segments[
                                     index
                                 ].startTime,
-                            segmentIndex: index
+                            segmentIndex: index,
+                            continuousSourceStartPTS:
+                                continuousVideoSourceStartPTS
                         )
                         do {
                             if let videoPacketSink {
@@ -3309,7 +3322,8 @@ private extension HLSVODMediaPump {
             streamIndex: Int32,
             outputStreamIndex: Int32,
             segmentStart: CMTime,
-            segmentIndex: Int
+            segmentIndex: Int,
+            continuousSourceStartPTS: Int64? = nil
         ) throws {
             guard let stream = demuxer.stream(
                 at: streamIndex
@@ -3317,24 +3331,32 @@ private extension HLSVODMediaPump {
                 throw HLSVODMediaPumpError
                     .demuxOpenFailed
             }
-            let localStart =
-                BlackCarrierSourceAxis.sourceStartPTS(
-                    demuxer: demuxer,
-                    streamIndex: streamIndex
-                )
-            guard let globalStart =
-                    BlackCarrierSourceAxis.streamTicks(
-                        for: segmentStart,
-                        timeBase:
-                            stream.pointee.time_base
-                    ) else {
-                throw HLSVODMediaPumpError
-                    .timestampOverflow(
-                        streamIndex:
-                            Int(streamIndex),
-                        segmentIndex:
-                            segmentIndex
+            let localStart: Int64
+            let globalStart: Int64
+            if let continuousSourceStartPTS {
+                localStart = continuousSourceStartPTS
+                globalStart = 0
+            } else {
+                localStart =
+                    BlackCarrierSourceAxis.sourceStartPTS(
+                        demuxer: demuxer,
+                        streamIndex: streamIndex
                     )
+                guard let segmentStartTicks =
+                        BlackCarrierSourceAxis.streamTicks(
+                            for: segmentStart,
+                            timeBase:
+                                stream.pointee.time_base
+                        ) else {
+                    throw HLSVODMediaPumpError
+                        .timestampOverflow(
+                            streamIndex:
+                                Int(streamIndex),
+                            segmentIndex:
+                                segmentIndex
+                        )
+                }
+                globalStart = segmentStartTicks
             }
             if packet.pointee.pts == Int64.min,
                packet.pointee.dts == Int64.min {

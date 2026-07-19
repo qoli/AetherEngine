@@ -342,6 +342,50 @@ final class HLSVODMediaPumpTests: XCTestCase {
         )
     }
 
+    func testSequentialMPEGTransportPreservesContinuousVideoTimestamps()
+        async throws
+    {
+        let fixture = try makeMPEGTransportFixture(
+            secondSegmentOmitsH264ParameterSets: false,
+            segmentDurations: [0.92, 1.08]
+        )
+        let capture = PacketCapture()
+        let pump = try await HLSVODMediaPump.make(
+            preflight: fixture.preflight,
+            videoPacketSink: { packet in
+                capture.append(packet)
+            },
+            fetchOverride: { request, _ in
+                try fixture.fetchStore.response(
+                    for: request
+                )
+            }
+        )
+        addTeardownBlock {
+            try await pump.close()
+        }
+
+        try await pump.produce(throughSegment: 0)
+        let firstSegmentPTS = capture.values
+        try await pump.produce(throughSegment: 1)
+        let allPTS = capture.values
+        let secondSegmentPTS = Array(
+            allPTS.dropFirst(firstSegmentPTS.count)
+        )
+
+        let firstMinimum = try XCTUnwrap(
+            firstSegmentPTS.min()
+        )
+        let secondMinimum = try XCTUnwrap(
+            secondSegmentPTS.min()
+        )
+        XCTAssertEqual(
+            secondMinimum - firstMinimum,
+            90_000,
+            "continuous MPEG-TS PTS must not be rebased to the approximate EXTINF boundary"
+        )
+    }
+
     func testRestartDoesNotReuseUnresolvedH264Parameters()
         async throws
     {
@@ -2762,15 +2806,27 @@ final class HLSVODMediaPumpTests: XCTestCase {
     }
 
     private func makeMPEGTransportFixture(
-        secondSegmentOmitsH264ParameterSets: Bool
+        secondSegmentOmitsH264ParameterSets: Bool,
+        segmentDurations: [TimeInterval] = [1, 1]
     ) throws -> MPEGTransportFixture {
+        guard segmentDurations.count == 2 else {
+            throw HLSVODMediaPumpError.unexpected(
+                reason:
+                    "MPEG-TS fixture requires exactly two durations"
+            )
+        }
         let firstSegment = try HLSPreflightInspectorTests
             .mpegTransportFixture()
+        let timestampShiftedSecondSegment =
+            try shiftingMPEGTransportVideoTimestamps(
+                firstSegment,
+                by: 90_000
+            )
         let secondSegment = secondSegmentOmitsH264ParameterSets
             ? try replacingH264ParameterSetsWithFiller(
-                firstSegment
+                timestampShiftedSecondSegment
             )
-            : firstSegment
+            : timestampShiftedSecondSegment
         let rootURL = URL(
             string:
                 "https://origin.example/transport.m3u8"
@@ -2792,10 +2848,13 @@ final class HLSVODMediaPumpTests: XCTestCase {
         let media = HLSMediaPlaylist(
             targetDuration: 1,
             mediaSequence: 0,
-            segments: segmentURLs.map {
+            segments: zip(
+                segmentURLs,
+                segmentDurations
+            ).map { url, duration in
                 HLSMediaSegment(
-                    uri: $0.lastPathComponent,
-                    duration: 1,
+                    uri: url.lastPathComponent,
+                    duration: duration,
                     discontinuityBefore: false
                 )
             },
@@ -2897,6 +2956,107 @@ final class HLSVODMediaPumpTests: XCTestCase {
             )
         }
         return Data(bytes)
+    }
+
+    private func shiftingMPEGTransportVideoTimestamps(
+        _ data: Data,
+        by offset: UInt64
+    ) throws -> Data {
+        var bytes = Array(data)
+        var shiftedTimestampCount = 0
+        var packetOffset = 0
+        while packetOffset + 188 <= bytes.count {
+            guard bytes[packetOffset] == 0x47 else {
+                throw HLSVODMediaPumpError.unexpected(
+                    reason:
+                        "MPEG-TS fixture lost packet sync"
+                )
+            }
+            let packetEnd = packetOffset + 188
+            let payloadUnitStarts =
+                bytes[packetOffset + 1] & 0x40 != 0
+            let adaptationControl =
+                (bytes[packetOffset + 3] >> 4) & 0x03
+            let hasPayload = adaptationControl == 1
+                || adaptationControl == 3
+            var payloadOffset = packetOffset + 4
+            if adaptationControl == 2
+                || adaptationControl == 3 {
+                payloadOffset += 1
+                    + Int(bytes[payloadOffset])
+            }
+            guard hasPayload,
+                  payloadUnitStarts,
+                  payloadOffset + 14 < packetEnd,
+                  bytes[payloadOffset] == 0,
+                  bytes[payloadOffset + 1] == 0,
+                  bytes[payloadOffset + 2] == 1,
+                  bytes[payloadOffset + 3] & 0xF0
+                    == 0xE0 else {
+                packetOffset = packetEnd
+                continue
+            }
+            let timestampFlags =
+                (bytes[payloadOffset + 7] >> 6) & 0x03
+            if timestampFlags == 2
+                || timestampFlags == 3 {
+                shiftMPEGTimestamp(
+                    in: &bytes,
+                    at: payloadOffset + 9,
+                    by: offset
+                )
+                shiftedTimestampCount += 1
+            }
+            if timestampFlags == 3 {
+                shiftMPEGTimestamp(
+                    in: &bytes,
+                    at: payloadOffset + 14,
+                    by: offset
+                )
+                shiftedTimestampCount += 1
+            }
+            packetOffset = packetEnd
+        }
+        guard shiftedTimestampCount > 0 else {
+            throw HLSVODMediaPumpError.unexpected(
+                reason:
+                    "MPEG-TS fixture exposed no video PES timestamps"
+            )
+        }
+        return Data(bytes)
+    }
+
+    private func shiftMPEGTimestamp(
+        in bytes: inout [UInt8],
+        at offset: Int,
+        by delta: UInt64
+    ) {
+        let current =
+            UInt64((bytes[offset] >> 1) & 0x07)
+                << 30
+            | UInt64(bytes[offset + 1]) << 22
+            | UInt64((bytes[offset + 2] >> 1) & 0x7F)
+                << 15
+            | UInt64(bytes[offset + 3]) << 7
+            | UInt64((bytes[offset + 4] >> 1) & 0x7F)
+        let shifted = (current + delta)
+            & ((UInt64(1) << 33) - 1)
+        let prefix = bytes[offset] & 0xF0
+        bytes[offset] = prefix
+            | UInt8((shifted >> 29) & 0x0E)
+            | 1
+        bytes[offset + 1] = UInt8(
+            (shifted >> 22) & 0xFF
+        )
+        bytes[offset + 2] = UInt8(
+            (shifted >> 14) & 0xFE
+        ) | 1
+        bytes[offset + 3] = UInt8(
+            (shifted >> 7) & 0xFF
+        )
+        bytes[offset + 4] = UInt8(
+            (shifted << 1) & 0xFE
+        ) | 1
     }
 
     private func response(
