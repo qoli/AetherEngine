@@ -190,6 +190,26 @@ struct HybridVideoDecodeSinkTests {
         }
     }
 
+    @Test("Software recovery refuses a non-HEVC stream")
+    func softwareRecoveryRequiresHEVC() throws {
+        let data = try BlackCarrierEncodedSample.verifiedMP4Data()
+        let demuxer = try openDemuxer(data: data)
+        defer { demuxer.close() }
+
+        #expect(
+            throws:
+                HybridVideoDecodeSinkError
+                    .softwareRecoveryRequiresHEVC
+        ) {
+            _ = try HybridVideoDecodeSink(
+                demuxer: demuxer,
+                initialGeneration: 0,
+                decoderPreference: .softwareHEVCRecovery,
+                onFrame: { _ in }
+            )
+        }
+    }
+
     @Test("Invalid clock demand fails explicitly")
     func invalidClockDemandFails() throws {
         let data = try BlackCarrierEncodedSample.verifiedMP4Data()

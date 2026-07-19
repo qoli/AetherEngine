@@ -105,6 +105,187 @@ final class HLSPreflightInspectorTests: XCTestCase {
         XCTAssertNil(inspected.resourceGraph)
     }
 
+    func testVideoInspectionAdvancesWithinThreeSegmentBound()
+        async throws
+    {
+        let rootURL = URL(
+            string: "https://example.com/media.m3u8"
+        )!
+        let firstURL = URL(
+            string: "https://example.com/first.ts"
+        )!
+        let secondURL = URL(
+            string: "https://example.com/second.ts"
+        )!
+        let thirdURL = URL(
+            string: "https://example.com/third.ts"
+        )!
+        let firstData = Data("metadata-only".utf8)
+        let secondData = try Self.mpegTransportFixture()
+        let playlist = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:3",
+            "#EXT-X-TARGETDURATION:1",
+            "#EXT-X-PLAYLIST-TYPE:VOD",
+            "#EXTINF:0.2,",
+            "first.ts",
+            "#EXTINF:0.2,",
+            "second.ts",
+            "#EXTINF:0.2,",
+            "third.ts",
+            "#EXT-X-ENDLIST",
+        ].joined(separator: "\n") + "\n"
+        let responses: [URL: HLSPreflightFetchResponse] = [
+            rootURL: .init(
+                data: Data(playlist.utf8),
+                effectiveURL: rootURL
+            ),
+            firstURL: .init(
+                data: firstData,
+                effectiveURL: firstURL
+            ),
+            secondURL: .init(
+                data: secondData,
+                effectiveURL: secondURL
+            ),
+            thirdURL: .init(
+                data: Data("must not be fetched".utf8),
+                effectiveURL: thirdURL
+            ),
+        ]
+        let inspected = try await HLSPreflightInspector(
+            httpHeaders: [:],
+            fetchOverride: { url, _ in
+                try XCTUnwrap(responses[url])
+            }
+        ).inspect(
+            rootURL: rootURL,
+            sourceIsSeekableVOD: true,
+            variantSelection: .highestBandwidth,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+
+        XCTAssertEqual(inspected.result.route, .hybridCarrier)
+        XCTAssertEqual(inspected.inspectedVideoSegmentIndex, 1)
+        XCTAssertEqual(
+            inspected.resourceGraph?
+                .inspectedFirstMediaSegmentData,
+            firstData
+        )
+    }
+
+    func testNextLowerCompatibleVariantStaysOnSameMaster()
+        async throws
+    {
+        let rootURL = URL(
+            string: "https://example.com/master.m3u8"
+        )!
+        let lowURL = URL(
+            string: "https://example.com/low.m3u8"
+        )!
+        let segmentURL = URL(
+            string: "https://example.com/low.ts"
+        )!
+        let responses: [URL: HLSPreflightFetchResponse] = [
+            rootURL: .init(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-STREAM-INF:BANDWIDTH=1000000
+                    low.m3u8
+                    #EXT-X-STREAM-INF:BANDWIDTH=4000000
+                    high.m3u8
+                    """.utf8
+                ),
+                effectiveURL: rootURL
+            ),
+            lowURL: .init(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-VERSION:3
+                    #EXT-X-TARGETDURATION:1
+                    #EXT-X-PLAYLIST-TYPE:VOD
+                    #EXTINF:0.2,
+                    low.ts
+                    #EXT-X-ENDLIST
+                    """.utf8
+                ),
+                effectiveURL: lowURL
+            ),
+            segmentURL: .init(
+                data: try Self.mpegTransportFixture(),
+                effectiveURL: segmentURL
+            ),
+        ]
+
+        let inspected = try await HLSPreflightInspector(
+            httpHeaders: [:],
+            fetchOverride: { url, _ in
+                try XCTUnwrap(responses[url])
+            }
+        ).inspect(
+            rootURL: rootURL,
+            sourceIsSeekableVOD: true,
+            variantSelection: .nextLowerCompatible(
+                thanBandwidth: 4_000_000,
+                audioGroupID: nil,
+                subtitleGroupID: nil
+            ),
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+
+        XCTAssertEqual(inspected.result.route, .hybridCarrier)
+        XCTAssertEqual(inspected.selectedVariantBandwidth, 1_000_000)
+    }
+
+    func testNextLowerVariantRejectsCapabilityGroupDrift()
+        async throws
+    {
+        let rootURL = URL(
+            string: "https://example.com/master.m3u8"
+        )!
+        let response = HLSPreflightFetchResponse(
+            data: Data(
+                """
+                #EXTM3U
+                #EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="avc1.42C01E",AUDIO="alternate"
+                low.m3u8
+                #EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS="avc1.42C01E",AUDIO="primary"
+                high.m3u8
+                """.utf8
+            ),
+            effectiveURL: rootURL
+        )
+
+        do {
+            _ = try await HLSPreflightInspector(
+                httpHeaders: [:],
+                fetchOverride: { _, _ in response }
+            ).inspect(
+                rootURL: rootURL,
+                sourceIsSeekableVOD: true,
+                variantSelection: .nextLowerCompatible(
+                    thanBandwidth: 4_000_000,
+                    audioGroupID: "primary",
+                    subtitleGroupID: nil
+                ),
+                hybridCapabilities:
+                    AetherHybridPlaybackSession.capabilities
+            )
+            XCTFail("expected capability-compatible variant rejection")
+        } catch let error as HLSPreflightError {
+            XCTAssertEqual(
+                error,
+                .requestedVariantNotFound(
+                    "next-lower-compatible"
+                )
+            )
+        }
+    }
+
     func testInvalidPlaylistPreservesParserReason() async throws {
         let rootURL = URL(
             string: "https://example.com/invalid.m3u8"

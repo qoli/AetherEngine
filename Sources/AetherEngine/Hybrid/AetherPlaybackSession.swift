@@ -1,0 +1,1829 @@
+import AVFoundation
+import Combine
+import CoreMedia
+import Foundation
+
+#if os(tvOS)
+import AVKit
+#endif
+
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
+
+public enum AetherPlaybackSessionState:
+    Sendable,
+    Equatable
+{
+    case idle
+    case preparing
+    case ready
+    case playing
+    case paused
+    case seeking
+    case recovering(AetherPlaybackRecoveryEvent)
+    case ended
+    case failed(AetherPlaybackFailure)
+    case stopped
+}
+
+public enum AetherPlaybackSessionError:
+    Error,
+    LocalizedError,
+    Sendable,
+    Equatable
+{
+    case invalidFactorySource
+    case invalidState
+    case noActiveRoute
+    case unsupported(PlaybackRouteReason)
+    case terminal(AetherPlaybackFailure)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidFactorySource:
+            "Aether playback session requires a finite URL-backed VOD request"
+        case .invalidState:
+            "Aether playback session is not available in its current state"
+        case .noActiveRoute:
+            "Aether playback session has no active render route"
+        case .unsupported(let reason):
+            "The media contract is unsupported: \(reason.rawValue)"
+        case .terminal(let failure):
+            failure.localizedDescription
+        }
+    }
+}
+
+public struct AetherPlaybackCapabilities:
+    Sendable,
+    Equatable
+{
+    public let route: PlaybackRenderRoute?
+    public let systemFeaturePolicy:
+        HybridPlaybackSystemFeaturePolicy
+    public let audioAnalysisTrackIDs: [Int]
+    public let selectedAudioAnalysisTrackID: Int?
+
+    public init(
+        route: PlaybackRenderRoute?,
+        systemFeaturePolicy:
+            HybridPlaybackSystemFeaturePolicy,
+        audioAnalysisTrackIDs: [Int],
+        selectedAudioAnalysisTrackID: Int?
+    ) {
+        self.route = route
+        self.systemFeaturePolicy = systemFeaturePolicy
+        self.audioAnalysisTrackIDs = audioAnalysisTrackIDs
+        self.selectedAudioAnalysisTrackID =
+            selectedAudioAnalysisTrackID
+    }
+}
+
+/// Stable host-mounted container for the only Hybrid presentation backend.
+/// Native playback leaves it empty; Hybrid installs exactly one
+/// `AetherHybridPresentationView` backed by AVSampleBufferDisplayLayer.
+@MainActor
+public final class AetherPlaybackPresentationView:
+    PlatformBaseView
+{
+    public private(set) weak var hybridPresentationView:
+        AetherHybridPresentationView?
+
+    #if canImport(UIKit)
+    public override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        isUserInteractionEnabled = false
+    }
+
+    public convenience init() {
+        self.init(frame: .zero)
+    }
+
+    public required init?(coder: NSCoder) { nil }
+    #elseif canImport(AppKit)
+    public override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = .clear
+    }
+
+    public convenience init() {
+        self.init(frame: .zero)
+    }
+
+    public required init?(coder: NSCoder) { nil }
+    #endif
+
+    func install(
+        _ view: AetherHybridPresentationView?
+    ) {
+        if hybridPresentationView === view { return }
+        hybridPresentationView?.removeFromSuperview()
+        hybridPresentationView = view
+        guard let view else { return }
+        view.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(view)
+        NSLayoutConstraint.activate([
+            view.leadingAnchor.constraint(equalTo: leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: trailingAnchor),
+            view.topAnchor.constraint(equalTo: topAnchor),
+            view.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+    }
+}
+
+@MainActor
+private enum AetherActiveRouteSession {
+    case native(AetherNativePlaybackSession)
+    case hybrid(AetherHybridPlaybackSession)
+
+    var route: PlaybackRenderRoute {
+        switch self {
+        case .native: .nativeAVPlayer
+        case .hybrid: .hybridCarrier
+        }
+    }
+
+    var preflightResult: PlaybackPreflightResult {
+        switch self {
+        case .native(let session): session.preflightResult
+        case .hybrid(let session): session.preflightResult
+        }
+    }
+
+    var audioAnalysisTrackIDs: [Int] {
+        switch self {
+        case .native(let session): session.audioAnalysisTrackIDs
+        case .hybrid(let session): session.audioAnalysisTrackIDs
+        }
+    }
+
+    var selectedAudioAnalysisTrackID: Int? {
+        switch self {
+        case .native(let session):
+            session.selectedAudioAnalysisTrackID
+        case .hybrid(let session):
+            session.selectedAudioAnalysisTrackID
+        }
+    }
+
+    var audioAnalysisDurationSeconds: Double? {
+        switch self {
+        case .native(let session):
+            session.audioAnalysisDurationSeconds
+        case .hybrid(let session):
+            session.diagnostics.timelineDurationSeconds
+        }
+    }
+
+    func prepare() async throws {
+        switch self {
+        case .native(let session): try await session.prepare()
+        case .hybrid(let session): try await session.prepare()
+        }
+    }
+
+    func play() throws {
+        switch self {
+        case .native(let session): try session.play()
+        case .hybrid(let session): try session.play()
+        }
+    }
+
+    func pause() throws {
+        switch self {
+        case .native(let session): try session.pause()
+        case .hybrid(let session): try session.pause()
+        }
+    }
+
+    func setRate(_ rate: Float) throws {
+        switch self {
+        case .native(let session): try session.setRate(rate)
+        case .hybrid(let session): try session.setRate(rate)
+        }
+    }
+
+    func seek(to target: CMTime) async throws {
+        switch self {
+        case .native(let session):
+            try await session.seek(to: target)
+        case .hybrid(let session):
+            _ = try await session.seek(to: target)
+        }
+    }
+
+    func audioAnalysisAvailability(
+        for trackID: Int
+    ) -> AudioAnalysisTrackAvailability {
+        switch self {
+        case .native(let session):
+            session.audioAnalysisAvailability(for: trackID)
+        case .hybrid(let session):
+            session.audioAnalysisAvailability(for: trackID)
+        }
+    }
+
+    func audioAnalysisStream(
+        request: AudioAnalysisRequest
+    ) throws -> AudioAnalysisStream {
+        switch self {
+        case .native(let session):
+            try session.audioAnalysisStream(request: request)
+        case .hybrid(let session):
+            try session.audioAnalysisStream(request: request)
+        }
+    }
+
+    func cancelAudioAnalysisStreams() {
+        switch self {
+        case .native(let session):
+            session.cancelAudioAnalysisStreams()
+        case .hybrid(let session):
+            session.cancelAudioAnalysisStreams()
+        }
+    }
+
+    func stop() {
+        switch self {
+        case .native(let session): session.stop()
+        case .hybrid(let session): session.stop()
+        }
+    }
+}
+
+@MainActor
+private enum AetherResolvedPlaybackSource {
+    case hls(AetherHLSPlaybackPreflight)
+    case progressive(
+        probe: SourceProbe,
+        result: PlaybackPreflightResult
+    )
+    case provisionalNative(PlaybackPreflightResult)
+
+    var result: PlaybackPreflightResult {
+        switch self {
+        case .hls(let preflight): preflight.result
+        case .progressive(_, let result): result
+        case .provisionalNative(let result): result
+        }
+    }
+
+    func admitting(
+        route: PlaybackRenderRoute
+    ) -> AetherResolvedPlaybackSource? {
+        if result.route == route { return self }
+        guard let alternate = PlaybackPreflight
+                .resolveRecoveryAlternate(
+                    sourceProfile: result.sourceProfile,
+                    hlsPackaging: result.hlsPackaging,
+                    excluding: result.route,
+                    hybridCapabilities:
+                        AetherHybridPlaybackSession.capabilities
+                ),
+              alternate.route == route else {
+            return nil
+        }
+        switch self {
+        case .hls(let preflight):
+            return .hls(preflight.replacingResult(alternate))
+        case .progressive(let probe, _):
+            return .progressive(
+                probe: probe,
+                result: alternate
+            )
+        case .provisionalNative:
+            return nil
+        }
+    }
+
+    func alternate(
+        excluding route: PlaybackRenderRoute
+    ) -> AetherResolvedPlaybackSource? {
+        guard let result = PlaybackPreflight
+                .resolveRecoveryAlternate(
+                    sourceProfile: self.result.sourceProfile,
+                    hlsPackaging: self.result.hlsPackaging,
+                    excluding: route,
+                    hybridCapabilities:
+                        AetherHybridPlaybackSession.capabilities
+                ) else {
+            return nil
+        }
+        switch self {
+        case .hls(let preflight):
+            return .hls(preflight.replacingResult(result))
+        case .progressive(let probe, _):
+            return .progressive(probe: probe, result: result)
+        case .provisionalNative:
+            return nil
+        }
+    }
+}
+
+/// Aether-owned playback lifecycle. The host mounts one player and one
+/// presentation container; route reconstruction and evidence-backed route
+/// transitions remain entirely inside this object.
+@MainActor
+public final class AetherPlaybackSession: ObservableObject {
+    /// Public admission catalog for the internally owned Hybrid route.
+    /// Hosts may display capability information, but cannot construct or
+    /// select the route implementation directly.
+    public nonisolated static var hybridCapabilities:
+        HybridPlaybackCapabilities
+    {
+        AetherHybridPlaybackSession.capabilities
+    }
+
+    /// System-feature contract that would apply if recovery admits Hybrid.
+    public nonisolated static var hybridSystemFeaturePolicy:
+        HybridPlaybackSystemFeaturePolicy
+    {
+        AetherHybridPlaybackSession.systemFeaturePolicy
+    }
+
+    public let avPlayer: AVPlayer
+    public let presentationView: AetherPlaybackPresentationView
+    public let sessionID: UUID
+
+    @Published public private(set) var state:
+        AetherPlaybackSessionState = .idle
+    @Published public private(set) var currentItem: AVPlayerItem?
+    @Published public private(set) var activeRoute:
+        PlaybackRenderRoute?
+    @Published public private(set) var preflightResult:
+        PlaybackPreflightResult?
+    @Published public private(set) var capabilities:
+        AetherPlaybackCapabilities
+    @Published public private(set) var recoveryHistory:
+        [AetherPlaybackRecoveryEvent] = []
+    @Published public private(set) var firstFailure:
+        AetherPlaybackFailure?
+    @Published public private(set) var selectedAudioAnalysisTrackID:
+        Int?
+    @Published public private(set) var overlaySubtitleTracks:
+        [AetherHybridOverlaySubtitleTrack] = []
+    @Published public private(set) var activeOverlaySubtitleTrackID:
+        Int?
+
+    public var audioAnalysisTrackIDs: [Int] {
+        activeSession?.audioAnalysisTrackIDs ?? []
+    }
+
+    public var audioAnalysisDurationSeconds: Double? {
+        activeSession?.audioAnalysisDurationSeconds
+    }
+
+    public var hybridDiagnostics: AetherHybridPlaybackDiagnostics? {
+        guard case .hybrid(let session) = activeSession else {
+            return nil
+        }
+        return session.diagnostics
+    }
+
+    private let url: URL
+    private let options: LoadOptions
+    private let variantSelection: HLSPreflightVariantSelection
+    private let recoveryBudget: AetherPlaybackRecoveryBudget
+    private var resolvedSource: AetherResolvedPlaybackSource?
+    private var activeSession: AetherActiveRouteSession?
+    private var routeCancellables = Set<AnyCancellable>()
+    private var currentItemObservation: NSKeyValueObservation?
+    private var healthyProgressObserver: Any?
+    private var lastRecoveryResetMediaTime: CMTime?
+    private var recoveryTask: Task<Void, Never>?
+    private var isStopped = false
+    private var isPreparingOrRecovering = false
+    private var didCompleteInitialPrepare = false
+    private var desiredPlaying = false
+    private var desiredRate: Float = 1
+    private var desiredOverlaySubtitleTrackID: Int?
+    private var externalMetadata: [AVMetadataItem] = []
+    private var systemActivity = AetherSystemPlaybackActivity()
+    private var eventSequence: UInt64 = 0
+    private var recoveryCoordinator = PlaybackRecoveryCoordinator(
+        now: ProcessInfo.processInfo.systemUptime
+    )
+    private var capabilitiesBeforeRecoveryAttempt:
+        AetherPlaybackCapabilities?
+
+    #if os(tvOS)
+    private weak var playerViewController: AVPlayerViewController?
+    #endif
+
+    init(
+        url: URL,
+        options: LoadOptions,
+        variantSelection: HLSPreflightVariantSelection,
+        recoveryBudget: AetherPlaybackRecoveryBudget = .production
+    ) {
+        self.url = url
+        self.options = options
+        self.variantSelection = variantSelection
+        self.recoveryBudget = recoveryBudget
+        avPlayer = AVPlayer()
+        presentationView = AetherPlaybackPresentationView()
+        sessionID = UUID()
+        capabilities = Self.capabilities(for: nil)
+        currentItemObservation = avPlayer.observe(
+            \.currentItem,
+            options: [.initial, .new]
+        ) { [weak self] player, _ in
+            Task { @MainActor [weak self] in
+                self?.publishCurrentItem(player.currentItem)
+            }
+        }
+        healthyProgressObserver = avPlayer.addPeriodicTimeObserver(
+            forInterval: CMTime(
+                seconds: 0.5,
+                preferredTimescale: 600
+            ),
+            queue: .main
+        ) { [weak self] time in
+            MainActor.assumeIsolated {
+                self?.observeHealthyProgress(time)
+            }
+        }
+    }
+
+    public func prepare() async throws {
+        guard !isStopped, state == .idle else {
+            throw AetherPlaybackSessionError.invalidState
+        }
+        state = .preparing
+        isPreparingOrRecovering = true
+        do {
+            let source = try await resolveCanonicalSource(
+                allowProvisionalNative: true
+            )
+            try await installAndPrepare(source)
+            didCompleteInitialPrepare = true
+            isPreparingOrRecovering = false
+            state = .ready
+            resetRecoveryEpisode()
+        } catch is CancellationError {
+            isPreparingOrRecovering = false
+            let failure = failure(
+                stage: .preparation,
+                error: CancellationError()
+            )
+            publishTerminal(failure)
+            throw CancellationError()
+        } catch {
+            let initialFailure = failure(
+                stage: activeRoute == nil ? .preflight : .preparation,
+                error: error
+            )
+            if try await recover(
+                from: initialFailure,
+                duringInitialPrepare: true
+            ) {
+                didCompleteInitialPrepare = true
+                isPreparingOrRecovering = false
+                return
+            }
+            isPreparingOrRecovering = false
+            let terminal = recoveryCoordinator.episodeFirstFailure
+                ?? initialFailure
+            publishTerminal(terminal)
+            throw AetherPlaybackSessionError.terminal(terminal)
+        }
+    }
+
+    public func play() throws {
+        guard !isStopped,
+              let activeSession,
+              !isPreparingOrRecovering else {
+            throw AetherPlaybackSessionError.invalidState
+        }
+        desiredPlaying = true
+        if desiredRate <= 0 { desiredRate = 1 }
+        try activeSession.play()
+        if desiredRate != 1 {
+            try activeSession.setRate(desiredRate)
+        }
+        state = .playing
+    }
+
+    public func pause() throws {
+        guard !isStopped,
+              let activeSession,
+              !isPreparingOrRecovering else {
+            throw AetherPlaybackSessionError.invalidState
+        }
+        desiredPlaying = false
+        try activeSession.pause()
+        state = .paused
+    }
+
+    public func setRate(_ rate: Float) throws {
+        guard rate.isFinite, rate >= 0,
+              !isStopped,
+              let activeSession,
+              !isPreparingOrRecovering else {
+            throw AetherPlaybackSessionError.invalidState
+        }
+        desiredRate = rate == 0 ? max(desiredRate, 1) : rate
+        desiredPlaying = rate > 0
+        try activeSession.setRate(rate)
+        state = rate == 0 ? .paused : .playing
+    }
+
+    public func seek(to target: CMTime) async throws {
+        guard !isStopped,
+              let activeSession,
+              !isPreparingOrRecovering else {
+            throw AetherPlaybackSessionError.invalidState
+        }
+        resetRecoveryEpisode()
+        state = .seeking
+        try await activeSession.seek(to: target)
+        state = desiredPlaying ? .playing : .paused
+    }
+
+    public func setExternalMetadata(
+        _ metadata: [AVMetadataItem]
+    ) {
+        externalMetadata = metadata
+        #if os(tvOS) || os(iOS)
+        currentItem?.externalMetadata = metadata
+        #endif
+    }
+
+    public func setSystemPlaybackActivity(
+        _ activity: AetherSystemPlaybackActivity
+    ) {
+        systemActivity = activity
+    }
+
+    #if os(tvOS)
+    public func configurePlayerViewController(
+        _ controller: AVPlayerViewController,
+        realVideoGravity: AetherHybridVideoGravity = .resizeAspect
+    ) throws {
+        guard !isStopped else {
+            throw AetherPlaybackSessionError.invalidState
+        }
+        playerViewController = controller
+        controller.player = avPlayer
+        controller.appliesPreferredDisplayCriteriaAutomatically = true
+        if let activeSession {
+            try configure(
+                activeSession,
+                controller: controller,
+                realVideoGravity: realVideoGravity
+            )
+        }
+    }
+    #endif
+
+    public func audioAnalysisAvailability(
+        for trackID: Int
+    ) -> AudioAnalysisTrackAvailability {
+        activeSession?.audioAnalysisAvailability(for: trackID)
+            ?? .unavailable(.noActiveSession)
+    }
+
+    public func audioAnalysisStream(
+        request: AudioAnalysisRequest
+    ) throws -> AudioAnalysisStream {
+        guard !isPreparingOrRecovering,
+              let activeSession else {
+            throw AudioAnalysisError.noActiveSession
+        }
+        return try activeSession.audioAnalysisStream(
+            request: request
+        )
+    }
+
+    public func cancelAudioAnalysisStreams() {
+        activeSession?.cancelAudioAnalysisStreams()
+    }
+
+    public func selectOverlaySubtitleTrack(
+        _ trackID: Int?
+    ) throws {
+        guard !isStopped,
+              !isPreparingOrRecovering,
+              case .hybrid(let hybrid) = activeSession else {
+            if trackID == nil {
+                desiredOverlaySubtitleTrackID = nil
+                activeOverlaySubtitleTrackID = nil
+                return
+            }
+            throw AetherPlaybackSessionError.invalidState
+        }
+        try hybrid.selectOverlaySubtitleTrack(trackID)
+        desiredOverlaySubtitleTrackID = trackID
+        activeOverlaySubtitleTrackID = trackID
+    }
+
+    public func stop() {
+        guard !isStopped else { return }
+        isStopped = true
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        routeCancellables.removeAll()
+        activeSession?.stop()
+        activeSession = nil
+        presentationView.install(nil)
+        avPlayer.pause()
+        avPlayer.replaceCurrentItem(with: nil)
+        currentItemObservation?.invalidate()
+        currentItemObservation = nil
+        if let healthyProgressObserver {
+            avPlayer.removeTimeObserver(healthyProgressObserver)
+            self.healthyProgressObserver = nil
+        }
+        activeRoute = nil
+        overlaySubtitleTracks = []
+        activeOverlaySubtitleTrackID = nil
+        capabilities = Self.capabilities(for: nil)
+        state = .stopped
+        #if os(tvOS)
+        if playerViewController?.player === avPlayer {
+            playerViewController?.player = nil
+        }
+        playerViewController = nil
+        #endif
+    }
+
+    private func resolveCanonicalSource(
+        allowProvisionalNative: Bool,
+        variantSelectionOverride:
+            HLSPreflightVariantSelection? = nil
+    ) async throws -> AetherResolvedPlaybackSource {
+        let sourceKind: AetherMediaSourceKind
+        do {
+            sourceKind = try await retryTransport(
+                stage: .classification
+            ) {
+                try await AetherURLPlaybackSourceClassifier.classify(
+                    url: self.url,
+                    options: self.options
+                )
+            }
+        } catch {
+            let failure = failure(stage: .classification, error: error)
+            if allowProvisionalNative,
+               failure.kind == .transientTransport
+                    || failure.kind == .inconclusiveEvidence {
+                return provisionalNativeSource()
+            }
+            throw failure
+        }
+
+        switch sourceKind {
+        case .hls:
+            do {
+                return .hls(
+                    try await retryTransport(stage: .preflight) {
+                        let operation = AetherPlaybackPreflightOperation()
+                        return try await operation.inspectHLS(
+                            url: self.url,
+                            sourceIsSeekableVOD: true,
+                            variantSelection:
+                                variantSelectionOverride
+                                ?? self.variantSelection,
+                            hybridCapabilities:
+                                AetherHybridPlaybackSession.capabilities,
+                            options: self.options
+                        )
+                    }
+                )
+            } catch {
+                let failure = failure(stage: .preflight, error: error)
+                if allowProvisionalNative,
+                   failure.kind == .transientTransport
+                        || failure.kind == .inconclusiveEvidence {
+                    return provisionalNativeSource()
+                }
+                throw failure
+            }
+
+        case .progressive:
+            do {
+                let probe: SourceProbe = try await retryTransport(
+                    stage: .preflight
+                ) {
+                    try await Task.detached(priority: .userInitiated) {
+                        try AetherEngine.probe(
+                            url: self.url,
+                            options: self.options
+                        )
+                    }.value
+                }
+                let isSeekableVOD =
+                    probe.durationSeconds.isFinite
+                    && probe.durationSeconds > 0
+                    && !probe.isLive
+                let profile = AetherSourceProfile(
+                    probe: probe,
+                    sourceKind: .progressive,
+                    isSeekableVOD: isSeekableVOD
+                )
+                let result = PlaybackPreflight.resolve(
+                    sourceProfile: profile,
+                    hlsPackaging: nil,
+                    hybridCapabilities:
+                        AetherHybridPlaybackSession.capabilities
+                )
+                return .progressive(probe: probe, result: result)
+            } catch {
+                let failure = failure(stage: .preflight, error: error)
+                if allowProvisionalNative,
+                   failure.kind == .transientTransport
+                        || failure.kind == .inconclusiveEvidence {
+                    return provisionalNativeSource()
+                }
+                throw failure
+            }
+
+        case .custom, .unclassifiedURL:
+            throw AetherPlaybackSessionError.invalidFactorySource
+        }
+    }
+
+    private func provisionalNativeSource()
+        -> AetherResolvedPlaybackSource
+    {
+        let profile = AetherSourceProfile(
+            sourceKind: .unclassifiedURL,
+            isSeekableVOD: true,
+            videoCodec: .unknown,
+            // Ignored by the provisional Native-only contract.
+            videoFormat: .sdr
+        )
+        return .provisionalNative(
+            PlaybackPreflight.resolve(
+                sourceProfile: profile,
+                hlsPackaging: nil,
+                hybridCapabilities:
+                    AetherHybridPlaybackSession.capabilities
+            )
+        )
+    }
+
+    private func installAndPrepare(
+        _ source: AetherResolvedPlaybackSource,
+        decoderPreference: HybridVideoDecoderPreference = .automatic
+    ) async throws {
+        guard source.result.route != .unsupported else {
+            throw AetherPlaybackSessionError.unsupported(
+                source.result.reason
+            )
+        }
+        let route = try await makeRouteSession(
+            source,
+            decoderPreference: decoderPreference
+        )
+        try install(route, source: source)
+        try await route.prepare()
+        publishCurrentItem(avPlayer.currentItem)
+    }
+
+    private func makeRouteSession(
+        _ source: AetherResolvedPlaybackSource,
+        decoderPreference: HybridVideoDecoderPreference = .automatic
+    ) async throws -> AetherActiveRouteSession {
+        switch source.result.route {
+        case .nativeAVPlayer:
+            let binding: AetherNativeAudioAnalysisBinding
+            switch source {
+            case .hls(let preflight):
+                binding = try await AetherPlaybackSessionFactory
+                    .makeNativeHLSAudioAnalysisBinding(
+                        url: url,
+                        options: options,
+                        preflight: preflight
+                    )
+            case .progressive(let probe, _):
+                binding = .progressive(
+                    sourceURL: url,
+                    httpHeaders: options.httpHeaders,
+                    probe: probe
+                )
+            case .provisionalNative:
+                binding = .unavailable(
+                    sourceURL: url,
+                    httpHeaders: options.httpHeaders,
+                    error: .analysisFailed(
+                        "source evidence remained inconclusive"
+                    )
+                )
+            }
+            return .native(
+                try AetherNativePlaybackSession.make(
+                    url: url,
+                    options: options,
+                    preflightResult: source.result,
+                    audioAnalysisBinding: binding,
+                    avPlayer: avPlayer
+                )
+            )
+
+        case .hybridCarrier:
+            switch source {
+            case .hls(let preflight):
+                return .hybrid(
+                    try await AetherHybridPlaybackSession.makeHLSVOD(
+                        preflight: preflight,
+                        avPlayer: avPlayer,
+                        decoderPreference: decoderPreference
+                    )
+                )
+            case .progressive(let probe, let result):
+                let timeline = try BlackCarrierTimeline.fileVOD(
+                    duration: CMTime(
+                        seconds: probe.durationSeconds,
+                        preferredTimescale: 90_000
+                    )
+                )
+                return .hybrid(
+                    try await AetherHybridPlaybackSession.makeSeekableVOD(
+                        source: .url(url),
+                        options: options,
+                        timeline: timeline,
+                        preflightResult: result,
+                        avPlayer: avPlayer,
+                        decoderPreference: decoderPreference
+                    )
+                )
+            case .provisionalNative:
+                throw AetherPlaybackSessionError.invalidFactorySource
+            }
+
+        case .unsupported:
+            throw AetherPlaybackSessionError.unsupported(
+                source.result.reason
+            )
+        }
+    }
+
+    private func install(
+        _ session: AetherActiveRouteSession,
+        source: AetherResolvedPlaybackSource
+    ) throws {
+        routeCancellables.removeAll()
+        activeSession = session
+        resolvedSource = source
+        activeRoute = session.route
+        preflightResult = session.preflightResult
+        switch session {
+        case .native(let native):
+            presentationView.install(nil)
+            bind(native)
+        case .hybrid(let hybrid):
+            presentationView.install(hybrid.presentationView)
+            bind(hybrid)
+        }
+        #if os(tvOS)
+        if let playerViewController {
+            try configure(
+                session,
+                controller: playerViewController,
+                realVideoGravity: .resizeAspect
+            )
+        }
+        #endif
+        publishCapabilities()
+        publishCurrentItem(avPlayer.currentItem)
+    }
+
+    private func bind(
+        _ session: AetherNativePlaybackSession
+    ) {
+        session.$state.sink { [weak self, weak session] state in
+            guard let self,
+                  let session,
+                  case .native(let active) = self.activeSession,
+                  active === session else { return }
+            self.handleNativeState(state)
+        }.store(in: &routeCancellables)
+        session.$selectedAudioAnalysisTrackID
+            .removeDuplicates()
+            .sink { [weak self] trackID in
+                self?.selectedAudioAnalysisTrackID = trackID
+                self?.publishCapabilities()
+            }
+            .store(in: &routeCancellables)
+    }
+
+    private func bind(
+        _ session: AetherHybridPlaybackSession
+    ) {
+        session.$state.sink { [weak self, weak session] state in
+            guard let self,
+                  let session,
+                  case .hybrid(let active) = self.activeSession,
+                  active === session else { return }
+            self.handleHybridState(state)
+        }.store(in: &routeCancellables)
+        session.$selectedAudioAnalysisTrackID
+            .removeDuplicates()
+            .sink { [weak self] trackID in
+                self?.selectedAudioAnalysisTrackID = trackID
+                self?.publishCapabilities()
+            }
+            .store(in: &routeCancellables)
+        session.$overlaySubtitleTracks
+            .combineLatest(session.$activeOverlaySubtitleTrackID)
+            .sink { [weak self] tracks, selectedTrackID in
+                self?.overlaySubtitleTracks = tracks
+                self?.activeOverlaySubtitleTrackID = selectedTrackID
+            }
+            .store(in: &routeCancellables)
+    }
+
+    private func handleNativeState(
+        _ nativeState: AetherNativePlaybackSessionState
+    ) {
+        switch nativeState {
+        case .idle: break
+        case .preparing: if !isPreparingOrRecovering { state = .preparing }
+        case .ready: if !isPreparingOrRecovering { state = .ready }
+        case .playing: if !isPreparingOrRecovering { state = .playing }
+        case .paused: if !isPreparingOrRecovering { state = .paused }
+        case .seeking: if !isPreparingOrRecovering { state = .seeking }
+        case .ended: state = .ended
+        case .failed(let failure):
+            guard didCompleteInitialPrepare,
+                  !isPreparingOrRecovering else { return }
+            scheduleRuntimeRecovery(
+                AetherPlaybackFailure(
+                    stage: .playback,
+                    kind: .routeRuntimeFailure,
+                    domain: "AetherNativePlaybackSessionFailure",
+                    code: 0,
+                    reason: failure.rawValue
+                )
+            )
+        case .stopped: break
+        }
+    }
+
+    private func handleHybridState(
+        _ hybridState: HybridPlaybackSessionState
+    ) {
+        switch hybridState {
+        case .idle: break
+        case .preparing:
+            if !isPreparingOrRecovering { state = .preparing }
+        case .ready:
+            if !isPreparingOrRecovering {
+                state = desiredPlaying ? .playing : .ready
+            }
+        case .seeking:
+            if !isPreparingOrRecovering { state = .seeking }
+        case .failed(let error):
+            guard didCompleteInitialPrepare,
+                  !isPreparingOrRecovering else { return }
+            scheduleRuntimeRecovery(
+                failure(stage: .playback, error: error)
+            )
+        case .stopped: break
+        }
+    }
+
+    private func scheduleRuntimeRecovery(
+        _ failure: AetherPlaybackFailure
+    ) {
+        guard recoveryTask == nil,
+              !isStopped,
+              !recoveryCoordinator.terminalOutcomeWasIssued else {
+            return
+        }
+        recoveryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let recovered = try await self.recover(
+                    from: failure,
+                    duringInitialPrepare: false
+                )
+                if !recovered {
+                    self.publishTerminal(
+                        self.recoveryCoordinator.episodeFirstFailure
+                            ?? failure
+                    )
+                }
+            } catch is CancellationError {
+                if !self.isStopped {
+                    self.publishTerminal(
+                        self.failure(
+                            stage: .playback,
+                            error: CancellationError()
+                        )
+                    )
+                }
+            } catch {
+                self.publishTerminal(
+                    self.recoveryCoordinator.episodeFirstFailure
+                        ?? self.failure(stage: .playback, error: error)
+                )
+            }
+            self.recoveryTask = nil
+        }
+    }
+
+    private func recover(
+        from initialFailure: AetherPlaybackFailure,
+        duringInitialPrepare: Bool
+    ) async throws -> Bool {
+        guard !isStopped else { throw CancellationError() }
+        isPreparingOrRecovering = true
+        firstFailure = firstFailure ?? initialFailure
+        beginRecoveryEpisodeIfNeeded(initialFailure)
+        let failedRoute = activeRoute
+        let resumeTime = avPlayer.currentTime()
+        var latestFailure = initialFailure
+        var freshSource = resolvedSource
+
+        switch initialFailure.kind {
+        case .unsupportedCapability, .authenticationRejected,
+             .securityBoundary, .malformedMedia,
+             .hostContractViolation, .cancelled,
+             .invariantViolation:
+            publishRecovery(
+                failure: initialFailure,
+                action: .terminate,
+                from: failedRoute,
+                to: nil,
+                outcome: .exhausted
+            )
+            isPreparingOrRecovering = false
+            return false
+        case .transientTransport, .inconclusiveEvidence,
+             .routeRuntimeFailure, .decoderRuntimeFailure:
+            break
+        }
+
+        if recoveryCoordinator.sameRouteRebuildCount
+                < recoveryBudget.maximumSameRouteRebuilds,
+           let failedRoute {
+            let action = AetherPlaybackRecoveryAction.rebuildSameRoute
+            recoveryCoordinator.recordAttempt(action)
+            publishRecovery(
+                failure: latestFailure,
+                action: action,
+                from: failedRoute,
+                to: failedRoute,
+                outcome: .scheduled
+            )
+            teardownActiveRoute()
+            do {
+                freshSource = try await resolveSameRouteRecoverySource(
+                    failedRoute: failedRoute,
+                    allowLowerVariant:
+                        initialFailure.kind != .decoderRuntimeFailure
+                )
+                guard let admitted = freshSource?.admitting(
+                    route: failedRoute
+                ) else {
+                    throw AetherPlaybackSessionError.unsupported(
+                        freshSource?.result.reason
+                            ?? .unsupportedVideoCodec
+                    )
+                }
+                try await installAndPrepare(admitted)
+                try await restorePlaybackContext(
+                    resumeTime: resumeTime,
+                    duringInitialPrepare: duringInitialPrepare
+                )
+                publishRecovery(
+                    failure: latestFailure,
+                    action: action,
+                    from: failedRoute,
+                    to: failedRoute,
+                    outcome: .succeeded
+                )
+                isPreparingOrRecovering = false
+                return true
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                latestFailure = failure(
+                    stage: .preparation,
+                    error: error
+                )
+                publishRecovery(
+                    failure: latestFailure,
+                    action: action,
+                    from: failedRoute,
+                    to: failedRoute,
+                    outcome: .failed
+                )
+            }
+        }
+
+        if freshSource == nil {
+            do {
+                freshSource = try await resolveCanonicalSource(
+                    allowProvisionalNative: true
+                )
+            } catch {
+                latestFailure = failure(stage: .preflight, error: error)
+            }
+        }
+        if failedRoute == .hybridCarrier,
+           initialFailure.kind == .decoderRuntimeFailure,
+           let softwareSource = freshSource?.admitting(
+                route: .hybridCarrier
+           ),
+           isSoftwareHEVCRecoveryEligible(softwareSource) {
+            let softwareAction = PlaybackRecoveryDecision.resolve(
+                context: AetherPlaybackRecoveryContext(
+                    failure: initialFailure,
+                    activeRoute: failedRoute,
+                    positivelyAdmittedAlternateRoute: nil,
+                    transportAttempt:
+                        recoveryBudget.maximumTransportAttempts,
+                    sameRouteRebuildCount:
+                        recoveryCoordinator.sameRouteRebuildCount,
+                    softwareDecoderTransitionCount:
+                        recoveryCoordinator
+                            .softwareDecoderTransitionCount,
+                    softwareDecoderRecoveryEligible: true,
+                    routeTransitionCount:
+                        recoveryCoordinator.routeTransitionCount,
+                    elapsedSeconds: episodeElapsedSeconds,
+                    systemActivity: systemActivity
+                ),
+                budget: recoveryBudget
+            )
+            if softwareAction == .switchToSoftwareDecoder {
+                recoveryCoordinator.recordAttempt(softwareAction)
+                publishRecovery(
+                    failure: latestFailure,
+                    action: softwareAction,
+                    from: failedRoute,
+                    to: failedRoute,
+                    outcome: .scheduled
+                )
+                teardownActiveRoute()
+                do {
+                    try await installAndPrepare(
+                        softwareSource,
+                        decoderPreference: .softwareHEVCRecovery
+                    )
+                    try await restorePlaybackContext(
+                        resumeTime: resumeTime,
+                        duringInitialPrepare: duringInitialPrepare
+                    )
+                    publishRecovery(
+                        failure: latestFailure,
+                        action: softwareAction,
+                        from: failedRoute,
+                        to: failedRoute,
+                        outcome: .succeeded
+                    )
+                    isPreparingOrRecovering = false
+                    return true
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    latestFailure = failure(
+                        stage: .decoder,
+                        error: error
+                    )
+                    publishRecovery(
+                        failure: latestFailure,
+                        action: softwareAction,
+                        from: failedRoute,
+                        to: failedRoute,
+                        outcome: .failed
+                    )
+                }
+            }
+        }
+        let alternate = failedRoute.flatMap {
+            freshSource?.alternate(excluding: $0)
+                ?? freshSource?.admitting(
+                    route: freshSource?.result.route ?? .unsupported
+                )
+        }
+        let selectionCompatibleAlternate:
+            AetherResolvedPlaybackSource? = alternate.flatMap {
+                source -> AetherResolvedPlaybackSource? in
+            if desiredOverlaySubtitleTrackID != nil,
+               source.result.route != .hybridCarrier {
+                return nil
+            }
+            return source
+        }
+        let action = PlaybackRecoveryDecision.resolve(
+            context: AetherPlaybackRecoveryContext(
+                failure: latestFailure,
+                activeRoute: failedRoute,
+                positivelyAdmittedAlternateRoute:
+                    selectionCompatibleAlternate?.result.route,
+                transportAttempt: recoveryBudget.maximumTransportAttempts,
+                sameRouteRebuildCount:
+                    recoveryCoordinator.sameRouteRebuildCount,
+                softwareDecoderTransitionCount:
+                    recoveryCoordinator
+                        .softwareDecoderTransitionCount,
+                softwareDecoderRecoveryEligible: false,
+                routeTransitionCount:
+                    recoveryCoordinator.routeTransitionCount,
+                elapsedSeconds: episodeElapsedSeconds,
+                systemActivity: systemActivity
+            ),
+            budget: recoveryBudget
+        )
+        guard case .transition(let targetRoute) = action,
+              let alternate = selectionCompatibleAlternate,
+              alternate.result.route == targetRoute else {
+            publishRecovery(
+                failure: latestFailure,
+                action: .terminate,
+                from: failedRoute,
+                to: nil,
+                outcome: .exhausted
+            )
+            isPreparingOrRecovering = false
+            return false
+        }
+
+        recoveryCoordinator.recordAttempt(action)
+        publishRecovery(
+            failure: latestFailure,
+            action: action,
+            from: failedRoute,
+            to: targetRoute,
+            outcome: .scheduled
+        )
+        teardownActiveRoute()
+        do {
+            try await installAndPrepare(alternate)
+            try await restorePlaybackContext(
+                resumeTime: resumeTime,
+                duringInitialPrepare: duringInitialPrepare
+            )
+            publishRecovery(
+                failure: latestFailure,
+                action: action,
+                from: failedRoute,
+                to: targetRoute,
+                outcome: .succeeded
+            )
+            isPreparingOrRecovering = false
+            return true
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            latestFailure = failure(stage: .preparation, error: error)
+            publishRecovery(
+                failure: latestFailure,
+                action: action,
+                from: failedRoute,
+                to: targetRoute,
+                outcome: .failed
+            )
+            isPreparingOrRecovering = false
+            return false
+        }
+    }
+
+    private func restorePlaybackContext(
+        resumeTime: CMTime,
+        duringInitialPrepare: Bool
+    ) async throws {
+        guard let activeSession else {
+            throw AetherPlaybackSessionError.noActiveRoute
+        }
+        if !duringInitialPrepare,
+           resumeTime.isValid,
+           resumeTime.isNumeric,
+           resumeTime.seconds.isFinite,
+           resumeTime.seconds > 0 {
+            try await activeSession.seek(to: resumeTime)
+        }
+        publishCurrentItem(avPlayer.currentItem)
+        if let desiredOverlaySubtitleTrackID {
+            guard case .hybrid(let hybrid) = activeSession else {
+                throw AetherPlaybackSessionError.invalidState
+            }
+            try hybrid.selectOverlaySubtitleTrack(
+                desiredOverlaySubtitleTrackID
+            )
+        }
+        if desiredPlaying {
+            try activeSession.play()
+            if desiredRate != 1 {
+                try activeSession.setRate(desiredRate)
+            }
+            state = .playing
+        } else {
+            state = .ready
+        }
+    }
+
+    private func lowerCompatibleVariantSelection(
+        for failedRoute: PlaybackRenderRoute
+    ) -> HLSPreflightVariantSelection? {
+        guard failedRoute == .hybridCarrier,
+              case .hls(let preflight) = resolvedSource,
+              let graph = preflight.resourceGraph,
+              let bandwidth = graph.selectedVariantBandwidth else {
+            return nil
+        }
+        return .nextLowerCompatible(
+            thanBandwidth: bandwidth,
+            audioGroupID: graph.separateAudioGroupID,
+            subtitleGroupID: graph.separateSubtitleGroupID
+        )
+    }
+
+    private func resolveSameRouteRecoverySource(
+        failedRoute: PlaybackRenderRoute,
+        allowLowerVariant: Bool
+    ) async throws -> AetherResolvedPlaybackSource {
+        guard allowLowerVariant,
+              let lowerSelection = lowerCompatibleVariantSelection(
+            for: failedRoute
+        ) else {
+            return try await resolveCanonicalSource(
+                allowProvisionalNative: false
+            )
+        }
+        do {
+            return try await resolveCanonicalSource(
+                allowProvisionalNative: false,
+                variantSelectionOverride: lowerSelection
+            )
+        } catch let failure as AetherPlaybackFailure
+        where failure.kind == .inconclusiveEvidence {
+            return try await resolveCanonicalSource(
+                allowProvisionalNative: false
+            )
+        }
+    }
+
+    private func isSoftwareHEVCRecoveryEligible(
+        _ source: AetherResolvedPlaybackSource
+    ) -> Bool {
+        PlaybackRecoveryDecision.permitsSoftwareHEVCRecovery(
+            sourceProfile: source.result.sourceProfile
+        )
+    }
+
+    private func retryTransport<T>(
+        stage: AetherPlaybackRecoveryStage,
+        operation: () async throws -> T
+    ) async throws -> T {
+        var attempt = 1
+        var pendingRetry:
+            (AetherPlaybackFailure, AetherPlaybackRecoveryAction)?
+        while true {
+            do {
+                let value = try await operation()
+                if let pendingRetry {
+                    publishRecovery(
+                        failure: pendingRetry.0,
+                        action: pendingRetry.1,
+                        from: activeRoute,
+                        to: activeRoute,
+                        outcome: .succeeded
+                    )
+                }
+                return value
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                let typed = failure(stage: stage, error: error)
+                if let pendingRetry {
+                    publishRecovery(
+                        failure: pendingRetry.0,
+                        action: pendingRetry.1,
+                        from: activeRoute,
+                        to: activeRoute,
+                        outcome: .failed
+                    )
+                }
+                pendingRetry = nil
+                beginRecoveryEpisodeIfNeeded(typed)
+                let action = PlaybackRecoveryDecision.resolve(
+                    context: AetherPlaybackRecoveryContext(
+                        failure: typed,
+                        activeRoute: activeRoute,
+                        positivelyAdmittedAlternateRoute: nil,
+                        transportAttempt: attempt,
+                        sameRouteRebuildCount:
+                            recoveryCoordinator.sameRouteRebuildCount,
+                        softwareDecoderTransitionCount:
+                            recoveryCoordinator
+                                .softwareDecoderTransitionCount,
+                        routeTransitionCount:
+                            recoveryCoordinator.routeTransitionCount,
+                        elapsedSeconds: episodeElapsedSeconds,
+                        systemActivity: systemActivity
+                    ),
+                    budget: recoveryBudget
+                )
+                guard case .retrySameOperation(let delay) = action else {
+                    throw typed
+                }
+                recoveryCoordinator.recordAttempt(action)
+                publishRecovery(
+                    failure: typed,
+                    action: action,
+                    from: activeRoute,
+                    to: activeRoute,
+                    outcome: .scheduled
+                )
+                pendingRetry = (typed, action)
+                try await Task.sleep(
+                    nanoseconds: UInt64(delay * 1_000_000_000)
+                )
+                attempt += 1
+            }
+        }
+    }
+
+    private func failure(
+        stage: AetherPlaybackRecoveryStage,
+        error: Error
+    ) -> AetherPlaybackFailure {
+        if let failure = error as? AetherPlaybackFailure {
+            return failure
+        }
+        if error is CancellationError {
+            return AetherPlaybackFailure(
+                stage: stage,
+                kind: .cancelled,
+                domain: "CancellationError",
+                code: 0,
+                reason: "Playback operation was cancelled"
+            )
+        }
+
+        let kind: AetherPlaybackFailureKind
+        switch error {
+        case let error as AetherURLPlaybackSourceClassificationError:
+            kind = Self.classify(error)
+        case let error as HLSPreflightError:
+            kind = Self.classify(error)
+        case let error as HybridPlaybackSessionError:
+            kind = Self.classify(error)
+        case is AetherNativePlaybackSessionError:
+            kind = .routeRuntimeFailure
+        case let error as AetherPlaybackSessionError:
+            switch error {
+            case .unsupported: kind = .unsupportedCapability
+            case .invalidFactorySource, .invalidState,
+                 .noActiveRoute, .terminal:
+                kind = .invariantViolation
+            }
+        default:
+            let urlError = error as? URLError
+            kind = urlError == nil
+                ? .routeRuntimeFailure
+                : .transientTransport
+        }
+        let nsError = error as NSError
+        return AetherPlaybackFailure(
+            stage: stage,
+            kind: kind,
+            domain: String(reflecting: type(of: error)),
+            code: nsError.code,
+            reason: Self.redactedReason(
+                kind: kind,
+                stage: stage,
+                error: error
+            )
+        )
+    }
+
+    private static func classify(
+        _ error: AetherURLPlaybackSourceClassificationError
+    ) -> AetherPlaybackFailureKind {
+        switch error {
+        case .emptyResource, .transport:
+            .transientTransport
+        case .httpStatus(let status):
+            if status == 401 || status == 403 {
+                .authenticationRejected
+            } else if status == 408 || status == 425
+                        || status == 429 || status >= 500 {
+                .transientTransport
+            } else {
+                .malformedMedia
+            }
+        case .redirectCredentialScopeViolation:
+            .securityBoundary
+        case .unsupportedURLScheme, .unreadableFile,
+             .nonHTTPResponse, .unsupportedContentEncoding:
+            .invariantViolation
+        }
+    }
+
+    private static func classify(
+        _ error: HLSPreflightError
+    ) -> AetherPlaybackFailureKind {
+        switch error {
+        case .transportFailure, .contentLengthMismatch:
+            .transientTransport
+        case .httpStatus(let status):
+            if status == 401 || status == 403 {
+                .authenticationRejected
+            } else if status == 408 || status == 425
+                        || status == 429 || status >= 500 {
+                .transientTransport
+            } else {
+                .malformedMedia
+            }
+        case .redirectCredentialScopeViolation:
+            .securityBoundary
+        case .unsupportedSeekableVODResourceGraph,
+             .selectedVariantWasNotMediaPlaylist:
+            .inconclusiveEvidence
+        case .requestedVariantNotFound(
+            "next-lower-compatible"
+        ):
+            .inconclusiveEvidence
+        case .invalidPlaylist, .unresolvableURI,
+             .requestedVariantNotFound,
+             .seekableVODPlaylistNotFinite,
+             .resourceTooLarge,
+             .unsupportedContentEncoding,
+             .nonHTTPResponse:
+            .malformedMedia
+        }
+    }
+
+    private static func classify(
+        _ error: HybridPlaybackSessionError
+    ) -> AetherPlaybackFailureKind {
+        switch error {
+        case .providerFailed, .carrierFailed, .readinessFailed,
+             .readinessTimedOut,
+             .carrierSeekDidNotLand:
+            .routeRuntimeFailure
+        case .decoderFailed:
+            .decoderRuntimeFailure
+        case .presentationFailed(let error):
+            if case .rendererFailed = error {
+                .routeRuntimeFailure
+            } else {
+                .malformedMedia
+            }
+        case .hlsPreflightGenerationInvalidated(let reason):
+            switch reason {
+            case .resourceUnavailable, .contentChanged:
+                .routeRuntimeFailure
+            case .credentialRejected:
+                .authenticationRejected
+            case .effectiveOriginChanged,
+                 .credentialScopeChanged:
+                .securityBoundary
+            }
+        case .carrierPresentationNotConfigured,
+             .carrierPresentationConfigurationTooLate,
+             .carrierPresentationContractChanged:
+            .hostContractViolation
+        case .cancelled:
+            .cancelled
+        case .videoPipelineMissing, .renderSurfaceMissing,
+             .invalidSeekableVODOptions,
+             .sourceIndependentReaderUnavailable,
+             .hlsPreflightRequired,
+             .hlsPreflightResourceGraphMissing,
+             .sourceKindMismatch, .timelineSourceMismatch,
+             .preflightRequiresHybrid,
+             .preflightContractChanged,
+             .sourceVideoFormatDiverged,
+             .sourceDolbyVisionConfigurationDiverged,
+             .invalidReadinessTimeout, .invalidSeekTarget,
+             .invalidRate, .notReady, .alreadyPreparing,
+             .alreadyStopped, .carrierItemMissing,
+             .carrierClockUnavailable, .resumeIntentMissing,
+             .generationDiverged:
+            .invariantViolation
+        }
+    }
+
+    private static func redactedReason(
+        kind: AetherPlaybackFailureKind,
+        stage: AetherPlaybackRecoveryStage,
+        error: Error
+    ) -> String {
+        switch error {
+        case let error as AetherPlaybackSessionError:
+            return error.localizedDescription
+        case let error as AetherNativePlaybackSessionError:
+            return error.localizedDescription
+        case is HybridPlaybackSessionError:
+            return "Hybrid playback failed (\(kind.rawValue))"
+        case is HLSPreflightError:
+            return "HLS preflight failed (\(kind.rawValue))"
+        case let error as AetherURLPlaybackSourceClassificationError:
+            return error.localizedDescription
+        default:
+            return "Playback \(stage.rawValue) failed (\(kind.rawValue))"
+        }
+    }
+
+    private func beginRecoveryEpisodeIfNeeded(
+        _ failure: AetherPlaybackFailure
+    ) {
+        recoveryCoordinator.begin(
+            with: failure,
+            now: ProcessInfo.processInfo.systemUptime
+        )
+        firstFailure = recoveryCoordinator.sessionFirstFailure
+    }
+
+    private func resetRecoveryEpisode() {
+        recoveryCoordinator.resetEpisode(
+            now: ProcessInfo.processInfo.systemUptime
+        )
+    }
+
+    private func observeHealthyProgress(_ time: CMTime) {
+        guard desiredPlaying,
+              !isPreparingOrRecovering,
+              time.isValid,
+              time.isNumeric,
+              time.seconds.isFinite else {
+            return
+        }
+        guard let lastRecoveryResetMediaTime else {
+            self.lastRecoveryResetMediaTime = time
+            return
+        }
+        let progress = CMTimeSubtract(
+            time,
+            lastRecoveryResetMediaTime
+        ).seconds
+        guard progress.isFinite,
+              progress
+                >= recoveryBudget.healthyProgressResetSeconds else {
+            return
+        }
+        self.lastRecoveryResetMediaTime = time
+        resetRecoveryEpisode()
+    }
+
+    private var episodeElapsedSeconds: TimeInterval {
+        recoveryCoordinator.elapsedSeconds(
+            now: ProcessInfo.processInfo.systemUptime
+        )
+    }
+
+    private func publishRecovery(
+        failure: AetherPlaybackFailure,
+        action: AetherPlaybackRecoveryAction,
+        from: PlaybackRenderRoute?,
+        to: PlaybackRenderRoute?,
+        outcome: AetherPlaybackRecoveryOutcome
+    ) {
+        beginRecoveryEpisodeIfNeeded(failure)
+        eventSequence += 1
+        let capabilityDelta:
+            AetherPlaybackCapabilityDelta?
+        if outcome == .scheduled {
+            capabilitiesBeforeRecoveryAttempt = capabilities
+            capabilityDelta = nil
+        } else if let before = capabilitiesBeforeRecoveryAttempt {
+            capabilityDelta = AetherPlaybackCapabilityDelta(
+                before: before,
+                after: capabilities
+            )
+            capabilitiesBeforeRecoveryAttempt = nil
+        } else {
+            capabilityDelta = nil
+        }
+        let event = AetherPlaybackRecoveryEvent(
+            sequence: eventSequence,
+            episodeID: recoveryCoordinator.episodeID,
+            attempt: recoveryCoordinator.attemptCount,
+            fromRoute: from,
+            toRoute: to,
+            failure: failure,
+            action: action,
+            outcome: outcome,
+            capabilityDelta: capabilityDelta
+        )
+        recoveryHistory.append(event)
+        if recoveryHistory.count > 64 {
+            recoveryHistory.removeFirst(
+                recoveryHistory.count - 64
+            )
+        }
+        state = .recovering(event)
+        EngineLog.emit(
+            "[AetherPlaybackSession] recovery sequence=\(event.sequence) "
+                + "attempt=\(event.attempt) "
+                + "from=\(from?.rawValue ?? "none") "
+                + "to=\(to?.rawValue ?? "none") "
+                + "kind=\(failure.kind.rawValue) "
+                + "capabilityChanged=\(capabilityDelta.map { $0.before != $0.after } ?? false) "
+                + "outcome=\(outcome.rawValue)",
+            category: .session
+        )
+    }
+
+    private func publishTerminal(
+        _ failure: AetherPlaybackFailure
+    ) {
+        guard !isStopped,
+              recoveryCoordinator.claimTerminalOutcome() else {
+            return
+        }
+        firstFailure = firstFailure ?? failure
+        state = .failed(failure)
+    }
+
+    private func teardownActiveRoute() {
+        routeCancellables.removeAll()
+        activeSession?.cancelAudioAnalysisStreams()
+        activeSession?.stop()
+        activeSession = nil
+        presentationView.install(nil)
+        activeRoute = nil
+        overlaySubtitleTracks = []
+        activeOverlaySubtitleTrackID = nil
+        capabilities = Self.capabilities(for: nil)
+    }
+
+    private func publishCurrentItem(
+        _ item: AVPlayerItem?
+    ) {
+        currentItem = item
+        #if os(tvOS) || os(iOS)
+        if let item, !externalMetadata.isEmpty {
+            item.externalMetadata = externalMetadata
+        }
+        #endif
+    }
+
+    private func publishCapabilities() {
+        capabilities = Self.capabilities(
+            for: activeSession
+        )
+    }
+
+    private static func capabilities(
+        for session: AetherActiveRouteSession?
+    ) -> AetherPlaybackCapabilities {
+        let nativePolicy = HybridPlaybackSystemFeaturePolicy(
+            pictureInPictureVideo: .available,
+            airPlayVideo: .available,
+            externalDisplayVideo: .available
+        )
+        switch session {
+        case .native(let native):
+            return AetherPlaybackCapabilities(
+                route: .nativeAVPlayer,
+                systemFeaturePolicy: nativePolicy,
+                audioAnalysisTrackIDs:
+                    native.audioAnalysisTrackIDs,
+                selectedAudioAnalysisTrackID:
+                    native.selectedAudioAnalysisTrackID
+            )
+        case .hybrid(let hybrid):
+            return AetherPlaybackCapabilities(
+                route: .hybridCarrier,
+                systemFeaturePolicy:
+                    AetherHybridPlaybackSession.systemFeaturePolicy,
+                audioAnalysisTrackIDs:
+                    hybrid.audioAnalysisTrackIDs,
+                selectedAudioAnalysisTrackID:
+                    hybrid.selectedAudioAnalysisTrackID
+            )
+        case nil:
+            return AetherPlaybackCapabilities(
+                route: nil,
+                systemFeaturePolicy: nativePolicy,
+                audioAnalysisTrackIDs: [],
+                selectedAudioAnalysisTrackID: nil
+            )
+        }
+    }
+
+    #if os(tvOS)
+    private func configure(
+        _ session: AetherActiveRouteSession,
+        controller: AVPlayerViewController,
+        realVideoGravity: AetherHybridVideoGravity
+    ) throws {
+        switch session {
+        case .native(let native):
+            try native.configurePlayerViewController(controller)
+            controller.allowsPictureInPicturePlayback = true
+            avPlayer.allowsExternalPlayback = true
+        case .hybrid(let hybrid):
+            try hybrid.configureCarrierPlayerViewController(
+                controller,
+                realVideoGravity: realVideoGravity
+            )
+            controller.allowsPictureInPicturePlayback = false
+            avPlayer.allowsExternalPlayback = false
+        }
+    }
+    #endif
+}

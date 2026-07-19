@@ -28,7 +28,7 @@ public enum AetherNativePlaybackSessionFailure:
     case playerItemFailed
 }
 
-public enum AetherNativePlaybackSessionError:
+enum AetherNativePlaybackSessionError:
     Error,
     Sendable,
     Equatable,
@@ -82,7 +82,7 @@ public struct AetherNativePlaybackDiagnostics:
 /// replace the asset, player item or player. Terminal item failure remains on this session and never
 /// selects the Hybrid or legacy route.
 @MainActor
-public final class AetherNativePlaybackSession: ObservableObject {
+final class AetherNativePlaybackSession: ObservableObject {
     public let preflightResult: PlaybackPreflightResult
     public let avPlayer: AVPlayer
     public let avPlayerItem: AVPlayerItem
@@ -138,13 +138,15 @@ public final class AetherNativePlaybackSession: ObservableObject {
     private init(
         preflightResult: PlaybackPreflightResult,
         asset: AVURLAsset,
+        avPlayer: AVPlayer,
         audioAnalysisBinding:
             AetherNativeAudioAnalysisBinding
     ) {
         self.preflightResult = preflightResult
         self.audioAnalysisBinding = audioAnalysisBinding
         avPlayerItem = AVPlayerItem(asset: asset)
-        avPlayer = AVPlayer(playerItem: avPlayerItem)
+        self.avPlayer = avPlayer
+        avPlayer.replaceCurrentItem(with: avPlayerItem)
         avPlayer.actionAtItemEnd = .pause
         avPlayer.preventsDisplaySleepDuringVideoPlayback = true
         avPlayer.automaticallyWaitsToMinimizeStalling = true
@@ -175,7 +177,8 @@ public final class AetherNativePlaybackSession: ObservableObject {
         options: LoadOptions = .init(),
         preflightResult: PlaybackPreflightResult,
         audioAnalysisBinding:
-            AetherNativeAudioAnalysisBinding
+            AetherNativeAudioAnalysisBinding,
+        avPlayer: AVPlayer = AVPlayer()
     ) throws -> AetherNativePlaybackSession {
         guard preflightResult.route == .nativeAVPlayer else {
             throw AetherNativePlaybackSessionError
@@ -198,6 +201,7 @@ public final class AetherNativePlaybackSession: ObservableObject {
         return AetherNativePlaybackSession(
             preflightResult: preflightResult,
             asset: AVURLAsset(url: url, options: assetOptions),
+            avPlayer: avPlayer,
             audioAnalysisBinding: audioAnalysisBinding
         )
     }

@@ -680,6 +680,8 @@ final class HybridPlaybackSession {
         source: MediaSource,
         options: LoadOptions,
         timeline: BlackCarrierTimeline,
+        avPlayer: AVPlayer = AVPlayer(),
+        decoderPreference: HybridVideoDecoderPreference = .automatic,
         initialGeneration: UInt64 = 0,
         selectTitleID: Int? = nil
     ) async throws -> HybridPlaybackSession {
@@ -697,6 +699,7 @@ final class HybridPlaybackSession {
                     bridgeMode: options.audioBridgeMode,
                     decodedFrameHandler: { relay.emit($0) },
                     videoFailureHandler: { relay.fail($0) },
+                    decoderPreference: decoderPreference,
                     initialGeneration: initialGeneration,
                     selectTitleID: selectTitleID
                 )
@@ -705,7 +708,8 @@ final class HybridPlaybackSession {
         do {
             let renderView = AetherHybridPresentationView()
             let transport = BlackCarrierAVPlayerSession(
-                provider: provider
+                provider: provider,
+                avPlayer: avPlayer
             )
             return try HybridPlaybackSession(
                 provider: provider,
@@ -725,6 +729,8 @@ final class HybridPlaybackSession {
     static func makeHLSVOD(
         preflight: AetherHLSPlaybackPreflight,
         bridgeMode: AudioBridgeMode = .surroundCompat,
+        avPlayer: AVPlayer = AVPlayer(),
+        decoderPreference: HybridVideoDecoderPreference = .automatic,
         initialGeneration: UInt64 = 0,
         fetchOverride:
             HLSVODOriginResourceLoader.Fetch? = nil
@@ -754,6 +760,7 @@ final class HybridPlaybackSession {
                 videoFailureHandler: {
                     relay.fail($0)
                 },
+                decoderPreference: decoderPreference,
                 initialGeneration:
                     initialGeneration,
                 fetchOverride: fetchOverride
@@ -773,7 +780,8 @@ final class HybridPlaybackSession {
         do {
             let renderView = AetherHybridPresentationView()
             let transport = BlackCarrierAVPlayerSession(
-                provider: provider
+                provider: provider,
+                avPlayer: avPlayer
             )
             return try HybridPlaybackSession(
                 provider: provider,

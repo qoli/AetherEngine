@@ -245,6 +245,7 @@ actor HLSVODMediaPump {
             HybridVideoDecodeSink.FrameHandler? = nil,
         videoFailureHandler:
             HybridVideoDecodeSink.FailureHandler? = nil,
+        decoderPreference: HybridVideoDecoderPreference = .automatic,
         initialGeneration: UInt64 = 0,
         maximumResourceBytes: Int =
             HLSVODOriginResourceLoader.defaultMaximumResourceBytes,
@@ -364,6 +365,7 @@ actor HLSVODMediaPump {
                     decodedFrameHandler,
                 videoFailureHandler:
                     videoFailureHandler,
+                decoderPreference: decoderPreference,
                 initialGeneration: initialGeneration
             )
             guard worker.hybridSubtitleContracts.map(\.track)
@@ -1329,6 +1331,7 @@ private extension HLSVODMediaPump {
                 HybridVideoDecodeSink.FrameHandler?,
             videoFailureHandler:
                 HybridVideoDecodeSink.FailureHandler?,
+            decoderPreference: HybridVideoDecoderPreference,
             initialGeneration: UInt64
         ) throws {
             self.graph = graph
@@ -1383,6 +1386,7 @@ private extension HLSVODMediaPump {
                         initialGeneration:
                             initialGeneration,
                         sourceStartPTSOverride: 0,
+                        decoderPreference: decoderPreference,
                         onFrame: decodedFrameHandler,
                         onFailure:
                             videoFailureHandler

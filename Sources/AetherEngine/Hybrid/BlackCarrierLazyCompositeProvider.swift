@@ -73,6 +73,7 @@ final class BlackCarrierLazyCompositeProvider:
         videoPacketSink: BlackCarrierMediaFanoutPump.VideoPacketSink? = nil,
         decodedFrameHandler: HybridVideoDecodeSink.FrameHandler? = nil,
         videoFailureHandler: HybridVideoDecodeSink.FailureHandler? = nil,
+        decoderPreference: HybridVideoDecoderPreference = .automatic,
         initialGeneration: UInt64 = 0,
         selectTitleID: Int? = nil
     ) throws -> BlackCarrierLazyCompositeProvider {
@@ -98,6 +99,7 @@ final class BlackCarrierLazyCompositeProvider:
                 videoPacketSink: videoPacketSink,
                 decodedFrameHandler: decodedFrameHandler,
                 videoFailureHandler: videoFailureHandler,
+                decoderPreference: decoderPreference,
                 initialGeneration: initialGeneration
             )
         } catch {

@@ -81,8 +81,13 @@ struct BlackCarrierAVPlayerSessionTests {
             videoProvider: videoProvider,
             audioStores: [audioStore]
         )
-        let session = BlackCarrierAVPlayerSession(provider: provider)
+        let stablePlayer = AVPlayer()
+        let session = BlackCarrierAVPlayerSession(
+            provider: provider,
+            avPlayer: stablePlayer
+        )
 
+        #expect(session.avPlayer === stablePlayer)
         #expect(session.avPlayer.currentItem == nil)
         #expect(!session.avPlayer.allowsExternalPlayback)
         #expect(session.transportState == .idle)

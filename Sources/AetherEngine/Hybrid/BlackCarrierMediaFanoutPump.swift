@@ -487,6 +487,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         videoPacketSink: VideoPacketSink? = nil,
         decodedFrameHandler: HybridVideoDecodeSink.FrameHandler? = nil,
         videoFailureHandler: HybridVideoDecodeSink.FailureHandler? = nil,
+        decoderPreference: HybridVideoDecoderPreference = .automatic,
         initialGeneration: UInt64 = 0,
         selectTitleID: Int? = nil
     ) throws -> BlackCarrierMediaFanoutPump {
@@ -503,6 +504,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             videoPacketSink: videoPacketSink,
             decodedFrameHandler: decodedFrameHandler,
             videoFailureHandler: videoFailureHandler,
+            decoderPreference: decoderPreference,
             initialGeneration: initialGeneration
         )
     }
@@ -515,6 +517,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         videoPacketSink: VideoPacketSink? = nil,
         decodedFrameHandler: HybridVideoDecodeSink.FrameHandler? = nil,
         videoFailureHandler: HybridVideoDecodeSink.FailureHandler? = nil,
+        decoderPreference: HybridVideoDecoderPreference = .automatic,
         initialGeneration: UInt64 = 0
     ) throws -> BlackCarrierMediaFanoutPump {
         do {
@@ -523,6 +526,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                 try HybridVideoDecodeSink(
                     demuxer: demuxer,
                     initialGeneration: initialGeneration,
+                    decoderPreference: decoderPreference,
                     onFrame: handler,
                     onFailure: videoFailureHandler
                 )

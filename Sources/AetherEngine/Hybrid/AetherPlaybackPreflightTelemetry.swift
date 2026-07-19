@@ -19,6 +19,7 @@ public enum AetherHLSPreflightTelemetryVariantSelection:
 {
     case highestBandwidth
     case exactVariant
+    case nextLowerCompatible
 
     init(_ selection: HLSPreflightVariantSelection) {
         self = switch selection {
@@ -26,6 +27,8 @@ public enum AetherHLSPreflightTelemetryVariantSelection:
             .highestBandwidth
         case .exactURI:
             .exactVariant
+        case .nextLowerCompatible:
+            .nextLowerCompatible
         }
     }
 }

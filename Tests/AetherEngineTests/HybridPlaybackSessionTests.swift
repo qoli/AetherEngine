@@ -1251,9 +1251,9 @@ struct HybridPlaybackSessionTests {
         )
     }
 
-    @Test("Decoder failure is terminal and tears down transport and renderer")
+    @Test("Route implementation reports decoder failure and tears down its generation")
     @MainActor
-    func decoderFailureTerminates() async throws {
+    func decoderFailureIsReportedToUnifiedCoordinator() async throws {
         let fixture = try makeSession()
         try await fixture.session.prepare(timeout: 1)
 

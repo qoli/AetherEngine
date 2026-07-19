@@ -7,6 +7,11 @@ import Libavcodec
 public enum HLSPreflightVariantSelection: Sendable, Equatable {
     case highestBandwidth
     case exactURI(String)
+    case nextLowerCompatible(
+        thanBandwidth: Int,
+        audioGroupID: String?,
+        subtitleGroupID: String?
+    )
 }
 
 /// Transport or manifest failure while gathering preflight evidence. This is distinct from a successful
@@ -216,7 +221,7 @@ struct HLSPreflightInspector {
               let segmentURL = HLSPlaylistParser.resolve(uri: firstSegment.uri, against: resolved.mediaURL) else {
             throw HLSPreflightError.unresolvableURI(resolved.media.segments.first?.uri ?? "<missing first segment>")
         }
-        let segment = try await fetch(segmentURL)
+        let firstSegmentResponse = try await fetch(segmentURL)
 
         let container: HLSVideoContainer
         let initSegment: Data?
@@ -242,11 +247,38 @@ struct HLSPreflightInspector {
             initSegmentEffectiveURL = nil
         }
 
-        guard let inspected = Self.inspectVideo(
+        var inspectedVideo = Self.inspectVideo(
             initSegment: initSegment,
-            segment: segment.data,
+            segment: firstSegmentResponse.data,
             container: container
-        ) else {
+        )
+        var inspectedVideoSegmentIndex = 0
+        var inspectedVideoSegmentResponse = firstSegmentResponse
+        if inspectedVideo == nil {
+            for (index, candidate) in resolved.media.segments
+                .prefix(3).enumerated().dropFirst() {
+                guard let candidateURL = HLSPlaylistParser.resolve(
+                    uri: candidate.uri,
+                    against: resolved.mediaURL
+                ) else {
+                    throw HLSPreflightError.unresolvableURI(
+                        candidate.uri
+                    )
+                }
+                let response = try await fetch(candidateURL)
+                if let candidateInspection = Self.inspectVideo(
+                    initSegment: initSegment,
+                    segment: response.data,
+                    container: container
+                ) {
+                    inspectedVideo = candidateInspection
+                    inspectedVideoSegmentIndex = index
+                    inspectedVideoSegmentResponse = response
+                    break
+                }
+            }
+        }
+        guard let inspected = inspectedVideo else {
             return AetherHLSPlaybackPreflight(
                 result: unresolvedResult(
                     isSeekableVOD: sourceIsSeekableVOD,
@@ -342,9 +374,16 @@ struct HLSPreflightInspector {
                     inspectedInitSegmentData: initSegment,
                     inspectedInitSegmentEffectiveURL:
                         initSegmentEffectiveURL,
-                    inspectedFirstMediaSegmentData: segment.data,
+                    inspectedFirstMediaSegmentData:
+                        firstSegmentResponse.data,
                     inspectedFirstMediaSegmentEffectiveURL:
-                        segment.effectiveURL,
+                        firstSegmentResponse.effectiveURL,
+                    inspectedVideoSegmentIndex:
+                        inspectedVideoSegmentIndex,
+                    inspectedVideoSegmentData:
+                        inspectedVideoSegmentResponse.data,
+                    inspectedVideoSegmentEffectiveURL:
+                        inspectedVideoSegmentResponse.effectiveURL,
                     httpHeaders: httpHeaders
                 )
                 audioAnalysisPolicy =
@@ -430,6 +469,27 @@ struct HLSPreflightInspector {
             case .exactURI(let uri):
                 guard let selected = master.variants.first(where: { $0.uri == uri }) else {
                     throw HLSPreflightError.requestedVariantNotFound(uri)
+                }
+                variant = selected
+            case .nextLowerCompatible(
+                let bandwidth,
+                let audioGroupID,
+                let subtitleGroupID
+            ):
+                guard let selected = master.variants
+                    .filter({
+                        $0.bandwidth < bandwidth
+                            && $0.audioGroupID == audioGroupID
+                            && $0.subtitleGroupID
+                                == subtitleGroupID
+                    })
+                    .max(by: {
+                        $0.bandwidth < $1.bandwidth
+                    }) else {
+                    throw HLSPreflightError
+                        .requestedVariantNotFound(
+                            "next-lower-compatible"
+                        )
                 }
                 variant = selected
             }

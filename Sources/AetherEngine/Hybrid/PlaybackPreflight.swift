@@ -18,6 +18,10 @@ public enum AetherMediaSourceKind: String, Sendable, Equatable, Hashable {
     case hls
     case progressive
     case custom
+    /// URL evidence remained inconclusive after the bounded retry budget.
+    /// This is an explicit same-URL Native trial contract, not inferred
+    /// progressive provenance and never a Hybrid admission.
+    case unclassifiedURL
 }
 
 /// Codec identity used by the route policy. `.unknown` is deliberately not treated as AVPlayer-compatible.
@@ -216,6 +220,8 @@ public enum PlaybackRouteReason: String, Sendable, Equatable {
     case nativeHLSContractVerified
     case nativeProtectedHLSContractVerified
     case nativeContainerRepackaging
+    case nativeProvisionalURL
+    case hybridRecoveryAfterNativeFailure
     case hybridHEV1SampleEntry
     case hybridHEVCInMPEGTransport
     case hybridHLSManifestMissingCodecs
@@ -279,6 +285,13 @@ public enum PlaybackPreflight {
                 hlsPackaging: hlsPackaging,
                 hybridCapabilities: hybridCapabilities
             )
+        case .unclassifiedURL:
+            return result(
+                sourceProfile,
+                nil,
+                .nativeAVPlayer,
+                .nativeProvisionalURL
+            )
         case .progressive, .custom:
             switch sourceProfile.videoCodec {
             case .h264, .hevc:
@@ -298,6 +311,52 @@ public enum PlaybackPreflight {
                     capabilities: hybridCapabilities
                 )
             }
+        }
+    }
+
+    /// Resolve the only evidence-backed alternate route allowed after the
+    /// active route has exhausted its same-route rebuild. The source profile,
+    /// packaging and capability facts are unchanged.
+    public static func resolveRecoveryAlternate(
+        sourceProfile: AetherSourceProfile,
+        hlsPackaging: HLSVideoPackaging?,
+        excluding activeRoute: PlaybackRenderRoute,
+        hybridCapabilities: HybridPlaybackCapabilities
+    ) -> PlaybackPreflightResult? {
+        switch activeRoute {
+        case .nativeAVPlayer:
+            guard sourceProfile.sourceKind != .unclassifiedURL,
+                  sourceProfile.videoCodec != .unknown else {
+                return nil
+            }
+            if sourceProfile.sourceKind == .hls {
+                guard let hlsPackaging,
+                      hlsPackaging.contentProtection == .none,
+                      hlsPackaging.codecVerification
+                        != .segmentNotInspected,
+                      hlsPackaging.actualVideoCodec
+                        == sourceProfile.videoCodec else {
+                    return nil
+                }
+            }
+            let result = hybridResult(
+                sourceProfile: sourceProfile,
+                hlsPackaging: hlsPackaging,
+                reason: .hybridRecoveryAfterNativeFailure,
+                capabilities: hybridCapabilities
+            )
+            return result.route == .hybridCarrier ? result : nil
+
+        case .hybridCarrier:
+            let result = resolve(
+                sourceProfile: sourceProfile,
+                hlsPackaging: hlsPackaging,
+                hybridCapabilities: hybridCapabilities
+            )
+            return result.route == .nativeAVPlayer ? result : nil
+
+        case .unsupported:
+            return nil
         }
     }
 

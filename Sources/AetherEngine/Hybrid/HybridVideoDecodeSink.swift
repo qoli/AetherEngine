@@ -218,6 +218,8 @@ enum HybridVideoDecodeSinkError:
     case streamContractMismatch
     case decoderOpenFailed(reason: String)
     case decoderFailed(VideoDecoderError)
+    case softwareRecoveryRequiresHEVC
+    case softwareRecoveryForbiddenForDolbyVision
     case invalidDecodedFrameColorMetadata(
         DecodedVideoFrameColorMetadataError
     )
@@ -254,6 +256,10 @@ enum HybridVideoDecodeSinkError:
             return "Hybrid video decoder could not open: \(reason)"
         case .decoderFailed(let error):
             return "Hybrid video decoder failed: \(error.localizedDescription)"
+        case .softwareRecoveryRequiresHEVC:
+            return "Software decoder recovery is restricted to HEVC"
+        case .softwareRecoveryForbiddenForDolbyVision:
+            return "Dolby Vision recovery requires the hardware decoder contract"
         case .invalidDecodedFrameColorMetadata(let error):
             return "Hybrid decoded frame color metadata is invalid: \(error.localizedDescription)"
         case .decodedFrameConstructionFailed(let reason):
@@ -294,6 +300,11 @@ enum HybridVideoDecodeSinkError:
             return "Hybrid video decoder is closed"
         }
     }
+}
+
+enum HybridVideoDecoderPreference: Sendable, Equatable {
+    case automatic
+    case softwareHEVCRecovery
 }
 
 /// Generation-aware adapter from the shared demux packet fanout to `DecodedVideoFrame`.
@@ -352,6 +363,7 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         sourceStartPTSOverride: Int64? = nil,
         maximumQueuedBytes: Int = 96 * 1_024 * 1_024,
         maximumQueuedPackets: Int = 8_192,
+        decoderPreference: HybridVideoDecoderPreference = .automatic,
         onFrame: @escaping FrameHandler,
         onFailure: FailureHandler? = nil
     ) throws {
@@ -390,9 +402,22 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         self.maximumQueuedPackets = maximumQueuedPackets
         frameHandler = onFrame
         failureHandler = onFailure
-        decoder = codecParameters.pointee.codec_id == AV_CODEC_ID_HEVC
-            ? HardwareVideoDecoder()
-            : SoftwareVideoDecoder(threadingMode: .boundedLatency)
+        switch decoderPreference {
+        case .automatic:
+            decoder = codecParameters.pointee.codec_id == AV_CODEC_ID_HEVC
+                ? HardwareVideoDecoder()
+                : SoftwareVideoDecoder(threadingMode: .boundedLatency)
+        case .softwareHEVCRecovery:
+            guard codecParameters.pointee.codec_id == AV_CODEC_ID_HEVC else {
+                throw HybridVideoDecodeSinkError.softwareRecoveryRequiresHEVC
+            }
+            guard streamContract.videoFormat != .dolbyVision,
+                  streamContract.dolbyVisionConfiguration == nil else {
+                throw HybridVideoDecodeSinkError
+                    .softwareRecoveryForbiddenForDolbyVision
+            }
+            decoder = SoftwareVideoDecoder(threadingMode: .boundedLatency)
+        }
 
         callbackBox.sink = self
         do {

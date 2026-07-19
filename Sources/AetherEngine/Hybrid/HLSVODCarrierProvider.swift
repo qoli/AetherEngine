@@ -85,6 +85,7 @@ final class HLSVODCarrierProvider:
             HybridVideoDecodeSink.FrameHandler? = nil,
         videoFailureHandler:
             HybridVideoDecodeSink.FailureHandler? = nil,
+        decoderPreference: HybridVideoDecoderPreference = .automatic,
         initialGeneration: UInt64 = 0,
         maximumResourceBytes: Int =
             HLSVODOriginResourceLoader.defaultMaximumResourceBytes,
@@ -122,6 +123,7 @@ final class HLSVODCarrierProvider:
                     decodedFrameHandler,
                 videoFailureHandler:
                     videoFailureHandler,
+                decoderPreference: decoderPreference,
                 initialGeneration:
                     initialGeneration,
                 maximumResourceBytes:

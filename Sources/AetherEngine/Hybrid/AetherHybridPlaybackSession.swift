@@ -201,7 +201,7 @@ public struct AetherHybridPlaybackDiagnostics: Sendable, Equatable {
 /// `contentOverlayView`. It never receives the provider, demuxer, decoder, frame queue or source-byte store.
 /// Call `stop()` when the playback page is dismissed.
 @MainActor
-public final class AetherHybridPlaybackSession: ObservableObject {
+final class AetherHybridPlaybackSession: ObservableObject {
     /// Capabilities that the current public session can actually admit.
     ///
     /// Clear, finite, seekable HLS VOD is admitted only through an opaque
@@ -343,7 +343,13 @@ public final class AetherHybridPlaybackSession: ObservableObject {
             hlsPackaging: preflightResult.hlsPackaging,
             hybridCapabilities: capabilities
         )
-        guard currentResult == preflightResult else {
+        guard currentResult == preflightResult
+                || PlaybackPreflight.resolveRecoveryAlternate(
+                    sourceProfile: preflightResult.sourceProfile,
+                    hlsPackaging: preflightResult.hlsPackaging,
+                    excluding: .nativeAVPlayer,
+                    hybridCapabilities: capabilities
+                ) == preflightResult else {
             throw HybridPlaybackSessionError
                 .preflightContractChanged(
                     route: currentResult.route,
@@ -413,6 +419,104 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         )
     }
 
+    static func makeSeekableVOD(
+        source: MediaSource,
+        options: LoadOptions,
+        timeline: BlackCarrierTimeline,
+        preflightResult: PlaybackPreflightResult,
+        avPlayer: AVPlayer,
+        decoderPreference: HybridVideoDecoderPreference = .automatic,
+        initialGeneration: UInt64 = 0,
+        selectTitleID: Int? = nil
+    ) async throws -> AetherHybridPlaybackSession {
+        try await makeInjectedSeekableVOD(
+            source: source,
+            options: options,
+            timeline: timeline,
+            preflightResult: preflightResult,
+            avPlayer: avPlayer,
+            decoderPreference: decoderPreference,
+            initialGeneration: initialGeneration,
+            selectTitleID: selectTitleID
+        )
+    }
+
+    private static func makeInjectedSeekableVOD(
+        source: MediaSource,
+        options: LoadOptions,
+        timeline: BlackCarrierTimeline,
+        preflightResult: PlaybackPreflightResult,
+        avPlayer: AVPlayer,
+        decoderPreference: HybridVideoDecoderPreference,
+        initialGeneration: UInt64,
+        selectTitleID: Int?
+    ) async throws -> AetherHybridPlaybackSession {
+        guard preflightResult.route == .hybridCarrier else {
+            throw HybridPlaybackSessionError.preflightRequiresHybrid(
+                route: preflightResult.route,
+                reason: preflightResult.reason
+            )
+        }
+        let currentResult = PlaybackPreflight.resolve(
+            sourceProfile: preflightResult.sourceProfile,
+            hlsPackaging: preflightResult.hlsPackaging,
+            hybridCapabilities: capabilities
+        )
+        guard currentResult == preflightResult
+                || PlaybackPreflight.resolveRecoveryAlternate(
+                    sourceProfile: preflightResult.sourceProfile,
+                    hlsPackaging: preflightResult.hlsPackaging,
+                    excluding: .nativeAVPlayer,
+                    hybridCapabilities: capabilities
+                ) == preflightResult else {
+            throw HybridPlaybackSessionError.preflightContractChanged(
+                route: currentResult.route,
+                reason: currentResult.reason
+            )
+        }
+        guard preflightResult.sourceProfile.sourceKind != .hls else {
+            throw HybridPlaybackSessionError.hlsPreflightRequired
+        }
+        try validate(
+            source: source,
+            options: options,
+            timeline: timeline,
+            sourceKind: preflightResult.sourceProfile.sourceKind
+        )
+        let core = try await HybridPlaybackSession.makeSeekableVOD(
+            source: source,
+            options: options,
+            timeline: timeline,
+            avPlayer: avPlayer,
+            decoderPreference: decoderPreference,
+            initialGeneration: initialGeneration,
+            selectTitleID: selectTitleID
+        )
+        guard core.sourceVideoFormat == preflightResult.sourceProfile.videoFormat else {
+            let decoded = core.sourceVideoFormat
+            core.stop()
+            throw HybridPlaybackSessionError.sourceVideoFormatDiverged(
+                preflight: preflightResult.sourceProfile.videoFormat,
+                decoded: decoded
+            )
+        }
+        guard core.sourceDolbyVisionConfiguration
+                == preflightResult.sourceProfile.dolbyVisionConfiguration else {
+            core.stop()
+            throw HybridPlaybackSessionError.sourceDolbyVisionConfigurationDiverged
+        }
+        guard let presentationView = core.presentationView else {
+            core.stop()
+            throw HybridPlaybackSessionError.renderSurfaceMissing
+        }
+        return AetherHybridPlaybackSession(
+            core: core,
+            preflightResult: preflightResult,
+            timeline: timeline,
+            presentationView: presentationView
+        )
+    }
+
     /// Construct a graph-bound Hybrid session from the exact HLS preflight used for route selection.
     ///
     /// The opaque preflight owns every selected playlist, init segment, media segment and request-header
@@ -452,7 +556,13 @@ public final class AetherHybridPlaybackSession: ObservableObject {
             hlsPackaging: preflight.result.hlsPackaging,
             hybridCapabilities: capabilities
         )
-        guard currentResult == preflight.result else {
+        guard currentResult == preflight.result
+                || PlaybackPreflight.resolveRecoveryAlternate(
+                    sourceProfile: preflight.result.sourceProfile,
+                    hlsPackaging: preflight.result.hlsPackaging,
+                    excluding: .nativeAVPlayer,
+                    hybridCapabilities: capabilities
+                ) == preflight.result else {
             throw HybridPlaybackSessionError
                 .preflightContractChanged(
                     route: currentResult.route,
@@ -483,7 +593,7 @@ public final class AetherHybridPlaybackSession: ObservableObject {
                 .makeHLSVOD(
                     preflight: preflight,
                     bridgeMode: bridgeMode,
-                    initialGeneration:
+            initialGeneration:
                         initialGeneration,
                     fetchOverride: fetchOverride
                 )
@@ -526,6 +636,75 @@ public final class AetherHybridPlaybackSession: ObservableObject {
             core: core,
             preflightResult: preflight.result,
             timeline: timeline,
+            presentationView: presentationView
+        )
+    }
+
+    static func makeHLSVOD(
+        preflight: AetherHLSPlaybackPreflight,
+        bridgeMode: AudioBridgeMode = .surroundCompat,
+        avPlayer: AVPlayer,
+        decoderPreference: HybridVideoDecoderPreference = .automatic,
+        initialGeneration: UInt64 = 0
+    ) async throws -> AetherHybridPlaybackSession {
+        guard preflight.result.route == .hybridCarrier else {
+            throw HybridPlaybackSessionError.preflightRequiresHybrid(
+                route: preflight.result.route,
+                reason: preflight.result.reason
+            )
+        }
+        let currentResult = PlaybackPreflight.resolve(
+            sourceProfile: preflight.result.sourceProfile,
+            hlsPackaging: preflight.result.hlsPackaging,
+            hybridCapabilities: capabilities
+        )
+        guard currentResult == preflight.result
+                || PlaybackPreflight.resolveRecoveryAlternate(
+                    sourceProfile: preflight.result.sourceProfile,
+                    hlsPackaging: preflight.result.hlsPackaging,
+                    excluding: .nativeAVPlayer,
+                    hybridCapabilities: capabilities
+                ) == preflight.result else {
+            throw HybridPlaybackSessionError.preflightContractChanged(
+                route: currentResult.route,
+                reason: currentResult.reason
+            )
+        }
+        guard preflight.result.sourceProfile.sourceKind == .hls else {
+            throw HybridPlaybackSessionError.sourceKindMismatch(expected: .hls)
+        }
+        guard let resourceGraph = preflight.resourceGraph else {
+            throw HybridPlaybackSessionError.hlsPreflightResourceGraphMissing
+        }
+        let core = try await HybridPlaybackSession.makeHLSVOD(
+            preflight: preflight,
+            bridgeMode: bridgeMode,
+            avPlayer: avPlayer,
+            decoderPreference: decoderPreference,
+            initialGeneration: initialGeneration
+        )
+        guard core.sourceVideoFormat == preflight.result.sourceProfile.videoFormat else {
+            let decoded = core.sourceVideoFormat
+            core.stop()
+            throw HybridPlaybackSessionError.sourceVideoFormatDiverged(
+                preflight: preflight.result.sourceProfile.videoFormat,
+                decoded: decoded
+            )
+        }
+        guard core.sourceDolbyVisionConfiguration
+                == preflight.result.sourceProfile.dolbyVisionConfiguration else {
+            core.stop()
+            throw HybridPlaybackSessionError.sourceDolbyVisionConfigurationDiverged
+        }
+        guard resourceGraph.timeline.source == .mirroredHLSVOD,
+              let presentationView = core.presentationView else {
+            core.stop()
+            throw HybridPlaybackSessionError.renderSurfaceMissing
+        }
+        return AetherHybridPlaybackSession(
+            core: core,
+            preflightResult: preflight.result,
+            timeline: resourceGraph.timeline,
             presentationView: presentationView
         )
     }
@@ -1004,7 +1183,7 @@ public final class AetherHybridPlaybackSession: ObservableObject {
         let timelineMatches = switch sourceKind {
         case .progressive, .custom:
             timeline.source == .fixedFileVOD
-        case .hls:
+        case .hls, .unclassifiedURL:
             false
         }
         guard timelineMatches else {

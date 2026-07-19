@@ -84,16 +84,18 @@ final class BlackCarrierAVPlayerSession {
     private var readinessContinuation: CheckedContinuation<Void, Error>?
     private var preparationTimedOut = false
 
-    init(provider: any BlackCarrierTransportProvider) {
+    init(
+        provider: any BlackCarrierTransportProvider,
+        avPlayer: AVPlayer = AVPlayer()
+    ) {
         self.provider = provider
         server = HLSLocalServer(provider: provider)
 
-        let player = AVPlayer()
-        player.allowsExternalPlayback = false
+        avPlayer.allowsExternalPlayback = false
         #if os(iOS) || os(tvOS)
-        player.usesExternalPlaybackWhileExternalScreenIsActive = false
+        avPlayer.usesExternalPlaybackWhileExternalScreenIsActive = false
         #endif
-        avPlayer = player
+        self.avPlayer = avPlayer
     }
 
     func start() throws {

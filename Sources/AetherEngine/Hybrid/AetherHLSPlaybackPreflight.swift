@@ -210,6 +210,9 @@ public struct AetherHLSPlaybackPreflight: Sendable, Equatable {
     public let resourceIdentity: String?
     public let selectedVariantBandwidth: Int?
     public let mediaSegmentCount: Int
+    /// Zero-based media segment that supplied positive video evidence.
+    /// Inspection is bounded to indices 0...2.
+    public let inspectedVideoSegmentIndex: Int?
     public let hasSeparateAudioRenditions: Bool
     public let audioRenditionCount: Int
     public let audioAnalysisPolicy:
@@ -243,6 +246,8 @@ public struct AetherHLSPlaybackPreflight: Sendable, Equatable {
         resourceIdentity = resourceGraph?.identity
         selectedVariantBandwidth = resourceGraph?.selectedVariantBandwidth
         mediaSegmentCount = resourceGraph?.segments.count ?? 0
+        inspectedVideoSegmentIndex =
+            resourceGraph?.inspectedVideoSegmentIndex
         audioRenditionCount =
             resourceGraph?.audioRenditions.count ?? 0
         hasSeparateAudioRenditions = audioRenditionCount > 0
@@ -270,6 +275,20 @@ public struct AetherHLSPlaybackPreflight: Sendable, Equatable {
         self.hdr10PlusEvidence = hdr10PlusEvidence
         self.resourceGraph = resourceGraph
         self.httpHeaders = httpHeaders
+    }
+
+    func replacingResult(
+        _ result: PlaybackPreflightResult
+    ) -> AetherHLSPlaybackPreflight {
+        AetherHLSPlaybackPreflight(
+            result: result,
+            resourceGraph: resourceGraph,
+            httpHeaders: httpHeaders,
+            audioAnalysisPolicy: audioAnalysisPolicy,
+            subtitleRenditions: subtitleRenditions,
+            overlaySubtitleTracks: overlaySubtitleTracks,
+            hdr10PlusEvidence: hdr10PlusEvidence
+        )
     }
 
     private static func defaultAudioAnalysisPolicy(
@@ -426,6 +445,7 @@ struct HLSVODResourceGraph: Sendable, Equatable {
     let inspectedInitSegmentEffectiveURL: URL?
     let inspectedFirstMediaSegmentData: Data
     let inspectedFirstMediaSegmentEffectiveURL: URL
+    let inspectedVideoSegmentIndex: Int
     let timeline: BlackCarrierTimeline
     let identity: String
 
@@ -445,6 +465,9 @@ struct HLSVODResourceGraph: Sendable, Equatable {
         inspectedInitSegmentEffectiveURL: URL?,
         inspectedFirstMediaSegmentData: Data,
         inspectedFirstMediaSegmentEffectiveURL: URL,
+        inspectedVideoSegmentIndex: Int = 0,
+        inspectedVideoSegmentData: Data? = nil,
+        inspectedVideoSegmentEffectiveURL: URL? = nil,
         httpHeaders: [String: String]
     ) throws -> HLSVODResourceGraph {
         if let separateAudioGroupID {
@@ -512,6 +535,25 @@ struct HLSVODResourceGraph: Sendable, Equatable {
         ) != nil else {
             throw HLSPreflightError.invalidPlaylist(
                 "selected video first-segment effective URL is not HTTP(S)"
+            )
+        }
+        guard (0 ..< min(3, segmentResources.count))
+                .contains(inspectedVideoSegmentIndex) else {
+            throw HLSPreflightError.invalidPlaylist(
+                "video inspection segment index exceeds the three-segment bound"
+            )
+        }
+        let boundInspectionData = inspectedVideoSegmentData
+            ?? inspectedFirstMediaSegmentData
+        let boundInspectionEffectiveURL =
+            inspectedVideoSegmentEffectiveURL
+            ?? inspectedFirstMediaSegmentEffectiveURL
+        guard !boundInspectionData.isEmpty,
+              HLSVODOriginScope(
+                url: boundInspectionEffectiveURL
+              ) != nil else {
+            throw HLSPreflightError.invalidPlaylist(
+                "selected video inspection evidence is missing"
             )
         }
         if initSegmentURL == nil {
@@ -590,6 +632,12 @@ struct HLSVODResourceGraph: Sendable, Equatable {
                 inspectedFirstMediaSegmentData,
             inspectedFirstMediaSegmentEffectiveURL:
                 inspectedFirstMediaSegmentEffectiveURL,
+            inspectedVideoSegmentIndex:
+                inspectedVideoSegmentIndex,
+            inspectedVideoSegmentData:
+                boundInspectionData,
+            inspectedVideoSegmentEffectiveURL:
+                boundInspectionEffectiveURL,
             httpHeaders: httpHeaders
         )
         return HLSVODResourceGraph(
@@ -613,6 +661,8 @@ struct HLSVODResourceGraph: Sendable, Equatable {
                 inspectedFirstMediaSegmentData,
             inspectedFirstMediaSegmentEffectiveURL:
                 inspectedFirstMediaSegmentEffectiveURL,
+            inspectedVideoSegmentIndex:
+                inspectedVideoSegmentIndex,
             timeline: timeline,
             identity: identity
         )
@@ -723,6 +773,9 @@ struct HLSVODResourceGraph: Sendable, Equatable {
         inspectedInitSegmentEffectiveURL: URL?,
         inspectedFirstMediaSegmentData: Data,
         inspectedFirstMediaSegmentEffectiveURL: URL,
+        inspectedVideoSegmentIndex: Int,
+        inspectedVideoSegmentData: Data,
+        inspectedVideoSegmentEffectiveURL: URL,
         httpHeaders: [String: String]
     ) -> String {
         var evidence = Data()
@@ -759,6 +812,17 @@ struct HLSVODResourceGraph: Sendable, Equatable {
         )
         append(
             inspectedFirstMediaSegmentEffectiveURL.absoluteString,
+            to: &evidence
+        )
+        append(String(inspectedVideoSegmentIndex), to: &evidence)
+        append(
+            HLSVODResourceDigest.sha256(
+                inspectedVideoSegmentData
+            ),
+            to: &evidence
+        )
+        append(
+            inspectedVideoSegmentEffectiveURL.absoluteString,
             to: &evidence
         )
         evidence.append(mediaPlaylistData)

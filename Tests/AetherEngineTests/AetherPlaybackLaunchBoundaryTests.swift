@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import Testing
 @testable import AetherEngine
@@ -195,6 +196,29 @@ struct AetherPlaybackLaunchBoundaryTests {
         #expect(throws: AetherNativePlaybackSessionError.stopped) {
             try session.play()
         }
+    }
+
+    @MainActor
+    @Test("Native route implementation retains the unified player identity")
+    func nativeRouteUsesInjectedPlayer() throws {
+        let stablePlayer = AVPlayer()
+        let session = try AetherNativePlaybackSession.make(
+            url: URL(fileURLWithPath: "/not-opened.mp4"),
+            preflightResult: nativePreflight(),
+            audioAnalysisBinding: .unavailable(
+                sourceURL: URL(
+                    fileURLWithPath: "/not-opened.mp4"
+                ),
+                httpHeaders: [:],
+                error: .analysisFailed("not prepared")
+            ),
+            avPlayer: stablePlayer
+        )
+
+        #expect(session.avPlayer === stablePlayer)
+        #expect(stablePlayer.currentItem === session.avPlayerItem)
+        session.stop()
+        #expect(stablePlayer.currentItem == nil)
     }
 
     @MainActor

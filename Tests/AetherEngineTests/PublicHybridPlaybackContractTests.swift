@@ -1,35 +1,12 @@
 import AetherEngine
-import CoreMedia
 import Foundation
 import Testing
-
-private final class PublicHybridEmptyReader:
-    IOReader,
-    @unchecked Sendable
-{
-    func read(
-        _ buffer: UnsafeMutablePointer<UInt8>?,
-        size: Int32
-    ) -> Int32 {
-        0
-    }
-
-    func seek(offset: Int64, whence: Int32) -> Int64 {
-        0
-    }
-
-    func close() {}
-
-    func makeIndependentReader() -> IOReader? {
-        PublicHybridEmptyReader()
-    }
-}
 
 @Suite("Public hybrid playback contract")
 struct PublicHybridPlaybackContractTests {
     @Test("Current admission is explicit about source, color and system-output limits")
     func currentCapabilitiesAndSystemFeaturePolicy() {
-        let capabilities = AetherHybridPlaybackSession.capabilities
+        let capabilities = AetherPlaybackSession.hybridCapabilities
 
         #expect(capabilities.supportedSourceKinds == [
             .hls,
@@ -46,21 +23,21 @@ struct PublicHybridPlaybackContractTests {
             capabilities.supportedDolbyVisionProfiles == [.profile84]
         )
         #expect(
-            AetherHybridPlaybackSession.systemFeaturePolicy
+            AetherPlaybackSession.hybridSystemFeaturePolicy
                 .availability(for: .pictureInPictureVideo)
                 == .unavailable(
                     .presentationOverlayUnavailableInPictureInPicture
                 )
         )
         #expect(
-            AetherHybridPlaybackSession.systemFeaturePolicy
+            AetherPlaybackSession.hybridSystemFeaturePolicy
                 .availability(for: .airPlayVideo)
                 == .unavailable(
                     .presentationOverlayUnavailableOnAirPlayReceiver
                 )
         )
         #expect(
-            AetherHybridPlaybackSession.systemFeaturePolicy
+            AetherPlaybackSession.hybridSystemFeaturePolicy
                 .availability(for: .externalDisplayVideo)
                 == .unavailable(
                     .presentationOverlayUnavailableOnExternalDisplay
@@ -87,7 +64,7 @@ struct PublicHybridPlaybackContractTests {
             ),
             hlsPackaging: packaging,
             hybridCapabilities:
-                AetherHybridPlaybackSession.capabilities
+                AetherPlaybackSession.hybridCapabilities
         )
         #expect(hdr10.route == .hybridCarrier)
         #expect(hdr10.reason == .hybridHEV1SampleEntry)
@@ -101,7 +78,7 @@ struct PublicHybridPlaybackContractTests {
             ),
             hlsPackaging: packaging,
             hybridCapabilities:
-                AetherHybridPlaybackSession.capabilities
+                AetherPlaybackSession.hybridCapabilities
         )
         #expect(hlg.route == .hybridCarrier)
         #expect(hlg.reason == .hybridHEV1SampleEntry)
@@ -128,7 +105,7 @@ struct PublicHybridPlaybackContractTests {
             ),
             hlsPackaging: packaging,
             hybridCapabilities:
-                AetherHybridPlaybackSession.capabilities
+                AetherPlaybackSession.hybridCapabilities
         )
         #expect(dolbyVision84.route == .hybridCarrier)
         #expect(dolbyVision84.reason == .hybridHEV1SampleEntry)
@@ -142,7 +119,7 @@ struct PublicHybridPlaybackContractTests {
             ),
             hlsPackaging: packaging,
             hybridCapabilities:
-                AetherHybridPlaybackSession.capabilities
+                AetherPlaybackSession.hybridCapabilities
         )
         #expect(hdr10Plus.route == .unsupported)
         #expect(hdr10Plus.reason == .unsupportedHybridVideoFormat)
@@ -168,7 +145,7 @@ struct PublicHybridPlaybackContractTests {
             sourceProfile: source,
             hlsPackaging: packaging,
             hybridCapabilities:
-                AetherHybridPlaybackSession.capabilities
+                AetherPlaybackSession.hybridCapabilities
         )
 
         #expect(result.route == .hybridCarrier)
@@ -176,95 +153,31 @@ struct PublicHybridPlaybackContractTests {
     }
 
     @MainActor
-    @Test("Public factory refuses a non-hybrid preflight without opening the source")
-    func publicFactoryRejectsNativeRoute() async throws {
-        let sourceProfile = AetherSourceProfile(
-            sourceKind: .custom,
-            isSeekableVOD: true,
-            videoCodec: .h264,
-            videoFormat: .sdr
-        )
-        let preflight = PlaybackPreflight.resolve(
-            sourceProfile: sourceProfile,
-            hlsPackaging: nil,
-            hybridCapabilities:
-                AetherHybridPlaybackSession.capabilities
-        )
-        let timeline = try BlackCarrierTimeline.fileVOD(
-            duration: CMTime(
-                seconds: 1,
-                preferredTimescale: 90_000
-            )
-        )
-        let expected = HybridPlaybackSessionError
-            .preflightRequiresHybrid(
-                route: .nativeAVPlayer,
-                reason: .nativeContainerRepackaging
+    @Test("Public factory returns one unresolved session without opening the source")
+    func publicFactoryReturnsUnifiedSession() throws {
+        let session = try AetherPlaybackSessionFactory
+            .makeSeekableURLVOD(
+                url: URL(
+                    string: "https://example.invalid/media.m3u8"
+                )!
             )
 
-        await #expect(throws: expected) {
-            try await AetherHybridPlaybackSession
-                .makeSeekableVOD(
-                    source: .custom(
-                        PublicHybridEmptyReader(),
-                        formatHint: "mp4"
-                    ),
-                    options: LoadOptions(),
-                    timeline: timeline,
-                    preflightResult: preflight
-                )
-        }
+        #expect(session.state == .idle)
+        #expect(session.activeRoute == nil)
+        #expect(session.currentItem == nil)
+        #expect(session.avPlayer.currentItem == nil)
     }
 
     @MainActor
-    @Test("Generic seekable factory requires the opaque HLS preflight factory")
-    func publicSeekableFactoryRejectsHLSBypass() async throws {
-        let sourceProfile = AetherSourceProfile(
-            sourceKind: .hls,
-            isSeekableVOD: true,
-            videoCodec: .hevc,
-            videoFormat: .sdr
-        )
-        let packaging = HLSVideoPackaging(
-            container: .fragmentedMP4,
-            sampleEntry: .hev1,
-            manifestCodecs: ["hev1"],
-            actualVideoCodec: .hevc,
-            codecVerification: .verified,
-            contentProtection: .none
-        )
-        let preflight = PlaybackPreflight.resolve(
-            sourceProfile: sourceProfile,
-            hlsPackaging: packaging,
-            hybridCapabilities: HybridPlaybackCapabilities(
-                hasDirectVideoDecoder: true,
-                hasSampleBufferRenderer: true,
-                supportedVideoFormats: [.sdr]
+    @Test("Public URL factory rejects a non-media URL scheme")
+    func publicFactoryRejectsNonMediaScheme() {
+        #expect(
+            throws: AetherPlaybackSessionFactoryError
+                .invalidURLSourceKind
+        ) {
+            try AetherPlaybackSessionFactory.makeSeekableURLVOD(
+                url: URL(string: "ftp://example.invalid/media.mp4")!
             )
-        )
-        let timeline = try BlackCarrierTimeline
-            .mirroredHLSVOD(segmentDurations: [
-                CMTime(
-                    seconds: 1,
-                    preferredTimescale: 90_000
-                ),
-            ])
-        let expected = HybridPlaybackSessionError
-            .hlsPreflightRequired
-
-        await #expect(throws: expected) {
-            try await AetherHybridPlaybackSession
-                .makeSeekableVOD(
-                    source: .url(
-                        URL(
-                            string:
-                                "https://example.invalid/media.m3u8"
-                        )!
-                    ),
-                    options: LoadOptions(),
-                    timeline: timeline,
-                    preflightResult: preflight
-                )
         }
     }
 }
