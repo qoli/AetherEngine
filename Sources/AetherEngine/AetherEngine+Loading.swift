@@ -93,7 +93,9 @@ extension AetherEngine {
         if let existing = nativeHost {
             host = existing
         } else {
-            host = NativeAVPlayerHost()
+            host = NativeAVPlayerHost(
+                avPlayer: injectedNativeAVPlayer ?? AVPlayer()
+            )
         }
         host.playerLayer.videoGravity = _videoGravity
         if !pendingExternalMetadata.isEmpty {
@@ -548,7 +550,9 @@ extension AetherEngine {
         if let existing = nativeHost {
             host = existing
         } else {
-            host = NativeAVPlayerHost()
+            host = NativeAVPlayerHost(
+                avPlayer: injectedNativeAVPlayer ?? AVPlayer()
+            )
         }
         host.playerLayer.videoGravity = _videoGravity
         // Forward pre-load externalMetadata so the AVPlayerItem picks it up before AVPlayer assigns it.

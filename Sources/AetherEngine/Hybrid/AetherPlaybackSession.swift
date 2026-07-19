@@ -261,14 +261,15 @@ private enum AetherResolvedPlaybackSource {
     case hls(AetherHLSPlaybackPreflight)
     case progressive(
         probe: SourceProbe,
-        result: PlaybackPreflightResult
+        result: PlaybackPreflightResult,
+        preparedSource: AetherPreparedURLSource?
     )
     case provisionalNative(PlaybackPreflightResult)
 
     var result: PlaybackPreflightResult {
         switch self {
         case .hls(let preflight): preflight.result
-        case .progressive(_, let result): result
+        case .progressive(_, let result, _): result
         case .provisionalNative(let result): result
         }
     }
@@ -291,10 +292,11 @@ private enum AetherResolvedPlaybackSource {
         switch self {
         case .hls(let preflight):
             return .hls(preflight.replacingResult(alternate))
-        case .progressive(let probe, _):
+        case .progressive(let probe, _, let preparedSource):
             return .progressive(
                 probe: probe,
-                result: alternate
+                result: alternate,
+                preparedSource: preparedSource
             )
         case .provisionalNative:
             return nil
@@ -317,8 +319,12 @@ private enum AetherResolvedPlaybackSource {
         switch self {
         case .hls(let preflight):
             return .hls(preflight.replacingResult(result))
-        case .progressive(let probe, _):
-            return .progressive(probe: probe, result: result)
+        case .progressive(let probe, _, let preparedSource):
+            return .progressive(
+                probe: probe,
+                result: result,
+                preparedSource: preparedSource
+            )
         case .provisionalNative:
             return nil
         }
@@ -707,16 +713,17 @@ public final class AetherPlaybackSession: ObservableObject {
 
         case .progressive:
             do {
-                let probe: SourceProbe = try await retryTransport(
+                let preparedSource = try await retryTransport(
                     stage: .preflight
                 ) {
                     try await Task.detached(priority: .userInitiated) {
-                        try AetherEngine.probe(
+                        try AetherEngine.prepareURLSource(
                             url: self.url,
                             options: self.options
                         )
                     }.value
                 }
+                let probe = preparedSource.probe
                 let isSeekableVOD =
                     probe.durationSeconds.isFinite
                     && probe.durationSeconds > 0
@@ -732,7 +739,20 @@ public final class AetherPlaybackSession: ObservableObject {
                     hybridCapabilities:
                         AetherHybridPlaybackSession.capabilities
                 )
-                return .progressive(probe: probe, result: result)
+                let retainedPreparedSource:
+                    AetherPreparedURLSource?
+                if result.route == .nativeAVPlayer,
+                   result.reason == .nativeHLSFMP4Remux {
+                    retainedPreparedSource = preparedSource
+                } else {
+                    preparedSource.discard()
+                    retainedPreparedSource = nil
+                }
+                return .progressive(
+                    probe: probe,
+                    result: result,
+                    preparedSource: retainedPreparedSource
+                )
             } catch {
                 let failure = failure(stage: .preflight, error: error)
                 if allowProvisionalNative,
@@ -801,7 +821,7 @@ public final class AetherPlaybackSession: ObservableObject {
                         options: options,
                         preflight: preflight
                     )
-            case .progressive(let probe, _):
+            case .progressive(let probe, _, _):
                 binding = .progressive(
                     sourceURL: url,
                     httpHeaders: options.httpHeaders,
@@ -816,15 +836,34 @@ public final class AetherPlaybackSession: ObservableObject {
                     )
                 )
             }
-            return .native(
-                try AetherNativePlaybackSession.make(
-                    url: url,
-                    options: options,
-                    preflightResult: source.result,
-                    audioAnalysisBinding: binding,
-                    avPlayer: avPlayer
+            if case .progressive(
+                _, let result, let preparedSource
+            ) = source,
+               result.reason == .nativeHLSFMP4Remux {
+                guard let preparedSource else {
+                    throw AetherNativePlaybackSessionError
+                        .nativeRemuxRequiresPreparedSource
+                }
+                return .native(
+                    try await AetherNativePlaybackSession.makeRemuxed(
+                        preparedSource: preparedSource,
+                        options: options,
+                        preflightResult: source.result,
+                        audioAnalysisBinding: binding,
+                        avPlayer: avPlayer
+                    )
                 )
-            )
+            } else {
+                return .native(
+                    try AetherNativePlaybackSession.make(
+                        url: url,
+                        options: options,
+                        preflightResult: source.result,
+                        audioAnalysisBinding: binding,
+                        avPlayer: avPlayer
+                    )
+                )
+            }
 
         case .hybridCarrier:
             switch source {
@@ -836,7 +875,7 @@ public final class AetherPlaybackSession: ObservableObject {
                         decoderPreference: decoderPreference
                     )
                 )
-            case .progressive(let probe, let result):
+            case .progressive(let probe, let result, _):
                 let timeline = try BlackCarrierTimeline.fileVOD(
                     duration: CMTime(
                         seconds: probe.durationSeconds,

@@ -25,12 +25,14 @@ final class PlaybackPreflightTests: XCTestCase {
         kind: AetherMediaSourceKind = .hls,
         seekableVOD: Bool = true,
         codec: AetherVideoCodec = .hevc,
+        container: AetherSourceContainer = .unknown,
         format: VideoFormat = .sdr
     ) -> AetherSourceProfile {
         AetherSourceProfile(
             sourceKind: kind,
             isSeekableVOD: seekableVOD,
             videoCodec: codec,
+            sourceContainer: container,
             videoFormat: format
         )
     }
@@ -393,6 +395,54 @@ final class PlaybackPreflightTests: XCTestCase {
 
         XCTAssertEqual(result.route, .hybridCarrier)
         XCTAssertEqual(result.reason, .hybridNonAVPlayerCodec)
+    }
+
+    func testMatroskaHEVCUsesNativeHLSFMP4Remux() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(
+                kind: .progressive,
+                codec: .hevc,
+                container: .matroska
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .nativeAVPlayer)
+        XCTAssertEqual(result.reason, .nativeHLSFMP4Remux)
+    }
+
+    func testMatroskaH264UsesNativeHLSFMP4Remux() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(
+                kind: .progressive,
+                codec: .h264,
+                container: .matroska
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .nativeAVPlayer)
+        XCTAssertEqual(result.reason, .nativeHLSFMP4Remux)
+    }
+
+    func testUnknownProgressiveContainerFailsInsteadOfPassingRawURLToAVPlayer() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(
+                kind: .progressive,
+                codec: .hevc,
+                container: .unknown
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(
+            result.reason,
+            .unsupportedProgressiveContainerUnverified
+        )
     }
 
     func testHybridSourceKindMustBePubliclyAdmitted() {

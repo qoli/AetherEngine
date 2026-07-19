@@ -5,6 +5,83 @@ import Libavformat
 import Libavcodec
 import Libavutil
 
+enum AetherPreparedURLSourceError: Error, LocalizedError {
+    case identityMismatch
+    case alreadyConsumed
+
+    var errorDescription: String? {
+        switch self {
+        case .identityMismatch:
+            "Prepared media facts do not match the canonical request"
+        case .alreadyConsumed:
+            "Prepared media source has already been consumed"
+        }
+    }
+}
+
+/// Owns the exact FFmpeg demuxer that established a progressive URL's
+/// preflight facts. A native HLS-fMP4 route consumes it once, transferring
+/// ownership into `HLSVideoEngine`; all other routes discard it explicitly.
+/// This prevents a second origin open between route admission and playback.
+final class AetherPreparedURLSource: @unchecked Sendable {
+    let url: URL
+    let httpHeaders: [String: String]
+    let isLive: Bool
+    let probesize: Int64?
+    let maxAnalyzeDuration: Int64?
+    let probe: SourceProbe
+
+    private let lock = NSLock()
+    private var demuxer: Demuxer?
+
+    init(
+        url: URL,
+        options: LoadOptions,
+        probe: SourceProbe,
+        demuxer: Demuxer
+    ) {
+        self.url = url
+        httpHeaders = options.httpHeaders
+        isLive = options.isLive
+        probesize = options.probesize
+        maxAnalyzeDuration = options.maxAnalyzeDuration
+        self.probe = probe
+        self.demuxer = demuxer
+    }
+
+    func consume(
+        url: URL,
+        options: LoadOptions
+    ) throws -> Demuxer {
+        guard self.url == url,
+              httpHeaders == options.httpHeaders,
+              isLive == options.isLive,
+              probesize == options.probesize,
+              maxAnalyzeDuration == options.maxAnalyzeDuration else {
+            throw AetherPreparedURLSourceError.identityMismatch
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let demuxer else {
+            throw AetherPreparedURLSourceError.alreadyConsumed
+        }
+        self.demuxer = nil
+        return demuxer
+    }
+
+    func discard() {
+        lock.lock()
+        let demuxer = demuxer
+        self.demuxer = nil
+        lock.unlock()
+        demuxer?.close()
+    }
+
+    deinit {
+        discard()
+    }
+}
+
 extension AetherEngine {
 
     // MARK: - Probe
@@ -39,6 +116,41 @@ extension AetherEngine {
         }
         defer { demuxer.close() }
         return makeSourceProbe(demuxer: demuxer, displayURL: displayURL)
+    }
+
+    /// Probe a URL while retaining the exact open demuxer for a subsequent
+    /// native HLS-fMP4 load. The returned owner is single-consumer and binds
+    /// URL, headers and probe budgets to prevent request substitution.
+    nonisolated static func prepareURLSource(
+        url: URL,
+        options: LoadOptions = .init()
+    ) throws -> AetherPreparedURLSource {
+        let demuxer = Demuxer()
+        do {
+            let profile = DemuxerOpenProfile.playback.withProbeBudget(
+                probesize: options.probesize,
+                maxAnalyzeDuration: options.maxAnalyzeDuration
+            )
+            try demuxer.open(
+                url: url,
+                extraHeaders: options.httpHeaders,
+                profile: profile,
+                isLive: options.isLive
+            )
+            let probe = makeSourceProbe(
+                demuxer: demuxer,
+                displayURL: url
+            )
+            return AetherPreparedURLSource(
+                url: url,
+                options: options,
+                probe: probe,
+                demuxer: demuxer
+            )
+        } catch {
+            demuxer.close()
+            throw error
+        }
     }
 
     /// Assemble a `SourceProbe` from an open demuxer. Shared by static probe entry points and `load(source:)`'s internal probe stage so all report identical metadata.
@@ -92,6 +204,7 @@ extension AetherEngine {
             videoFormat: detectedFormat,
             videoCodecID: Int32(bitPattern: detectedCodecID.rawValue),
             videoCodecName: codecName,
+            sourceContainer: demuxer.sourceContainer,
             videoWidth: width,
             videoHeight: height,
             videoFrameRate: snappedRate,

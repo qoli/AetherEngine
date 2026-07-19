@@ -59,9 +59,9 @@ struct AetherPlaybackLaunchBoundaryTests {
     private func nativePreflight() -> PlaybackPreflightResult {
         PlaybackPreflight.resolve(
             sourceProfile: AetherSourceProfile(
-                sourceKind: .progressive,
+                sourceKind: .unclassifiedURL,
                 isSeekableVOD: true,
-                videoCodec: .h264,
+                videoCodec: .unknown,
                 videoFormat: .sdr
             ),
             hlsPackaging: nil,
@@ -80,6 +80,17 @@ struct AetherPlaybackLaunchBoundaryTests {
         let url = directory.appendingPathComponent("source.wav")
         try makeWAV().write(to: url)
         return url
+    }
+
+    private func blackCarrierSourceURL() -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources")
+            .appendingPathComponent("AetherEngine")
+            .appendingPathComponent("Resources")
+            .appendingPathComponent("black-carrier-idr.mp4")
     }
 
     @Test("HLS classification is based on bytes, including BOM and whitespace")
@@ -169,23 +180,58 @@ struct AetherPlaybackLaunchBoundaryTests {
     }
 
     @MainActor
-    @Test("A native session exclusively owns and tears down its player item")
-    func nativeSessionOwnership() throws {
-        let profile = AetherSourceProfile(
-            sourceKind: .progressive,
-            isSeekableVOD: true,
-            videoCodec: .h264,
-            videoFormat: .sdr
-        )
+    @Test("A progressive remux admission cannot use the direct AVURLAsset factory")
+    func remuxAdmissionRejectsDirectNativeFactory() throws {
         let preflight = PlaybackPreflight.resolve(
-            sourceProfile: profile,
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .progressive,
+                isSeekableVOD: true,
+                videoCodec: .hevc,
+                sourceContainer: .matroska,
+                videoFormat: .sdr
+            ),
             hlsPackaging: nil,
             hybridCapabilities:
                 AetherHybridPlaybackSession.capabilities
         )
+
+        #expect(
+            throws: AetherNativePlaybackSessionError
+                .nativeRemuxRequiresPreparedSource
+        ) {
+            try AetherNativePlaybackSession.make(
+                url: URL(fileURLWithPath: "/not-opened.mkv"),
+                preflightResult: preflight
+            )
+        }
+    }
+
+    @Test("Prepared progressive facts are bound to the canonical request")
+    func preparedSourceRejectsRequestSubstitution() throws {
+        let prepared = try AetherEngine.prepareURLSource(
+            url: blackCarrierSourceURL()
+        )
+        defer { prepared.discard() }
+        let substitutedURL = blackCarrierSourceURL()
+            .deletingLastPathComponent()
+            .appendingPathComponent("different.mp4")
+
+        #expect(
+            throws: AetherPreparedURLSourceError.identityMismatch
+        ) {
+            _ = try prepared.consume(
+                url: substitutedURL,
+                options: .init()
+            )
+        }
+    }
+
+    @MainActor
+    @Test("A native session exclusively owns and tears down its player item")
+    func nativeSessionOwnership() throws {
         let session = try AetherNativePlaybackSession.make(
             url: URL(fileURLWithPath: "/not-opened.mp4"),
-            preflightResult: preflight
+            preflightResult: nativePreflight()
         )
 
         #expect(session.avPlayer.currentItem === session.avPlayerItem)
@@ -217,6 +263,50 @@ struct AetherPlaybackLaunchBoundaryTests {
 
         #expect(session.avPlayer === stablePlayer)
         #expect(stablePlayer.currentItem === session.avPlayerItem)
+        session.stop()
+        #expect(stablePlayer.currentItem == nil)
+    }
+
+    @MainActor
+    @Test("Progressive Native admission remuxes to local HLS on the stable player")
+    func progressiveNativeUsesLocalHLSRemux() async throws {
+        let originURL = ProcessInfo.processInfo.environment[
+            "AETHER_NATIVE_REMUX_TEST_SOURCE"
+        ].map(URL.init(fileURLWithPath:)) ?? blackCarrierSourceURL()
+        let session = try AetherPlaybackSessionFactory
+            .makeSeekableURLVOD(url: originURL)
+        let stablePlayer = session.avPlayer
+        let stablePresentation = session.presentationView
+
+        try await session.prepare()
+
+        #expect(session.avPlayer === stablePlayer)
+        #expect(session.presentationView === stablePresentation)
+        #expect(session.activeRoute == .nativeAVPlayer)
+        #expect(
+            session.preflightResult?.reason
+                == .nativeHLSFMP4Remux
+        )
+        let expectedContainer: AetherSourceContainer =
+            originURL.pathExtension.lowercased() == "mkv"
+                ? .matroska
+                : .isoBaseMedia
+        #expect(
+            session.preflightResult?.sourceProfile
+                .sourceContainer == expectedContainer
+        )
+        guard let asset = session.currentItem?.asset
+                as? AVURLAsset else {
+            Issue.record("Native remux did not publish an AVURLAsset")
+            session.stop()
+            return
+        }
+        #expect(asset.url != originURL)
+        #expect(
+            asset.url.host == "127.0.0.1"
+                || asset.url.host == "localhost"
+        )
+
         session.stop()
         #expect(stablePlayer.currentItem == nil)
     }

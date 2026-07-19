@@ -494,6 +494,11 @@ public final class AetherEngine: ObservableObject {
     /// Native AVPlayer + AVPlayerLayer host. Non-nil between load and stop.
     var nativeHost: NativeAVPlayerHost?
 
+    /// Unified-session injection seam. The full engine still owns item and
+    /// pipeline lifecycle; only the stable AVPlayer identity comes from the
+    /// outer AetherPlaybackSession.
+    let injectedNativeAVPlayer: AVPlayer?
+
     /// Combine subscriptions mirroring nativeHost's @Published into the engine. Cancelled in stopInternal.
     var nativeCancellables: Set<AnyCancellable> = []
 
@@ -1222,7 +1227,12 @@ public final class AetherEngine: ObservableObject {
     #endif
     #endif
 
-    public init() throws {
+    public convenience init() throws {
+        try self.init(nativeAVPlayer: nil)
+    }
+
+    init(nativeAVPlayer: AVPlayer?) throws {
+        injectedNativeAVPlayer = nativeAVPlayer
         // Route av_log into EngineLog before any libav* entry point so probe/load diagnostics are captured.
         FFmpegLogBridge.install()
 
@@ -1342,6 +1352,43 @@ public final class AetherEngine: ObservableObject {
         audioSourceStreamIndex: Int32? = nil,
         discTitleID: Int? = nil
     ) async throws -> SourceProbe? {
+        try await loadImpl(
+            source: source,
+            startPosition: startPosition,
+            options: options,
+            audioSourceStreamIndex: audioSourceStreamIndex,
+            discTitleID: discTitleID,
+            preparedURLSource: nil
+        )
+    }
+
+    /// Internal single-open handoff used by the unified playback session.
+    /// The prepared owner validates the canonical URL/header/probe contract
+    /// before transferring its demuxer into the normal native pipeline.
+    func load(
+        preparedURLSource: AetherPreparedURLSource,
+        startPosition: Double? = nil,
+        options: LoadOptions = .init(),
+        audioSourceStreamIndex: Int32? = nil
+    ) async throws -> SourceProbe? {
+        try await loadImpl(
+            source: .url(preparedURLSource.url),
+            startPosition: startPosition,
+            options: options,
+            audioSourceStreamIndex: audioSourceStreamIndex,
+            discTitleID: nil,
+            preparedURLSource: preparedURLSource
+        )
+    }
+
+    private func loadImpl(
+        source: MediaSource,
+        startPosition: Double?,
+        options: LoadOptions,
+        audioSourceStreamIndex: Int32?,
+        discTitleID: Int?,
+        preparedURLSource: AetherPreparedURLSource?
+    ) async throws -> SourceProbe? {
         // Preserve the NativeAVPlayerHost across native->native reloads so AVKit's system Now-Playing
         // registration survives the seam (issue #15). Captured before stopInternal resets playbackBackend;
         // the SW dispatch branch releases it if this source routes software.
@@ -1460,7 +1507,18 @@ public final class AetherEngine: ObservableObject {
         var probedAudioTracks: [TrackInfo] = []
         var probedSubtitleTracks: [TrackInfo] = []
         var probedDefaultAudioIndex: Int32 = -1
-        let probe = Demuxer()
+        let probe: Demuxer
+        let probeWasPrepared: Bool
+        if let preparedURLSource {
+            probe = try preparedURLSource.consume(
+                url: url,
+                options: options
+            )
+            probeWasPrepared = true
+        } else {
+            probe = Demuxer()
+            probeWasPrepared = false
+        }
         // Register so stopInternal can markClosed(): avformat_open_input/find_stream_info can block for the
         // full AVIOReader reconnect budget (device repro: a 500-looping channel kept reconnecting across three
         // subsequent sessions until the budget ran out).
@@ -1473,21 +1531,23 @@ public final class AetherEngine: ObservableObject {
             // Detach avformat_open_input + find_stream_info off @MainActor (~6 s on a slow CDN).
             // AetherEngine#10: a @MainActor async body without a suspension point blocks the main thread
             // despite the async signature; Task.detached.value introduces a real background hop.
-            try await Task.detached(priority: .userInitiated) { [probe, source, options] in
-                // Caller-bounded find_stream_info budget (#68); nil keeps the .playback default. This probe
-                // demuxer is reused as the session demuxer, so the cap lands on the open that actually pays it.
-                let probeProfile = DemuxerOpenProfile.playback.withProbeBudget(
-                    probesize: options.probesize, maxAnalyzeDuration: options.maxAnalyzeDuration)
-                switch source {
-                case .url(let u):
-                    // isLive configures the AVIOReader for endless-feed mode; must be set at open time because
-                    // the probe demuxer is reused as the session demuxer (avformat_open_input runs only once).
-                    try probe.open(url: u, extraHeaders: options.httpHeaders, profile: probeProfile, isLive: options.isLive, selectTitleID: discTitleID)
-                case .custom(let reader, let formatHint):
-                    // isLive suppresses SEEK_END duration estimate on forward-only live readers; same open-time requirement.
-                    try probe.open(reader: reader, formatHint: formatHint, profile: probeProfile, isLive: options.isLive, selectTitleID: discTitleID)
-                }
-            }.value
+            if !probeWasPrepared {
+                try await Task.detached(priority: .userInitiated) { [probe, source, options] in
+                    // Caller-bounded find_stream_info budget (#68); nil keeps the .playback default. This probe
+                    // demuxer is reused as the session demuxer, so the cap lands on the open that actually pays it.
+                    let probeProfile = DemuxerOpenProfile.playback.withProbeBudget(
+                        probesize: options.probesize, maxAnalyzeDuration: options.maxAnalyzeDuration)
+                    switch source {
+                    case .url(let u):
+                        // isLive configures the AVIOReader for endless-feed mode; must be set at open time because
+                        // the probe demuxer is reused as the session demuxer (avformat_open_input runs only once).
+                        try probe.open(url: u, extraHeaders: options.httpHeaders, profile: probeProfile, isLive: options.isLive, selectTitleID: discTitleID)
+                    case .custom(let reader, let formatHint):
+                        // isLive suppresses SEEK_END duration estimate on forward-only live readers; same open-time requirement.
+                        try probe.open(reader: reader, formatHint: formatHint, profile: probeProfile, isLive: options.isLive, selectTitleID: discTitleID)
+                    }
+                }.value
+            }
             probeOpened = true
             let videoIdx = probe.videoStreamIndex
             if videoIdx >= 0, let stream = probe.stream(at: videoIdx) {

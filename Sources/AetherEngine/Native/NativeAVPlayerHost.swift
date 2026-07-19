@@ -98,8 +98,7 @@ final class NativeAVPlayerHost {
 
     // MARK: - Init
 
-    init() {
-        let player = AVPlayer()
+    init(avPlayer player: AVPlayer = AVPlayer()) {
         // Keep automaticallyWaitsToMinimizeStalling at default true: false caused permanent startup stall on 4K HEVC (rate dropped to 0 after asset.load and never resumed).
         self.avPlayer = player
         self.playerLayer = AVPlayerLayer(player: player)

@@ -59,6 +59,7 @@ public struct AetherSourceProfile: Sendable, Equatable {
     public let sourceKind: AetherMediaSourceKind
     public let isSeekableVOD: Bool
     public let videoCodec: AetherVideoCodec
+    public let sourceContainer: AetherSourceContainer
     public let videoFormat: VideoFormat
     public let dolbyVisionConfiguration:
         AetherDolbyVisionConfiguration?
@@ -68,6 +69,7 @@ public struct AetherSourceProfile: Sendable, Equatable {
         sourceKind: AetherMediaSourceKind,
         isSeekableVOD: Bool,
         videoCodec: AetherVideoCodec,
+        sourceContainer: AetherSourceContainer = .unknown,
         videoFormat: VideoFormat,
         dolbyVisionConfiguration:
             AetherDolbyVisionConfiguration? = nil,
@@ -76,6 +78,7 @@ public struct AetherSourceProfile: Sendable, Equatable {
         self.sourceKind = sourceKind
         self.isSeekableVOD = isSeekableVOD
         self.videoCodec = videoCodec
+        self.sourceContainer = sourceContainer
         self.videoFormat = videoFormat
         self.dolbyVisionConfiguration =
             dolbyVisionConfiguration
@@ -94,6 +97,7 @@ public struct AetherSourceProfile: Sendable, Equatable {
             sourceKind: sourceKind,
             isSeekableVOD: isSeekableVOD,
             videoCodec: AetherVideoCodec(codecName: probe.videoCodecName),
+            sourceContainer: probe.sourceContainer,
             videoFormat: probe.videoFormat,
             dolbyVisionConfiguration:
                 probe.dolbyVisionConfiguration,
@@ -219,7 +223,7 @@ public struct HybridPlaybackCapabilities: Sendable, Equatable {
 public enum PlaybackRouteReason: String, Sendable, Equatable {
     case nativeHLSContractVerified
     case nativeProtectedHLSContractVerified
-    case nativeContainerRepackaging
+    case nativeHLSFMP4Remux
     case nativeProvisionalURL
     case hybridRecoveryAfterNativeFailure
     case hybridHEV1SampleEntry
@@ -236,6 +240,7 @@ public enum PlaybackRouteReason: String, Sendable, Equatable {
     case unsupportedHybridDecoderUnavailable
     case unsupportedHybridSampleBufferRendererUnavailable
     case unsupportedHybridVideoFormat
+    case unsupportedProgressiveContainerUnverified
     case unsupportedDolbyVisionConfigurationMissing
     case unsupportedDolbyVisionProfile
     case unsupportedDolbyVisionConfigurationMismatch
@@ -295,11 +300,20 @@ public enum PlaybackPreflight {
         case .progressive, .custom:
             switch sourceProfile.videoCodec {
             case .h264, .hevc:
+                guard sourceProfile.sourceContainer
+                        .supportsNativeHLSFMP4Remux else {
+                    return result(
+                        sourceProfile,
+                        nil,
+                        .unsupported,
+                        .unsupportedProgressiveContainerUnverified
+                    )
+                }
                 return result(
                     sourceProfile,
                     nil,
                     .nativeAVPlayer,
-                    .nativeContainerRepackaging
+                    .nativeHLSFMP4Remux
                 )
             case .unknown:
                 return result(sourceProfile, nil, .unsupported, .unsupportedVideoCodec)
@@ -328,6 +342,13 @@ public enum PlaybackPreflight {
             guard sourceProfile.sourceKind != .unclassifiedURL,
                   sourceProfile.videoCodec != .unknown else {
                 return nil
+            }
+            if sourceProfile.sourceKind == .progressive
+                || sourceProfile.sourceKind == .custom {
+                guard sourceProfile.sourceContainer
+                        .supportsNativeHLSFMP4Remux else {
+                    return nil
+                }
             }
             if sourceProfile.sourceKind == .hls {
                 guard let hlsPackaging,

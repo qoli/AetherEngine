@@ -21,6 +21,7 @@ func runProbe(url: URL) -> Int32 {
     let codec = probe.videoCodecName ?? "(unknown)"
 
     print("Duration:    \(duration)s")
+    print("Container:   \(probe.sourceContainer.rawValue)")
     print("Video:       codec=\(codec) resolution=\(res) fps=\(rate)")
     print("  format:    \(probe.videoFormat)")
     if probe.isDolbyVision {

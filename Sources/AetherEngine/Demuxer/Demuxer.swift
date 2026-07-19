@@ -134,6 +134,34 @@ public final class Demuxer: @unchecked Sendable {
     private var ownedIOReader: IOReader?
     private var openProfile: DemuxerOpenProfile = .playback
 
+    /// Positive container fact from the active AVInputFormat. FFmpeg may
+    /// advertise aliases (for example `matroska,webm`), so admission matches
+    /// exact comma-separated format names rather than URL suffixes.
+    var sourceContainer: AetherSourceContainer {
+        guard let ctx = formatContext,
+              let formatName = ctx.pointee.iformat?.pointee.name else {
+            return .unknown
+        }
+        let names = Set(
+            String(cString: formatName)
+                .lowercased()
+                .split(separator: ",")
+                .map(String.init)
+        )
+        if names.contains("matroska") || names.contains("webm") {
+            return .matroska
+        }
+        if !names.isDisjoint(with: [
+            "mov", "mp4", "m4a", "3gp", "3g2", "mj2",
+        ]) {
+            return .isoBaseMedia
+        }
+        if names.contains("mpegts") {
+            return .mpegTransport
+        }
+        return .other
+    }
+
     /// #112 round 11: whether `seekByteEstimate` has what it needs (a resolved byte size and a positive
     /// duration). The side reader caps the timestamp-seek attempt tight when this is true, because the
     /// verified estimate is a cheaper, bounded way to position on an index-less source.

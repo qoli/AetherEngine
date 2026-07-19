@@ -225,6 +225,7 @@ struct AetherPlaybackRecoveryTests {
             sourceKind: .progressive,
             isSeekableVOD: true,
             videoCodec: .h264,
+            sourceContainer: .matroska,
             videoFormat: .hdr10
         )
         let result = PlaybackPreflight.resolveRecoveryAlternate(
@@ -236,6 +237,23 @@ struct AetherPlaybackRecoveryTests {
         )
         #expect(result?.route == .hybridCarrier)
         #expect(result?.reason == .hybridRecoveryAfterNativeFailure)
+
+        let unverifiedContainer = AetherSourceProfile(
+            sourceKind: .progressive,
+            isSeekableVOD: true,
+            videoCodec: .h264,
+            sourceContainer: .unknown,
+            videoFormat: .hdr10
+        )
+        #expect(
+            PlaybackPreflight.resolveRecoveryAlternate(
+                sourceProfile: unverifiedContainer,
+                hlsPackaging: nil,
+                excluding: .nativeAVPlayer,
+                hybridCapabilities:
+                    AetherHybridPlaybackSession.capabilities
+            ) == nil
+        )
 
         let unknown = AetherSourceProfile(
             sourceKind: .unclassifiedURL,

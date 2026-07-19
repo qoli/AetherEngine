@@ -11,7 +11,7 @@ struct PlaybackPreflightTelemetryTests {
             expectedRoute: PlaybackRenderRoute,
             expectedReason: PlaybackRouteReason
         )] = [
-            (.h264, .nativeAVPlayer, .nativeContainerRepackaging),
+            (.h264, .nativeAVPlayer, .nativeHLSFMP4Remux),
             (.vp9, .hybridCarrier, .hybridNonAVPlayerCodec),
             (.unknown, .unsupported, .unsupportedVideoCodec),
         ]
@@ -33,6 +33,9 @@ struct PlaybackPreflightTelemetryTests {
                     sourceKind: .progressive,
                     isSeekableVOD: true,
                     videoCodec: item.codec,
+                    sourceContainer: item.codec == .h264
+                        ? .matroska
+                        : .unknown,
                     videoFormat: .sdr
                 ),
                 hlsPackaging: nil,

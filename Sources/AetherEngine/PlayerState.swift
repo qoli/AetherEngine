@@ -257,6 +257,28 @@ public enum VideoFormat: Sendable, Equatable, Hashable {
     case hlg
 }
 
+/// Container identity established by FFmpeg after opening the source.
+///
+/// This is deliberately not derived from the URL path or MIME type. Native
+/// HLS-fMP4 remux admission requires one of the positively identified
+/// containers; `.unknown` and `.other` never imply AVPlayer compatibility.
+public enum AetherSourceContainer: String, Sendable, Equatable, Hashable {
+    case matroska
+    case isoBaseMedia
+    case mpegTransport
+    case unknown
+    case other
+
+    public var supportsNativeHLSFMP4Remux: Bool {
+        switch self {
+        case .matroska, .isoBaseMedia, .mpegTransport:
+            true
+        case .unknown, .other:
+            false
+        }
+    }
+}
+
 /// One-shot container + stream metadata from `AetherEngine.probe(url:options:)`. No HLS server, no decoders.
 public struct SourceProbe: Sendable {
     public let url: URL
@@ -268,6 +290,8 @@ public struct SourceProbe: Sendable {
     public let videoCodecID: Int32
     /// Codec name from libavcodec (e.g. "hevc", "h264", "av1"). nil when unavailable.
     public let videoCodecName: String?
+    /// Input container positively identified by FFmpeg. Never inferred from the URL suffix.
+    public let sourceContainer: AetherSourceContainer
     /// 0 when no video track.
     public let videoWidth: Int32
     /// 0 when no video track.
@@ -294,6 +318,7 @@ public struct SourceProbe: Sendable {
         videoFormat: VideoFormat,
         videoCodecID: Int32,
         videoCodecName: String?,
+        sourceContainer: AetherSourceContainer = .unknown,
         videoWidth: Int32,
         videoHeight: Int32,
         videoFrameRate: Double?,
@@ -311,6 +336,7 @@ public struct SourceProbe: Sendable {
         self.videoFormat = videoFormat
         self.videoCodecID = videoCodecID
         self.videoCodecName = videoCodecName
+        self.sourceContainer = sourceContainer
         self.videoWidth = videoWidth
         self.videoHeight = videoHeight
         self.videoFrameRate = videoFrameRate

@@ -26,6 +26,7 @@ public enum AetherNativePlaybackSessionFailure:
 {
     case assetNotPlayable
     case playerItemFailed
+    case engineFailed
 }
 
 enum AetherNativePlaybackSessionError:
@@ -40,6 +41,10 @@ enum AetherNativePlaybackSessionError:
     )
     case assetNotPlayable
     case audioAnalysisBindingSourceMismatch
+    case nativeRemuxRequiresPreparedSource
+    case incompatibleRemuxOptions
+    case sourceFactsDiverged
+    case engineRouteContractDiverged
     case stopped
     case invalidRate
     case invalidSeekTarget
@@ -52,6 +57,14 @@ enum AetherNativePlaybackSessionError:
             "The native playback asset is not playable"
         case .audioAnalysisBindingSourceMismatch:
             "The native audio-analysis binding does not match the playback source"
+        case .nativeRemuxRequiresPreparedSource:
+            "Native HLS-fMP4 remux requires the admitted prepared source"
+        case .incompatibleRemuxOptions:
+            "Native HLS-fMP4 remux requires a finite video VOD request"
+        case .sourceFactsDiverged:
+            "The prepared source facts changed before native remux"
+        case .engineRouteContractDiverged:
+            "The native remux pipeline did not produce the stable AVPlayer route"
         case .stopped:
             "The native playback session has stopped"
         case .invalidRate:
@@ -85,7 +98,7 @@ public struct AetherNativePlaybackDiagnostics:
 final class AetherNativePlaybackSession: ObservableObject {
     public let preflightResult: PlaybackPreflightResult
     public let avPlayer: AVPlayer
-    public let avPlayerItem: AVPlayerItem
+    public private(set) var avPlayerItem: AVPlayerItem
 
     @Published public private(set) var state:
         AetherNativePlaybackSessionState = .idle
@@ -121,6 +134,7 @@ final class AetherNativePlaybackSession: ObservableObject {
     }
 
     private var itemStatusObservation: NSKeyValueObservation?
+    private var currentItemObservation: NSKeyValueObservation?
     private var timeControlObservation: NSKeyValueObservation?
     private var endObserver: NSObjectProtocol?
     private var mediaSelectionObserver: NSObjectProtocol?
@@ -133,24 +147,34 @@ final class AetherNativePlaybackSession: ObservableObject {
         AetherNativeAudioAnalysisBinding
     private let audioAnalysisTelemetryHub =
         AetherAudioAnalysisTelemetryHub()
+    private let engine: AetherEngine?
+    private var engineCancellables = Set<AnyCancellable>()
     private var isStopped = false
 
     private init(
         preflightResult: PlaybackPreflightResult,
-        asset: AVURLAsset,
+        avPlayerItem: AVPlayerItem,
         avPlayer: AVPlayer,
         audioAnalysisBinding:
-            AetherNativeAudioAnalysisBinding
+            AetherNativeAudioAnalysisBinding,
+        engine: AetherEngine? = nil
     ) {
         self.preflightResult = preflightResult
         self.audioAnalysisBinding = audioAnalysisBinding
-        avPlayerItem = AVPlayerItem(asset: asset)
+        self.avPlayerItem = avPlayerItem
         self.avPlayer = avPlayer
-        avPlayer.replaceCurrentItem(with: avPlayerItem)
+        self.engine = engine
+        if avPlayer.currentItem !== avPlayerItem {
+            avPlayer.replaceCurrentItem(with: avPlayerItem)
+        }
         avPlayer.actionAtItemEnd = .pause
         avPlayer.preventsDisplaySleepDuringVideoPlayback = true
         avPlayer.automaticallyWaitsToMinimizeStalling = true
-        installObservers()
+        if let engine {
+            installEngineObservers(engine)
+        } else {
+            installDirectObservers()
+        }
     }
 
     public static func make(
@@ -193,6 +217,10 @@ final class AetherNativePlaybackSession: ObservableObject {
             throw AetherNativePlaybackSessionError
                 .audioAnalysisBindingSourceMismatch
         }
+        guard preflightResult.reason != .nativeHLSFMP4Remux else {
+            throw AetherNativePlaybackSessionError
+                .nativeRemuxRequiresPreparedSource
+        }
         var assetOptions: [String: Any] = [:]
         if !options.httpHeaders.isEmpty {
             assetOptions["AVURLAssetHTTPHeaderFieldsKey"] =
@@ -200,10 +228,85 @@ final class AetherNativePlaybackSession: ObservableObject {
         }
         return AetherNativePlaybackSession(
             preflightResult: preflightResult,
-            asset: AVURLAsset(url: url, options: assetOptions),
+            avPlayerItem: AVPlayerItem(
+                asset: AVURLAsset(url: url, options: assetOptions)
+            ),
             avPlayer: avPlayer,
             audioAnalysisBinding: audioAnalysisBinding
         )
+    }
+
+    static func makeRemuxed(
+        preparedSource: AetherPreparedURLSource,
+        options: LoadOptions,
+        preflightResult: PlaybackPreflightResult,
+        audioAnalysisBinding: AetherNativeAudioAnalysisBinding,
+        avPlayer: AVPlayer
+    ) async throws -> AetherNativePlaybackSession {
+        guard preflightResult.route == .nativeAVPlayer,
+              preflightResult.reason == .nativeHLSFMP4Remux else {
+            throw AetherNativePlaybackSessionError
+                .preflightRequiresNative(
+                    route: preflightResult.route,
+                    reason: preflightResult.reason
+                )
+        }
+        guard audioAnalysisBinding.sourceURL
+                == preparedSource.url,
+              audioAnalysisBinding.httpHeaders
+                == options.httpHeaders else {
+            throw AetherNativePlaybackSessionError
+                .audioAnalysisBindingSourceMismatch
+        }
+        guard !options.nativeRemoteHLS,
+              !options.audioOnly,
+              !options.isLive else {
+            throw AetherNativePlaybackSessionError
+                .incompatibleRemuxOptions
+        }
+
+        let engine = try AetherEngine(nativeAVPlayer: avPlayer)
+        var engineOptions = options
+        engineOptions.autoplay = false
+        do {
+            guard let loadedProbe = try await engine.load(
+                preparedURLSource: preparedSource,
+                options: engineOptions
+            ) else {
+                engine.stop()
+                throw AetherNativePlaybackSessionError
+                    .sourceFactsDiverged
+            }
+            let loadedProfile = AetherSourceProfile(
+                probe: loadedProbe,
+                sourceKind: .progressive,
+                isSeekableVOD:
+                    loadedProbe.durationSeconds.isFinite
+                    && loadedProbe.durationSeconds > 0
+                    && !loadedProbe.isLive
+            )
+            guard loadedProfile == preflightResult.sourceProfile else {
+                engine.stop()
+                throw AetherNativePlaybackSessionError
+                    .sourceFactsDiverged
+            }
+            guard engine.currentAVPlayer === avPlayer,
+                  let item = avPlayer.currentItem else {
+                engine.stop()
+                throw AetherNativePlaybackSessionError
+                    .engineRouteContractDiverged
+            }
+            return AetherNativePlaybackSession(
+                preflightResult: preflightResult,
+                avPlayerItem: item,
+                avPlayer: avPlayer,
+                audioAnalysisBinding: audioAnalysisBinding,
+                engine: engine
+            )
+        } catch {
+            engine.stop()
+            throw error
+        }
     }
 
     /// Bounded asset validation before the host issues play. AVPlayerItem readiness remains observable
@@ -217,7 +320,17 @@ final class AetherNativePlaybackSession: ObservableObject {
                 state = .failed(.assetNotPlayable)
                 throw AetherNativePlaybackSessionError.assetNotPlayable
             }
-            await refreshSelectedAudioAnalysisTrackIDFromPlayer()
+            if let engine {
+                if case .error = engine.state {
+                    throw AetherNativePlaybackSessionError
+                        .engineRouteContractDiverged
+                }
+                applySelectedAudioAnalysisTrackID(
+                    engine.activeAudioTrackIndex
+                )
+            } else {
+                await refreshSelectedAudioAnalysisTrackIDFromPlayer()
+            }
             if avPlayerItem.status == .readyToPlay {
                 state = .ready
             }
@@ -233,13 +346,21 @@ final class AetherNativePlaybackSession: ObservableObject {
 
     public func play() throws {
         try requireActive()
-        avPlayer.play()
+        if let engine {
+            engine.play()
+        } else {
+            avPlayer.play()
+        }
         state = .playing
     }
 
     public func pause() throws {
         try requireActive()
-        avPlayer.pause()
+        if let engine {
+            engine.pause()
+        } else {
+            avPlayer.pause()
+        }
         state = .paused
     }
 
@@ -249,10 +370,18 @@ final class AetherNativePlaybackSession: ObservableObject {
             throw AetherNativePlaybackSessionError.invalidRate
         }
         if rate == 0 {
-            avPlayer.pause()
+            if let engine {
+                engine.pause()
+            } else {
+                avPlayer.pause()
+            }
             state = .paused
         } else {
-            avPlayer.rate = rate
+            if let engine {
+                engine.setRate(rate)
+            } else {
+                avPlayer.rate = rate
+            }
             state = .playing
         }
     }
@@ -267,14 +396,20 @@ final class AetherNativePlaybackSession: ObservableObject {
         }
         let shouldResume = avPlayer.rate > 0
         state = .seeking
-        let finished = await withCheckedContinuation {
-            (continuation: CheckedContinuation<Bool, Never>) in
-            avPlayer.seek(
-                to: target,
-                toleranceBefore: .zero,
-                toleranceAfter: .zero
-            ) { finished in
-                continuation.resume(returning: finished)
+        let finished: Bool
+        if let engine {
+            await engine.seek(to: target.seconds)
+            finished = true
+        } else {
+            finished = await withCheckedContinuation {
+                (continuation: CheckedContinuation<Bool, Never>) in
+                avPlayer.seek(
+                    to: target,
+                    toleranceBefore: .zero,
+                    toleranceAfter: .zero
+                ) { finished in
+                    continuation.resume(returning: finished)
+                }
             }
         }
         try requireActive()
@@ -377,6 +512,8 @@ final class AetherNativePlaybackSession: ObservableObject {
         isStopped = true
         itemStatusObservation?.invalidate()
         itemStatusObservation = nil
+        currentItemObservation?.invalidate()
+        currentItemObservation = nil
         timeControlObservation?.invalidate()
         timeControlObservation = nil
         audioAnalysisSelectionResolutionTask?.cancel()
@@ -393,12 +530,17 @@ final class AetherNativePlaybackSession: ObservableObject {
         }
         cancelAudioAnalysisStreams()
         audioAnalysisTelemetryHub.finish()
-        avPlayer.pause()
-        avPlayer.replaceCurrentItem(with: nil)
+        engineCancellables.removeAll()
+        if let engine {
+            engine.stop()
+        } else {
+            avPlayer.pause()
+            avPlayer.replaceCurrentItem(with: nil)
+        }
         state = .stopped
     }
 
-    private func installObservers() {
+    private func installDirectObservers() {
         itemStatusObservation = avPlayerItem.observe(
             \.status,
             options: [.initial, .new]
@@ -462,6 +604,50 @@ final class AetherNativePlaybackSession: ObservableObject {
                     self?.handleMediaSelectionChange()
                 }
             }
+    }
+
+    private func installEngineObservers(_ engine: AetherEngine) {
+        currentItemObservation = avPlayer.observe(
+            \.currentItem,
+            options: [.new]
+        ) { [weak self] player, _ in
+            Task { @MainActor in
+                guard let self, !self.isStopped,
+                      let item = player.currentItem else { return }
+                self.avPlayerItem = item
+            }
+        }
+        engine.$state
+            .sink { [weak self] engineState in
+                guard let self, !self.isStopped else { return }
+                switch engineState {
+                case .idle:
+                    break
+                case .loading:
+                    if self.state == .idle {
+                        self.state = .preparing
+                    }
+                case .playing:
+                    self.state = .playing
+                case .paused:
+                    if self.state != .seeking {
+                        self.state = .paused
+                    }
+                case .seeking:
+                    self.state = .seeking
+                case .ended:
+                    self.state = .ended
+                case .error:
+                    self.state = .failed(.engineFailed)
+                }
+            }
+            .store(in: &engineCancellables)
+        engine.$activeAudioTrackIndex
+            .removeDuplicates()
+            .sink { [weak self] trackID in
+                self?.applySelectedAudioAnalysisTrackID(trackID)
+            }
+            .store(in: &engineCancellables)
     }
 
     private func handleMediaSelectionChange() {
