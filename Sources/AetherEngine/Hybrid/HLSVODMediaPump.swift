@@ -1965,12 +1965,45 @@ private extension HLSVODMediaPump {
             guard let actualVideoStream =
                     demuxer.stream(
                         at: actualVideoIndex
-                    ),
-                  try HybridVideoStreamContract(
+                    ) else {
+                throw HLSVODMediaPumpError
+                    .videoStreamCount(
+                        segmentIndex: index,
+                        count: 0
+                    )
+            }
+            let candidateVideoContract =
+                try HybridVideoStreamContract(
                     demuxer: demuxer,
                     stream: actualVideoStream,
                     sourceStartPTSOverride: 0
-                  ) == videoContract else {
+                )
+            // MPEG-TS is a continuous bitstream across media-sequence
+            // boundaries unless the playlist declares a discontinuity.
+            // A later segment may therefore omit redundant H.264 SPS/PPS;
+            // the long-lived decoder already owns the established values.
+            switch videoContract.match(
+                candidateVideoContract,
+                allowsOmittedH264ParameterSets:
+                    initData == nil
+            ) {
+            case .exact:
+                break
+            case .reusesEstablishedH264CodecParameters:
+                EngineLog.emit(
+                    "[HLSVODMediaPump] video contract reused established H.264 parameters "
+                        + "segment=\(index) "
+                        + "observed={\(candidateVideoContract.diagnosticSummary)}",
+                    category: .demux
+                )
+            case .mismatch:
+                EngineLog.emit(
+                    "[HLSVODMediaPump] video contract changed "
+                        + "segment=\(index) "
+                        + "expected={\(videoContract.diagnosticSummary)} "
+                        + "observed={\(candidateVideoContract.diagnosticSummary)}",
+                    category: .demux
+                )
                 throw HLSVODMediaPumpError
                     .videoContractChanged(
                         segmentIndex: index

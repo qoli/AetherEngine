@@ -155,6 +155,11 @@ final class HLSVODMediaPumpTests: XCTestCase {
         let videoSegmentURLs: [URL]
     }
 
+    private struct MPEGTransportFixture {
+        let preflight: AetherHLSPlaybackPreflight
+        let fetchStore: FetchStore
+    }
+
     func testIncrementalPumpNormalizesPacketsAndBuildsCarrierAudio()
         async throws
     {
@@ -286,6 +291,98 @@ final class HLSVODMediaPumpTests: XCTestCase {
             minimumPTS: 48_000 - 256,
             maximumPTS: 96_000
         )
+    }
+
+    func testSequentialMPEGTransportSegmentCanReuseEstablishedH264Parameters()
+        async throws
+    {
+        let fixture = try makeMPEGTransportFixture(
+            secondSegmentOmitsH264ParameterSets: true
+        )
+        let capture = FrameCapture()
+        let pump = try await HLSVODMediaPump.make(
+            preflight: fixture.preflight,
+            decodedFrameHandler: { frame in
+                capture.append(frame)
+            },
+            fetchOverride: { request, _ in
+                try fixture.fetchStore.response(
+                    for: request
+                )
+            }
+        )
+        addTeardownBlock {
+            try await pump.close()
+        }
+
+        try await pump.advanceVideoDecodeDemand(
+            to: CMTime(
+                value: 180_000,
+                timescale: 90_000
+            )
+        )
+        try await pump.produce(throughSegment: 1)
+
+        let snapshot = await pump.snapshot()
+        XCTAssertEqual(
+            snapshot.highestProducedVideoSegmentIndex,
+            1
+        )
+        XCTAssertGreaterThan(snapshot.videoPacketCount, 0)
+        XCTAssertTrue(
+            capture.values.contains {
+                CMTimeCompare(
+                    $0,
+                    CMTime(
+                        value: 90_000,
+                        timescale: 90_000
+                    )
+                ) >= 0
+            }
+        )
+    }
+
+    func testRestartDoesNotReuseUnresolvedH264Parameters()
+        async throws
+    {
+        let fixture = try makeMPEGTransportFixture(
+            secondSegmentOmitsH264ParameterSets: true
+        )
+        let pump = try await HLSVODMediaPump.make(
+            preflight: fixture.preflight,
+            fetchOverride: { request, _ in
+                try fixture.fetchStore.response(
+                    for: request
+                )
+            }
+        )
+        addTeardownBlock {
+            try await pump.close()
+        }
+        var classifier = HybridSeekIntentClassifier(
+            timeline: try XCTUnwrap(
+                fixture.preflight.hybridTimeline
+            )
+        )
+        let intent = try classifier
+            .registerExplicitHostSeek(
+                to: CMTime(
+                    seconds: 1.5,
+                    preferredTimescale: 90_000
+                )
+            )
+
+        do {
+            _ = try await pump.restart(for: intent)
+            XCTFail(
+                "unresolved random-access segment unexpectedly restarted playback"
+            )
+        } catch let error as HLSVODMediaPumpError {
+            XCTAssertEqual(
+                error,
+                .videoContractChanged(segmentIndex: 1)
+            )
+        }
     }
 
     func testWebVTTRenditionUsesNativeCarrierEndpointsAndFailureStaysTrackLocal()
@@ -2662,6 +2759,144 @@ final class HLSVODMediaPumpTests: XCTestCase {
             ),
             videoSegmentURLs: segmentURLs
         )
+    }
+
+    private func makeMPEGTransportFixture(
+        secondSegmentOmitsH264ParameterSets: Bool
+    ) throws -> MPEGTransportFixture {
+        let firstSegment = try HLSPreflightInspectorTests
+            .mpegTransportFixture()
+        let secondSegment = secondSegmentOmitsH264ParameterSets
+            ? try replacingH264ParameterSetsWithFiller(
+                firstSegment
+            )
+            : firstSegment
+        let rootURL = URL(
+            string:
+                "https://origin.example/transport.m3u8"
+        )!
+        let playlistURL = URL(
+            string:
+                "https://cdn.example/transport/main.m3u8"
+        )!
+        let segmentURLs = [
+            URL(
+                string:
+                    "https://cdn.example/transport/v0.ts"
+            )!,
+            URL(
+                string:
+                    "https://cdn.example/transport/v1.ts"
+            )!,
+        ]
+        let media = HLSMediaPlaylist(
+            targetDuration: 1,
+            mediaSequence: 0,
+            segments: segmentURLs.map {
+                HLSMediaSegment(
+                    uri: $0.lastPathComponent,
+                    duration: 1,
+                    discontinuityBefore: false
+                )
+            },
+            hasEndList: true,
+            hasUnsupportedEncryption: false,
+            hasMap: false,
+            mapURI: nil,
+            contentProtection: .none
+        )
+        let graph = try HLSVODResourceGraph.make(
+            requestedRootURL: rootURL,
+            effectiveRootURL: rootURL,
+            selectedMediaPlaylistURL: playlistURL,
+            selectedVariant: nil,
+            separateAudioGroupID: nil,
+            mediaPlaylistData: Data("#EXTM3U".utf8),
+            media: media,
+            audioRenditions: [],
+            inspectedInitSegmentData: nil,
+            inspectedInitSegmentEffectiveURL: nil,
+            inspectedFirstMediaSegmentData: firstSegment,
+            inspectedFirstMediaSegmentEffectiveURL:
+                segmentURLs[0],
+            httpHeaders: [:]
+        )
+        let result = PlaybackPreflightResult(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .hls,
+                isSeekableVOD: true,
+                videoCodec: .h264,
+                videoFormat: .sdr
+            ),
+            hlsPackaging: HLSVideoPackaging(
+                container: .mpegTransport,
+                sampleEntry: .notApplicable,
+                manifestCodecs: [],
+                actualVideoCodec: .h264,
+                codecVerification:
+                    .manifestMissingButSegmentVerified,
+                contentProtection: .none
+            ),
+            route: .hybridCarrier,
+            reason: .hybridHLSManifestMissingCodecs
+        )
+        return MPEGTransportFixture(
+            preflight: AetherHLSPlaybackPreflight(
+                result: result,
+                resourceGraph: graph,
+                httpHeaders: [:]
+            ),
+            fetchStore: FetchStore(
+                responses: [
+                    segmentURLs[1]: response(
+                        data: secondSegment,
+                        url: segmentURLs[1]
+                    ),
+                ]
+            )
+        )
+    }
+
+    private func replacingH264ParameterSetsWithFiller(
+        _ data: Data
+    ) throws -> Data {
+        var bytes = Array(data)
+        var replacementCount = 0
+        var index = 0
+        while index + 4 < bytes.count {
+            let headerIndex: Int?
+            if bytes[index] == 0,
+               bytes[index + 1] == 0,
+               bytes[index + 2] == 1 {
+                headerIndex = index + 3
+            } else if bytes[index] == 0,
+                      bytes[index + 1] == 0,
+                      bytes[index + 2] == 0,
+                      bytes[index + 3] == 1 {
+                headerIndex = index + 4
+            } else {
+                headerIndex = nil
+            }
+            if let headerIndex,
+               headerIndex < bytes.count {
+                let type = bytes[headerIndex] & 0x1F
+                if type == 7 || type == 8 {
+                    bytes[headerIndex] =
+                        (bytes[headerIndex] & 0xE0) | 12
+                    replacementCount += 1
+                }
+                index = headerIndex + 1
+            } else {
+                index += 1
+            }
+        }
+        guard replacementCount >= 2 else {
+            throw HLSVODMediaPumpError.unexpected(
+                reason:
+                    "MPEG-TS fixture did not expose H.264 SPS/PPS"
+            )
+        }
+        return Data(bytes)
     }
 
     private func response(

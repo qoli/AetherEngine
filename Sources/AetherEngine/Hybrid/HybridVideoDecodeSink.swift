@@ -5,6 +5,14 @@ import Libavcodec
 import Libavformat
 import Libavutil
 
+enum HybridVideoStreamContractMatch: Sendable, Equatable {
+    case exact
+    /// A sequential MPEG-TS segment identified H.264 but did not repeat the
+    /// SPS/PPS that established the long-lived decoder contract.
+    case reusesEstablishedH264CodecParameters
+    case mismatch
+}
+
 struct HybridVideoStreamContract: Sendable, Equatable {
     let codecID: UInt32
     let codedWidth: Int
@@ -151,6 +159,52 @@ struct HybridVideoStreamContract: Sendable, Equatable {
         }
         let rounded = Int(angle.rounded())
         return ((rounded % 360) + 360) % 360
+    }
+
+    func match(
+        _ candidate: HybridVideoStreamContract,
+        allowsOmittedH264ParameterSets: Bool
+    ) -> HybridVideoStreamContractMatch {
+        if candidate == self {
+            return .exact
+        }
+        guard allowsOmittedH264ParameterSets,
+              codecID == AV_CODEC_ID_H264.rawValue,
+              candidate.codecID == codecID,
+              codedWidth > 0,
+              codedHeight > 0,
+              !codecConfiguration.isEmpty,
+              candidate.codedWidth == 0,
+              candidate.codedHeight == 0,
+              candidate.codecConfiguration.isEmpty,
+              candidate.packetTimeBaseNumerator
+                == packetTimeBaseNumerator,
+              candidate.packetTimeBaseDenominator
+                == packetTimeBaseDenominator,
+              candidate.sourceStartPTS
+                == sourceStartPTS,
+              candidate.sourceStartTime
+                == sourceStartTime else {
+            return .mismatch
+        }
+        return .reusesEstablishedH264CodecParameters
+    }
+
+    var diagnosticSummary: String {
+        let framesPerSecond = displayFrameRate.map {
+            String($0)
+        } ?? "none"
+        return [
+            "codecID=\(codecID)",
+            "size=\(codedWidth)x\(codedHeight)",
+            "configBytes=\(codecConfiguration.count)",
+            "format=\(String(describing: videoFormat))",
+            "sar=\(pixelAspectRatioNumerator):\(pixelAspectRatioDenominator)",
+            "rotation=\(rotationDegrees)",
+            "frameDuration=\(nominalFrameDuration.value)/\(nominalFrameDuration.timescale)",
+            "fps=\(framesPerSecond)",
+            "timeBase=\(packetTimeBaseNumerator)/\(packetTimeBaseDenominator)",
+        ].joined(separator: " ")
     }
 }
 

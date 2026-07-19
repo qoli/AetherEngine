@@ -50,7 +50,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
 
     func testMPEGTransportSegmentUsesFFmpegProbe() async throws {
         let inspected = try await inspectMPEGTransportSegment(
-            try mpegTransportFixture(),
+            try Self.mpegTransportFixture(),
             segmentName: "segment.ts"
         )
 
@@ -65,7 +65,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
             )
         )
         XCTAssertNotEqual(segment.first, 0x47)
-        segment.append(try mpegTransportFixture())
+        segment.append(try Self.mpegTransportFixture())
 
         let inspected = try await inspectMPEGTransportSegment(
             segment,
@@ -235,7 +235,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
         )
     }
 
-    private func mpegTransportFixture() throws -> Data {
+    static func mpegTransportFixture() throws -> Data {
         try XCTUnwrap(
             Data(
                 base64Encoded: Self.mpegTransportFixtureBase64,
