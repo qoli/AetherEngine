@@ -162,7 +162,10 @@ enum HLSPlaylistParser {
 
     static func parse(_ text: String) throws -> HLSPlaylist {
         let lines = text
-            .split(separator: "\n", omittingEmptySubsequences: true)
+            .split(
+                omittingEmptySubsequences: true,
+                whereSeparator: { $0.isNewline }
+            )
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         guard lines.first?.hasPrefix("#EXTM3U") == true else {

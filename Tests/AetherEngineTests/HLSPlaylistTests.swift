@@ -228,6 +228,33 @@ final class HLSPlaylistTests: XCTestCase {
         XCTAssertFalse(media.hasByteRange)
     }
 
+    func testParsesMediaPlaylistWithCommonLineEndings() throws {
+        let fixtureLines = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:3",
+            "#EXT-X-TARGETDURATION:3",
+            "#EXT-X-MEDIA-SEQUENCE:0",
+            "#EXTINF:2.96,",
+            "segment.jpg",
+            "#EXT-X-ENDLIST",
+        ]
+
+        for separator in ["\n", "\r\n", "\r"] {
+            let text = fixtureLines.joined(separator: separator)
+                + separator
+            guard case .media(let media) =
+                    try HLSPlaylistParser.parse(text) else {
+                return XCTFail(
+                    "expected media playlist for \(separator.debugDescription)"
+                )
+            }
+            XCTAssertEqual(media.targetDuration, 3)
+            XCTAssertEqual(media.mediaSequence, 0)
+            XCTAssertEqual(media.segments.map(\.uri), ["segment.jpg"])
+            XCTAssertTrue(media.hasEndList)
+        }
+    }
+
     func testMediaPlaylistRejectsSegmentWithoutEXTINF() {
         let text = """
         #EXTM3U

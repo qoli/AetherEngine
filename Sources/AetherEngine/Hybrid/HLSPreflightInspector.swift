@@ -1011,8 +1011,12 @@ struct HLSPreflightInspector {
         }
         do {
             return try HLSPlaylistParser.parse(text)
+        } catch HLSIngestError.playlistInvalid(let reason) {
+            throw HLSPreflightError.invalidPlaylist(reason)
         } catch {
-            throw HLSPreflightError.invalidPlaylist(error.localizedDescription)
+            throw HLSPreflightError.invalidPlaylist(
+                String(describing: error)
+            )
         }
     }
 

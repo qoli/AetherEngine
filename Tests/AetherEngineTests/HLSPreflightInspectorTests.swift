@@ -69,7 +69,8 @@ final class HLSPreflightInspectorTests: XCTestCase {
 
         let inspected = try await inspectMPEGTransportSegment(
             segment,
-            segmentName: "segment.png"
+            segmentName: "segment.jpg",
+            playlistLineEnding: "\r\n"
         )
 
         assertHybridMPEGTransportInspection(inspected)
@@ -104,9 +105,44 @@ final class HLSPreflightInspectorTests: XCTestCase {
         XCTAssertNil(inspected.resourceGraph)
     }
 
+    func testInvalidPlaylistPreservesParserReason() async throws {
+        let rootURL = URL(
+            string: "https://example.com/invalid.m3u8"
+        )!
+        let response = HLSPreflightFetchResponse(
+            data: Data(
+                "#EXTM3U\r\n#EXT-X-ENDLIST\r\n".utf8
+            ),
+            effectiveURL: rootURL
+        )
+
+        do {
+            _ = try await HLSPreflightInspector(
+                httpHeaders: [:],
+                fetchOverride: { _, _ in response }
+            ).inspect(
+                rootURL: rootURL,
+                sourceIsSeekableVOD: true,
+                variantSelection: .highestBandwidth,
+                hybridCapabilities: HybridPlaybackCapabilities(
+                    hasDirectVideoDecoder: true,
+                    hasSampleBufferRenderer: true,
+                    supportedVideoFormats: [.sdr]
+                )
+            )
+            XCTFail("expected invalid playlist")
+        } catch let error as HLSPreflightError {
+            XCTAssertEqual(
+                error,
+                .invalidPlaylist("missing TARGETDURATION")
+            )
+        }
+    }
+
     private func inspectMPEGTransportSegment(
         _ segmentData: Data,
-        segmentName: String
+        segmentName: String,
+        playlistLineEnding: String = "\n"
     ) async throws -> AetherHLSPlaybackPreflight {
         let rootURL = URL(
             string: "https://example.com/media.m3u8"
@@ -117,15 +153,18 @@ final class HLSPreflightInspectorTests: XCTestCase {
         let responses: [URL: HLSPreflightFetchResponse] = [
             rootURL: HLSPreflightFetchResponse(
                 data: Data(
-                    """
-                    #EXTM3U
-                    #EXT-X-VERSION:3
-                    #EXT-X-TARGETDURATION:1
-                    #EXT-X-PLAYLIST-TYPE:VOD
-                    #EXTINF:0.2,
-                    \(segmentName)
-                    #EXT-X-ENDLIST
-                    """.utf8
+                    [
+                        "#EXTM3U",
+                        "#EXT-X-VERSION:3",
+                        "#EXT-X-TARGETDURATION:1",
+                        "#EXT-X-PLAYLIST-TYPE:VOD",
+                        "#EXTINF:0.2,",
+                        segmentName,
+                        "#EXT-X-ENDLIST",
+                    ]
+                    .joined(separator: playlistLineEnding)
+                    .appending(playlistLineEnding)
+                    .utf8
                 ),
                 effectiveURL: rootURL
             ),

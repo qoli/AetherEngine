@@ -219,6 +219,46 @@ struct PlaybackPreflightTelemetryTests {
         )
     }
 
+    @Test("Invalid-playlist telemetry stays stable while the thrown parser reason is preserved")
+    func invalidPlaylistReasonIsNotCopiedIntoTelemetry() async throws {
+        let parserReason =
+            "missing TARGETDURATION private-parser-context"
+        let original = HLSPreflightError
+            .invalidPlaylist(parserReason)
+        let operation = AetherPlaybackPreflightOperation()
+        let stream = await operation.telemetryEvents()
+
+        do {
+            _ = try await operation.inspectHLS(
+                rootURL: URL(
+                    string: "https://example.com/invalid.m3u8"
+                )!,
+                sourceIsSeekableVOD: true,
+                variantSelection: .highestBandwidth,
+                hybridCapabilities: capabilities,
+                inspector: HLSPreflightInspector(
+                    httpHeaders: [:],
+                    fetchOverride: { _, _ in
+                        throw original
+                    }
+                )
+            )
+            Issue.record("Expected invalid playlist")
+        } catch let error as HLSPreflightError {
+            #expect(error == original)
+        }
+
+        let events = await collect(stream)
+        #expect(events.map(\.kind) == [.started, .failed])
+        #expect(!String(describing: events).contains(parserReason))
+        guard case .failed(let failure) =
+                events.last?.snapshot else {
+            Issue.record("Missing HLS failed event")
+            return
+        }
+        #expect(failure.reason == .hlsInvalidPlaylist)
+    }
+
     @Test("A preflight operation cannot be reused or silently restarted")
     func oneShotOperationRejectsReuse() async throws {
         let operation = AetherPlaybackPreflightOperation()
