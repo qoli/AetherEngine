@@ -340,7 +340,16 @@ public enum PlaybackPreflight {
         switch activeRoute {
         case .nativeAVPlayer:
             guard sourceProfile.sourceKind != .unclassifiedURL,
-                  sourceProfile.videoCodec != .unknown else {
+                  sourceProfile.videoCodec != .unknown,
+                  sourceProfile.videoCodec != .h264,
+                  sourceProfile.videoCodec != .hevc else {
+                return nil
+            }
+            guard resolve(
+                sourceProfile: sourceProfile,
+                hlsPackaging: hlsPackaging,
+                hybridCapabilities: hybridCapabilities
+            ).route == .nativeAVPlayer else {
                 return nil
             }
             if sourceProfile.sourceKind == .progressive
@@ -459,30 +468,40 @@ public enum PlaybackPreflight {
 
         switch sourceProfile.videoCodec {
         case .h264:
-            // H.264-in-TS and H.264-in-fMP4 are both an AVPlayer-native HLS contract after segment
-            // verification. A manifest/segment mismatch still uses the direct-decoder route because the
-            // selected variant is not a trustworthy AVPlayer contract.
-            if hlsPackaging.codecVerification == .verified {
-                return result(sourceProfile, hlsPackaging, .nativeAVPlayer, .nativeHLSContractVerified)
-            }
-            return hybridResult(
-                sourceProfile: sourceProfile,
-                hlsPackaging: hlsPackaging,
-                reason: hlsReason(for: hlsPackaging),
-                capabilities: hybridCapabilities
+            // A direct media playlist is not required to declare CODECS. Once the selected segment
+            // positively identifies an AVPlayer-supported H.264 stream, the segment fact is authoritative
+            // for decoder capability. Missing or stale manifest metadata must not create another media
+            // pipeline.
+            return result(
+                sourceProfile,
+                hlsPackaging,
+                .nativeAVPlayer,
+                .nativeHLSContractVerified
             )
 
         case .hevc:
             if hlsPackaging.container == .fragmentedMP4,
-               hlsPackaging.codecVerification == .verified,
                hlsPackaging.sampleEntry == .hvc1 || hlsPackaging.sampleEntry == .dvh1 {
                 return result(sourceProfile, hlsPackaging, .nativeAVPlayer, .nativeHLSContractVerified)
             }
-            return hybridResult(
-                sourceProfile: sourceProfile,
-                hlsPackaging: hlsPackaging,
-                reason: hlsReason(for: hlsPackaging),
-                capabilities: hybridCapabilities
+            if let reason = nativeCodecMetadataFailure(
+                sourceProfile
+            ) {
+                return result(
+                    sourceProfile,
+                    hlsPackaging,
+                    .unsupported,
+                    reason
+                )
+            }
+            // HEVC remains an AVPlayer decoder capability. Packaging that AVPlayer cannot consume is a
+            // positive packaging boundary, not evidence for the Hybrid codec route and not permission to
+            // invent remote-HLS normalization inside the adapter.
+            return result(
+                sourceProfile,
+                hlsPackaging,
+                .unsupported,
+                .unsupportedHLSVideoPackaging
             )
 
         case .unknown:
@@ -498,23 +517,29 @@ public enum PlaybackPreflight {
         }
     }
 
-    private static func hlsReason(for packaging: HLSVideoPackaging) -> PlaybackRouteReason {
-        switch packaging.codecVerification {
-        case .manifestMissingButSegmentVerified:
-            return .hybridHLSManifestMissingCodecs
-        case .mismatch:
-            return .hybridHLSManifestSegmentMismatch
-        case .verified, .protectedManifestVerified,
-             .segmentNotInspected:
-            break
+    private static func nativeCodecMetadataFailure(
+        _ sourceProfile: AetherSourceProfile
+    ) -> PlaybackRouteReason? {
+        if sourceProfile.videoFormat == .dolbyVision {
+            guard let configuration =
+                    sourceProfile.dolbyVisionConfiguration else {
+                return .unsupportedDolbyVisionConfigurationMissing
+            }
+            guard configuration.profile == 8,
+                  configuration.baseLayerSignalCompatibilityID == 4 else {
+                return .unsupportedDolbyVisionProfile
+            }
+            guard configuration.verifiedHybridProfile != nil,
+                  sourceProfile
+                    .hasVerifiedDolbyVisionProfile84BaseLayer else {
+                return .unsupportedDolbyVisionConfigurationMismatch
+            }
+        } else if sourceProfile.dolbyVisionConfiguration != nil
+                    || sourceProfile
+                        .hasVerifiedDolbyVisionProfile84BaseLayer {
+            return .unsupportedDolbyVisionConfigurationMismatch
         }
-        if packaging.container == .mpegTransport, packaging.actualVideoCodec == .hevc {
-            return .hybridHEVCInMPEGTransport
-        }
-        if packaging.sampleEntry == .hev1 {
-            return .hybridHEV1SampleEntry
-        }
-        return .hybridNonAVPlayerCodec
+        return nil
     }
 
     private static func hybridResult(

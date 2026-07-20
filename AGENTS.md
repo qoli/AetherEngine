@@ -46,6 +46,42 @@ Apply these priorities in order:
 
 Do not optimize for a pure route graph at the expense of a playable movie.
 
+## Existing capability first
+
+Before adding a demuxer, seek path, restart mechanism, codec-parameter repair,
+or recovery implementation, first establish why the existing `AetherEngine`,
+`HLSVideoEngine`, `NativeAVPlayerHost`, or `SoftwarePlaybackHost` capability
+cannot satisfy the request. The unified playback session is an ownership and
+lifecycle adapter; it must not narrow the success semantics of those engines or
+replace a mature path with a less resilient parallel implementation.
+
+When a new route bypasses an existing capability and loses resilience, restore
+capability routing to the original owner before modifying the newer media
+pipeline.
+
+Keep these two capabilities distinct:
+
+- AetherEngine producing loopback HLS-fMP4 is an established remux output used
+  for progressive containers such as Matroska that AVPlayer cannot ingest.
+- Feeding a remote HLS playlist into FFmpeg's HLS demuxer and producing another
+  HLS playlist is a new HLS-in-HLS-out capability. It must be designed and
+  accepted independently; do not describe it as reconnecting existing remux
+  capability.
+
+Clear H.264/AAC remote HLS is direct AVPlayer media after positive segment
+inspection confirms an AVPlayer-supported MPEG-TS or fMP4 stream. Direct media
+playlists may legitimately omit `CODECS`; missing or stale manifest `CODECS`
+does not authorize REMUX or Hybrid. Hybrid is reserved for a codec AVPlayer
+cannot decode, not for incomplete manifest metadata or AVPlayer-incompatible
+packaging of an otherwise native codec.
+
+The unified session adapter may delegate lifecycle operations, observe the
+engine's state and seek/recovery intent, manage operation supersession, and
+enforce an overall deadline. It must not implement segment production, cache
+epochs, producer restart, decoder bootstrap, or a second seek algorithm. Do not
+judge seek failure from an immediate `currentTime` tolerance, and do not treat a
+`playing` flag without demonstrated media-time progress as successful recovery.
+
 ## Read the controlling path first
 
 Inspect the real owner before changing behavior:
@@ -319,4 +355,3 @@ Every playback-resilience change must report:
 - first/original error and terminal error behavior;
 - tests and device/fixture verification performed;
 - exact unverified surfaces or blockers.
-

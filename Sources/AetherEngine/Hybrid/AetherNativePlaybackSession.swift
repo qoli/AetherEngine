@@ -74,6 +74,7 @@ enum AetherNativePlaybackSessionError:
     case invalidRate
     case invalidSeekTarget
     case seekDidNotApply
+    case seekTimedOut(seconds: Double)
     case startupTimedOut
 
     public var errorDescription: String? {
@@ -100,10 +101,21 @@ enum AetherNativePlaybackSessionError:
             "The native playback seek target is invalid"
         case .seekDidNotApply:
             "The native playback seek did not apply to the active generation"
+        case .seekTimedOut(let seconds):
+            "The native playback seek exceeded its \(seconds)-second recovery deadline"
         case .startupTimedOut:
             "The native playback item did not become ready within three seconds"
         }
     }
+}
+
+private enum AetherNativeBoundedSeekOutcome:
+    Sendable,
+    Equatable
+{
+    case applied
+    case rejected
+    case timedOut
 }
 
 /// Privacy-safe Native-session diagnostics. Source URLs, headers, decoder
@@ -120,11 +132,62 @@ public struct AetherNativePlaybackDiagnostics:
     public let activeAudioAnalysisRequestCount: Int
 }
 
+/// Unstructured MainActor race used only by the unified adapter to put the
+/// recovery episode's deadline around the existing engine seek. Cancelling the
+/// losing task does not invent a second landing policy: engine generation/load
+/// guards still own any late AVPlayer completion after route teardown.
+@MainActor
+private final class AetherNativeEngineSeekDeadlineRace {
+    private var continuation:
+        CheckedContinuation<AetherNativeBoundedSeekOutcome, Never>?
+    private var operationTask: Task<Void, Never>?
+    private var timeoutTask: Task<Void, Never>?
+
+    func start(
+        continuation: CheckedContinuation<
+            AetherNativeBoundedSeekOutcome,
+            Never
+        >,
+        engine: AetherEngine,
+        targetSeconds: Double,
+        timeout: TimeInterval
+    ) {
+        self.continuation = continuation
+        operationTask = Task { @MainActor [weak self] in
+            await engine.seek(to: targetSeconds)
+            self?.resolve(.applied)
+        }
+        timeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(
+                nanoseconds: UInt64(timeout * 1_000_000_000)
+            )
+            guard !Task.isCancelled else { return }
+            self?.resolve(.timedOut)
+        }
+    }
+
+    func cancel() {
+        resolve(.timedOut)
+    }
+
+    private func resolve(
+        _ outcome: AetherNativeBoundedSeekOutcome
+    ) {
+        guard let continuation else { return }
+        self.continuation = nil
+        operationTask?.cancel()
+        timeoutTask?.cancel()
+        operationTask = nil
+        timeoutTask = nil
+        continuation.resume(returning: outcome)
+    }
+}
+
 /// Aether-owned AVPlayer lifecycle for a preflight-admitted `.nativeAVPlayer` route.
 ///
 /// The host may mount `avPlayer` in AVPlayerViewController and observe `state`, but it does not create or
-/// replace the asset, player item or player. Terminal item failure remains on this session and never
-/// selects the Hybrid or legacy route.
+/// replace the asset, player item or player. Failure evidence returns to the unified recovery
+/// coordinator; the host never chooses a replacement route or legacy player.
 @MainActor
 final class AetherNativePlaybackSession: ObservableObject {
     public let preflightResult: PlaybackPreflightResult
@@ -219,6 +282,9 @@ final class AetherNativePlaybackSession: ObservableObject {
     private var directPlayIntent = false
     private var directRateIntent: Float = 1
     private var directExplicitAudioTrackID: Int?
+    private var seekRequestSequence: UInt64 = 0
+    private var activeEngineSeekDeadlineRace:
+        AetherNativeEngineSeekDeadlineRace?
     private var audioAnalysisSelectionResolutionTask:
         Task<Void, Never>?
     private var audioAnalysisSessions: [
@@ -424,7 +490,8 @@ final class AetherNativePlaybackSession: ObservableObject {
                 }
                 guard avPlayerItem.status == .readyToPlay else {
                     state = .failed(.playerItemFailed)
-                    throw AetherNativePlaybackSessionError.startupTimedOut
+                    throw AetherNativePlaybackSessionError
+                        .startupTimedOut
                 }
                 state = .ready
             }
@@ -485,41 +552,101 @@ final class AetherNativePlaybackSession: ObservableObject {
         }
     }
 
-    public func seek(to target: CMTime) async throws {
+    func seek(
+        to target: CMTime,
+        timeout: TimeInterval = 30
+    ) async throws -> AetherPlaybackSeekResult {
         try requireActive()
         guard target.isValid,
               target.isNumeric,
               target.seconds.isFinite,
-              target.seconds >= 0 else {
+              target.seconds >= 0,
+              timeout.isFinite,
+              timeout > 0 else {
             throw AetherNativePlaybackSessionError.invalidSeekTarget
         }
+        seekRequestSequence &+= 1
+        let requestSequence = seekRequestSequence
+        activeEngineSeekDeadlineRace?.cancel()
+        activeEngineSeekDeadlineRace = nil
         let engineShouldResume = engine != nil && state == .playing
         state = .seeking
-        let finished: Bool
         if let engine {
-            await engine.seek(to: target.seconds)
-            let delta = abs(engine.currentTime - target.seconds)
-            finished = engine.state != .idle
-                && engine.state != .ended
-                && delta.isFinite
-                && delta <= 0.5
-        } else {
-            finished = await withCheckedContinuation {
-                (continuation: CheckedContinuation<Bool, Never>) in
-                avPlayer.seek(
-                    to: target,
-                    toleranceBefore: .zero,
-                    toleranceAfter: .zero
-                ) { finished in
-                    continuation.resume(returning: finished)
-                }
+            let deadline = ProcessInfo.processInfo.systemUptime
+                + timeout
+            let seekRace = AetherNativeEngineSeekDeadlineRace()
+            activeEngineSeekDeadlineRace = seekRace
+            let engineSeekOutcome = await withCheckedContinuation {
+                continuation in
+                seekRace.start(
+                    continuation: continuation,
+                    engine: engine,
+                    targetSeconds: target.seconds,
+                    timeout: timeout
+                )
             }
-        }
-        try requireActive()
-        guard finished else {
-            throw AetherNativePlaybackSessionError.seekDidNotApply
-        }
-        if engine == nil {
+            if activeEngineSeekDeadlineRace === seekRace {
+                activeEngineSeekDeadlineRace = nil
+            }
+            try requireActive()
+            guard requestSequence == seekRequestSequence else {
+                return .superseded
+            }
+            switch engineSeekOutcome {
+            case .applied:
+                break
+            case .timedOut:
+                throw AetherNativePlaybackSessionError
+                    .seekTimedOut(seconds: timeout)
+            case .rejected:
+                throw AetherNativePlaybackSessionError.seekDidNotApply
+            }
+            while true {
+                try requireActive()
+                guard requestSequence == seekRequestSequence else {
+                    return .superseded
+                }
+                switch engine.state {
+                case .error, .idle, .ended:
+                    throw AetherNativePlaybackSessionError
+                        .seekDidNotApply
+                case .loading, .playing, .paused, .seeking:
+                    break
+                }
+                let physicallyLanded = !engine.isSeeking
+                    && engine.pendingRecoverySeekClockTarget == nil
+                if physicallyLanded {
+                    state = engineShouldResume
+                        ? .playing
+                        : .paused
+                    return .applied
+                }
+                guard ProcessInfo.processInfo.systemUptime
+                        < deadline else {
+                    throw AetherNativePlaybackSessionError
+                        .seekTimedOut(seconds: timeout)
+                }
+                try await Task.sleep(nanoseconds: 25_000_000)
+            }
+        } else {
+            avPlayer.currentItem?.cancelPendingSeeks()
+            let outcome = await boundedDirectSeek(
+                to: target,
+                timeout: timeout
+            )
+            try requireActive()
+            guard requestSequence == seekRequestSequence else {
+                return .superseded
+            }
+            switch outcome {
+            case .applied:
+                break
+            case .rejected:
+                throw AetherNativePlaybackSessionError.seekDidNotApply
+            case .timedOut:
+                throw AetherNativePlaybackSessionError
+                    .seekTimedOut(seconds: timeout)
+            }
             if directPlayIntent {
                 avPlayer.rate = directRateIntent
                 state = .playing
@@ -527,8 +654,43 @@ final class AetherNativePlaybackSession: ObservableObject {
                 avPlayer.pause()
                 state = .paused
             }
-        } else {
-            state = engineShouldResume ? .playing : .paused
+            return .applied
+        }
+    }
+
+    private func boundedDirectSeek(
+        to target: CMTime,
+        timeout: TimeInterval
+    ) async -> AetherNativeBoundedSeekOutcome {
+        let resumeGuard = SeekResumeGuard()
+        return await withCheckedContinuation {
+            (continuation: CheckedContinuation<
+                AetherNativeBoundedSeekOutcome,
+                Never
+            >) in
+            Task { @MainActor in
+                try? await Task.sleep(
+                    nanoseconds: UInt64(
+                        timeout * 1_000_000_000
+                    )
+                )
+                guard resumeGuard.claim() else { return }
+                continuation.resume(returning: .timedOut)
+            }
+            avPlayer.seek(
+                to: target,
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            ) { finished in
+                Task { @MainActor in
+                    guard resumeGuard.claim() else { return }
+                    continuation.resume(
+                        returning: finished
+                            ? .applied
+                            : .rejected
+                    )
+                }
+            }
         }
     }
 
@@ -705,6 +867,9 @@ final class AetherNativePlaybackSession: ObservableObject {
     public func stop() {
         guard !isStopped else { return }
         isStopped = true
+        seekRequestSequence &+= 1
+        activeEngineSeekDeadlineRace?.cancel()
+        activeEngineSeekDeadlineRace = nil
         itemStatusObservation?.invalidate()
         itemStatusObservation = nil
         currentItemObservation?.invalidate()

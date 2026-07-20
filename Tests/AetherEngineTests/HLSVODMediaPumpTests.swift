@@ -1611,12 +1611,18 @@ final class HLSVODMediaPumpTests: XCTestCase {
     }
 
     @MainActor
-    func testPublicHybridSessionComposesHLSProviderIntoAVPlayerAndSampleBufferPresentation()
+    func testPublicHybridSessionRejectsStaleH264HybridClaimBeforeOriginFetch()
         async throws
     {
         let fixture = try makeFixture()
-        let session =
-            try await AetherHybridPlaybackSession
+        let expected = HybridPlaybackSessionError
+            .preflightContractChanged(
+                route: .nativeAVPlayer,
+                reason: .nativeHLSContractVerified
+            )
+
+        do {
+            _ = try await AetherHybridPlaybackSession
                 .makeHLSVOD(
                     preflight: fixture.preflight,
                     fetchOverride: {
@@ -1626,45 +1632,19 @@ final class HLSVODMediaPumpTests: XCTestCase {
                             .response(for: request)
                     }
                 )
-        defer { session.stop() }
-
-        try await session.prepare(timeout: 10)
-
-        XCTAssertEqual(
-            session.state,
-            .ready(generation: 0)
-        )
-        XCTAssertEqual(
-            session.preflightResult,
-            fixture.preflight.result
-        )
-        XCTAssertEqual(
-            session.timeline.source,
-            .mirroredHLSVOD
-        )
-        XCTAssertEqual(
-            session.audioAnalysisTrackIDs,
-            [0]
-        )
-        XCTAssertNotNil(session.avPlayer.currentItem)
-        let presentationView = session.presentationView
-        XCTAssertEqual(
-            presentationView.diagnostics.generation,
-            0
-        )
-        XCTAssertEqual(
-            try XCTUnwrap(
-                presentationView.diagnostics
-                    .lastEnqueuedTimeSeconds
-            ),
-            0,
-            accuracy: 0.000_001
-        )
-        XCTAssertEqual(
-            session.diagnostics.carrierBandwidth
-                .declaredTransportBudget,
-            2_000_000
-        )
+            XCTFail(
+                "AVPlayer-supported H.264 HLS unexpectedly created a Hybrid session"
+            )
+        } catch let error as HybridPlaybackSessionError {
+            XCTAssertEqual(error, expected)
+        }
+        for url in fixture.videoSegmentURLs
+            + fixture.audioSegmentURLs {
+            XCTAssertEqual(
+                fixture.fetchStore.count(for: url),
+                0
+            )
+        }
     }
 
     @MainActor
@@ -1727,7 +1707,7 @@ final class HLSVODMediaPumpTests: XCTestCase {
     {
         let fixture = try makeFixture()
         let preflight = AetherHLSPlaybackPreflight(
-            result: fixture.preflight.result,
+            result: makeTrueHybridResult(),
             resourceGraph: nil,
             httpHeaders: [:]
         )
@@ -1771,14 +1751,20 @@ final class HLSVODMediaPumpTests: XCTestCase {
         let source = AetherSourceProfile(
             sourceKind: .hls,
             isSeekableVOD: true,
-            videoCodec: .h264,
+            videoCodec: .vp9,
             videoFormat: .hdr10Plus
+        )
+        let packaging = HLSVideoPackaging(
+            container: .fragmentedMP4,
+            sampleEntry: .unknown,
+            manifestCodecs: ["vp09.00.10.08"],
+            actualVideoCodec: .vp9,
+            codecVerification: .verified,
+            contentProtection: .none
         )
         let result = PlaybackPreflight.resolve(
             sourceProfile: source,
-            hlsPackaging:
-                fixture.preflight.result
-                    .hlsPackaging,
+            hlsPackaging: packaging,
             hybridCapabilities:
                 HybridPlaybackCapabilities(
                     hasDirectVideoDecoder: true,
@@ -1829,65 +1815,6 @@ final class HLSVODMediaPumpTests: XCTestCase {
                 0
             )
         }
-    }
-
-    @MainActor
-    func testHybridSessionRequiresNewPreflightWhenStartupCredentialIsRejected()
-        async throws
-    {
-        let fixture = try makeFixture()
-        let rejectedURL = fixture.audioSegmentURLs[0]
-        let rejected = FetchStore(
-            responses: [
-                rejectedURL:
-                    HLSVODOriginFetchResponse(
-                        data: Data(),
-                        effectiveURL: rejectedURL,
-                        statusCode: 403,
-                        contentLength: 0,
-                        contentEncoding: nil
-                    ),
-            ]
-        )
-        let expected = HybridPlaybackSessionError
-            .hlsPreflightGenerationInvalidated(
-                .credentialRejected(
-                    statusCode: 403,
-                    resource: .audioSegment(
-                        renditionOrdinal: 0,
-                        index: 0
-                    )
-                )
-            )
-
-        do {
-            _ = try await AetherHybridPlaybackSession
-                .makeHLSVOD(
-                    preflight: fixture.preflight,
-                    fetchOverride: {
-                        request,
-                        _ in
-                        if request.url == rejectedURL {
-                            return try rejected.response(
-                                for: request
-                            )
-                        }
-                        return try fixture.fetchStore
-                            .response(for: request)
-                    }
-                )
-            XCTFail(
-                "expired startup credential unexpectedly created a hybrid session"
-            )
-        } catch let error
-                as HybridPlaybackSessionError {
-            XCTAssertEqual(error, expected)
-        }
-        XCTAssertEqual(
-            rejected.count(for: rejectedURL),
-            1,
-            "session creation must not retry the rejected preflight generation"
-        )
     }
 
     func testCarrierProviderPublishesTypedRuntimeRepreflightRequirement()
@@ -2668,6 +2595,37 @@ final class HLSVODMediaPumpTests: XCTestCase {
                         fragmentBaseMediaDecodeTime($0)
                     )
                 }
+        )
+    }
+
+    private func makeTrueHybridResult(
+        videoFormat: VideoFormat = .sdr,
+        supportedVideoFormats: Set<VideoFormat> = [.sdr]
+    ) -> PlaybackPreflightResult {
+        let source = AetherSourceProfile(
+            sourceKind: .hls,
+            isSeekableVOD: true,
+            videoCodec: .vp9,
+            videoFormat: videoFormat
+        )
+        let packaging = HLSVideoPackaging(
+            container: .fragmentedMP4,
+            sampleEntry: .unknown,
+            manifestCodecs: ["vp09.00.10.08"],
+            actualVideoCodec: .vp9,
+            codecVerification: .verified,
+            contentProtection: .none
+        )
+        return PlaybackPreflight.resolve(
+            sourceProfile: source,
+            hlsPackaging: packaging,
+            hybridCapabilities:
+                HybridPlaybackCapabilities(
+                    hasDirectVideoDecoder: true,
+                    hasSampleBufferRenderer: true,
+                    supportedVideoFormats:
+                        supportedVideoFormats
+                )
         )
     }
 

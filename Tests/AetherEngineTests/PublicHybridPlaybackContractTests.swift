@@ -45,13 +45,13 @@ struct PublicHybridPlaybackContractTests {
         )
     }
 
-    @Test("Public capabilities admit verified HDR10, HLG and Dolby Vision 8.4 but reject HDR10 Plus")
+    @Test("Public Hybrid color capabilities apply only to genuine non-AVPlayer codecs")
     func publicColorAdmissionMatchesDeviceEvidence() {
         let packaging = HLSVideoPackaging(
             container: .fragmentedMP4,
-            sampleEntry: .hev1,
-            manifestCodecs: ["hev1"],
-            actualVideoCodec: .hevc,
+            sampleEntry: .unknown,
+            manifestCodecs: ["vp09.00.10.08"],
+            actualVideoCodec: .vp9,
             codecVerification: .verified,
             contentProtection: .none
         )
@@ -59,7 +59,7 @@ struct PublicHybridPlaybackContractTests {
             sourceProfile: AetherSourceProfile(
                 sourceKind: .hls,
                 isSeekableVOD: true,
-                videoCodec: .hevc,
+                videoCodec: .vp9,
                 videoFormat: .hdr10
             ),
             hlsPackaging: packaging,
@@ -67,13 +67,13 @@ struct PublicHybridPlaybackContractTests {
                 AetherPlaybackSession.hybridCapabilities
         )
         #expect(hdr10.route == .hybridCarrier)
-        #expect(hdr10.reason == .hybridHEV1SampleEntry)
+        #expect(hdr10.reason == .hybridNonAVPlayerCodec)
 
         let hlg = PlaybackPreflight.resolve(
             sourceProfile: AetherSourceProfile(
                 sourceKind: .hls,
                 isSeekableVOD: true,
-                videoCodec: .hevc,
+                videoCodec: .vp9,
                 videoFormat: .hlg
             ),
             hlsPackaging: packaging,
@@ -81,40 +81,13 @@ struct PublicHybridPlaybackContractTests {
                 AetherPlaybackSession.hybridCapabilities
         )
         #expect(hlg.route == .hybridCarrier)
-        #expect(hlg.reason == .hybridHEV1SampleEntry)
-
-        let profile84 = AetherDolbyVisionConfiguration(
-            versionMajor: 1,
-            versionMinor: 0,
-            profile: 8,
-            level: 3,
-            rpuPresent: true,
-            enhancementLayerPresent: false,
-            baseLayerPresent: true,
-            baseLayerSignalCompatibilityID: 4,
-            metadataCompression: 0
-        )
-        let dolbyVision84 = PlaybackPreflight.resolve(
-            sourceProfile: AetherSourceProfile(
-                sourceKind: .hls,
-                isSeekableVOD: true,
-                videoCodec: .hevc,
-                videoFormat: .dolbyVision,
-                dolbyVisionConfiguration: profile84,
-                hasVerifiedDolbyVisionProfile84BaseLayer: true
-            ),
-            hlsPackaging: packaging,
-            hybridCapabilities:
-                AetherPlaybackSession.hybridCapabilities
-        )
-        #expect(dolbyVision84.route == .hybridCarrier)
-        #expect(dolbyVision84.reason == .hybridHEV1SampleEntry)
+        #expect(hlg.reason == .hybridNonAVPlayerCodec)
 
         let hdr10Plus = PlaybackPreflight.resolve(
             sourceProfile: AetherSourceProfile(
                 sourceKind: .hls,
                 isSeekableVOD: true,
-                videoCodec: .hevc,
+                videoCodec: .vp9,
                 videoFormat: .hdr10Plus
             ),
             hlsPackaging: packaging,
@@ -130,14 +103,14 @@ struct PublicHybridPlaybackContractTests {
         let source = AetherSourceProfile(
             sourceKind: .hls,
             isSeekableVOD: true,
-            videoCodec: .hevc,
+            videoCodec: .vp9,
             videoFormat: .sdr
         )
         let packaging = HLSVideoPackaging(
             container: .fragmentedMP4,
-            sampleEntry: .hev1,
-            manifestCodecs: ["hev1"],
-            actualVideoCodec: .hevc,
+            sampleEntry: .unknown,
+            manifestCodecs: ["vp09.00.10.08"],
+            actualVideoCodec: .vp9,
             codecVerification: .verified,
             contentProtection: .none
         )
@@ -149,7 +122,7 @@ struct PublicHybridPlaybackContractTests {
         )
 
         #expect(result.route == .hybridCarrier)
-        #expect(result.reason == .hybridHEV1SampleEntry)
+        #expect(result.reason == .hybridNonAVPlayerCodec)
     }
 
     @MainActor

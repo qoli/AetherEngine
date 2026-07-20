@@ -154,14 +154,35 @@ final class BlackCarrierAVPlayerSession {
         transportState = .started
     }
 
-    func seek(to time: CMTime) async -> Bool {
-        await withCheckedContinuation { continuation in
+    func seek(
+        to time: CMTime,
+        timeout: TimeInterval
+    ) async -> Bool {
+        guard timeout.isFinite, timeout > 0 else { return false }
+        let resumeGuard = SeekResumeGuard()
+        return await withCheckedContinuation { continuation in
+            Task { @MainActor in
+                do {
+                    try await Task.sleep(
+                        nanoseconds: UInt64(
+                            timeout * 1_000_000_000
+                        )
+                    )
+                } catch {
+                    return
+                }
+                guard resumeGuard.claim() else { return }
+                continuation.resume(returning: false)
+            }
             avPlayer.seek(
                 to: time,
                 toleranceBefore: .zero,
                 toleranceAfter: .zero
             ) { finished in
-                continuation.resume(returning: finished)
+                Task { @MainActor in
+                    guard resumeGuard.claim() else { return }
+                    continuation.resume(returning: finished)
+                }
             }
         }
     }

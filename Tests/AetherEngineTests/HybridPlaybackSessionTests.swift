@@ -453,7 +453,7 @@ struct HybridPlaybackSessionTests {
 
         func prepare(timeout: TimeInterval) async throws {}
 
-        func seek(to time: CMTime) async -> Bool {
+        func seek(to time: CMTime, timeout: TimeInterval) async -> Bool {
             seekTargets.append(time)
             onSeek?(time)
             return true
@@ -1556,6 +1556,46 @@ struct HybridPlaybackSessionTests {
             targets[0],
             targets.last!,
         ])
+    }
+
+    @Test("A blocked provider restart exits on the shared seek deadline")
+    @MainActor
+    func providerRestartUsesSeekDeadline() async throws {
+        let fixture = try makeSession()
+        defer { fixture.session.stop() }
+        try await fixture.session.prepare(timeout: 1)
+        let gate = RestartGate()
+        fixture.provider.configureRestartGate(gate)
+        let target = CMTime(
+            seconds: 4.5,
+            preferredTimescale: 600
+        )
+
+        let seek = Task { @MainActor in
+            try await fixture.session.seek(
+                to: target,
+                timeout: 0.05
+            )
+        }
+        let restartBlocked = await waitUntilResult {
+            gate.isWaiting
+        }
+        #expect(restartBlocked)
+        do {
+            _ = try await seek.value
+            Issue.record("Blocked provider restart exceeded its deadline without failing")
+        } catch let error as HybridPlaybackSessionError {
+            #expect(
+                error == .readinessTimedOut(seconds: 0.05)
+            )
+        }
+        gate.release()
+
+        #expect(
+            fixture.session.state
+                == .failed(.readinessTimedOut(seconds: 0.05))
+        )
+        #expect(fixture.transport.didStop)
     }
 
     @Test("Route implementation reports decoder failure and tears down its generation")

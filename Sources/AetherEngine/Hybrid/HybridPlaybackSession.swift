@@ -339,7 +339,10 @@ protocol HybridCarrierPlayerTransport: AnyObject {
 
     func startPrepared() throws
     func prepare(timeout: TimeInterval) async throws
-    func seek(to time: CMTime) async -> Bool
+    func seek(
+        to time: CMTime,
+        timeout: TimeInterval
+    ) async -> Bool
     func stop()
 }
 
@@ -389,6 +392,57 @@ extension HybridPlaybackRenderSurface {
 
 extension AetherHybridPresentationView: HybridPlaybackRenderSurface {
     var retainsAcceptedFramesUntilCapacityCallback: Bool { true }
+}
+
+@MainActor
+private final class HybridSeekDeadlineRace<Value: Sendable> {
+    private var continuation:
+        CheckedContinuation<Value, Error>?
+    private var operationTask: Task<Void, Never>?
+    private var timeoutTask: Task<Void, Never>?
+
+    func start(
+        continuation: CheckedContinuation<Value, Error>,
+        timeout: TimeInterval,
+        timeoutError: HybridPlaybackSessionError,
+        operation: @escaping @Sendable () async throws -> Value
+    ) {
+        self.continuation = continuation
+        operationTask = Task { @MainActor [self] in
+            do {
+                let value = try await operation()
+                resolve(.success(value))
+            } catch {
+                resolve(.failure(error))
+            }
+        }
+        timeoutTask = Task { @MainActor [self] in
+            do {
+                try await Task.sleep(
+                    nanoseconds: UInt64(
+                        timeout * 1_000_000_000
+                    )
+                )
+            } catch {
+                return
+            }
+            resolve(.failure(timeoutError))
+        }
+    }
+
+    func cancel() {
+        resolve(.failure(CancellationError()))
+    }
+
+    private func resolve(_ result: Result<Value, Error>) {
+        guard let continuation else { return }
+        self.continuation = nil
+        operationTask?.cancel()
+        timeoutTask?.cancel()
+        operationTask = nil
+        timeoutTask = nil
+        continuation.resume(with: result)
+    }
 }
 
 actor HybridPlaybackProviderCoordinator {
@@ -1903,7 +1957,14 @@ final class HybridPlaybackSession {
                     segmentIndex: segmentIndex
                 )
             }
-            let restart = try await coordinator.restart(for: intent)
+            let restart = try await performWithinSeekDeadline(
+                step: "providerRestart",
+                generation: generation,
+                deadline: deadline,
+                originalTimeout: timeout
+            ) { [coordinator] in
+                try await coordinator.restart(for: intent)
+            }
             switch restart {
             case .applied:
                 break
@@ -1929,7 +1990,13 @@ final class HybridPlaybackSession {
                 managedTimeJumpSuppressionTarget = target
                 managedTimeJumpSuppressionDeadline =
                     ProcessInfo.processInfo.systemUptime + 2
-                let landed = await transport.seek(to: target)
+                let landed = await transport.seek(
+                    to: target,
+                    timeout: try remainingTime(
+                        until: deadline,
+                        originalTimeout: timeout
+                    )
+                )
                 guard generation == classifier.generation else {
                     return supersededResult(
                         currentGeneration: classifier.generation
@@ -1956,9 +2023,16 @@ final class HybridPlaybackSession {
             // produce many target frames. Running it first can deadlock when
             // the paused, pre-seek renderer cannot release those frames until
             // the carrier timebase reaches the target.
-            try await coordinator.prepareGeneration(
-                segmentIndex: segmentIndex
-            )
+            try await performWithinSeekDeadline(
+                step: "providerPrepareGeneration",
+                generation: generation,
+                deadline: deadline,
+                originalTimeout: timeout
+            ) { [coordinator] in
+                try await coordinator.prepareGeneration(
+                    segmentIndex: segmentIndex
+                )
+            }
             guard generation == classifier.generation else {
                 return supersededResult(
                     currentGeneration: classifier.generation
@@ -2720,6 +2794,47 @@ final class HybridPlaybackSession {
             )
         }
         return remaining
+    }
+
+    private func performWithinSeekDeadline<Value: Sendable>(
+        step: String,
+        generation: UInt64,
+        deadline: TimeInterval,
+        originalTimeout: TimeInterval,
+        operation: @escaping @Sendable () async throws -> Value
+    ) async throws -> Value {
+        let remaining = try remainingTime(
+            until: deadline,
+            originalTimeout: originalTimeout
+        )
+        let race = HybridSeekDeadlineRace<Value>()
+        do {
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation {
+                    continuation in
+                    race.start(
+                        continuation: continuation,
+                        timeout: remaining,
+                        timeoutError: .readinessTimedOut(
+                            seconds: originalTimeout
+                        ),
+                        operation: operation
+                    )
+                }
+            } onCancel: {
+                Task { @MainActor in race.cancel() }
+            }
+        } catch let error as HybridPlaybackSessionError {
+            if case .readinessTimedOut = error {
+                EngineLog.emit(
+                    "[HybridPlaybackSession] seek deadline exceeded "
+                        + "generation=\(generation) step=\(step) "
+                        + "budget=\(originalTimeout)s",
+                    category: .session
+                )
+            }
+            throw error
+        }
     }
 
     private func ensureActiveGeneration(

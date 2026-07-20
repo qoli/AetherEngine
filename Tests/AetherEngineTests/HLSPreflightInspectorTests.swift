@@ -26,7 +26,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
         )
     }
 
-    func testMissingManifestCodecRequiresHybridEvidencePath() {
+    func testMissingManifestCodecPreservesPositiveSegmentEvidence() {
         XCTAssertEqual(
             HLSPreflightInspector.codecVerification(
                 manifestCodecs: [],
@@ -54,7 +54,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
             segmentName: "segment.ts"
         )
 
-        assertHybridMPEGTransportInspection(inspected)
+        assertDirectMPEGTransportInspection(inspected)
     }
 
     func testPNGPrefixedMPEGTransportUsesFFmpegProbe() async throws {
@@ -73,12 +73,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
             playlistLineEnding: "\r\n"
         )
 
-        assertHybridMPEGTransportInspection(inspected)
-        XCTAssertEqual(
-            inspected.resourceGraph?
-                .inspectedFirstMediaSegmentData,
-            segment
-        )
+        assertDirectMPEGTransportInspection(inspected)
     }
 
     func testUnparseableMPEGTransportSegmentIsTypedUnsupported()
@@ -166,13 +161,9 @@ final class HLSPreflightInspectorTests: XCTestCase {
                 AetherHybridPlaybackSession.capabilities
         )
 
-        XCTAssertEqual(inspected.result.route, .hybridCarrier)
-        XCTAssertEqual(inspected.inspectedVideoSegmentIndex, 1)
-        XCTAssertEqual(
-            inspected.resourceGraph?
-                .inspectedFirstMediaSegmentData,
-            firstData
-        )
+        XCTAssertEqual(inspected.result.route, .nativeAVPlayer)
+        XCTAssertEqual(inspected.result.reason, .nativeHLSContractVerified)
+        XCTAssertNil(inspected.resourceGraph)
     }
 
     func testNextLowerCompatibleVariantStaysOnSameMaster()
@@ -237,8 +228,8 @@ final class HLSPreflightInspectorTests: XCTestCase {
                 AetherHybridPlaybackSession.capabilities
         )
 
-        XCTAssertEqual(inspected.result.route, .hybridCarrier)
-        XCTAssertEqual(inspected.selectedVariantBandwidth, 1_000_000)
+        XCTAssertEqual(inspected.result.route, .nativeAVPlayer)
+        XCTAssertEqual(inspected.result.reason, .nativeHLSContractVerified)
     }
 
     func testNextLowerVariantRejectsCapabilityGroupDrift()
@@ -374,20 +365,20 @@ final class HLSPreflightInspectorTests: XCTestCase {
         )
     }
 
-    private func assertHybridMPEGTransportInspection(
+    private func assertDirectMPEGTransportInspection(
         _ inspected: AetherHLSPlaybackPreflight,
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
         XCTAssertEqual(
             inspected.result.route,
-            .hybridCarrier,
+            .nativeAVPlayer,
             file: file,
             line: line
         )
         XCTAssertEqual(
             inspected.result.reason,
-            .hybridHLSManifestMissingCodecs,
+            .nativeHLSContractVerified,
             file: file,
             line: line
         )
@@ -409,7 +400,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
             file: file,
             line: line
         )
-        XCTAssertNotNil(
+        XCTAssertNil(
             inspected.resourceGraph,
             file: file,
             line: line
@@ -459,6 +450,14 @@ final class HLSPreflightInspectorTests: XCTestCase {
         ////////////////////////////////////////////////////////////////////////////////////////
         /////////////////////////////////////////wAAAeAAAICABSEACR6xAAAAAQnwAAAAAWdCwArd7ARAAAAD
         AEAAAAUDxIngAAAAAWjODyyAAAABZYiCAU8mKAAP7+A=
+        """
+
+    private static let av1FMP4InitBase64 = """
+        AAAAIGZ0eXBpc281AAACAGlzbzVpc282YXYwMW1wNDEAAAL/bW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAAAAAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAgF0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAEAAAABAAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAAAAAAAAAABAAAAAAF5bWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAABAAAAAAABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABJG1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAAORzdGJsAAAAmHN0c2QAAAAAAAAAAQAAAIhhdjAxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAEAAQABIAAAASAAAAAAAAAABF0xhdmM2Mi4yOC4xMDEgbGlic3Z0YXYxAAAAAAAAAAAAGP//AAAAGGF2MUOBAAwACgoAAAACr/+AXwAIAAAACmZpZWwBAAAAABBwYXNwAAAAAQAAAAEAAAAQc3R0cwAAAAAAAAAAAAAAEHN0c2MAAAAAAAAAAAAAABRzdHN6AAAAAAAAAAAAAAAAAAAAEHN0Y28AAAAAAAAAAAAAAChtdmV4AAAAIHRyZXgAAAAAAAAAAQAAAAEAAAAAAAAAAAAAAAAAAABidWR0YQAAAFptZXRhAAAAAAAAACFoZGxyAAAAAAAAAABtZGlyYXBwbAAAAAAAAAAAAAAAAC1pbHN0AAAAJal0b28AAAAdZGF0YQAAAAEAAAAATGF2ZjYyLjEyLjEwMQ==
+        """
+
+    private static let av1FMP4SegmentBase64 = """
+        AAAAGHN0eXBtc2RoAAAAAG1zZGhtc2l4AAAANHNpZHgBAAAAAAAAAQAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAI0AAEAAgAAAAAAAAGhtb29mAAAAEG1maGQAAAAAAAAAAQAAAFB0cmFmAAAAHHRmaGQAAgA4AAAAAQAAQAAAAAAdAQEAAAAAABR0ZmR0AQAAAAAAAAAAAAAAAAAAGHRydW4AAAAFAAAAAQAAAHACAAAAAAAAJW1kYXQKCgAAAAKv/4lfIAgyDxAArAIFFCCBAAADJP/MgA==
         """
 
     func testProtectedNativeHLSUsesManifestContractWithoutFetchingMedia()
@@ -943,7 +942,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
         }
     }
 
-    func testProtectedAlternateAudioTurnsHybridCandidateIntoTypedUnsupported()
+    func testProtectedAlternateAudioStaysDirectNativeButAnalysisIsUnavailable()
         async throws
     {
         let timeline = try BlackCarrierTimeline.fileVOD(
@@ -1041,14 +1040,14 @@ final class HLSPreflightInspectorTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(inspected.result.route, .unsupported)
+        XCTAssertEqual(inspected.result.route, .nativeAVPlayer)
         XCTAssertEqual(
             inspected.result.reason,
-            .unsupportedHLSContentProtection
+            .nativeHLSContractVerified
         )
         XCTAssertEqual(
             inspected.result.hlsPackaging?.contentProtection,
-            .sampleAES
+            HLSContentProtection.none
         )
         XCTAssertEqual(
             inspected.audioAnalysisPolicy,
@@ -1076,10 +1075,12 @@ final class HLSPreflightInspectorTests: XCTestCase {
                 preferredTimescale: 90_000
             )
         )
-        let provider = try BlackCarrierVideoProvider(timeline: timeline)
-        defer { provider.close() }
-        let initData = try XCTUnwrap(provider.initSegment())
-        let segmentData = try XCTUnwrap(provider.mediaSegment(at: 0))
+        let initData = try XCTUnwrap(
+            Data(base64Encoded: Self.av1FMP4InitBase64)
+        )
+        let segmentData = try XCTUnwrap(
+            Data(base64Encoded: Self.av1FMP4SegmentBase64)
+        )
 
         let requestedRoot = URL(
             string:
@@ -1144,7 +1145,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
             #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Invalid",LANGUAGE="fr",DEFAULT=NO,AUTOSELECT=YES,FORCED=NO,URI="../subs/invalid.m3u8?token=invalid-subtitle-playlist-secret"
             #EXT-X-STREAM-INF:BANDWIDTH=900000,CODECS="avc1.42C01E"
             video/low.m3u8
-            #EXT-X-STREAM-INF:BANDWIDTH=1400000,CODECS="hvc1.2.4.L150",AUDIO="audio",SUBTITLES="subs"
+            #EXT-X-STREAM-INF:BANDWIDTH=1400000,CODECS="av01.0.00M.08",AUDIO="audio",SUBTITLES="subs"
             \(selectedURI)
             """.utf8
         )
@@ -1340,7 +1341,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
         )
         XCTAssertEqual(
             inspected.result.reason,
-            .hybridHLSManifestSegmentMismatch
+            .hybridNonAVPlayerCodec
         )
         XCTAssertEqual(inspected.selectedVariantBandwidth, 1_400_000)
         XCTAssertEqual(inspected.mediaSegmentCount, 1)

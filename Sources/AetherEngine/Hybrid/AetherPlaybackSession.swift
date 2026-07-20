@@ -403,14 +403,20 @@ private enum AetherActiveRouteSession {
     }
 
     func seek(
-        to target: CMTime
+        to target: CMTime,
+        timeout: TimeInterval
     ) async throws -> AetherPlaybackSeekResult {
         switch self {
         case .native(let session):
-            try await session.seek(to: target)
-            return .applied
+            return try await session.seek(
+                to: target,
+                timeout: timeout
+            )
         case .hybrid(let session):
-            return switch try await session.seek(to: target) {
+            return switch try await session.seek(
+                to: target,
+                timeout: timeout
+            ) {
             case .applied: .applied
             case .superseded: .superseded
             }
@@ -528,6 +534,15 @@ private enum AetherResolvedPlaybackSource {
         }
     }
 
+    var nativeExecutionMode:
+        AetherNativePlaybackExecutionMode?
+    {
+        guard result.route == .nativeAVPlayer else { return nil }
+        return result.reason == .nativeHLSFMP4Remux
+            ? .aetherRemux
+            : .directAsset
+    }
+
     func admitting(
         route: PlaybackRenderRoute
     ) -> AetherResolvedPlaybackSource? {
@@ -583,6 +598,15 @@ private enum AetherResolvedPlaybackSource {
             return nil
         }
     }
+}
+
+private enum AetherNativePlaybackExecutionMode:
+    String,
+    Sendable,
+    Equatable
+{
+    case directAsset
+    case aetherRemux
 }
 
 @MainActor
@@ -679,6 +703,8 @@ public final class AetherPlaybackSession: ObservableObject {
     private let recoveryBudget: AetherPlaybackRecoveryBudget
     private var resolvedSource: AetherResolvedPlaybackSource?
     private var activeSession: AetherActiveRouteSession?
+    private var activeNativeExecutionMode:
+        AetherNativePlaybackExecutionMode?
     private var routeCancellables = Set<AnyCancellable>()
     private var currentItemObservation: NSKeyValueObservation?
     private var healthyProgressObserver: Any?
@@ -919,7 +945,10 @@ public final class AetherPlaybackSession: ObservableObject {
         state = .seeking
         activeSeekOperationSequence = operationSequence
         do {
-            let result = try await activeSession.seek(to: target)
+            let result = try await activeSession.seek(
+                to: target,
+                timeout: try remainingRecoveryOperationTimeout()
+            )
             if activeSeekOperationSequence == operationSequence {
                 activeSeekOperationSequence = nil
             }
@@ -1295,6 +1324,7 @@ public final class AetherPlaybackSession: ObservableObject {
         routeCancellables.removeAll()
         activeSession?.stop()
         activeSession = nil
+        activeNativeExecutionMode = nil
         presentationView.install(nil)
         avPlayer.pause()
         avPlayer.replaceCurrentItem(with: nil)
@@ -1646,6 +1676,7 @@ public final class AetherPlaybackSession: ObservableObject {
         }
         resolvedSource = source
         activeRoute = session.route
+        activeNativeExecutionMode = source.nativeExecutionMode
         preflightResult = session.preflightResult
         publishCapabilities()
         if case .hybrid(let hybrid) = session {
@@ -1661,7 +1692,8 @@ public final class AetherPlaybackSession: ObservableObject {
             "[AetherPlaybackSession] route committed "
                 + "session=\(sessionID.uuidString.prefix(8)) "
                 + "source=\(sourceFingerprint) "
-                + "route=\(session.route.rawValue)",
+                + "route=\(session.route.rawValue) "
+                + "nativeExecution=\(activeNativeExecutionMode?.rawValue ?? "none")",
             category: .session
         )
     }
@@ -2160,7 +2192,10 @@ public final class AetherPlaybackSession: ObservableObject {
            resumeTime.isNumeric,
            resumeTime.seconds.isFinite,
            resumeTime.seconds >= 0 {
-            let seekResult = try await activeSession.seek(to: resumeTime)
+            let seekResult = try await activeSession.seek(
+                to: resumeTime,
+                timeout: try remainingRecoveryOperationTimeout()
+            )
             guard seekResult == .applied else {
                 throw CancellationError()
             }
@@ -2452,6 +2487,22 @@ public final class AetherPlaybackSession: ObservableObject {
                         recoveryBudget.maximumEpisodeDurationSeconds
                 )
         }
+    }
+
+    private func remainingRecoveryOperationTimeout()
+        throws -> TimeInterval
+    {
+        let remaining = currentRecoveryDeadline.remainingSeconds(
+            now: ProcessInfo.processInfo.systemUptime
+        )
+        guard remaining > 0 else {
+            throw AetherPlaybackSessionError
+                .recoveryDeadlineExceeded(
+                    seconds:
+                        recoveryBudget.maximumEpisodeDurationSeconds
+                )
+        }
+        return remaining
     }
 
     private func failure(

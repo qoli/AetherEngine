@@ -397,22 +397,24 @@ struct AetherPlaybackLaunchBoundaryTests {
         // that transport fact must not overwrite the user's play intent.
         session.avPlayer.pause()
         await Task.yield()
-        try await session.seek(
+        let playingSeek = try await session.seek(
             to: CMTime(
                 seconds: 0.5,
                 preferredTimescale: 600
             )
         )
+        #expect(playingSeek == .applied)
         #expect(session.state == .playing)
         #expect(session.avPlayer.rate > 0)
 
         try session.pause()
-        try await session.seek(
+        let pausedSeek = try await session.seek(
             to: CMTime(
                 seconds: 1,
                 preferredTimescale: 600
             )
         )
+        #expect(pausedSeek == .applied)
         #expect(session.state == .paused)
         #expect(session.avPlayer.rate == 0)
         session.stop()

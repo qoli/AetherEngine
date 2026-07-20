@@ -438,24 +438,41 @@ struct AetherPlaybackRecoveryTests {
         }
     }
 
-    @Test("Native failure can use Hybrid only with positive same-source evidence")
+    @Test("Native routes never reinterpret native-codec or impossible route facts as Hybrid")
     func alternateRouteAdmission() {
-        let profile = AetherSourceProfile(
+        let nativeRemuxProfile = AetherSourceProfile(
             sourceKind: .progressive,
             isSeekableVOD: true,
             videoCodec: .h264,
             sourceContainer: .matroska,
             videoFormat: .hdr10
         )
-        let result = PlaybackPreflight.resolveRecoveryAlternate(
-            sourceProfile: profile,
-            hlsPackaging: nil,
-            excluding: .nativeAVPlayer,
-            hybridCapabilities:
-                AetherHybridPlaybackSession.capabilities
+        #expect(
+            PlaybackPreflight.resolveRecoveryAlternate(
+                sourceProfile: nativeRemuxProfile,
+                hlsPackaging: nil,
+                excluding: .nativeAVPlayer,
+                hybridCapabilities:
+                    AetherHybridPlaybackSession.capabilities
+            ) == nil
         )
-        #expect(result?.route == .hybridCarrier)
-        #expect(result?.reason == .hybridRecoveryAfterNativeFailure)
+
+        let genuineHybridProfile = AetherSourceProfile(
+            sourceKind: .progressive,
+            isSeekableVOD: true,
+            videoCodec: .av1,
+            sourceContainer: .matroska,
+            videoFormat: .sdr
+        )
+        #expect(
+            PlaybackPreflight.resolveRecoveryAlternate(
+                sourceProfile: genuineHybridProfile,
+                hlsPackaging: nil,
+                excluding: .nativeAVPlayer,
+                hybridCapabilities:
+                    AetherHybridPlaybackSession.capabilities
+            ) == nil
+        )
 
         let unverifiedContainer = AetherSourceProfile(
             sourceKind: .progressive,
