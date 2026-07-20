@@ -49,6 +49,13 @@ enum HLSVODOriginResourcePurpose: Sendable, Equatable {
     case analysis
 }
 
+enum HLSVODTransportDisposition: Sendable, Equatable {
+    case transient
+    case cancelled
+    case security
+    case invariant
+}
+
 enum HLSVODPreflightGenerationInvalidation:
     Sendable,
     Equatable
@@ -130,6 +137,7 @@ enum HLSVODOriginResourceError:
     )
     case transport(URLError.Code)
     case transportFailure
+    case transportBudgetExhausted
     case cacheDirectoryCreationFailed
     case cacheReadFailed
     case cacheWriteFailed
@@ -189,6 +197,8 @@ enum HLSVODOriginResourceError:
             "HLS VOD origin-resource transport failed with URL error \(code.rawValue)"
         case .transportFailure:
             "HLS VOD origin-resource transport failed"
+        case .transportBudgetExhausted:
+            "HLS VOD origin-resource transport recovery budget was exhausted"
         case .cacheDirectoryCreationFailed:
             "HLS VOD origin-resource cache directory could not be created"
         case .cacheReadFailed:
@@ -209,6 +219,23 @@ struct HLSVODOriginFetchResponse: Sendable {
     let statusCode: Int
     let contentLength: Int64?
     let contentEncoding: String?
+    let retryAfterSeconds: TimeInterval?
+
+    init(
+        data: Data,
+        effectiveURL: URL,
+        statusCode: Int,
+        contentLength: Int64?,
+        contentEncoding: String?,
+        retryAfterSeconds: TimeInterval? = nil
+    ) {
+        self.data = data
+        self.effectiveURL = effectiveURL
+        self.statusCode = statusCode
+        self.contentLength = contentLength
+        self.contentEncoding = contentEncoding
+        self.retryAfterSeconds = retryAfterSeconds
+    }
 }
 
 struct HLSVODOriginResourcePayload: Sendable, Equatable {
@@ -240,6 +267,8 @@ struct HLSVODOriginResourceDelivery:
 struct HLSVODOriginResourceLoaderSnapshot: Sendable, Equatable {
     let cachedResourceCount: Int
     let cachedBytes: Int64
+    let cacheIsAvailable: Bool
+    let cacheFailureCount: Int
     let inFlightResourceCount: Int
     let inFlightWaiterCount: Int
     let inFlightPlaybackWaiterCount: Int
@@ -506,12 +535,17 @@ actor HLSVODOriginResourceLoader {
     private let maximumResourceBytes: Int
     private let capacityBytes: Int64
     private let fetch: Fetch
+    private let transportRetryBudget:
+        PlaybackTransportRetryBudget
     let sessionDirectory: URL
 
     private var cache: [HLSVODOriginResourceKey: CacheEntry] = [:]
     private var flights: [HLSVODOriginResourceKey: Flight] = [:]
     private var cachedBytes: Int64 = 0
     private var accessCounter: UInt64 = 0
+    private var cacheIsAvailable: Bool
+    private var cacheFailureCount = 0
+    private var cacheRebuildWasAttempted = false
     private var activeAnalysisPermitID: UUID?
     private var analysisPermitOrder: [UUID] = []
     private var analysisPermitWaiters:
@@ -532,6 +566,9 @@ actor HLSVODOriginResourceLoader {
         capacityBytes: Int64 =
             HLSVODOriginResourceLoader.defaultCapacityBytes,
         baseDirectory: URL = FileManager.default.temporaryDirectory,
+        transportRetryBudget: PlaybackTransportRetryBudget = .init(
+            maximumFailureAttempts: 3
+        ),
         fetchOverride: Fetch? = nil
     ) throws {
         guard maximumResourceBytes > 0,
@@ -542,6 +579,7 @@ actor HLSVODOriginResourceLoader {
         self.httpHeaders = httpHeaders
         self.maximumResourceBytes = maximumResourceBytes
         self.capacityBytes = capacityBytes
+        self.transportRetryBudget = transportRetryBudget
         if let fetchOverride {
             fetch = fetchOverride
         } else {
@@ -556,6 +594,7 @@ actor HLSVODOriginResourceLoader {
             "AetherHLSOrigin-\(UUID().uuidString)",
             isDirectory: true
         )
+        cacheIsAvailable = true
         do {
             try FileManager.default.createDirectory(
                 at: sessionDirectory,
@@ -563,8 +602,12 @@ actor HLSVODOriginResourceLoader {
                 attributes: [.posixPermissions: 0o700]
             )
         } catch {
-            throw HLSVODOriginResourceError
-                .cacheDirectoryCreationFailed
+            cacheIsAvailable = false
+            cacheFailureCount = 1
+            EngineLog.emit(
+                "[HLSVODOriginResourceLoader] cache unavailable code=directoryCreation",
+                category: .session
+            )
         }
     }
 
@@ -660,6 +703,8 @@ actor HLSVODOriginResourceLoader {
         HLSVODOriginResourceLoaderSnapshot(
             cachedResourceCount: cache.count,
             cachedBytes: cachedBytes,
+            cacheIsAvailable: cacheIsAvailable,
+            cacheFailureCount: cacheFailureCount,
             inFlightResourceCount: flights.count,
             inFlightWaiterCount: flights.values.reduce(0) {
                 $0 + $1.waiters.count
@@ -766,10 +811,12 @@ actor HLSVODOriginResourceLoader {
                 )
             }
         } catch {
-            let error =
-                HLSVODOriginResourceError.cacheCleanupFailed
-            closeError = error
-            throw error
+            cacheIsAvailable = false
+            cacheFailureCount += 1
+            EngineLog.emit(
+                "[HLSVODOriginResourceLoader] cache unavailable code=cleanup",
+                category: .session
+            )
         }
     }
 
@@ -857,7 +904,6 @@ actor HLSVODOriginResourceLoader {
 
         let taskID = UUID()
         let resource = flight.resource
-        let fetch = self.fetch
         let headers = httpHeaders
         let maximumBytes = maximumResourceBytes
         let priority: TaskPriority =
@@ -894,9 +940,10 @@ actor HLSVODOriginResourceLoader {
                         "identity",
                         forHTTPHeaderField: "Accept-Encoding"
                     )
-                    response = try await fetch(
-                        request,
-                        maximumBytes
+                    response = try await self.fetchWithRetry(
+                        request: request,
+                        maximumBytes: maximumBytes,
+                        resourceKey: resource.key
                     )
                 }
                 await self.finish(
@@ -916,6 +963,166 @@ actor HLSVODOriginResourceLoader {
         flight.taskID = taskID
         flight.taskPurpose = flight.activePurpose
         flights[key] = flight
+    }
+
+    private func fetchWithRetry(
+        request: URLRequest,
+        maximumBytes: Int,
+        resourceKey: HLSVODOriginResourceKey
+    ) async throws -> HLSVODOriginFetchResponse {
+        var attempt = 1
+        while true {
+            guard !transportRetryBudget.isExhausted else {
+                throw HLSVODOriginResourceError
+                    .transportBudgetExhausted
+            }
+            do {
+                let response = try await fetch(
+                    request,
+                    maximumBytes
+                )
+                if (200..<300).contains(response.statusCode),
+                   response.data.isEmpty {
+                    throw HLSVODOriginResourceError.emptyResource(
+                        resourceKey
+                    )
+                }
+                guard Self.isRetryableStatus(response.statusCode) else {
+                    return response
+                }
+                let sharedAttempt = transportRetryBudget
+                    .recordRetryableFailure()
+                guard attempt < 3,
+                      !transportRetryBudget.isExhausted else {
+                    return response
+                }
+                let delay = response.retryAfterSeconds.map {
+                    min(5, max(0, $0))
+                } ?? (sharedAttempt <= 1 ? 1 : 2)
+                EngineLog.emit(
+                    "[HLSVODOriginResourceLoader] transport retry "
+                        + "resource=\(resourceKey.cacheFileName) "
+                        + "attempt=\(attempt + 1) "
+                        + "status=\(response.statusCode) "
+                        + "delay=\(delay)",
+                    category: .session
+                )
+                try await Task.sleep(
+                    nanoseconds: UInt64(delay * 1_000_000_000)
+                )
+                attempt += 1
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                let typed = Self.typedTransportError(error)
+                guard Self.isRetryableTransportError(typed) else {
+                    throw typed
+                }
+                let sharedAttempt = transportRetryBudget
+                    .recordRetryableFailure()
+                guard attempt < 3,
+                      !transportRetryBudget.isExhausted else {
+                    throw typed
+                }
+                let delay: TimeInterval =
+                    sharedAttempt <= 1 ? 1 : 2
+                EngineLog.emit(
+                    "[HLSVODOriginResourceLoader] transport retry "
+                        + "resource=\(resourceKey.cacheFileName) "
+                        + "attempt=\(attempt + 1) "
+                        + "code=\(Self.transportCaseCode(typed)) "
+                        + "delay=\(delay)",
+                    category: .session
+                )
+                try await Task.sleep(
+                    nanoseconds: UInt64(delay * 1_000_000_000)
+                )
+                attempt += 1
+            }
+        }
+    }
+
+    private nonisolated static func isRetryableStatus(
+        _ status: Int
+    ) -> Bool {
+        status == 408 || status == 425 || status == 429
+            || status >= 500
+    }
+
+    private nonisolated static func typedTransportError(
+        _ error: Error
+    ) -> HLSVODOriginResourceError {
+        if let typed = error as? HLSVODOriginResourceError {
+            return typed
+        }
+        if let urlError = error as? URLError {
+            return .transport(urlError.code)
+        }
+        return .transportFailure
+    }
+
+    private nonisolated static func isRetryableTransportError(
+        _ error: HLSVODOriginResourceError
+    ) -> Bool {
+        switch error {
+        case .transport(let code):
+            transportDisposition(for: code) == .transient
+        case .transportFailure,
+             .contentLengthMismatch, .emptyResource:
+            true
+        case .transportBudgetExhausted:
+            false
+        case .httpStatus(let status):
+            isRetryableStatus(status)
+        default:
+            false
+        }
+    }
+
+    nonisolated static func transportDisposition(
+        for code: URLError.Code
+    ) -> HLSVODTransportDisposition {
+        switch code {
+        case .timedOut, .cannotFindHost, .cannotConnectToHost,
+             .networkConnectionLost, .dnsLookupFailed,
+             .notConnectedToInternet, .resourceUnavailable,
+             .internationalRoamingOff, .callIsActive,
+             .dataNotAllowed,
+             .backgroundSessionWasDisconnected:
+            .transient
+        case .cancelled:
+            .cancelled
+        case .secureConnectionFailed,
+             .serverCertificateHasBadDate,
+             .serverCertificateUntrusted,
+             .serverCertificateHasUnknownRoot,
+             .serverCertificateNotYetValid,
+             .clientCertificateRejected,
+             .clientCertificateRequired,
+             .appTransportSecurityRequiresSecureConnection:
+            .security
+        default:
+            .invariant
+        }
+    }
+
+    private nonisolated static func transportCaseCode(
+        _ error: HLSVODOriginResourceError
+    ) -> String {
+        switch error {
+        case .transport(let code):
+            "url:\(code.rawValue)"
+        case .transportFailure:
+            "transport"
+        case .contentLengthMismatch:
+            "truncated"
+        case .emptyResource:
+            "empty"
+        case .httpStatus(let status):
+            "http:\(status)"
+        default:
+            "nonretryable"
+        }
     }
 
     private func pauseAnalysisFetches(
@@ -1344,13 +1551,14 @@ actor HLSVODOriginResourceLoader {
             data: response.data,
             sha256: sha256
         )
-        try cache(payload)
+        cache(payload)
         return payload
     }
 
     private func cachedPayload(
         for key: HLSVODOriginResourceKey
     ) throws -> HLSVODOriginResourcePayload? {
+        guard cacheIsAvailable else { return nil }
         guard var entry = cache[key] else { return nil }
         let data: Data
         do {
@@ -1359,11 +1567,13 @@ actor HLSVODOriginResourceLoader {
                 options: [.mappedIfSafe]
             )
         } catch {
-            throw HLSVODOriginResourceError.cacheReadFailed
+            discardCorruptCacheEntry(key, entry: entry)
+            return nil
         }
         guard data.count == entry.byteCount,
               HLSVODResourceDigest.sha256(data) == entry.sha256 else {
-            throw HLSVODOriginResourceError.cacheReadFailed
+            discardCorruptCacheEntry(key, entry: entry)
+            return nil
         }
         accessCounter &+= 1
         entry.lastAccess = accessCounter
@@ -1376,7 +1586,45 @@ actor HLSVODOriginResourceLoader {
         )
     }
 
+    private func discardCorruptCacheEntry(
+        _ key: HLSVODOriginResourceKey,
+        entry: CacheEntry
+    ) {
+        cache.removeValue(forKey: key)
+        cachedBytes = max(
+            0,
+            cachedBytes - Int64(entry.byteCount)
+        )
+        try? FileManager.default.removeItem(at: entry.fileURL)
+        cacheFailureCount += 1
+        EngineLog.emit(
+            "[HLSVODOriginResourceLoader] corrupt cache entry removed resource=\(key.cacheFileName)",
+            category: .session
+        )
+    }
+
     private func cache(
+        _ payload: HLSVODOriginResourcePayload
+    ) {
+        guard cacheIsAvailable else { return }
+        do {
+            try writeCachePayload(payload)
+        } catch {
+            cacheFailureCount += 1
+            guard rebuildCacheDirectoryOnce() else {
+                disableCache()
+                return
+            }
+            do {
+                try writeCachePayload(payload)
+            } catch {
+                cacheFailureCount += 1
+                disableCache()
+            }
+        }
+    }
+
+    private func writeCachePayload(
         _ payload: HLSVODOriginResourcePayload
     ) throws {
         let byteCount = payload.data.count
@@ -1405,6 +1653,41 @@ actor HLSVODOriginResourceLoader {
             lastAccess: accessCounter
         )
         cachedBytes += Int64(byteCount)
+    }
+
+    private func rebuildCacheDirectoryOnce() -> Bool {
+        guard !cacheRebuildWasAttempted else { return false }
+        cacheRebuildWasAttempted = true
+        do {
+            if FileManager.default.fileExists(
+                atPath: sessionDirectory.path
+            ) {
+                try FileManager.default.removeItem(
+                    at: sessionDirectory
+                )
+            }
+            try FileManager.default.createDirectory(
+                at: sessionDirectory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            cache.removeAll(keepingCapacity: true)
+            cachedBytes = 0
+            cacheIsAvailable = true
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func disableCache() {
+        cacheIsAvailable = false
+        cache.removeAll(keepingCapacity: true)
+        cachedBytes = 0
+        EngineLog.emit(
+            "[HLSVODOriginResourceLoader] cache unavailable code=ioFailure",
+            category: .session
+        )
     }
 
     private func evictToFit(
@@ -1618,9 +1901,21 @@ final class HLSVODBoundedHTTPFetcher:
         guard (200..<300).contains(http.statusCode) else {
             completionHandler(.cancel)
             finish(
-                .failure(
-                    HLSVODOriginResourceError.httpStatus(
-                        http.statusCode
+                .success(
+                    HLSVODOriginFetchResponse(
+                        data: Data(),
+                        effectiveURL:
+                            http.url ?? request.url!,
+                        statusCode: http.statusCode,
+                        contentLength: nil,
+                        contentEncoding: nil,
+                        retryAfterSeconds:
+                            Self.retryAfterSeconds(
+                                http.value(
+                                    forHTTPHeaderField:
+                                        "Retry-After"
+                                )
+                            )
                     )
                 )
             )
@@ -1759,10 +2054,34 @@ final class HLSVODBoundedHTTPFetcher:
                     contentEncoding: response.value(
                         forHTTPHeaderField:
                             "Content-Encoding"
+                    ),
+                    retryAfterSeconds: Self.retryAfterSeconds(
+                        response.value(
+                            forHTTPHeaderField: "Retry-After"
+                        )
                     )
                 )
             )
         )
+    }
+
+    nonisolated static func retryAfterSeconds(
+        _ value: String?
+    ) -> TimeInterval? {
+        guard let value else { return nil }
+        if let seconds = TimeInterval(value),
+           seconds.isFinite,
+           seconds >= 0 {
+            return seconds
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE',' dd MMM yyyy HH':'mm':'ss z"
+        guard let date = formatter.date(from: value) else {
+            return nil
+        }
+        return max(0, date.timeIntervalSinceNow)
     }
 
     private func finish(

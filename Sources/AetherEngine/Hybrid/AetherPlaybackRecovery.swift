@@ -67,6 +67,34 @@ public struct AetherPlaybackFailure:
     public var errorDescription: String? { reason }
 }
 
+/// The single terminal outcome issued by a playback session. The first
+/// evidence remains available even when the last failed recovery attempt came
+/// from another stage or route.
+public struct AetherPlaybackTerminalFailure:
+    Error,
+    LocalizedError,
+    Sendable,
+    Equatable
+{
+    public let firstFailure: AetherPlaybackFailure
+    public let finalFailure: AetherPlaybackFailure
+    public let exhaustionReason: String
+
+    public init(
+        firstFailure: AetherPlaybackFailure,
+        finalFailure: AetherPlaybackFailure,
+        exhaustionReason: String
+    ) {
+        self.firstFailure = firstFailure
+        self.finalFailure = finalFailure
+        self.exhaustionReason = exhaustionReason
+    }
+
+    public var errorDescription: String? {
+        finalFailure.localizedDescription
+    }
+}
+
 public struct AetherPlaybackRecoveryBudget:
     Sendable,
     Equatable
@@ -102,6 +130,71 @@ public struct AetherPlaybackRecoveryBudget:
     }
 
     public static let production = AetherPlaybackRecoveryBudget()
+}
+
+/// One recovery-episode transport failure budget shared by classification,
+/// preflight and graph-bound origin requests. Successful requests do not
+/// consume it; the third retryable failure closes the budget until explicit
+/// Seek/load or two seconds of healthy playback resets the episode.
+final class PlaybackTransportRetryBudget:
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private let maximumFailureAttempts: Int
+    private var failureAttempts = 0
+
+    init(maximumFailureAttempts: Int) {
+        precondition(maximumFailureAttempts > 0)
+        self.maximumFailureAttempts = maximumFailureAttempts
+    }
+
+    var isExhausted: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return failureAttempts >= maximumFailureAttempts
+    }
+
+    @discardableResult
+    func recordRetryableFailure() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        if failureAttempts < maximumFailureAttempts {
+            failureAttempts += 1
+        }
+        return failureAttempts
+    }
+
+    var currentFailureAttempt: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return failureAttempts
+    }
+
+    func reset() {
+        lock.lock()
+        failureAttempts = 0
+        lock.unlock()
+    }
+}
+
+struct PlaybackRecoveryDeadline: Sendable, Equatable {
+    let startedAt: TimeInterval
+    let durationSeconds: TimeInterval
+
+    init(startedAt: TimeInterval, durationSeconds: TimeInterval) {
+        precondition(startedAt.isFinite)
+        precondition(durationSeconds.isFinite && durationSeconds > 0)
+        self.startedAt = startedAt
+        self.durationSeconds = durationSeconds
+    }
+
+    func remainingSeconds(now: TimeInterval) -> TimeInterval {
+        max(0, startedAt + durationSeconds - now)
+    }
+
+    func isExpired(now: TimeInterval) -> Bool {
+        remainingSeconds(now: now) <= 0
+    }
 }
 
 public struct AetherSystemPlaybackActivity:
@@ -265,6 +358,64 @@ public enum PlaybackRecoveryDecision {
     }
 }
 
+/// Pure classification of typed Hybrid evidence. Keeping this outside the
+/// route session prevents resource pressure, media corruption and host
+/// binding drift from collapsing into one generic runtime failure.
+enum PlaybackFailureEvidenceDecision {
+    static func kind(
+        for error: AetherHybridPresentationError
+    ) -> AetherPlaybackFailureKind {
+        switch error {
+        case .invalidPresentationTime, .invalidFrameDuration,
+             .invalidGeometry, .unsupportedRotation,
+             .nonMonotonicPresentationTime:
+            .malformedMedia
+        case .frameFormatDiverged:
+            .routeRuntimeFailure
+        case .unsupportedVideoFormat:
+            .unsupportedCapability
+        case .carrierBindingChanged,
+             .displayLayerTimebaseChanged:
+            .hostContractViolation
+        case .pixelBufferNotIOSurfaceBacked:
+            .decoderRuntimeFailure
+        case .pendingQueueOverflow, .carrierTimebaseUnavailable,
+             .rendererStalled, .rendererFailed,
+             .formatDescriptionCreationFailed,
+             .sampleBufferCreationFailed,
+             .sampleAttachmentCreationFailed:
+            .routeRuntimeFailure
+        }
+    }
+
+    static func hlsGraphFailureCode(
+        _ reason: AetherHLSPreflightInvalidationReason
+    ) -> String {
+        switch reason {
+        case .resourceUnavailable(
+            let statusCode,
+            let resource
+        ) where statusCode == 404 || statusCode == 410:
+            switch resource {
+            case .videoInit, .videoSegment:
+                return "hybrid.origin.selectedVariantUnavailable"
+            case .audioInit, .audioSegment, .subtitleSegment:
+                return "hybrid.hls.graph.resourceUnavailable"
+            }
+        case .resourceUnavailable:
+            return "hybrid.hls.graph.resourceUnavailable"
+        case .contentChanged:
+            return "hybrid.hls.graph.contentChanged"
+        case .credentialRejected:
+            return "hybrid.hls.graph.credentialRejected"
+        case .effectiveOriginChanged:
+            return "hybrid.hls.graph.effectiveOriginChanged"
+        case .credentialScopeChanged:
+            return "hybrid.hls.graph.credentialScopeChanged"
+        }
+    }
+}
+
 /// Mutable episode accounting separated from route construction. The host
 /// session supplies the monotonic clock so reset and terminal de-duplication
 /// remain deterministic in tests.
@@ -347,6 +498,82 @@ public enum AetherPlaybackRecoveryOutcome:
     case succeeded
     case failed
     case exhausted
+    case merged
+}
+
+/// Pure operation ordering used by the MainActor session. Route generations
+/// may finish out of order, but only the newest user Seek is allowed to commit
+/// position or failure state.
+struct PlaybackOperationCoordinator: Sendable, Equatable {
+    private(set) var latestSeekSequence: UInt64 = 0
+
+    mutating func beginSeek() -> UInt64 {
+        latestSeekSequence &+= 1
+        return latestSeekSequence
+    }
+
+    func isCurrentSeek(_ sequence: UInt64) -> Bool {
+        sequence == latestSeekSequence
+    }
+}
+
+struct PlaybackRouteTransactionCoordinator: Sendable, Equatable {
+    private(set) var latestSequence: UInt64 = 0
+    private(set) var activeSequence: UInt64?
+
+    mutating func begin() -> UInt64 {
+        latestSequence &+= 1
+        activeSequence = latestSequence
+        return latestSequence
+    }
+
+    func isActive(_ sequence: UInt64) -> Bool {
+        activeSequence == sequence
+    }
+
+    mutating func invalidate() {
+        activeSequence = nil
+    }
+}
+
+/// Generation/user-action scoped proof that playback has made real monotonic
+/// progress. Timeline jumps while seeking never count toward the healthy
+/// progress reset budget; the first eligible clock sample anchors the epoch.
+struct PlaybackProgressEpoch: Sendable, Equatable {
+    private(set) var sequence: UInt64 = 0
+    private(set) var baselineSeconds: Double?
+
+    mutating func begin() {
+        sequence &+= 1
+        baselineSeconds = nil
+    }
+
+    mutating func observe(
+        seconds: Double,
+        eligible: Bool,
+        requiredProgressSeconds: TimeInterval
+    ) -> Bool {
+        guard seconds.isFinite,
+              eligible,
+              requiredProgressSeconds.isFinite,
+              requiredProgressSeconds > 0 else {
+            return false
+        }
+        guard let baselineSeconds else {
+            self.baselineSeconds = seconds
+            return false
+        }
+        let progress = seconds - baselineSeconds
+        guard progress >= 0 else {
+            self.baselineSeconds = seconds
+            return false
+        }
+        guard progress >= requiredProgressSeconds else {
+            return false
+        }
+        self.baselineSeconds = seconds
+        return true
+    }
 }
 
 public struct AetherPlaybackCapabilityDelta:

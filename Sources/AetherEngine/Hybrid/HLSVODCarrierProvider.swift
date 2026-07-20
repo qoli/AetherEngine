@@ -10,7 +10,7 @@ enum HLSVODCarrierProviderError:
     case startupResourceMissing(ordinal: Int)
     case pump(HLSVODMediaPumpError)
     case closed
-    case unexpected(reason: String)
+    case unexpected(HybridPlaybackFailureEvidence)
 
     var errorDescription: String? {
         switch self {
@@ -20,8 +20,8 @@ enum HLSVODCarrierProviderError:
             error.localizedDescription
         case .closed:
             "HLS VOD carrier provider is closed"
-        case .unexpected(let reason):
-            "HLS VOD carrier provider failed unexpectedly: \(reason)"
+        case .unexpected(let evidence):
+            "HLS VOD carrier provider failed at \(evidence.stage.rawValue).\(evidence.caseCode) (\(evidence.underlyingDomain):\(evidence.underlyingCode))"
         }
     }
 }
@@ -93,6 +93,9 @@ final class HLSVODCarrierProvider:
             HLSVODOriginResourceLoader.defaultCapacityBytes,
         baseDirectory: URL =
             FileManager.default.temporaryDirectory,
+        transportRetryBudget: PlaybackTransportRetryBudget = .init(
+            maximumFailureAttempts: 3
+        ),
         fetchOverride:
             HLSVODOriginResourceLoader.Fetch? = nil
     ) async throws -> HLSVODCarrierProvider {
@@ -110,7 +113,11 @@ final class HLSVODCarrierProvider:
         } catch {
             throw HLSVODCarrierProviderError
                 .unexpected(
-                    reason: String(describing: error)
+                    HybridPlaybackFailureEvidence(
+                        stage: .routeCreation,
+                        caseCode: "videoProvider",
+                        error: error
+                    )
                 )
         }
         let pump: HLSVODMediaPump
@@ -130,6 +137,7 @@ final class HLSVODCarrierProvider:
                     maximumResourceBytes,
                 capacityBytes: capacityBytes,
                 baseDirectory: baseDirectory,
+                transportRetryBudget: transportRetryBudget,
                 fetchOverride: fetchOverride
             )
         } catch {
@@ -141,7 +149,11 @@ final class HLSVODCarrierProvider:
             }
             throw HLSVODCarrierProviderError
                 .unexpected(
-                    reason: String(describing: error)
+                    HybridPlaybackFailureEvidence(
+                        stage: .routeCreation,
+                        caseCode: "mediaPump",
+                        error: error
+                    )
                 )
         }
 
@@ -156,9 +168,10 @@ final class HLSVODCarrierProvider:
             do {
                 try await pump.close()
             } catch {
+                let nsError = error as NSError
                 EngineLog.emit(
                     "[HLSVODCarrierProvider] setup cleanup failed: "
-                        + String(describing: error),
+                        + "domain=\(nsError.domain) code=\(nsError.code)",
                     category: .session
                 )
             }
@@ -413,9 +426,10 @@ final class HLSVODCarrierProvider:
                 try await self.pump.close()
             }
         } catch {
+            let nsError = error as NSError
             EngineLog.emit(
                 "[HLSVODCarrierProvider] close failed: "
-                    + String(describing: error),
+                    + "domain=\(nsError.domain) code=\(nsError.code)",
                 category: .session
             )
         }
@@ -801,7 +815,11 @@ final class HLSVODCarrierProvider:
             return .pump(pump)
         }
         return .unexpected(
-            reason: String(describing: error)
+            HybridPlaybackFailureEvidence(
+                stage: .provider,
+                caseCode: "runtime",
+                error: error
+            )
         )
     }
 
@@ -810,12 +828,16 @@ final class HLSVODCarrierProvider:
     ) -> HybridPlaybackSessionError? {
         if let provider =
                 error as? HLSVODCarrierProviderError {
-            guard case .pump(let pump) = provider else {
+            switch provider {
+            case .pump(let pump):
+                return hybridPlaybackSessionError(
+                    from: pump
+                )
+            case .unexpected(let evidence):
+                return .providerFailed(evidence)
+            case .startupResourceMissing, .closed:
                 return nil
             }
-            return hybridPlaybackSessionError(
-                from: pump
-            )
         }
         if let pump = error as? HLSVODMediaPumpError {
             guard case .origin(let origin) = pump else {
@@ -826,15 +848,125 @@ final class HLSVODCarrierProvider:
             )
         }
         if let origin =
-                error as? HLSVODOriginResourceError,
-           case .preflightGenerationInvalidated(
+                error as? HLSVODOriginResourceError {
+            if case .preflightGenerationInvalidated(
                 let reason
-           ) = origin {
-            return .hlsPreflightGenerationInvalidated(
-                reason.publicReason
+            ) = origin {
+                return .hlsPreflightGenerationInvalidated(
+                    reason.publicReason
+                )
+            }
+            return .originFailed(
+                originFailure(from: origin)
             )
         }
         return nil
+    }
+
+    private static func originFailure(
+        from error: HLSVODOriginResourceError
+    ) -> HybridPlaybackOriginFailure {
+        switch error {
+        case .transport(let code):
+            let scope: HybridPlaybackOriginFailureScope =
+                switch HLSVODOriginResourceLoader
+                    .transportDisposition(for: code) {
+                case .transient: .transient
+                case .cancelled: .cancelled
+                case .security: .security
+                case .invariant: .invariant
+                }
+            return .init(
+                scope: scope,
+                caseCode: "transport",
+                underlyingDomain: NSURLErrorDomain,
+                underlyingCode: code.rawValue
+            )
+        case .transportFailure:
+            return .init(
+                scope: .transient,
+                caseCode: "transportFailure",
+                underlyingDomain: NSURLErrorDomain,
+                underlyingCode: URLError.Code.unknown.rawValue
+            )
+        case .transportBudgetExhausted:
+            return .init(
+                scope: .transient,
+                caseCode: "transportBudgetExhausted",
+                underlyingDomain: "AetherPlaybackRecovery",
+                underlyingCode: 3
+            )
+        case .httpStatus(let status):
+            let scope: HybridPlaybackOriginFailureScope
+            if status == 401 || status == 403 {
+                scope = .authentication
+            } else if status == 408 || status == 425
+                        || status == 429 || status >= 500 {
+                scope = .transient
+            } else {
+                scope = .malformed
+            }
+            return .init(
+                scope: scope,
+                caseCode: "httpStatus",
+                underlyingDomain: "HTTP",
+                underlyingCode: status
+            )
+        case .contentLengthMismatch, .emptyResource:
+            return .init(
+                scope: .transient,
+                caseCode: "truncatedResponse",
+                underlyingDomain: "AetherHLSOrigin",
+                underlyingCode: 1
+            )
+        case .effectiveOriginMismatch,
+             .redirectCredentialScopeViolation:
+            return .init(
+                scope: .security,
+                caseCode: "originScope",
+                underlyingDomain: "AetherHLSOrigin",
+                underlyingCode: 2
+            )
+        case .preflightEvidenceMismatch:
+            return .init(
+                scope: .graphInvalidated,
+                caseCode: "contentChanged",
+                underlyingDomain: "AetherHLSOrigin",
+                underlyingCode: 3
+            )
+        case .resourceTooLarge, .unsupportedContentEncoding,
+             .nonHTTPResponse:
+            return .init(
+                scope: .malformed,
+                caseCode: "invalidResponse",
+                underlyingDomain: "AetherHLSOrigin",
+                underlyingCode: 4
+            )
+        case .preflightGenerationInvalidated:
+            return .init(
+                scope: .graphInvalidated,
+                caseCode: "generationInvalidated",
+                underlyingDomain: "AetherHLSOrigin",
+                underlyingCode: 5
+            )
+        case .closed:
+            return .init(
+                scope: .resource,
+                caseCode: "closed",
+                underlyingDomain: "AetherHLSOrigin",
+                underlyingCode: 6
+            )
+        case .invalidLimits, .resourceNotBound,
+             .cacheDirectoryCreationFailed, .cacheReadFailed,
+             .cacheWriteFailed, .cacheEvictionFailed,
+             .cacheCleanupFailed:
+            return .init(
+                scope: .resource,
+                caseCode: "resourceFailure",
+                underlyingDomain: "AetherHLSOrigin",
+                underlyingCode: 7
+            )
+        }
     }
 }
 
@@ -893,8 +1025,13 @@ private enum BlockingAsyncBridge {
         guard let result = box.take() else {
             throw HLSVODCarrierProviderError
                 .unexpected(
-                    reason:
-                        "async bridge completed without a result"
+                    HybridPlaybackFailureEvidence(
+                        stage: .provider,
+                        caseCode: "asyncBridgeMissingResult",
+                        underlyingDomain:
+                            "HLSVODCarrierProvider",
+                        underlyingCode: 1
+                    )
                 )
         }
         return try result.get()

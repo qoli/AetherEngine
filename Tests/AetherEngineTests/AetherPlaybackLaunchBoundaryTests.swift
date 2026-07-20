@@ -378,6 +378,47 @@ struct AetherPlaybackLaunchBoundaryTests {
     }
 
     @MainActor
+    @Test("Native Seek restores user intent instead of transient AVPlayer rate")
+    func nativeSeekUsesSessionIntent() async throws {
+        let url = try temporaryWAV()
+        defer {
+            try? FileManager.default.removeItem(
+                at: url.deletingLastPathComponent()
+            )
+        }
+        let session = try AetherNativePlaybackSession.make(
+            url: url,
+            preflightResult: nativePreflight()
+        )
+        try await session.prepare()
+        try session.play()
+
+        // AVPlayer reports rate zero while buffering and while a Seek lands;
+        // that transport fact must not overwrite the user's play intent.
+        session.avPlayer.pause()
+        await Task.yield()
+        try await session.seek(
+            to: CMTime(
+                seconds: 0.5,
+                preferredTimescale: 600
+            )
+        )
+        #expect(session.state == .playing)
+        #expect(session.avPlayer.rate > 0)
+
+        try session.pause()
+        try await session.seek(
+            to: CMTime(
+                seconds: 1,
+                preferredTimescale: 600
+            )
+        )
+        #expect(session.state == .paused)
+        #expect(session.avPlayer.rate == 0)
+        session.stop()
+    }
+
+    @MainActor
     @Test("Native audio selection cancels the old cursor before publishing replacement identity")
     func nativeSelectionCancelsOldAnalysisCursor() async throws {
         let url = try temporaryWAV()

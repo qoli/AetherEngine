@@ -2,6 +2,92 @@ import AVFoundation
 import CoreMedia
 import Foundation
 
+public enum HybridPlaybackOriginFailureScope:
+    String,
+    Sendable,
+    Equatable
+{
+    case transient
+    case authentication
+    case security
+    case graphInvalidated
+    case malformed
+    case resource
+    case cancelled
+    case invariant
+}
+
+public struct HybridPlaybackOriginFailure:
+    Sendable,
+    Equatable
+{
+    public let scope: HybridPlaybackOriginFailureScope
+    public let caseCode: String
+    public let underlyingDomain: String
+    public let underlyingCode: Int
+
+    public init(
+        scope: HybridPlaybackOriginFailureScope,
+        caseCode: String,
+        underlyingDomain: String,
+        underlyingCode: Int
+    ) {
+        self.scope = scope
+        self.caseCode = caseCode
+        self.underlyingDomain = underlyingDomain
+        self.underlyingCode = underlyingCode
+    }
+}
+
+public enum HybridPlaybackFailureStage:
+    String,
+    Sendable,
+    Equatable
+{
+    case routeCreation
+    case preparation
+    case seek
+    case runtime
+    case provider
+    case carrier
+}
+
+public struct HybridPlaybackFailureEvidence:
+    Sendable,
+    Equatable
+{
+    public let stage: HybridPlaybackFailureStage
+    public let caseCode: String
+    public let underlyingDomain: String
+    public let underlyingCode: Int
+
+    public init(
+        stage: HybridPlaybackFailureStage,
+        caseCode: String,
+        underlyingDomain: String,
+        underlyingCode: Int
+    ) {
+        self.stage = stage
+        self.caseCode = caseCode
+        self.underlyingDomain = underlyingDomain
+        self.underlyingCode = underlyingCode
+    }
+
+    init(
+        stage: HybridPlaybackFailureStage,
+        caseCode: String,
+        error: Error
+    ) {
+        let nsError = error as NSError
+        self.init(
+            stage: stage,
+            caseCode: caseCode,
+            underlyingDomain: nsError.domain,
+            underlyingCode: nsError.code
+        )
+    }
+}
+
 public enum HybridPlaybackSessionError:
     Error,
     LocalizedError,
@@ -47,8 +133,9 @@ public enum HybridPlaybackSessionError:
     case hlsPreflightGenerationInvalidated(
         AetherHLSPreflightInvalidationReason
     )
-    case providerFailed(reason: String)
-    case carrierFailed(reason: String)
+    case providerFailed(HybridPlaybackFailureEvidence)
+    case originFailed(HybridPlaybackOriginFailure)
+    case carrierFailed(HybridPlaybackFailureEvidence)
     case presentationFailed(AetherHybridPresentationError)
     case decoderFailed(reason: String)
     case readinessFailed(reason: String)
@@ -119,10 +206,12 @@ public enum HybridPlaybackSessionError:
             return "Hybrid seek lost its required transport resume intent"
         case .hlsPreflightGenerationInvalidated:
             return "Hybrid HLS preflight generation is no longer valid; run a new preflight before creating another session"
-        case .providerFailed(let reason):
-            return "Hybrid carrier provider failed: \(reason)"
-        case .carrierFailed(let reason):
-            return "Hybrid AVPlayer carrier failed: \(reason)"
+        case .providerFailed(let evidence):
+            return "Hybrid carrier provider failed at \(evidence.stage.rawValue).\(evidence.caseCode) (\(evidence.underlyingDomain):\(evidence.underlyingCode))"
+        case .originFailed(let failure):
+            return "Hybrid origin request failed at \(failure.caseCode) (\(failure.underlyingDomain):\(failure.underlyingCode))"
+        case .carrierFailed(let evidence):
+            return "Hybrid AVPlayer carrier failed at \(evidence.stage.rawValue).\(evidence.caseCode) (\(evidence.underlyingDomain):\(evidence.underlyingCode))"
         case .presentationFailed(let error):
             return "Hybrid sample-buffer presentation failed: \(error.localizedDescription)"
         case .decoderFailed(let reason):
@@ -258,6 +347,7 @@ extension BlackCarrierAVPlayerSession: HybridCarrierPlayerTransport {}
 
 @MainActor
 protocol HybridPlaybackRenderSurface: AnyObject {
+    var retainsAcceptedFramesUntilCapacityCallback: Bool { get }
     func beginGeneration(
         _ generation: UInt64,
         videoFormat: VideoFormat
@@ -275,9 +365,31 @@ protocol HybridPlaybackRenderSurface: AnyObject {
     ) throws
     func flush(removingDisplayedImage: Bool)
     func invalidate()
+    func installMailboxCallbacks(
+        frameDidLeaveMailbox: @escaping @Sendable () -> Void,
+        asynchronousFailureHandler: @escaping @MainActor (
+            AetherHybridPresentationError
+        ) -> Void
+    )
+    func setRendererStallDetectionEnabled(_ enabled: Bool)
 }
 
-extension AetherHybridPresentationView: HybridPlaybackRenderSurface {}
+extension HybridPlaybackRenderSurface {
+    var retainsAcceptedFramesUntilCapacityCallback: Bool { false }
+
+    func installMailboxCallbacks(
+        frameDidLeaveMailbox: @escaping @Sendable () -> Void,
+        asynchronousFailureHandler: @escaping @MainActor (
+            AetherHybridPresentationError
+        ) -> Void
+    ) {}
+
+    func setRendererStallDetectionEnabled(_ enabled: Bool) {}
+}
+
+extension AetherHybridPresentationView: HybridPlaybackRenderSurface {
+    var retainsAcceptedFramesUntilCapacityCallback: Bool { true }
+}
 
 actor HybridPlaybackProviderCoordinator {
     private let provider: any HybridCarrierTransportProvider
@@ -333,41 +445,208 @@ actor HybridPlaybackProviderCoordinator {
     }
 }
 
+struct HybridPlaybackFrameRelayDiagnostics: Sendable, Equatable {
+    let queuedFrames: Int
+    let presentationFrames: Int
+    let drainIsScheduled: Bool
+    let highWaterWasReached: Bool
+
+    var mailboxDepth: Int {
+        queuedFrames + presentationFrames
+    }
+}
+
 final class HybridPlaybackFrameRelay: @unchecked Sendable {
-    private let lock = NSLock()
+    private let condition = NSCondition()
     private weak var session: HybridPlaybackSession?
+    private var queuedFrames: [DecodedVideoFrame] = []
+    private var presentationFrames = 0
+    private var drainIsScheduled = false
+    private var highWaterWasReached = false
+
+    private static let highWaterMark =
+        AetherHybridPresentationView.maximumPendingSampleBuffers
+    private static let lowWaterMark =
+        AetherHybridPresentationView.pendingSampleLowWaterMark
 
     func attach(_ session: HybridPlaybackSession) {
-        lock.lock()
+        condition.lock()
         self.session = session
-        lock.unlock()
+        condition.broadcast()
+        condition.unlock()
     }
 
     func detach() {
-        lock.lock()
+        condition.lock()
         session = nil
-        lock.unlock()
+        queuedFrames.removeAll(keepingCapacity: true)
+        presentationFrames = 0
+        drainIsScheduled = false
+        highWaterWasReached = false
+        condition.broadcast()
+        condition.unlock()
     }
 
     func emit(_ frame: DecodedVideoFrame) {
-        lock.lock()
-        let session = session
-        lock.unlock()
-        guard let session else { return }
-        Task { @MainActor [weak session] in
-            session?.receiveDecodedFrame(frame)
+        condition.lock()
+        while session != nil,
+              mailboxDepth >= Self.highWaterMark
+                || (highWaterWasReached
+                    && mailboxDepth > Self.lowWaterMark) {
+            condition.wait()
         }
+        guard session != nil else {
+            condition.unlock()
+            return
+        }
+        queuedFrames.append(frame)
+        if mailboxDepth >= Self.highWaterMark {
+            highWaterWasReached = true
+        }
+        condition.unlock()
+        scheduleDrainIfNeeded()
     }
 
     func fail(_ error: HybridVideoDecodeSinkError) {
-        lock.lock()
+        condition.lock()
         let session = session
-        lock.unlock()
+        condition.unlock()
         guard let session else { return }
         Task { @MainActor [weak session] in
             session?.receiveDecoderFailure(error)
         }
     }
+
+    func frameDidLeavePresentationMailbox() {
+        condition.lock()
+        if presentationFrames > 0 {
+            presentationFrames -= 1
+        }
+        resumeProducerIfNeededLocked()
+        condition.unlock()
+        scheduleDrainIfNeeded()
+    }
+
+    var diagnostics: HybridPlaybackFrameRelayDiagnostics {
+        condition.lock()
+        defer { condition.unlock() }
+        return HybridPlaybackFrameRelayDiagnostics(
+            queuedFrames: queuedFrames.count,
+            presentationFrames: presentationFrames,
+            drainIsScheduled: drainIsScheduled,
+            highWaterWasReached: highWaterWasReached
+        )
+    }
+
+    private var mailboxDepth: Int {
+        queuedFrames.count + presentationFrames
+    }
+
+    private func scheduleDrainIfNeeded() {
+        condition.lock()
+        guard !drainIsScheduled,
+              !queuedFrames.isEmpty,
+              let session else {
+            condition.unlock()
+            return
+        }
+        drainIsScheduled = true
+        condition.unlock()
+        Task { @MainActor [weak self, weak session] in
+            guard let self, let session else {
+                self?.finishDrain()
+                return
+            }
+            self.drain(on: session)
+        }
+    }
+
+    @MainActor
+    private func drain(on session: HybridPlaybackSession) {
+        while let frame = peekFrame() {
+            reservePresentationOwnership()
+            switch session.receiveDecodedFrame(frame) {
+            case .retainedByPresentation:
+                completeQueuedFrame(
+                    removeQueuedFrame: true,
+                    releaseReservedOwnership: false
+                )
+            case .completed:
+                completeQueuedFrame(
+                    removeQueuedFrame: true,
+                    releaseReservedOwnership: true
+                )
+            case .backpressured:
+                completeQueuedFrame(
+                    removeQueuedFrame: false,
+                    releaseReservedOwnership: true
+                )
+                finishDrain()
+                return
+            }
+        }
+        finishDrain()
+    }
+
+    private func peekFrame() -> DecodedVideoFrame? {
+        condition.lock()
+        let frame = queuedFrames.first
+        condition.unlock()
+        return frame
+    }
+
+    /// Reserves presentation ownership before entering the MainActor surface.
+    /// A ready renderer is allowed to enqueue and synchronously report that the
+    /// frame left its mailbox before `receiveDecodedFrame` returns. Reserving
+    /// first keeps that callback ordered and prevents a permanent +1 depth leak.
+    private func reservePresentationOwnership() {
+        condition.lock()
+        presentationFrames += 1
+        condition.unlock()
+    }
+
+    private func completeQueuedFrame(
+        removeQueuedFrame: Bool,
+        releaseReservedOwnership: Bool
+    ) {
+        condition.lock()
+        if removeQueuedFrame, !queuedFrames.isEmpty {
+            queuedFrames.removeFirst()
+        }
+        if releaseReservedOwnership, presentationFrames > 0 {
+            presentationFrames -= 1
+        }
+        resumeProducerIfNeededLocked()
+        condition.unlock()
+    }
+
+    private func finishDrain() {
+        condition.lock()
+        drainIsScheduled = false
+        let shouldReschedule =
+            session != nil && !queuedFrames.isEmpty
+                && mailboxDepth < Self.highWaterMark
+        condition.unlock()
+        if shouldReschedule {
+            scheduleDrainIfNeeded()
+        }
+    }
+
+    private func resumeProducerIfNeededLocked() {
+        if mailboxDepth <= Self.lowWaterMark {
+            highWaterWasReached = false
+            condition.broadcast()
+        } else if !highWaterWasReached,
+                  mailboxDepth < Self.highWaterMark {
+            condition.signal()
+        }
+    }
+}
+
+private enum HybridDecodedFrameDelivery {
+    case retainedByPresentation
+    case completed
+    case backpressured
 }
 
 /// Engine-owned composition of AVPlayer carrier transport, real-video decode demand and sample-buffer timing.
@@ -381,6 +660,14 @@ final class HybridPlaybackSession {
     private struct ResumeIntent {
         let wasPlaying: Bool
         let rate: Float
+    }
+
+    private struct QueuedSeekOperation {
+        let sequence: UInt64
+        let target: CMTime
+        let timeout: TimeInterval
+        let continuation:
+            CheckedContinuation<HybridPlaybackSeekResult, Error>
     }
 
     private static let clockInterval = CMTime(
@@ -425,6 +712,10 @@ final class HybridPlaybackSession {
     /// this engine boundary.
     private let audioAnalysisTrackIDByCarrierOrdinal:
         [Int: Int]
+    private let audioTrackIDByCarrierOrdinal: [Int: Int]
+    private let advertisedAudioTracks: [AetherPlaybackTrack]
+    private let advertisedNativeSubtitleTracks:
+        [AetherPlaybackTrack]
     private let carrierBandwidthTelemetrySource:
         (any HybridCarrierBandwidthTelemetrySource)?
     private let realVideoBitrateTelemetrySource:
@@ -445,6 +736,12 @@ final class HybridPlaybackSession {
     private var managedTimeJumpSuppressionDeadline: TimeInterval?
     private var externalJumpTask: Task<Void, Never>?
     private var pendingResumeIntent: ResumeIntent?
+    private var seekRequestSequence: UInt64 = 0
+    private var latestSeekRequestSequence: UInt64 = 0
+    private var queuedSeekOperation: QueuedSeekOperation?
+    private var activeSeekRequestSequence: UInt64?
+    private var cancelledSeekRequestSequences = Set<UInt64>()
+    private var seekWorkerTask: Task<Void, Never>?
     private(set) var audioAnalysisPlaybackPressure:
         HybridAudioAnalysisPlaybackPressure = .none
     private(set) var carrierForwardBufferSeconds: Double?
@@ -466,6 +763,8 @@ final class HybridPlaybackSession {
     private var audioAnalysisSelectionResolutionTask:
         Task<Void, Never>?
     private(set) var selectedAudioAnalysisTrackID: Int?
+    private(set) var selectedAudioTrackIDValue: Int?
+    private var selectedNativeSubtitleTrackID: Int?
     var stateDidChange:
         (@MainActor @Sendable (HybridPlaybackSessionState) -> Void)?
     var telemetryDidChange:
@@ -476,6 +775,8 @@ final class HybridPlaybackSession {
             Int?
         ) -> Void)?
     var selectedAudioAnalysisTrackIDDidChange:
+        (@MainActor @Sendable (Int?) -> Void)?
+    var selectedAudioTrackIDDidChange:
         (@MainActor @Sendable (Int?) -> Void)?
     var runtimePresentationValidation:
         (@MainActor () throws -> Void) = {}
@@ -535,6 +836,41 @@ final class HybridPlaybackSession {
 
     var activeOverlaySubtitleTrackID: Int? {
         subtitleController?.selectedTrackID
+    }
+
+    var audioTracks: [AetherPlaybackTrack] {
+        advertisedAudioTracks
+    }
+
+    var subtitleTracks: [AetherPlaybackTrack] {
+        advertisedNativeSubtitleTracks
+            + overlaySubtitleTracks.map { track in
+                AetherPlaybackTrack(
+                    id: "subtitle-overlay:\(track.id)",
+                    sourceTrackID: track.id,
+                    kind: .subtitle,
+                    name: track.name,
+                    language: track.language,
+                    codec: track.kind.rawValue,
+                    isDefault: track.isDefault,
+                    isForced: track.isForced,
+                    isExternal: track.isExternal
+                )
+            }
+    }
+
+    var selectedAudioTrackID: Int? {
+        selectedAudioTrackIDValue
+    }
+
+    var selectedSubtitleTrackIdentifier: String? {
+        if let overlayID = activeOverlaySubtitleTrackID {
+            return "subtitle-overlay:\(overlayID)"
+        }
+        if let nativeID = selectedNativeSubtitleTrackID {
+            return "subtitle-native:\(nativeID)"
+        }
+        return nil
     }
 
     var carrierBandwidthTelemetry:
@@ -600,6 +936,62 @@ final class HybridPlaybackSession {
                     return (rendition.ordinal, trackID)
                 }
         )
+        let audioTrackPairs = provider.alternateAudioRenditions
+            .compactMap { rendition -> (Int, Int)? in
+                guard let trackID = provider.sourceTrackID(
+                    forAudioOrdinal: rendition.ordinal
+                ) else {
+                    return nil
+                }
+                return (rendition.ordinal, trackID)
+            }
+        audioTrackIDByCarrierOrdinal = Dictionary(
+            uniqueKeysWithValues: audioTrackPairs
+        )
+        advertisedAudioTracks = provider.alternateAudioRenditions
+            .compactMap { rendition in
+                guard let sourceTrackID = provider.sourceTrackID(
+                    forAudioOrdinal: rendition.ordinal
+                ) else {
+                    return nil
+                }
+                return AetherPlaybackTrack(
+                    id: "audio-source:\(sourceTrackID)",
+                    sourceTrackID: sourceTrackID,
+                    kind: .audio,
+                    name: rendition.name,
+                    language: rendition.language,
+                    codec: nil,
+                    isDefault: rendition.isDefault,
+                    isAtmos: rendition.channels?
+                        .localizedCaseInsensitiveContains("JOC")
+                        == true
+                )
+            }
+        advertisedNativeSubtitleTracks = provider
+            .nativeSubtitleRenditions.map { rendition in
+                AetherPlaybackTrack(
+                    id: "subtitle-native:\(rendition.ordinal)",
+                    sourceTrackID: nil,
+                    kind: .subtitle,
+                    name: rendition.name,
+                    language: rendition.language,
+                    codec: "webvtt",
+                    isDefault: rendition.isDefault,
+                    isForced: rendition.isForced
+                )
+            }
+        selectedNativeSubtitleTrackID = nil
+        if let defaultOrdinal = provider.alternateAudioRenditions
+            .first(where: \.isDefault)?.ordinal {
+            selectedAudioTrackIDValue =
+                audioTrackIDByCarrierOrdinal[defaultOrdinal]
+        } else if audioTrackIDByCarrierOrdinal.count == 1 {
+            selectedAudioTrackIDValue =
+                audioTrackIDByCarrierOrdinal.values.first
+        } else {
+            selectedAudioTrackIDValue = nil
+        }
         if let defaultRendition = provider
             .alternateAudioRenditions
             .first(where: \.isDefault),
@@ -650,6 +1042,16 @@ final class HybridPlaybackSession {
         )
         avPlayer = transport.avPlayer
         relay.attach(self)
+        if renderSurface.retainsAcceptedFramesUntilCapacityCallback {
+            renderSurface.installMailboxCallbacks(
+                frameDidLeaveMailbox: { [weak relay] in
+                    relay?.frameDidLeavePresentationMailbox()
+                },
+                asynchronousFailureHandler: { [weak self] error in
+                    self?.receivePresentationFailure(error)
+                }
+            )
+        }
         subtitleController?.tracksDidChange = {
             [weak self] tracks, selectedTrackID in
             self?.subtitleTracksDidChange?(
@@ -732,6 +1134,9 @@ final class HybridPlaybackSession {
         avPlayer: AVPlayer = AVPlayer(),
         decoderPreference: HybridVideoDecoderPreference = .automatic,
         initialGeneration: UInt64 = 0,
+        transportRetryBudget: PlaybackTransportRetryBudget = .init(
+            maximumFailureAttempts: 3
+        ),
         fetchOverride:
             HLSVODOriginResourceLoader.Fetch? = nil
     ) async throws -> HybridPlaybackSession {
@@ -763,6 +1168,7 @@ final class HybridPlaybackSession {
                 decoderPreference: decoderPreference,
                 initialGeneration:
                     initialGeneration,
+                transportRetryBudget: transportRetryBudget,
                 fetchOverride: fetchOverride
             )
         } catch {
@@ -808,8 +1214,13 @@ final class HybridPlaybackSession {
                 preflight.hybridTimeline else {
             throw HybridPlaybackSessionError
                 .providerFailed(
-                    reason:
-                        "HLS preflight did not retain a hybrid timeline"
+                    HybridPlaybackFailureEvidence(
+                        stage: .routeCreation,
+                        caseCode: "missingHLSTimeline",
+                        underlyingDomain:
+                            "HybridPlaybackSession",
+                        underlyingCode: 1
+                    )
                 )
         }
         return timeline
@@ -949,11 +1360,13 @@ final class HybridPlaybackSession {
         }
         try validateCarrierClock()
         avPlayer.play()
+        renderSurface.setRendererStallDetectionEnabled(true)
         telemetryDidChange?(.transportChanged)
         reevaluateAudioAnalysisPlaybackPressure()
     }
 
     func pause() throws {
+        renderSurface.setRendererStallDetectionEnabled(false)
         switch state {
         case .ready:
             try validateCarrierClock()
@@ -986,6 +1399,7 @@ final class HybridPlaybackSession {
         }
         try validateCarrierClock()
         avPlayer.rate = rate
+        renderSurface.setRendererStallDetectionEnabled(rate > 0)
         telemetryDidChange?(.transportChanged)
         reevaluateAudioAnalysisPlaybackPressure()
     }
@@ -994,11 +1408,112 @@ final class HybridPlaybackSession {
         to target: CMTime,
         timeout: TimeInterval = 15
     ) async throws -> HybridPlaybackSeekResult {
-        try await performSeek(
-            to: target,
-            issueCarrierSeek: true,
-            timeout: timeout
-        )
+        seekRequestSequence &+= 1
+        let sequence = seekRequestSequence
+        latestSeekRequestSequence = sequence
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation {
+                continuation in
+                enqueueSeekOperation(
+                    QueuedSeekOperation(
+                        sequence: sequence,
+                        target: target,
+                        timeout: timeout,
+                        continuation: continuation
+                    )
+                )
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.cancelSeekOperation(sequence: sequence)
+            }
+        }
+    }
+
+    private func enqueueSeekOperation(
+        _ operation: QueuedSeekOperation
+    ) {
+        if let superseded = queuedSeekOperation {
+            superseded.continuation.resume(
+                returning: .superseded(
+                    currentGeneration: classifier.generation
+                )
+            )
+        }
+        queuedSeekOperation = operation
+        guard seekWorkerTask == nil else { return }
+        seekWorkerTask = Task { @MainActor [weak self] in
+            await self?.drainSeekOperations()
+        }
+    }
+
+    private func cancelSeekOperation(sequence: UInt64) {
+        cancelledSeekRequestSequences.insert(sequence)
+        if queuedSeekOperation?.sequence == sequence {
+            let cancelled = queuedSeekOperation
+            queuedSeekOperation = nil
+            cancelled?.continuation.resume(
+                throwing: CancellationError()
+            )
+            cancelledSeekRequestSequences.remove(sequence)
+        }
+    }
+
+    private func drainSeekOperations() async {
+        while let operation = queuedSeekOperation {
+            queuedSeekOperation = nil
+            activeSeekRequestSequence = operation.sequence
+            do {
+                let result = try await performSeek(
+                    to: operation.target,
+                    issueCarrierSeek: true,
+                    timeout: operation.timeout
+                )
+                let wasCancelled = cancelledSeekRequestSequences
+                    .remove(operation.sequence) != nil
+                if wasCancelled {
+                    operation.continuation.resume(
+                        throwing: CancellationError()
+                    )
+                } else if operation.sequence
+                            != latestSeekRequestSequence {
+                    operation.continuation.resume(
+                        returning: .superseded(
+                            currentGeneration: classifier.generation
+                        )
+                    )
+                } else {
+                    operation.continuation.resume(returning: result)
+                }
+            } catch {
+                let wasCancelled = cancelledSeekRequestSequences
+                    .remove(operation.sequence) != nil
+                if wasCancelled
+                    || operation.sequence
+                        != latestSeekRequestSequence {
+                    operation.continuation.resume(
+                        returning: .superseded(
+                            currentGeneration: classifier.generation
+                        )
+                    )
+                } else {
+                    let typed = error as? HybridPlaybackSessionError
+                        ?? .providerFailed(
+                            HybridPlaybackFailureEvidence(
+                                stage: .seek,
+                                caseCode: "seekWorker",
+                                error: error
+                            )
+                        )
+                    if typed != .cancelled {
+                        terminate(with: typed)
+                    }
+                    operation.continuation.resume(throwing: typed)
+                }
+            }
+            activeSeekRequestSequence = nil
+        }
+        seekWorkerTask = nil
     }
 
     func audioAnalysisStream(
@@ -1025,8 +1540,9 @@ final class HybridPlaybackSession {
             throw AudioAnalysisError
                 .sourceCannotCreateIndependentReader
         } catch {
+            let nsError = error as NSError
             throw AudioAnalysisError.analysisFailed(
-                String(describing: error)
+                "analysisSource(\(nsError.domain):\(nsError.code))"
             )
         }
 
@@ -1082,11 +1598,79 @@ final class HybridPlaybackSession {
         nativeWebVTTBridge?.setOverlaySubtitleActive(
             trackID != nil
         )
+        if trackID != nil {
+            selectedNativeSubtitleTrackID = nil
+        }
+    }
+
+    func selectAudioTrack(_ trackID: Int) async throws {
+        guard case .ready = state,
+              let ordinal = audioTrackIDByCarrierOrdinal
+                .first(where: { $0.value == trackID })?.key,
+              let item = avPlayer.currentItem else {
+            throw AetherPlaybackTrackSelectionError
+                .selectionUnavailable("audio-source:\(trackID)")
+        }
+        guard let group = try await item.asset
+            .loadMediaSelectionGroup(for: .audible),
+              group.options.indices.contains(ordinal) else {
+            throw AetherPlaybackTrackSelectionError
+                .selectionUnavailable("audio-source:\(trackID)")
+        }
+        item.select(group.options[ordinal], in: group)
+        applySelectedAudioAnalysisTrackID(
+            carrierOptionIndex: ordinal
+        )
+        rebuildPresentationAtCarrierTime()
+    }
+
+    func selectNativeSubtitleTrack(
+        _ ordinal: Int?
+    ) async throws {
+        guard case .ready = state,
+              let item = avPlayer.currentItem else {
+            throw AetherPlaybackTrackSelectionError
+                .selectionUnavailable(
+                    ordinal.map { "subtitle-native:\($0)" }
+                        ?? "subtitle-off"
+                )
+        }
+        guard let group = try await item.asset
+            .loadMediaSelectionGroup(for: .legible) else {
+            if ordinal == nil {
+                selectedNativeSubtitleTrackID = nil
+                return
+            }
+            throw AetherPlaybackTrackSelectionError
+                .selectionUnavailable("subtitle-native:\(ordinal!)")
+        }
+        if let ordinal {
+            guard group.options.indices.contains(ordinal) else {
+                throw AetherPlaybackTrackSelectionError
+                    .unknownTrack("subtitle-native:\(ordinal)")
+            }
+            item.select(group.options[ordinal], in: group)
+            selectedNativeSubtitleTrackID = ordinal
+            subtitleController?.deselect()
+            nativeWebVTTBridge?.setOverlaySubtitleActive(false)
+        } else {
+            item.select(nil, in: group)
+            selectedNativeSubtitleTrackID = nil
+        }
+        rebuildPresentationAtCarrierTime()
     }
 
     func stop() {
         guard state != .stopped else { return }
         state = .stopped
+        seekWorkerTask?.cancel()
+        seekWorkerTask = nil
+        if let queuedSeekOperation {
+            self.queuedSeekOperation = nil
+            queuedSeekOperation.continuation.resume(
+                throwing: CancellationError()
+            )
+        }
         teardownObservers()
         cancelDecodeDemandWorker()
         externalJumpTask?.cancel()
@@ -1127,33 +1711,44 @@ final class HybridPlaybackSession {
         telemetryDidChange?(.audioAnalysis(event))
     }
 
-    func receiveDecodedFrame(_ frame: DecodedVideoFrame) {
+    @discardableResult
+    fileprivate func receiveDecodedFrame(
+        _ frame: DecodedVideoFrame
+    ) -> HybridDecodedFrameDelivery {
         switch state {
         case .failed, .stopped:
-            return
+            return .completed
         case .idle, .preparing, .ready, .seeking:
             break
         }
         let outcome = readinessGate.considerDecodedFrame(frame)
         switch outcome {
         case .staleGeneration, .terminalFailure:
-            return
+            return .completed
         case .frameOutsideTargetWindow:
             readinessPrerollFramesRejected += 1
-            return
+            return .completed
         case .acceptedWaiting, .becameReady, .alreadyReady:
             break
         }
         do {
-            _ = try renderSurface.enqueue(frame)
+            let enqueueOutcome = try renderSurface.enqueue(frame)
+            if enqueueOutcome == .backpressured {
+                return .backpressured
+            }
+            if enqueueOutcome == .staleGeneration {
+                return .completed
+            }
         } catch let error as AetherHybridPresentationError {
             terminate(with: .presentationFailed(error))
-            return
+            return .completed
         } catch {
+            let nsError = error as NSError
             terminate(with: .readinessFailed(
-                reason: String(describing: error)
+                reason:
+                    "frameEnqueue(\(nsError.domain):\(nsError.code))"
             ))
-            return
+            return .completed
         }
         if videoFormat == .hdr10,
            frame.videoFormat == .hdr10Plus {
@@ -1162,9 +1757,21 @@ final class HybridPlaybackSession {
         }
         guard outcome == .acceptedWaiting
                 || outcome == .becameReady else {
-            return
+            return renderSurface
+                .retainsAcceptedFramesUntilCapacityCallback
+                ? .retainedByPresentation
+                : .completed
         }
         publishVideoReadyTelemetryIfNeeded(frame)
+        return renderSurface.retainsAcceptedFramesUntilCapacityCallback
+            ? .retainedByPresentation
+            : .completed
+    }
+
+    private func receivePresentationFailure(
+        _ error: AetherHybridPresentationError
+    ) {
+        terminate(with: .presentationFailed(error))
     }
 
     func receiveDecoderFailure(
@@ -1192,8 +1799,10 @@ final class HybridPlaybackSession {
         } catch let error as HybridPlaybackSessionError {
             terminate(with: error)
         } catch {
+            let nsError = error as NSError
             terminate(with: .readinessFailed(
-                reason: String(describing: error)
+                reason:
+                    "clockTick(\(nsError.domain):\(nsError.code))"
             ))
         }
     }
@@ -1263,6 +1872,7 @@ final class HybridPlaybackSession {
         managedSeekGeneration = generation
         decodeDemandSuspended = true
         cancelDecodeDemandWorker()
+        renderSurface.setRendererStallDetectionEnabled(false)
         avPlayer.pause()
         state = .seeking(generation: generation, target: target)
         telemetryDidChange?(
@@ -1315,15 +1925,6 @@ final class HybridPlaybackSession {
                 )
             }
 
-            try await coordinator.prepareGeneration(
-                segmentIndex: segmentIndex
-            )
-            guard generation == classifier.generation else {
-                return supersededResult(
-                    currentGeneration: classifier.generation
-                )
-            }
-
             if issueCarrierSeek {
                 managedTimeJumpSuppressionTarget = target
                 managedTimeJumpSuppressionDeadline =
@@ -1346,6 +1947,21 @@ final class HybridPlaybackSession {
                     generation: generation,
                     target: target,
                     segmentIndex: segmentIndex
+                )
+            }
+
+            // Land the only playback clock before target decode is allowed to
+            // fill the bounded presentation mailbox. `restart` establishes the
+            // new provider generation; `prepareGeneration` may synchronously
+            // produce many target frames. Running it first can deadlock when
+            // the paused, pre-seek renderer cannot release those frames until
+            // the carrier timebase reaches the target.
+            try await coordinator.prepareGeneration(
+                segmentIndex: segmentIndex
+            )
+            guard generation == classifier.generation else {
+                return supersededResult(
+                    currentGeneration: classifier.generation
                 )
             }
 
@@ -1383,7 +1999,6 @@ final class HybridPlaybackSession {
                 )
             }
             let typed = await mapSeekError(error)
-            terminate(with: typed)
             throw typed
         }
     }
@@ -1551,9 +2166,15 @@ final class HybridPlaybackSession {
                     self.terminate(with: error)
                 }
             } catch {
-                self.terminate(with: .providerFailed(
-                    reason: String(describing: error)
-                ))
+                self.terminate(
+                    with: .providerFailed(
+                        HybridPlaybackFailureEvidence(
+                            stage: .runtime,
+                            caseCode: "externalTimeJump",
+                            error: error
+                        )
+                    )
+                )
             }
         }
     }
@@ -1631,6 +2252,15 @@ final class HybridPlaybackSession {
     private func applySelectedAudioAnalysisTrackID(
         carrierOptionIndex: Int?
     ) {
+        let selectedPlaybackTrackID = carrierOptionIndex.flatMap {
+            audioTrackIDByCarrierOrdinal[$0]
+        }
+        if selectedPlaybackTrackID != selectedAudioTrackIDValue {
+            selectedAudioTrackIDValue = selectedPlaybackTrackID
+            selectedAudioTrackIDDidChange?(
+                selectedPlaybackTrackID
+            )
+        }
         let resolvedTrackID: Int?
         if let carrierOptionIndex {
             resolvedTrackID =
@@ -1689,9 +2319,15 @@ final class HybridPlaybackSession {
                     self.terminate(with: error)
                 }
             } catch {
-                self.terminate(with: .providerFailed(
-                    reason: String(describing: error)
-                ))
+                self.terminate(
+                    with: .providerFailed(
+                        HybridPlaybackFailureEvidence(
+                            stage: .runtime,
+                            caseCode: "carrierStallRebuild",
+                            error: error
+                        )
+                    )
+                )
             }
         }
     }
@@ -2118,11 +2754,15 @@ final class HybridPlaybackSession {
     }
 
     private func restoreResumeIntent(_ intent: ResumeIntent) {
-        guard intent.wasPlaying else { return }
+        guard intent.wasPlaying else {
+            renderSurface.setRendererStallDetectionEnabled(false)
+            return
+        }
         avPlayer.play()
         if intent.rate != 1 {
             avPlayer.rate = intent.rate
         }
+        renderSurface.setRendererStallDetectionEnabled(true)
     }
 
     private func supersededResult(
@@ -2244,9 +2884,21 @@ final class HybridPlaybackSession {
             return .presentationFailed(presentation)
         }
         if error is BlackCarrierAVPlayerSessionError {
-            return .carrierFailed(reason: String(describing: error))
+            return .carrierFailed(
+                HybridPlaybackFailureEvidence(
+                    stage: .carrier,
+                    caseCode: "prepare",
+                    error: error
+                )
+            )
         }
-        return .providerFailed(reason: String(describing: error))
+        return .providerFailed(
+            HybridPlaybackFailureEvidence(
+                stage: .preparation,
+                caseCode: "prepare",
+                error: error
+            )
+        )
     }
 
     private func mapSeekError(
@@ -2270,7 +2922,13 @@ final class HybridPlaybackSession {
                 error as? AetherHybridPresentationError {
             return .presentationFailed(presentation)
         }
-        return .providerFailed(reason: String(describing: error))
+        return .providerFailed(
+            HybridPlaybackFailureEvidence(
+                stage: .seek,
+                caseCode: "seek",
+                error: error
+            )
+        )
     }
 
     private func mapProviderError(
@@ -2291,7 +2949,11 @@ final class HybridPlaybackSession {
             return typed
         }
         return .providerFailed(
-            reason: String(describing: error)
+            HybridPlaybackFailureEvidence(
+                stage: .provider,
+                caseCode: "runtime",
+                error: error
+            )
         )
     }
 

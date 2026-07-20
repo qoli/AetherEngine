@@ -38,6 +38,7 @@ public enum AetherPlaybackSessionError:
     case invalidFactorySource
     case invalidState
     case noActiveRoute
+    case recoveryDeadlineExceeded(seconds: TimeInterval)
     case unsupported(PlaybackRouteReason)
     case terminal(AetherPlaybackFailure)
 
@@ -49,10 +50,85 @@ public enum AetherPlaybackSessionError:
             "Aether playback session is not available in its current state"
         case .noActiveRoute:
             "Aether playback session has no active render route"
+        case .recoveryDeadlineExceeded(let seconds):
+            "Aether playback recovery exceeded its \(seconds)-second episode deadline"
         case .unsupported(let reason):
             "The media contract is unsupported: \(reason.rawValue)"
         case .terminal(let failure):
             failure.localizedDescription
+        }
+    }
+}
+
+public enum AetherPlaybackSeekResult: Sendable, Equatable {
+    case applied
+    case superseded
+}
+
+public enum AetherPlaybackTrackKind: String, Sendable, Equatable {
+    case audio
+    case subtitle
+}
+
+public struct AetherPlaybackTrack:
+    Identifiable,
+    Sendable,
+    Equatable
+{
+    public let id: String
+    public let sourceTrackID: Int?
+    public let kind: AetherPlaybackTrackKind
+    public let name: String
+    public let language: String?
+    public let codec: String?
+    public let isDefault: Bool
+    public let isForced: Bool
+    public let isAtmos: Bool
+    public let isExternal: Bool
+
+    public init(
+        id: String,
+        sourceTrackID: Int?,
+        kind: AetherPlaybackTrackKind,
+        name: String,
+        language: String?,
+        codec: String?,
+        isDefault: Bool,
+        isForced: Bool = false,
+        isAtmos: Bool = false,
+        isExternal: Bool = false
+    ) {
+        self.id = id
+        self.sourceTrackID = sourceTrackID
+        self.kind = kind
+        self.name = name
+        self.language = language
+        self.codec = codec
+        self.isDefault = isDefault
+        self.isForced = isForced
+        self.isAtmos = isAtmos
+        self.isExternal = isExternal
+    }
+}
+
+public enum AetherPlaybackTrackSelectionError:
+    Error,
+    LocalizedError,
+    Sendable,
+    Equatable
+{
+    case unknownTrack(String)
+    case selectionUnavailable(String)
+    case selectedTrackCouldNotBeRestored(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unknownTrack(let id):
+            return "Playback track \(id) is unknown"
+        case .selectionUnavailable(let id):
+            return "Playback track \(id) cannot be selected on the active route"
+        case .selectedTrackCouldNotBeRestored(let id):
+            return "Selected playback track \(id) could not be restored"
         }
     }
 }
@@ -66,19 +142,44 @@ public struct AetherPlaybackCapabilities:
         HybridPlaybackSystemFeaturePolicy
     public let audioAnalysisTrackIDs: [Int]
     public let selectedAudioAnalysisTrackID: Int?
+    public let videoFormat: VideoFormat?
+    public let dolbyVisionProfile: Int?
+    public let variantBitrate: Int?
+    public let audioTracks: [AetherPlaybackTrack]
+    public let subtitleTracks: [AetherPlaybackTrack]
+    public let selectedAudioTrackID: String?
+    public let selectedSubtitleTrackID: String?
+    public let atmosAvailable: Bool
+    public let audioAnalysisAvailable: Bool
 
     public init(
         route: PlaybackRenderRoute?,
         systemFeaturePolicy:
             HybridPlaybackSystemFeaturePolicy,
         audioAnalysisTrackIDs: [Int],
-        selectedAudioAnalysisTrackID: Int?
+        selectedAudioAnalysisTrackID: Int?,
+        videoFormat: VideoFormat?,
+        dolbyVisionProfile: Int?,
+        variantBitrate: Int?,
+        audioTracks: [AetherPlaybackTrack],
+        subtitleTracks: [AetherPlaybackTrack],
+        selectedAudioTrackID: String?,
+        selectedSubtitleTrackID: String?
     ) {
         self.route = route
         self.systemFeaturePolicy = systemFeaturePolicy
         self.audioAnalysisTrackIDs = audioAnalysisTrackIDs
         self.selectedAudioAnalysisTrackID =
             selectedAudioAnalysisTrackID
+        self.videoFormat = videoFormat
+        self.dolbyVisionProfile = dolbyVisionProfile
+        self.variantBitrate = variantBitrate
+        self.audioTracks = audioTracks
+        self.subtitleTracks = subtitleTracks
+        self.selectedAudioTrackID = selectedAudioTrackID
+        self.selectedSubtitleTrackID = selectedSubtitleTrackID
+        atmosAvailable = audioTracks.contains(where: \.isAtmos)
+        audioAnalysisAvailable = !audioAnalysisTrackIDs.isEmpty
     }
 }
 
@@ -148,6 +249,17 @@ private enum AetherActiveRouteSession {
         }
     }
 
+    func isIdentical(to other: AetherActiveRouteSession) -> Bool {
+        switch (self, other) {
+        case (.native(let lhs), .native(let rhs)):
+            lhs === rhs
+        case (.hybrid(let lhs), .hybrid(let rhs)):
+            lhs === rhs
+        default:
+            false
+        }
+    }
+
     var preflightResult: PlaybackPreflightResult {
         switch self {
         case .native(let session): session.preflightResult
@@ -168,6 +280,88 @@ private enum AetherActiveRouteSession {
             session.selectedAudioAnalysisTrackID
         case .hybrid(let session):
             session.selectedAudioAnalysisTrackID
+        }
+    }
+
+    var audioTracks: [AetherPlaybackTrack] {
+        switch self {
+        case .native(let session):
+            session.audioTracks.map { track in
+                AetherPlaybackTrack(
+                    id: "audio-source:\(track.id)",
+                    sourceTrackID: track.id,
+                    kind: .audio,
+                    name: track.name,
+                    language: track.language,
+                    codec: track.codec,
+                    isDefault: track.isDefault,
+                    isAtmos: track.isAtmos
+                )
+            }
+        case .hybrid(let session):
+            session.audioTracks
+        }
+    }
+
+    var subtitleTracks: [AetherPlaybackTrack] {
+        switch self {
+        case .native(let session):
+            session.subtitleTracks.map { track in
+                AetherPlaybackTrack(
+                    id: "subtitle-source:\(track.id)",
+                    sourceTrackID: track.id,
+                    kind: .subtitle,
+                    name: track.name,
+                    language: track.language,
+                    codec: track.codec,
+                    isDefault: track.isDefault,
+                    isForced: track.isForced,
+                    isExternal: track.isExternal
+                )
+            }
+        case .hybrid(let session):
+            session.subtitleTracks.map { track in
+                guard track.id.hasPrefix("subtitle-overlay:"),
+                      let sourceTrackID = track.sourceTrackID else {
+                    return track
+                }
+                return AetherPlaybackTrack(
+                    id: "subtitle-source:\(sourceTrackID)",
+                    sourceTrackID: sourceTrackID,
+                    kind: track.kind,
+                    name: track.name,
+                    language: track.language,
+                    codec: track.codec,
+                    isDefault: track.isDefault,
+                    isForced: track.isForced,
+                    isAtmos: track.isAtmos,
+                    isExternal: track.isExternal
+                )
+            }
+        }
+    }
+
+    var selectedAudioTrackIdentifier: String? {
+        switch self {
+        case .native(let session):
+            session.selectedAudioTrackID.map { "audio-source:\($0)" }
+        case .hybrid(let session):
+            session.selectedAudioTrackID.map { "audio-source:\($0)" }
+        }
+    }
+
+    var selectedSubtitleTrackIdentifier: String? {
+        switch self {
+        case .native(let session):
+            session.selectedSubtitleTrackID.map {
+                "subtitle-source:\($0)"
+            }
+        case .hybrid(let session):
+            if let overlayID = session.activeOverlaySubtitleTrackID {
+                "subtitle-source:\(overlayID)"
+            } else {
+                session.selectedSubtitleTrackIdentifier
+            }
         }
     }
 
@@ -208,12 +402,18 @@ private enum AetherActiveRouteSession {
         }
     }
 
-    func seek(to target: CMTime) async throws {
+    func seek(
+        to target: CMTime
+    ) async throws -> AetherPlaybackSeekResult {
         switch self {
         case .native(let session):
             try await session.seek(to: target)
+            return .applied
         case .hybrid(let session):
-            _ = try await session.seek(to: target)
+            return switch try await session.seek(to: target) {
+            case .applied: .applied
+            case .superseded: .superseded
+            }
         }
     }
 
@@ -245,6 +445,60 @@ private enum AetherActiveRouteSession {
             session.cancelAudioAnalysisStreams()
         case .hybrid(let session):
             session.cancelAudioAnalysisStreams()
+        }
+    }
+
+    func selectAudioTrack(_ id: String) async throws {
+        guard let track = audioTracks.first(where: { $0.id == id }),
+              let sourceTrackID = track.sourceTrackID else {
+            throw AetherPlaybackTrackSelectionError.unknownTrack(id)
+        }
+        switch self {
+        case .native(let session):
+            try await session.selectAudioTrack(sourceTrackID)
+        case .hybrid(let session):
+            try await session.selectAudioTrack(sourceTrackID)
+        }
+    }
+
+    func selectSubtitleTrack(_ id: String?) async throws {
+        switch self {
+        case .native(let session):
+            if let id {
+                guard let track = subtitleTracks.first(where: {
+                    $0.id == id
+                }), let sourceTrackID = track.sourceTrackID else {
+                    throw AetherPlaybackTrackSelectionError
+                        .unknownTrack(id)
+                }
+                try await session.selectSubtitleTrack(sourceTrackID)
+            } else {
+                try await session.selectSubtitleTrack(nil)
+            }
+        case .hybrid(let session):
+            guard let id else {
+                try session.selectOverlaySubtitleTrack(nil)
+                try await session.selectNativeSubtitleTrack(nil)
+                return
+            }
+            if id.hasPrefix("subtitle-source:"),
+               let trackID = Int(id.dropFirst(
+                    "subtitle-source:".count
+               )) {
+                try session.selectOverlaySubtitleTrack(trackID)
+            } else if id.hasPrefix("subtitle-overlay:"),
+               let trackID = Int(id.dropFirst(
+                    "subtitle-overlay:".count
+               )) {
+                try session.selectOverlaySubtitleTrack(trackID)
+            } else if id.hasPrefix("subtitle-native:"),
+                      let ordinal = Int(id.dropFirst(
+                        "subtitle-native:".count
+                      )) {
+                try await session.selectNativeSubtitleTrack(ordinal)
+            } else {
+                throw AetherPlaybackTrackSelectionError.unknownTrack(id)
+            }
         }
     }
 
@@ -331,6 +585,25 @@ private enum AetherResolvedPlaybackSource {
     }
 }
 
+@MainActor
+private struct AetherPlaybackContextSnapshot {
+    let position: CMTime
+}
+
+@MainActor
+private final class AetherPlaybackAudioAnalysisProxy {
+    let id = UUID()
+    let originalRequest: AudioAnalysisRequest
+    let gate = AudioAnalysisDemandGate()
+    var task: Task<Void, Never>?
+    var lastConfirmedSamplePosition: Int64?
+    var shouldMarkDiscontinuity = false
+
+    init(request: AudioAnalysisRequest) {
+        originalRequest = request
+    }
+}
+
 /// Aether-owned playback lifecycle. The host mounts one player and one
 /// presentation container; route reconstruction and evidence-backed route
 /// transitions remain entirely inside this object.
@@ -355,6 +628,7 @@ public final class AetherPlaybackSession: ObservableObject {
     public let avPlayer: AVPlayer
     public let presentationView: AetherPlaybackPresentationView
     public let sessionID: UUID
+    public let sourceFingerprint: String
 
     @Published public private(set) var state:
         AetherPlaybackSessionState = .idle
@@ -369,8 +643,16 @@ public final class AetherPlaybackSession: ObservableObject {
         [AetherPlaybackRecoveryEvent] = []
     @Published public private(set) var firstFailure:
         AetherPlaybackFailure?
+    @Published public private(set) var terminalFailure:
+        AetherPlaybackTerminalFailure?
     @Published public private(set) var selectedAudioAnalysisTrackID:
         Int?
+    @Published public private(set) var audioTracks:
+        [AetherPlaybackTrack] = []
+    @Published public private(set) var subtitleTracks:
+        [AetherPlaybackTrack] = []
+    @Published public private(set) var selectedAudioTrackID: String?
+    @Published public private(set) var selectedSubtitleTrackID: String?
     @Published public private(set) var overlaySubtitleTracks:
         [AetherHybridOverlaySubtitleTrack] = []
     @Published public private(set) var activeOverlaySubtitleTrackID:
@@ -400,13 +682,22 @@ public final class AetherPlaybackSession: ObservableObject {
     private var routeCancellables = Set<AnyCancellable>()
     private var currentItemObservation: NSKeyValueObservation?
     private var healthyProgressObserver: Any?
-    private var lastRecoveryResetMediaTime: CMTime?
+    private var playbackProgressEpoch = PlaybackProgressEpoch()
+    private var lastConfirmedMediaTime: CMTime = .zero
     private var recoveryTask: Task<Void, Never>?
     private var isStopped = false
     private var isPreparingOrRecovering = false
     private var didCompleteInitialPrepare = false
     private var desiredPlaying = false
     private var desiredRate: Float = 1
+    private var desiredSeekTarget: CMTime?
+    private var desiredAudioTrackID: String?
+    private var desiredSubtitleTrackID: String?
+    private var operationCoordinator = PlaybackOperationCoordinator()
+    private var routeTransactions =
+        PlaybackRouteTransactionCoordinator()
+    private var activeSeekOperationSequence: UInt64?
+    private var lastAppliedSeekOperationSequence: UInt64?
     private var desiredOverlaySubtitleTrackID: Int?
     private var externalMetadata: [AVMetadataItem] = []
     private var systemActivity = AetherSystemPlaybackActivity()
@@ -416,6 +707,14 @@ public final class AetherPlaybackSession: ObservableObject {
     )
     private var capabilitiesBeforeRecoveryAttempt:
         AetherPlaybackCapabilities?
+    private var mergedRuntimeFailureKeys = Set<String>()
+    private var lastRecoveryFailure: AetherPlaybackFailure?
+    private let transportRetryBudget:
+        PlaybackTransportRetryBudget
+    private var lowerVariantRecoveryWasAttempted = false
+    private var audioAnalysisProxies: [
+        UUID: AetherPlaybackAudioAnalysisProxy
+    ] = [:]
 
     #if os(tvOS)
     private weak var playerViewController: AVPlayerViewController?
@@ -431,10 +730,27 @@ public final class AetherPlaybackSession: ObservableObject {
         self.options = options
         self.variantSelection = variantSelection
         self.recoveryBudget = recoveryBudget
+        transportRetryBudget = PlaybackTransportRetryBudget(
+            maximumFailureAttempts:
+                recoveryBudget.maximumTransportAttempts
+        )
         avPlayer = AVPlayer()
         presentationView = AetherPlaybackPresentationView()
         sessionID = UUID()
-        capabilities = Self.capabilities(for: nil)
+        var components = URLComponents(
+            url: url,
+            resolvingAgainstBaseURL: false
+        )
+        components?.query = nil
+        components?.fragment = nil
+        let publicSourceClass = components?.url?.absoluteString
+            ?? "invalid-url-class"
+        sourceFingerprint = String(
+            HLSVODResourceDigest.sha256(
+                Data(publicSourceClass.utf8)
+            ).prefix(12)
+        )
+        capabilities = Self.capabilities(for: nil, source: nil)
         currentItemObservation = avPlayer.observe(
             \.currentItem,
             options: [.initial, .new]
@@ -467,6 +783,7 @@ public final class AetherPlaybackSession: ObservableObject {
                 allowProvisionalNative: true
             )
             try await installAndPrepare(source)
+            await applyCanonicalDefaultTrackIntent()
             didCompleteInitialPrepare = true
             isPreparingOrRecovering = false
             state = .ready
@@ -495,19 +812,26 @@ public final class AetherPlaybackSession: ObservableObject {
             isPreparingOrRecovering = false
             let terminal = recoveryCoordinator.episodeFirstFailure
                 ?? initialFailure
-            publishTerminal(terminal)
+            publishTerminal(
+                terminal,
+                finalFailure: lastRecoveryFailure ?? initialFailure,
+                exhaustionReason: "initial recovery exhausted"
+            )
             throw AetherPlaybackSessionError.terminal(terminal)
         }
     }
 
     public func play() throws {
         guard !isStopped,
-              let activeSession,
-              !isPreparingOrRecovering else {
+              terminalFailure == nil else {
             throw AetherPlaybackSessionError.invalidState
         }
         desiredPlaying = true
         if desiredRate <= 0 { desiredRate = 1 }
+        guard !isPreparingOrRecovering else { return }
+        guard let activeSession else {
+            throw AetherPlaybackSessionError.noActiveRoute
+        }
         try activeSession.play()
         if desiredRate != 1 {
             try activeSession.setRate(desiredRate)
@@ -517,11 +841,14 @@ public final class AetherPlaybackSession: ObservableObject {
 
     public func pause() throws {
         guard !isStopped,
-              let activeSession,
-              !isPreparingOrRecovering else {
+              terminalFailure == nil else {
             throw AetherPlaybackSessionError.invalidState
         }
         desiredPlaying = false
+        guard !isPreparingOrRecovering else { return }
+        guard let activeSession else {
+            throw AetherPlaybackSessionError.noActiveRoute
+        }
         try activeSession.pause()
         state = .paused
     }
@@ -529,26 +856,118 @@ public final class AetherPlaybackSession: ObservableObject {
     public func setRate(_ rate: Float) throws {
         guard rate.isFinite, rate >= 0,
               !isStopped,
-              let activeSession,
-              !isPreparingOrRecovering else {
+              terminalFailure == nil else {
             throw AetherPlaybackSessionError.invalidState
         }
         desiredRate = rate == 0 ? max(desiredRate, 1) : rate
         desiredPlaying = rate > 0
+        guard !isPreparingOrRecovering else { return }
+        guard let activeSession else {
+            throw AetherPlaybackSessionError.noActiveRoute
+        }
         try activeSession.setRate(rate)
         state = rate == 0 ? .paused : .playing
     }
 
-    public func seek(to target: CMTime) async throws {
+    public func seek(
+        to target: CMTime
+    ) async throws -> AetherPlaybackSeekResult {
+        guard target.isValid,
+              target.isNumeric,
+              target.seconds.isFinite,
+              target.seconds >= 0 else {
+            throw AetherPlaybackSessionError.invalidState
+        }
         guard !isStopped,
-              let activeSession,
-              !isPreparingOrRecovering else {
+              terminalFailure == nil else {
             throw AetherPlaybackSessionError.invalidState
         }
         resetRecoveryEpisode()
+        let operationSequence = operationCoordinator.beginSeek()
+        desiredSeekTarget = target
+        let formattedTarget = String(format: "%.3f", target.seconds)
+        EngineLog.emit(
+            "[AetherPlaybackSession] seek operation=\(operationSequence) "
+                + "session=\(sessionID.uuidString.prefix(8)) "
+                + "target=\(formattedTarget)",
+            category: .session
+        )
+
+        while isPreparingOrRecovering {
+            guard operationCoordinator.isCurrentSeek(operationSequence) else {
+                return .superseded
+            }
+            if let terminalFailure {
+                throw AetherPlaybackSessionError.terminal(
+                    terminalFailure.finalFailure
+                )
+            }
+            guard !isStopped else { throw CancellationError() }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        guard operationCoordinator.isCurrentSeek(operationSequence) else {
+            return .superseded
+        }
+        if lastAppliedSeekOperationSequence == operationSequence {
+            desiredSeekTarget = nil
+            return .applied
+        }
+        guard let activeSession else {
+            throw AetherPlaybackSessionError.noActiveRoute
+        }
+
         state = .seeking
-        try await activeSession.seek(to: target)
-        state = desiredPlaying ? .playing : .paused
+        activeSeekOperationSequence = operationSequence
+        do {
+            let result = try await activeSession.seek(to: target)
+            if activeSeekOperationSequence == operationSequence {
+                activeSeekOperationSequence = nil
+            }
+            guard operationCoordinator.isCurrentSeek(operationSequence) else {
+                return .superseded
+            }
+            guard result == .applied else {
+                return .superseded
+            }
+            lastConfirmedMediaTime = target
+            lastAppliedSeekOperationSequence = operationSequence
+            desiredSeekTarget = nil
+            state = desiredPlaying ? .playing : .paused
+            return .applied
+        } catch is CancellationError {
+            if activeSeekOperationSequence == operationSequence {
+                activeSeekOperationSequence = nil
+            }
+            guard operationCoordinator.isCurrentSeek(operationSequence) else {
+                return .superseded
+            }
+            throw CancellationError()
+        } catch {
+            if activeSeekOperationSequence == operationSequence {
+                activeSeekOperationSequence = nil
+            }
+            guard operationCoordinator.isCurrentSeek(operationSequence) else {
+                return .superseded
+            }
+            let seekFailure = failure(stage: .playback, error: error)
+            if try await recover(
+                from: seekFailure,
+                duringInitialPrepare: false
+            ) {
+                guard operationCoordinator.isCurrentSeek(operationSequence) else {
+                    return .superseded
+                }
+                lastAppliedSeekOperationSequence = operationSequence
+                desiredSeekTarget = nil
+                return .applied
+            }
+            publishTerminal(
+                recoveryCoordinator.episodeFirstFailure ?? seekFailure,
+                finalFailure: seekFailure,
+                exhaustionReason: "seek recovery exhausted"
+            )
+            throw AetherPlaybackSessionError.terminal(seekFailure)
+        }
     }
 
     public func setExternalMetadata(
@@ -597,40 +1016,280 @@ public final class AetherPlaybackSession: ObservableObject {
     public func audioAnalysisStream(
         request: AudioAnalysisRequest
     ) throws -> AudioAnalysisStream {
-        guard !isPreparingOrRecovering,
-              let activeSession else {
+        guard !isStopped,
+              terminalFailure == nil else {
             throw AudioAnalysisError.noActiveSession
         }
-        return try activeSession.audioAnalysisStream(
+        let proxy = AetherPlaybackAudioAnalysisProxy(
             request: request
+        )
+        audioAnalysisProxies[proxy.id] = proxy
+        proxy.task = Task { @MainActor [weak self, weak proxy] in
+            guard let self, let proxy else { return }
+            await self.runAudioAnalysisProxy(proxy)
+        }
+        let proxyID = proxy.id
+        return AudioAnalysisStream(
+            gate: proxy.gate,
+            cancel: { [weak self] in
+                Task { @MainActor [weak self] in
+                    self?.cancelAudioAnalysisProxy(proxyID)
+                }
+            }
         )
     }
 
     public func cancelAudioAnalysisStreams() {
+        let ids = Array(audioAnalysisProxies.keys)
+        ids.forEach(cancelAudioAnalysisProxy)
         activeSession?.cancelAudioAnalysisStreams()
     }
 
-    public func selectOverlaySubtitleTrack(
-        _ trackID: Int?
-    ) throws {
+    public func selectAudioTrack(_ id: String) async throws {
         guard !isStopped,
-              !isPreparingOrRecovering,
-              case .hybrid(let hybrid) = activeSession else {
-            if trackID == nil {
-                desiredOverlaySubtitleTrackID = nil
-                activeOverlaySubtitleTrackID = nil
+              terminalFailure == nil,
+              audioTracks.contains(where: { $0.id == id }) else {
+            throw AetherPlaybackTrackSelectionError.unknownTrack(id)
+        }
+        desiredAudioTrackID = id
+        while isPreparingOrRecovering {
+            guard !isStopped else { throw CancellationError() }
+            if let terminalFailure {
+                throw AetherPlaybackSessionError.terminal(
+                    terminalFailure.finalFailure
+                )
+            }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        guard let activeSession else {
+            throw AetherPlaybackSessionError.noActiveRoute
+        }
+        do {
+            try await activeSession.selectAudioTrack(id)
+            publishTrackState(from: activeSession)
+            publishCapabilities()
+        } catch {
+            let selectionFailure = failure(
+                stage: .playback,
+                error: error
+            )
+            if try await recover(
+                from: selectionFailure,
+                duringInitialPrepare: false
+            ) {
                 return
             }
+            publishTerminal(
+                selectionFailure,
+                finalFailure: selectionFailure,
+                exhaustionReason:
+                    "selected audio track could not be restored"
+            )
+            throw AetherPlaybackSessionError.terminal(
+                selectionFailure
+            )
+        }
+    }
+
+    public func selectSubtitleTrack(_ id: String?) async throws {
+        guard !isStopped,
+              terminalFailure == nil else {
             throw AetherPlaybackSessionError.invalidState
         }
-        try hybrid.selectOverlaySubtitleTrack(trackID)
-        desiredOverlaySubtitleTrackID = trackID
-        activeOverlaySubtitleTrackID = trackID
+        if let id,
+           !subtitleTracks.contains(where: { $0.id == id }) {
+            throw AetherPlaybackTrackSelectionError.unknownTrack(id)
+        }
+        desiredSubtitleTrackID = id
+        desiredOverlaySubtitleTrackID = id.flatMap { selectedID in
+            subtitleTracks.first(where: {
+                $0.id == selectedID
+                    && $0.id.hasPrefix("subtitle-source:")
+            })?.sourceTrackID
+        }
+        while isPreparingOrRecovering {
+            guard !isStopped else { throw CancellationError() }
+            if let terminalFailure {
+                throw AetherPlaybackSessionError.terminal(
+                    terminalFailure.finalFailure
+                )
+            }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        guard let activeSession else {
+            throw AetherPlaybackSessionError.noActiveRoute
+        }
+        try await activeSession.selectSubtitleTrack(id)
+        publishTrackState(from: activeSession)
+        publishCapabilities()
+    }
+
+    private func applyCanonicalDefaultTrackIntent() async {
+        guard desiredSubtitleTrackID == nil,
+              !options.externalSubtitles.isEmpty,
+              let activeSession else {
+            return
+        }
+        publishTrackState(from: activeSession)
+        guard let externalTrack = subtitleTracks.first(where: {
+            $0.isExternal && $0.isDefault
+        }) ?? subtitleTracks.first(where: \.isExternal) else {
+            EngineLog.emit(
+                "[AetherPlaybackSession] canonical external subtitle "
+                    + "unavailable session=\(sessionID.uuidString.prefix(8)) "
+                    + "route=\(activeSession.route.rawValue)",
+                category: .session
+            )
+            return
+        }
+        do {
+            try await activeSession.selectSubtitleTrack(externalTrack.id)
+            desiredSubtitleTrackID = externalTrack.id
+            desiredOverlaySubtitleTrackID = externalTrack.sourceTrackID
+            publishTrackState(from: activeSession)
+            publishCapabilities()
+        } catch {
+            // External subtitles are a declared degradable capability. Keep
+            // playback alive and publish their unselected state.
+            desiredSubtitleTrackID = nil
+            desiredOverlaySubtitleTrackID = nil
+            publishTrackState(from: activeSession)
+            publishCapabilities()
+            EngineLog.emit(
+                "[AetherPlaybackSession] canonical external subtitle "
+                    + "selection unavailable session=\(sessionID.uuidString.prefix(8)) "
+                    + "code=externalSubtitleSelectionUnavailable",
+                category: .session
+            )
+        }
+    }
+
+    private func runAudioAnalysisProxy(
+        _ proxy: AetherPlaybackAudioAnalysisProxy
+    ) async {
+        defer {
+            audioAnalysisProxies.removeValue(forKey: proxy.id)
+        }
+        while !Task.isCancelled, !isStopped {
+            while isPreparingOrRecovering {
+                guard !Task.isCancelled, !isStopped else {
+                    await proxy.gate.cancel()
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 25_000_000)
+            }
+            guard let activeSession else {
+                await proxy.gate.fail(.noActiveSession)
+                return
+            }
+            let request: AudioAnalysisRequest
+            do {
+                let lowerBound = proxy.lastConfirmedSamplePosition.map {
+                    Double($0) / 48_000
+                } ?? proxy.originalRequest.range.lowerBound
+                guard lowerBound
+                        < proxy.originalRequest.range.upperBound else {
+                    await proxy.gate.finish()
+                    return
+                }
+                request = try AudioAnalysisRequest(
+                    audioTrackID:
+                        proxy.originalRequest.audioTrackID,
+                    range: lowerBound
+                        ..< proxy.originalRequest.range.upperBound
+                )
+            } catch let error as AudioAnalysisError {
+                await proxy.gate.fail(error)
+                return
+            } catch {
+                await proxy.gate.fail(.invalidRange)
+                return
+            }
+
+            switch activeSession.audioAnalysisAvailability(
+                for: request.audioTrackID
+            ) {
+            case .available:
+                break
+            case .unavailable(let error):
+                publishCapabilities()
+                await proxy.gate.fail(error)
+                return
+            }
+
+            do {
+                let stream = try activeSession.audioAnalysisStream(
+                    request: request
+                )
+                var iterator = stream.makeAsyncIterator()
+                while !Task.isCancelled {
+                    try await proxy.gate.waitForDemand()
+                    guard let buffer = try await iterator.next() else {
+                        await proxy.gate.finish()
+                        return
+                    }
+                    let delivered: AudioAnalysisBuffer
+                    if proxy.shouldMarkDiscontinuity {
+                        delivered = AudioAnalysisBuffer(
+                            pcm: buffer.pcm,
+                            sourceSamplePosition:
+                                buffer.sourceSamplePosition,
+                            isDiscontinuous: true
+                        )
+                        proxy.shouldMarkDiscontinuity = false
+                        EngineLog.emit(
+                            "[AetherPlaybackSession] analysis discontinuity "
+                                + "session=\(sessionID.uuidString.prefix(8)) "
+                                + "analysis=\(proxy.id.uuidString.prefix(8))",
+                            category: .session
+                        )
+                    } else {
+                        delivered = buffer
+                    }
+                    let didDeliver = await proxy.gate.yield(delivered)
+                    guard didDeliver else { return }
+                    proxy.lastConfirmedSamplePosition =
+                        delivered.sourceSamplePosition
+                        + Int64(delivered.pcm.frameLength)
+                }
+            } catch let error as AudioAnalysisError {
+                if error == .cancelled {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    if isPreparingOrRecovering {
+                        proxy.shouldMarkDiscontinuity = true
+                        continue
+                    }
+                }
+                await proxy.gate.fail(error)
+                return
+            } catch is CancellationError {
+                await proxy.gate.cancel()
+                return
+            } catch {
+                await proxy.gate.fail(
+                    .analysisFailed(
+                        "route analysis failed at \(String(reflecting: type(of: error)))"
+                    )
+                )
+                return
+            }
+        }
+        await proxy.gate.cancel()
+    }
+
+    private func cancelAudioAnalysisProxy(_ id: UUID) {
+        guard let proxy = audioAnalysisProxies.removeValue(
+            forKey: id
+        ) else { return }
+        proxy.task?.cancel()
+        proxy.task = nil
+        Task { await proxy.gate.cancel() }
     }
 
     public func stop() {
         guard !isStopped else { return }
         isStopped = true
+        routeTransactions.invalidate()
         recoveryTask?.cancel()
         recoveryTask = nil
         routeCancellables.removeAll()
@@ -648,7 +1307,11 @@ public final class AetherPlaybackSession: ObservableObject {
         activeRoute = nil
         overlaySubtitleTracks = []
         activeOverlaySubtitleTrackID = nil
-        capabilities = Self.capabilities(for: nil)
+        audioTracks = []
+        subtitleTracks = []
+        selectedAudioTrackID = nil
+        selectedSubtitleTrackID = nil
+        capabilities = Self.capabilities(for: nil, source: nil)
         state = .stopped
         #if os(tvOS)
         if playerViewController?.player === avPlayer {
@@ -686,21 +1349,27 @@ public final class AetherPlaybackSession: ObservableObject {
         switch sourceKind {
         case .hls:
             do {
-                return .hls(
-                    try await retryTransport(stage: .preflight) {
-                        let operation = AetherPlaybackPreflightOperation()
-                        return try await operation.inspectHLS(
-                            url: self.url,
-                            sourceIsSeekableVOD: true,
-                            variantSelection:
-                                variantSelectionOverride
-                                ?? self.variantSelection,
-                            hybridCapabilities:
-                                AetherHybridPlaybackSession.capabilities,
-                            options: self.options
-                        )
-                    }
-                )
+                let preflight = try await retryTransport(
+                    stage: .preflight
+                ) {
+                    let operation = AetherPlaybackPreflightOperation()
+                    return try await operation.inspectHLS(
+                        url: self.url,
+                        sourceIsSeekableVOD: true,
+                        variantSelection:
+                            variantSelectionOverride
+                            ?? self.variantSelection,
+                        hybridCapabilities:
+                            AetherHybridPlaybackSession.capabilities,
+                        options: self.options
+                    )
+                }
+                if allowProvisionalNative,
+                   preflight.result.route == .unsupported,
+                   Self.isInconclusiveHLSPreflight(preflight) {
+                    return provisionalNativeSource()
+                }
+                return .hls(preflight)
             } catch {
                 let failure = failure(stage: .preflight, error: error)
                 if allowProvisionalNative,
@@ -788,6 +1457,21 @@ public final class AetherPlaybackSession: ObservableObject {
         )
     }
 
+    private static func isInconclusiveHLSPreflight(
+        _ preflight: AetherHLSPlaybackPreflight
+    ) -> Bool {
+        switch preflight.result.reason {
+        case .unsupportedHLSPreflightMissing,
+             .unsupportedHLSSegmentNotInspected:
+            return true
+        case .unsupportedHLSContentProtection:
+            return preflight.result.hlsPackaging?
+                .contentProtection == .unknown
+        default:
+            return false
+        }
+    }
+
     private func installAndPrepare(
         _ source: AetherResolvedPlaybackSource,
         decoderPreference: HybridVideoDecoderPreference = .automatic
@@ -797,12 +1481,26 @@ public final class AetherPlaybackSession: ObservableObject {
                 source.result.reason
             )
         }
+        let transaction = routeTransactions.begin()
         let route = try await makeRouteSession(
             source,
             decoderPreference: decoderPreference
         )
-        try install(route, source: source)
+        guard routeTransactions.isActive(transaction) else {
+            route.stop()
+            throw CancellationError()
+        }
+        try install(
+            route,
+            source: source,
+            transaction: transaction
+        )
         try await route.prepare()
+        try commit(
+            route,
+            source: source,
+            transaction: transaction
+        )
         publishCurrentItem(avPlayer.currentItem)
     }
 
@@ -872,7 +1570,8 @@ public final class AetherPlaybackSession: ObservableObject {
                     try await AetherHybridPlaybackSession.makeHLSVOD(
                         preflight: preflight,
                         avPlayer: avPlayer,
-                        decoderPreference: decoderPreference
+                        decoderPreference: decoderPreference,
+                        transportRetryBudget: transportRetryBudget
                     )
                 )
             case .progressive(let probe, let result, _):
@@ -905,13 +1604,15 @@ public final class AetherPlaybackSession: ObservableObject {
 
     private func install(
         _ session: AetherActiveRouteSession,
-        source: AetherResolvedPlaybackSource
+        source: AetherResolvedPlaybackSource,
+        transaction: UInt64
     ) throws {
+        guard routeTransactions.isActive(transaction) else {
+            throw CancellationError()
+        }
         routeCancellables.removeAll()
         activeSession = session
         resolvedSource = source
-        activeRoute = session.route
-        preflightResult = session.preflightResult
         switch session {
         case .native(let native):
             presentationView.install(nil)
@@ -929,8 +1630,40 @@ public final class AetherPlaybackSession: ObservableObject {
             )
         }
         #endif
-        publishCapabilities()
         publishCurrentItem(avPlayer.currentItem)
+    }
+
+    private func commit(
+        _ session: AetherActiveRouteSession,
+        source: AetherResolvedPlaybackSource,
+        transaction: UInt64
+    ) throws {
+        guard routeTransactions.isActive(transaction),
+              let activeSession,
+              activeSession.isIdentical(to: session) else {
+            session.stop()
+            throw CancellationError()
+        }
+        resolvedSource = source
+        activeRoute = session.route
+        preflightResult = session.preflightResult
+        publishCapabilities()
+        if case .hybrid(let hybrid) = session {
+            overlaySubtitleTracks = hybrid.overlaySubtitleTracks
+            activeOverlaySubtitleTrackID =
+                hybrid.activeOverlaySubtitleTrackID
+        } else {
+            overlaySubtitleTracks = []
+            activeOverlaySubtitleTrackID = nil
+        }
+        publishTrackState(from: session)
+        EngineLog.emit(
+            "[AetherPlaybackSession] route committed "
+                + "session=\(sessionID.uuidString.prefix(8)) "
+                + "source=\(sourceFingerprint) "
+                + "route=\(session.route.rawValue)",
+            category: .session
+        )
     }
 
     private func bind(
@@ -941,13 +1674,19 @@ public final class AetherPlaybackSession: ObservableObject {
                   let session,
                   case .native(let active) = self.activeSession,
                   active === session else { return }
-            self.handleNativeState(state)
+            self.handleNativeState(
+                state,
+                evidence: session.lastFailureEvidence
+            )
         }.store(in: &routeCancellables)
         session.$selectedAudioAnalysisTrackID
             .removeDuplicates()
             .sink { [weak self] trackID in
                 self?.selectedAudioAnalysisTrackID = trackID
-                self?.publishCapabilities()
+                if self?.activeRoute == .nativeAVPlayer,
+                   self?.isPreparingOrRecovering == false {
+                    self?.publishCapabilities()
+                }
             }
             .store(in: &routeCancellables)
     }
@@ -966,12 +1705,19 @@ public final class AetherPlaybackSession: ObservableObject {
             .removeDuplicates()
             .sink { [weak self] trackID in
                 self?.selectedAudioAnalysisTrackID = trackID
-                self?.publishCapabilities()
+                if self?.activeRoute == .hybridCarrier,
+                   self?.isPreparingOrRecovering == false {
+                    self?.publishCapabilities()
+                }
             }
             .store(in: &routeCancellables)
         session.$overlaySubtitleTracks
             .combineLatest(session.$activeOverlaySubtitleTrackID)
             .sink { [weak self] tracks, selectedTrackID in
+                guard self?.activeRoute == .hybridCarrier,
+                      self?.isPreparingOrRecovering == false else {
+                    return
+                }
                 self?.overlaySubtitleTracks = tracks
                 self?.activeOverlaySubtitleTrackID = selectedTrackID
             }
@@ -979,7 +1725,8 @@ public final class AetherPlaybackSession: ObservableObject {
     }
 
     private func handleNativeState(
-        _ nativeState: AetherNativePlaybackSessionState
+        _ nativeState: AetherNativePlaybackSessionState,
+        evidence: AetherNativePlaybackFailureEvidence?
     ) {
         switch nativeState {
         case .idle: break
@@ -991,16 +1738,29 @@ public final class AetherPlaybackSession: ObservableObject {
         case .ended: state = .ended
         case .failed(let failure):
             guard didCompleteInitialPrepare,
-                  !isPreparingOrRecovering else { return }
-            scheduleRuntimeRecovery(
-                AetherPlaybackFailure(
-                    stage: .playback,
-                    kind: .routeRuntimeFailure,
-                    domain: "AetherNativePlaybackSessionFailure",
-                    code: 0,
-                    reason: failure.rawValue
-                )
-            )
+                  !isPreparingOrRecovering,
+                  activeSeekOperationSequence == nil else { return }
+            let kind: AetherPlaybackFailureKind =
+                switch evidence?.category {
+                case .transientTransport: .transientTransport
+                case .authentication: .authenticationRejected
+                case .security: .securityBoundary
+                case .decoder: .decoderRuntimeFailure
+                case .malformed: .malformedMedia
+                case .cancelled: .cancelled
+                case .invariant: .invariantViolation
+                case .routeRuntime, nil: .routeRuntimeFailure
+                }
+            scheduleRuntimeRecovery(AetherPlaybackFailure(
+                stage: .playback,
+                kind: kind,
+                domain: evidence?.domain
+                    ?? "AetherNativePlaybackSessionFailure",
+                code: evidence?.code ?? 0,
+                reason: evidence.map {
+                    "native.\($0.caseCode)"
+                } ?? failure.rawValue
+            ))
         case .stopped: break
         }
     }
@@ -1020,7 +1780,8 @@ public final class AetherPlaybackSession: ObservableObject {
             if !isPreparingOrRecovering { state = .seeking }
         case .failed(let error):
             guard didCompleteInitialPrepare,
-                  !isPreparingOrRecovering else { return }
+                  !isPreparingOrRecovering,
+                  activeSeekOperationSequence == nil else { return }
             scheduleRuntimeRecovery(
                 failure(stage: .playback, error: error)
             )
@@ -1031,9 +1792,38 @@ public final class AetherPlaybackSession: ObservableObject {
     private func scheduleRuntimeRecovery(
         _ failure: AetherPlaybackFailure
     ) {
-        guard recoveryTask == nil,
-              !isStopped,
+        guard !isStopped,
               !recoveryCoordinator.terminalOutcomeWasIssued else {
+            return
+        }
+        if recoveryTask != nil {
+            if Self.isPermanentFailure(failure.kind) {
+                recoveryTask?.cancel()
+                publishRecovery(
+                    failure: failure,
+                    action: .terminate,
+                    from: activeRoute,
+                    to: nil,
+                    outcome: .exhausted
+                )
+                publishTerminal(
+                    recoveryCoordinator.sessionFirstFailure ?? failure,
+                    finalFailure: failure,
+                    exhaustionReason:
+                        "permanent failure superseded active recovery"
+                )
+                return
+            }
+            let key = "\(failure.stage.rawValue):\(failure.kind.rawValue):\(failure.domain):\(failure.code)"
+            if mergedRuntimeFailureKeys.insert(key).inserted {
+                publishRecovery(
+                    failure: failure,
+                    action: .rebuildSameRoute,
+                    from: activeRoute,
+                    to: activeRoute,
+                    outcome: .merged
+                )
+            }
             return
         }
         recoveryTask = Task { @MainActor [weak self] in
@@ -1044,9 +1834,14 @@ public final class AetherPlaybackSession: ObservableObject {
                     duringInitialPrepare: false
                 )
                 if !recovered {
+                    let original = self.recoveryCoordinator
+                        .episodeFirstFailure ?? failure
                     self.publishTerminal(
-                        self.recoveryCoordinator.episodeFirstFailure
-                            ?? failure
+                        original,
+                        finalFailure:
+                            self.lastRecoveryFailure ?? failure,
+                        exhaustionReason:
+                            "runtime recovery exhausted"
                     )
                 }
             } catch is CancellationError {
@@ -1076,8 +1871,10 @@ public final class AetherPlaybackSession: ObservableObject {
         isPreparingOrRecovering = true
         firstFailure = firstFailure ?? initialFailure
         beginRecoveryEpisodeIfNeeded(initialFailure)
-        let failedRoute = activeRoute
-        let resumeTime = avPlayer.currentTime()
+        let recoveryDeadline = currentRecoveryDeadline
+        try ensureRecoveryDeadline(recoveryDeadline)
+        let failedRoute = activeSession?.route ?? activeRoute
+        let playbackContext = snapshotPlaybackContext()
         var latestFailure = initialFailure
         var freshSource = resolvedSource
 
@@ -1100,6 +1897,22 @@ public final class AetherPlaybackSession: ObservableObject {
             break
         }
 
+        // Classification/preflight/remux transport work has already passed
+        // through retryTransport's single three-attempt session budget. With
+        // no candidate route there is nothing to rebuild and starting another
+        // classifier loop here would double-count that budget.
+        guard failedRoute != nil else {
+            publishRecovery(
+                failure: initialFailure,
+                action: .terminate,
+                from: nil,
+                to: nil,
+                outcome: .exhausted
+            )
+            isPreparingOrRecovering = false
+            return false
+        }
+
         if recoveryCoordinator.sameRouteRebuildCount
                 < recoveryBudget.maximumSameRouteRebuilds,
            let failedRoute {
@@ -1114,10 +1927,13 @@ public final class AetherPlaybackSession: ObservableObject {
             )
             teardownActiveRoute()
             do {
+                try ensureRecoveryDeadline(recoveryDeadline)
                 freshSource = try await resolveSameRouteRecoverySource(
                     failedRoute: failedRoute,
                     allowLowerVariant:
-                        initialFailure.kind != .decoderRuntimeFailure
+                        isSelectedVariantAvailabilityFailure(
+                            initialFailure
+                        )
                 )
                 guard let admitted = freshSource?.admitting(
                     route: failedRoute
@@ -1128,8 +1944,9 @@ public final class AetherPlaybackSession: ObservableObject {
                     )
                 }
                 try await installAndPrepare(admitted)
+                try ensureRecoveryDeadline(recoveryDeadline)
                 try await restorePlaybackContext(
-                    resumeTime: resumeTime,
+                    playbackContext,
                     duringInitialPrepare: duringInitialPrepare
                 )
                 publishRecovery(
@@ -1160,6 +1977,7 @@ public final class AetherPlaybackSession: ObservableObject {
 
         if freshSource == nil {
             do {
+                try ensureRecoveryDeadline(recoveryDeadline)
                 freshSource = try await resolveCanonicalSource(
                     allowProvisionalNative: true
                 )
@@ -1204,12 +2022,13 @@ public final class AetherPlaybackSession: ObservableObject {
                 )
                 teardownActiveRoute()
                 do {
+                    try ensureRecoveryDeadline(recoveryDeadline)
                     try await installAndPrepare(
                         softwareSource,
                         decoderPreference: .softwareHEVCRecovery
                     )
                     try await restorePlaybackContext(
-                        resumeTime: resumeTime,
+                        playbackContext,
                         duringInitialPrepare: duringInitialPrepare
                     )
                     publishRecovery(
@@ -1247,8 +2066,7 @@ public final class AetherPlaybackSession: ObservableObject {
         let selectionCompatibleAlternate:
             AetherResolvedPlaybackSource? = alternate.flatMap {
                 source -> AetherResolvedPlaybackSource? in
-            if desiredOverlaySubtitleTrackID != nil,
-               source.result.route != .hybridCarrier {
+            guard permitsRouteTransition(after: latestFailure) else {
                 return nil
             }
             return source
@@ -1297,9 +2115,11 @@ public final class AetherPlaybackSession: ObservableObject {
         )
         teardownActiveRoute()
         do {
+            try ensureRecoveryDeadline(recoveryDeadline)
             try await installAndPrepare(alternate)
+            try ensureRecoveryDeadline(recoveryDeadline)
             try await restorePlaybackContext(
-                resumeTime: resumeTime,
+                playbackContext,
                 duringInitialPrepare: duringInitialPrepare
             )
             publishRecovery(
@@ -1328,28 +2148,77 @@ public final class AetherPlaybackSession: ObservableObject {
     }
 
     private func restorePlaybackContext(
-        resumeTime: CMTime,
+        _ context: AetherPlaybackContextSnapshot,
         duringInitialPrepare: Bool
     ) async throws {
         guard let activeSession else {
             throw AetherPlaybackSessionError.noActiveRoute
         }
+        let resumeTime = desiredSeekTarget ?? context.position
         if !duringInitialPrepare,
            resumeTime.isValid,
            resumeTime.isNumeric,
            resumeTime.seconds.isFinite,
-           resumeTime.seconds > 0 {
-            try await activeSession.seek(to: resumeTime)
-        }
-        publishCurrentItem(avPlayer.currentItem)
-        if let desiredOverlaySubtitleTrackID {
-            guard case .hybrid(let hybrid) = activeSession else {
-                throw AetherPlaybackSessionError.invalidState
+           resumeTime.seconds >= 0 {
+            let seekResult = try await activeSession.seek(to: resumeTime)
+            guard seekResult == .applied else {
+                throw CancellationError()
             }
-            try hybrid.selectOverlaySubtitleTrack(
-                desiredOverlaySubtitleTrackID
+            lastConfirmedMediaTime = resumeTime
+            if desiredSeekTarget != nil {
+                lastAppliedSeekOperationSequence =
+                    operationCoordinator.latestSeekSequence
+            }
+        }
+        // The stable player and session-owned intent remain live while a route
+        // is being rebuilt. Apply their latest values instead of replaying an
+        // episode-start snapshot over changes made during recovery.
+        #if os(tvOS) || os(iOS)
+        currentItem?.externalMetadata = externalMetadata
+        #endif
+        publishCurrentItem(avPlayer.currentItem)
+        if let desiredAudioTrackID {
+            guard activeSession.audioTracks.contains(where: {
+                $0.id == desiredAudioTrackID
+            }) else {
+                throw AetherPlaybackTrackSelectionError
+                    .selectedTrackCouldNotBeRestored(
+                        desiredAudioTrackID
+                    )
+            }
+            try await activeSession.selectAudioTrack(
+                desiredAudioTrackID
             )
         }
+        if let desiredSubtitleTrackID {
+            if activeSession.subtitleTracks.contains(where: {
+                $0.id == desiredSubtitleTrackID
+            }) {
+                do {
+                    try await activeSession.selectSubtitleTrack(
+                        desiredSubtitleTrackID
+                    )
+                } catch {
+                    selectedSubtitleTrackID = nil
+                    EngineLog.emit(
+                        "[AetherPlaybackSession] optional subtitle unavailable "
+                            + "session=\(sessionID.uuidString.prefix(8)) "
+                            + "track=declared",
+                        category: .session
+                    )
+                }
+            } else {
+                selectedSubtitleTrackID = nil
+                EngineLog.emit(
+                    "[AetherPlaybackSession] optional subtitle unavailable "
+                        + "session=\(sessionID.uuidString.prefix(8)) "
+                        + "track=missing",
+                    category: .session
+                )
+            }
+        }
+        publishTrackState(from: activeSession)
+        publishCapabilities()
         if desiredPlaying {
             try activeSession.play()
             if desiredRate != 1 {
@@ -1357,8 +2226,43 @@ public final class AetherPlaybackSession: ObservableObject {
             }
             state = .playing
         } else {
-            state = .ready
+            state = didCompleteInitialPrepare ? .paused : .ready
         }
+    }
+
+    private func snapshotPlaybackContext()
+        -> AetherPlaybackContextSnapshot
+    {
+        let playerTime = avPlayer.currentTime()
+        let confirmedPosition: CMTime
+        if let desiredSeekTarget {
+            confirmedPosition = desiredSeekTarget
+        } else if lastConfirmedMediaTime.isValid,
+                  lastConfirmedMediaTime.isNumeric,
+                  lastConfirmedMediaTime.seconds.isFinite {
+            confirmedPosition = lastConfirmedMediaTime
+        } else if playerTime.isValid,
+                  playerTime.isNumeric,
+                  playerTime.seconds.isFinite {
+            confirmedPosition = playerTime
+        } else {
+            confirmedPosition = .zero
+        }
+        let formattedPosition = String(
+            format: "%.3f",
+            confirmedPosition.seconds
+        )
+        EngineLog.emit(
+            "[AetherPlaybackSession] context snapshot "
+                + "session=\(sessionID.uuidString.prefix(8)) "
+                + "seekOperation=\(operationCoordinator.latestSeekSequence) "
+                + "position=\(formattedPosition) "
+                + "playing=\(desiredPlaying) rate=\(desiredRate)",
+            category: .session
+        )
+        return AetherPlaybackContextSnapshot(
+            position: confirmedPosition
+        )
     }
 
     private func lowerCompatibleVariantSelection(
@@ -1382,6 +2286,7 @@ public final class AetherPlaybackSession: ObservableObject {
         allowLowerVariant: Bool
     ) async throws -> AetherResolvedPlaybackSource {
         guard allowLowerVariant,
+              !lowerVariantRecoveryWasAttempted,
               let lowerSelection = lowerCompatibleVariantSelection(
             for: failedRoute
         ) else {
@@ -1389,6 +2294,7 @@ public final class AetherPlaybackSession: ObservableObject {
                 allowProvisionalNative: false
             )
         }
+        lowerVariantRecoveryWasAttempted = true
         do {
             return try await resolveCanonicalSource(
                 allowProvisionalNative: false,
@@ -1410,16 +2316,45 @@ public final class AetherPlaybackSession: ObservableObject {
         )
     }
 
+    private func isSelectedVariantAvailabilityFailure(
+        _ failure: AetherPlaybackFailure
+    ) -> Bool {
+        failure.kind == .transientTransport
+            && failure.reason == "hybrid.origin.selectedVariantUnavailable"
+    }
+
+    private func permitsRouteTransition(
+        after failure: AetherPlaybackFailure
+    ) -> Bool {
+        !failure.reason.hasPrefix("hybrid.presentation.mediaDivergence")
+    }
+
     private func retryTransport<T>(
         stage: AetherPlaybackRecoveryStage,
         operation: () async throws -> T
     ) async throws -> T {
-        var attempt = 1
         var pendingRetry:
             (AetherPlaybackFailure, AetherPlaybackRecoveryAction)?
         while true {
             do {
+                if recoveryCoordinator.episodeFirstFailure != nil {
+                    try ensureRecoveryDeadline(currentRecoveryDeadline)
+                    if transportRetryBudget.isExhausted {
+                        throw AetherPlaybackFailure(
+                            stage: stage,
+                            kind: .transientTransport,
+                            domain: "AetherPlaybackRecovery",
+                            code: recoveryBudget
+                                .maximumTransportAttempts,
+                            reason:
+                                "transport recovery budget exhausted"
+                        )
+                    }
+                }
                 let value = try await operation()
+                if recoveryCoordinator.episodeFirstFailure != nil {
+                    try ensureRecoveryDeadline(currentRecoveryDeadline)
+                }
                 if let pendingRetry {
                     publishRecovery(
                         failure: pendingRetry.0,
@@ -1445,12 +2380,17 @@ public final class AetherPlaybackSession: ObservableObject {
                 }
                 pendingRetry = nil
                 beginRecoveryEpisodeIfNeeded(typed)
+                let isRetryable = typed.kind == .transientTransport
+                    || typed.kind == .inconclusiveEvidence
+                let transportAttempt = isRetryable
+                    ? transportRetryBudget.recordRetryableFailure()
+                    : transportRetryBudget.currentFailureAttempt
                 let action = PlaybackRecoveryDecision.resolve(
                     context: AetherPlaybackRecoveryContext(
                         failure: typed,
                         activeRoute: activeRoute,
                         positivelyAdmittedAlternateRoute: nil,
-                        transportAttempt: attempt,
+                        transportAttempt: max(1, transportAttempt),
                         sameRouteRebuildCount:
                             recoveryCoordinator.sameRouteRebuildCount,
                         softwareDecoderTransitionCount:
@@ -1475,11 +2415,42 @@ public final class AetherPlaybackSession: ObservableObject {
                     outcome: .scheduled
                 )
                 pendingRetry = (typed, action)
+                let remaining = currentRecoveryDeadline.remainingSeconds(
+                    now: ProcessInfo.processInfo.systemUptime
+                )
+                guard delay < remaining else {
+                    throw AetherPlaybackSessionError
+                        .recoveryDeadlineExceeded(
+                            seconds: recoveryBudget
+                                .maximumEpisodeDurationSeconds
+                        )
+                }
                 try await Task.sleep(
                     nanoseconds: UInt64(delay * 1_000_000_000)
                 )
-                attempt += 1
             }
+        }
+    }
+
+    private var currentRecoveryDeadline: PlaybackRecoveryDeadline {
+        PlaybackRecoveryDeadline(
+            startedAt: recoveryCoordinator.episodeStartedAt,
+            durationSeconds:
+                recoveryBudget.maximumEpisodeDurationSeconds
+        )
+    }
+
+    private func ensureRecoveryDeadline(
+        _ deadline: PlaybackRecoveryDeadline
+    ) throws {
+        guard !deadline.isExpired(
+            now: ProcessInfo.processInfo.systemUptime
+        ) else {
+            throw AetherPlaybackSessionError
+                .recoveryDeadlineExceeded(
+                    seconds:
+                        recoveryBudget.maximumEpisodeDurationSeconds
+                )
         }
     }
 
@@ -1499,6 +2470,58 @@ public final class AetherPlaybackSession: ObservableObject {
                 reason: "Playback operation was cancelled"
             )
         }
+        if let hybrid = error as? HybridPlaybackSessionError,
+           case .originFailed(let origin) = hybrid {
+            let originKind: AetherPlaybackFailureKind
+            switch origin.scope {
+            case .transient:
+                originKind = .transientTransport
+            case .authentication:
+                originKind = .authenticationRejected
+            case .security:
+                originKind = .securityBoundary
+            case .graphInvalidated, .resource:
+                originKind = .routeRuntimeFailure
+            case .malformed:
+                originKind = .malformedMedia
+            case .cancelled:
+                originKind = .cancelled
+            case .invariant:
+                originKind = .invariantViolation
+            }
+            return AetherPlaybackFailure(
+                stage: .origin,
+                kind: originKind,
+                domain: origin.underlyingDomain,
+                code: origin.underlyingCode,
+                reason: "hybrid.origin.\(origin.caseCode)"
+            )
+        }
+        if let hybrid = error as? HybridPlaybackSessionError {
+            let evidence: HybridPlaybackFailureEvidence?
+            switch hybrid {
+            case .providerFailed(let value),
+                 .carrierFailed(let value):
+                evidence = value
+            default:
+                evidence = nil
+            }
+            if let evidence {
+                let evidenceStage:
+                    AetherPlaybackRecoveryStage = switch evidence.stage {
+                case .routeCreation: .routeCreation
+                case .preparation: .preparation
+                case .seek, .runtime, .provider, .carrier: .playback
+                }
+                return AetherPlaybackFailure(
+                    stage: evidenceStage,
+                    kind: .routeRuntimeFailure,
+                    domain: evidence.underlyingDomain,
+                    code: evidence.underlyingCode,
+                    reason: "hybrid.\(evidence.stage.rawValue).\(evidence.caseCode)"
+                )
+            }
+        }
 
         let kind: AetherPlaybackFailureKind
         switch error {
@@ -1513,6 +2536,8 @@ public final class AetherPlaybackSession: ObservableObject {
         case let error as AetherPlaybackSessionError:
             switch error {
             case .unsupported: kind = .unsupportedCapability
+            case .recoveryDeadlineExceeded:
+                kind = .routeRuntimeFailure
             case .invalidFactorySource, .invalidState,
                  .noActiveRoute, .terminal:
                 kind = .invariantViolation
@@ -1602,14 +2627,21 @@ public final class AetherPlaybackSession: ObservableObject {
              .readinessTimedOut,
              .carrierSeekDidNotLand:
             .routeRuntimeFailure
+        case .originFailed(let failure):
+            switch failure.scope {
+            case .transient: .transientTransport
+            case .authentication: .authenticationRejected
+            case .security: .securityBoundary
+            case .graphInvalidated, .resource:
+                .routeRuntimeFailure
+            case .malformed: .malformedMedia
+            case .cancelled: .cancelled
+            case .invariant: .invariantViolation
+            }
         case .decoderFailed:
             .decoderRuntimeFailure
         case .presentationFailed(let error):
-            if case .rendererFailed = error {
-                .routeRuntimeFailure
-            } else {
-                .malformedMedia
-            }
+            PlaybackFailureEvidenceDecision.kind(for: error)
         case .hlsPreflightGenerationInvalidated(let reason):
             switch reason {
             case .resourceUnavailable, .contentChanged:
@@ -1626,7 +2658,14 @@ public final class AetherPlaybackSession: ObservableObject {
             .hostContractViolation
         case .cancelled:
             .cancelled
-        case .videoPipelineMissing, .renderSurfaceMissing,
+        case .videoPipelineMissing:
+            .unsupportedCapability
+        case .carrierItemMissing, .carrierClockUnavailable,
+             .resumeIntentMissing, .generationDiverged,
+             .sourceVideoFormatDiverged,
+             .sourceDolbyVisionConfigurationDiverged:
+            .routeRuntimeFailure
+        case .renderSurfaceMissing,
              .invalidSeekableVODOptions,
              .sourceIndependentReaderUnavailable,
              .hlsPreflightRequired,
@@ -1634,13 +2673,9 @@ public final class AetherPlaybackSession: ObservableObject {
              .sourceKindMismatch, .timelineSourceMismatch,
              .preflightRequiresHybrid,
              .preflightContractChanged,
-             .sourceVideoFormatDiverged,
-             .sourceDolbyVisionConfigurationDiverged,
              .invalidReadinessTimeout, .invalidSeekTarget,
              .invalidRate, .notReady, .alreadyPreparing,
-             .alreadyStopped, .carrierItemMissing,
-             .carrierClockUnavailable, .resumeIntentMissing,
-             .generationDiverged:
+             .alreadyStopped:
             .invariantViolation
         }
     }
@@ -1655,14 +2690,62 @@ public final class AetherPlaybackSession: ObservableObject {
             return error.localizedDescription
         case let error as AetherNativePlaybackSessionError:
             return error.localizedDescription
-        case is HybridPlaybackSessionError:
-            return "Hybrid playback failed (\(kind.rawValue))"
+        case let error as HybridPlaybackSessionError:
+            return hybridFailureCode(error)
         case is HLSPreflightError:
             return "HLS preflight failed (\(kind.rawValue))"
         case let error as AetherURLPlaybackSourceClassificationError:
             return error.localizedDescription
         default:
             return "Playback \(stage.rawValue) failed (\(kind.rawValue))"
+        }
+    }
+
+    private static func hybridFailureCode(
+        _ error: HybridPlaybackSessionError
+    ) -> String {
+        switch error {
+        case .providerFailed:
+            return "hybrid.provider.failed"
+        case .originFailed(let failure):
+            return "hybrid.origin.\(failure.caseCode)"
+        case .carrierFailed:
+            return "hybrid.carrier.failed"
+        case .decoderFailed:
+            return "hybrid.decoder.failed"
+        case .readinessFailed:
+            return "hybrid.readiness.failed"
+        case .readinessTimedOut:
+            return "hybrid.readiness.timeout"
+        case .carrierSeekDidNotLand:
+            return "hybrid.carrier.seekDidNotLand"
+        case .generationDiverged:
+            return "hybrid.operation.generationDiverged"
+        case .cancelled:
+            return "hybrid.operation.cancelled"
+        case .hlsPreflightGenerationInvalidated(let reason):
+            return PlaybackFailureEvidenceDecision
+                .hlsGraphFailureCode(reason)
+        case .presentationFailed(let error):
+            switch error {
+            case .invalidPresentationTime, .invalidFrameDuration,
+                 .invalidGeometry, .unsupportedRotation,
+                 .frameFormatDiverged,
+                 .nonMonotonicPresentationTime:
+                return "hybrid.presentation.mediaDivergence.\(String(reflecting: type(of: error)))"
+            case .pixelBufferNotIOSurfaceBacked:
+                return "hybrid.presentation.iosurfaceUnavailable"
+            case .carrierBindingChanged:
+                return "hybrid.presentation.carrierBindingDrift"
+            case .rendererStalled:
+                return "hybrid.presentation.rendererStalled"
+            case .pendingQueueOverflow:
+                return "hybrid.presentation.legacyQueueOverflow"
+            default:
+                return "hybrid.presentation.resourceFailure"
+            }
+        default:
+            return "hybrid.session.\(String(reflecting: type(of: error)))"
         }
     }
 
@@ -1676,35 +2759,54 @@ public final class AetherPlaybackSession: ObservableObject {
         firstFailure = recoveryCoordinator.sessionFirstFailure
     }
 
-    private func resetRecoveryEpisode() {
+    private func resetRecoveryEpisode(
+        beginProgressEpoch: Bool = true
+    ) {
         recoveryCoordinator.resetEpisode(
             now: ProcessInfo.processInfo.systemUptime
         )
+        if beginProgressEpoch {
+            playbackProgressEpoch.begin()
+        }
+        mergedRuntimeFailureKeys.removeAll(keepingCapacity: true)
+        lastRecoveryFailure = nil
+        transportRetryBudget.reset()
+    }
+
+    private static func isPermanentFailure(
+        _ kind: AetherPlaybackFailureKind
+    ) -> Bool {
+        switch kind {
+        case .unsupportedCapability, .authenticationRejected,
+             .securityBoundary, .malformedMedia,
+             .hostContractViolation, .invariantViolation:
+            true
+        case .transientTransport, .inconclusiveEvidence,
+             .routeRuntimeFailure, .decoderRuntimeFailure,
+             .cancelled:
+            false
+        }
     }
 
     private func observeHealthyProgress(_ time: CMTime) {
-        guard desiredPlaying,
-              !isPreparingOrRecovering,
-              time.isValid,
+        guard time.isValid,
               time.isNumeric,
               time.seconds.isFinite else {
             return
         }
-        guard let lastRecoveryResetMediaTime else {
-            self.lastRecoveryResetMediaTime = time
+        lastConfirmedMediaTime = time
+        let demonstratedHealthyProgress = playbackProgressEpoch.observe(
+            seconds: time.seconds,
+            eligible: desiredPlaying
+                && state == .playing
+                && !isPreparingOrRecovering,
+            requiredProgressSeconds:
+                recoveryBudget.healthyProgressResetSeconds
+        )
+        guard demonstratedHealthyProgress else {
             return
         }
-        let progress = CMTimeSubtract(
-            time,
-            lastRecoveryResetMediaTime
-        ).seconds
-        guard progress.isFinite,
-              progress
-                >= recoveryBudget.healthyProgressResetSeconds else {
-            return
-        }
-        self.lastRecoveryResetMediaTime = time
-        resetRecoveryEpisode()
+        resetRecoveryEpisode(beginProgressEpoch: false)
     }
 
     private var episodeElapsedSeconds: TimeInterval {
@@ -1721,13 +2823,15 @@ public final class AetherPlaybackSession: ObservableObject {
         outcome: AetherPlaybackRecoveryOutcome
     ) {
         beginRecoveryEpisodeIfNeeded(failure)
+        lastRecoveryFailure = failure
         eventSequence += 1
         let capabilityDelta:
             AetherPlaybackCapabilityDelta?
         if outcome == .scheduled {
             capabilitiesBeforeRecoveryAttempt = capabilities
             capabilityDelta = nil
-        } else if let before = capabilitiesBeforeRecoveryAttempt {
+        } else if outcome != .merged,
+                  let before = capabilitiesBeforeRecoveryAttempt {
             capabilityDelta = AetherPlaybackCapabilityDelta(
                 before: before,
                 after: capabilities
@@ -1769,24 +2873,75 @@ public final class AetherPlaybackSession: ObservableObject {
     private func publishTerminal(
         _ failure: AetherPlaybackFailure
     ) {
+        publishTerminal(
+            failure,
+            finalFailure: failure,
+            exhaustionReason: terminalExhaustionReason(for: failure)
+        )
+    }
+
+    private func publishTerminal(
+        _ firstCandidate: AetherPlaybackFailure,
+        finalFailure: AetherPlaybackFailure,
+        exhaustionReason: String
+    ) {
         guard !isStopped,
               recoveryCoordinator.claimTerminalOutcome() else {
             return
         }
-        firstFailure = firstFailure ?? failure
-        state = .failed(failure)
+        let original = recoveryCoordinator.sessionFirstFailure
+            ?? firstFailure
+            ?? firstCandidate
+        firstFailure = original
+        terminalFailure = AetherPlaybackTerminalFailure(
+            firstFailure: original,
+            finalFailure: finalFailure,
+            exhaustionReason: exhaustionReason
+        )
+        EngineLog.emit(
+            "[AetherPlaybackSession] terminal "
+                + "session=\(sessionID.uuidString.prefix(8)) "
+                + "source=\(sourceFingerprint) "
+                + "first=\(original.kind.rawValue) "
+                + "final=\(finalFailure.kind.rawValue) "
+                + "attempts=\(recoveryCoordinator.attemptCount) "
+                + "reason=\(exhaustionReason)",
+            category: .session
+        )
+        state = .failed(finalFailure)
+    }
+
+    private func terminalExhaustionReason(
+        for failure: AetherPlaybackFailure
+    ) -> String {
+        switch failure.kind {
+        case .authenticationRejected:
+            return "authorization rejected"
+        case .securityBoundary:
+            return "security boundary"
+        case .hostContractViolation:
+            return "host presentation contract violated"
+        case .unsupportedCapability:
+            return "positive capability boundary"
+        case .malformedMedia:
+            return "positive corrupt media evidence"
+        case .cancelled:
+            return "operation cancelled without successor"
+        case .invariantViolation:
+            return "required playback invariant failed"
+        case .transientTransport, .inconclusiveEvidence,
+             .routeRuntimeFailure, .decoderRuntimeFailure:
+            return "bounded recovery exhausted"
+        }
     }
 
     private func teardownActiveRoute() {
+        routeTransactions.invalidate()
         routeCancellables.removeAll()
         activeSession?.cancelAudioAnalysisStreams()
         activeSession?.stop()
         activeSession = nil
         presentationView.install(nil)
-        activeRoute = nil
-        overlaySubtitleTracks = []
-        activeOverlaySubtitleTrackID = nil
-        capabilities = Self.capabilities(for: nil)
     }
 
     private func publishCurrentItem(
@@ -1802,12 +2957,25 @@ public final class AetherPlaybackSession: ObservableObject {
 
     private func publishCapabilities() {
         capabilities = Self.capabilities(
-            for: activeSession
+            for: activeSession,
+            source: resolvedSource
         )
     }
 
+    private func publishTrackState(
+        from session: AetherActiveRouteSession
+    ) {
+        audioTracks = session.audioTracks
+        subtitleTracks = session.subtitleTracks
+        selectedAudioTrackID =
+            session.selectedAudioTrackIdentifier
+        selectedSubtitleTrackID =
+            session.selectedSubtitleTrackIdentifier
+    }
+
     private static func capabilities(
-        for session: AetherActiveRouteSession?
+        for session: AetherActiveRouteSession?,
+        source: AetherResolvedPlaybackSource?
     ) -> AetherPlaybackCapabilities {
         let nativePolicy = HybridPlaybackSystemFeaturePolicy(
             pictureInPictureVideo: .available,
@@ -1816,15 +2984,31 @@ public final class AetherPlaybackSession: ObservableObject {
         )
         switch session {
         case .native(let native):
+            let tracks = AetherActiveRouteSession
+                .native(native)
             return AetherPlaybackCapabilities(
                 route: .nativeAVPlayer,
                 systemFeaturePolicy: nativePolicy,
                 audioAnalysisTrackIDs:
                     native.audioAnalysisTrackIDs,
                 selectedAudioAnalysisTrackID:
-                    native.selectedAudioAnalysisTrackID
+                    native.selectedAudioAnalysisTrackID,
+                videoFormat:
+                    native.preflightResult.sourceProfile.videoFormat,
+                dolbyVisionProfile: native.preflightResult
+                    .sourceProfile.dolbyVisionConfiguration
+                    .map { Int($0.profile) },
+                variantBitrate: selectedVariantBitrate(source),
+                audioTracks: tracks.audioTracks,
+                subtitleTracks: tracks.subtitleTracks,
+                selectedAudioTrackID:
+                    tracks.selectedAudioTrackIdentifier,
+                selectedSubtitleTrackID:
+                    tracks.selectedSubtitleTrackIdentifier
             )
         case .hybrid(let hybrid):
+            let tracks = AetherActiveRouteSession
+                .hybrid(hybrid)
             return AetherPlaybackCapabilities(
                 route: .hybridCarrier,
                 systemFeaturePolicy:
@@ -1832,16 +3016,45 @@ public final class AetherPlaybackSession: ObservableObject {
                 audioAnalysisTrackIDs:
                     hybrid.audioAnalysisTrackIDs,
                 selectedAudioAnalysisTrackID:
-                    hybrid.selectedAudioAnalysisTrackID
+                    hybrid.selectedAudioAnalysisTrackID,
+                videoFormat:
+                    hybrid.preflightResult.sourceProfile.videoFormat,
+                dolbyVisionProfile: hybrid.preflightResult
+                    .sourceProfile.dolbyVisionConfiguration
+                    .map { Int($0.profile) },
+                variantBitrate: selectedVariantBitrate(source),
+                audioTracks: tracks.audioTracks,
+                subtitleTracks: tracks.subtitleTracks,
+                selectedAudioTrackID:
+                    tracks.selectedAudioTrackIdentifier,
+                selectedSubtitleTrackID:
+                    tracks.selectedSubtitleTrackIdentifier
             )
         case nil:
             return AetherPlaybackCapabilities(
                 route: nil,
-                systemFeaturePolicy: nativePolicy,
+                systemFeaturePolicy:
+                    AetherHybridPlaybackSession.systemFeaturePolicy,
                 audioAnalysisTrackIDs: [],
-                selectedAudioAnalysisTrackID: nil
+                selectedAudioAnalysisTrackID: nil,
+                videoFormat: nil,
+                dolbyVisionProfile: nil,
+                variantBitrate: nil,
+                audioTracks: [],
+                subtitleTracks: [],
+                selectedAudioTrackID: nil,
+                selectedSubtitleTrackID: nil
             )
         }
+    }
+
+    private static func selectedVariantBitrate(
+        _ source: AetherResolvedPlaybackSource?
+    ) -> Int? {
+        guard case .hls(let preflight) = source else {
+            return nil
+        }
+        return preflight.selectedVariantBandwidth
     }
 
     #if os(tvOS)

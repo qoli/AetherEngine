@@ -9,6 +9,15 @@ private enum HybridPlaybackSessionFixtureError: Error {
     case pixelBufferCreationFailed
 }
 
+private extension HybridPlaybackSeekResult {
+    var isSuperseded: Bool {
+        if case .superseded = self {
+            return true
+        }
+        return false
+    }
+}
+
 @MainActor
 private final class HybridTelemetryTriggerRecorder {
     private(set) var values:
@@ -103,6 +112,52 @@ private func makeHybridPlaybackSessionFrame(
 
 @Suite("Hybrid playback session", .serialized)
 struct HybridPlaybackSessionTests {
+    private final class ThreadSafeCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+
+        func increment() {
+            lock.lock()
+            value += 1
+            lock.unlock()
+        }
+
+        func snapshot() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
+    private final class RestartGate: @unchecked Sendable {
+        private let condition = NSCondition()
+        private var isOpen = false
+        private var waiterPresent = false
+
+        func wait() {
+            condition.lock()
+            waiterPresent = true
+            condition.broadcast()
+            while !isOpen {
+                condition.wait()
+            }
+            condition.unlock()
+        }
+
+        func release() {
+            condition.lock()
+            isOpen = true
+            condition.broadcast()
+            condition.unlock()
+        }
+
+        var isWaiting: Bool {
+            condition.lock()
+            defer { condition.unlock() }
+            return waiterPresent && !isOpen
+        }
+    }
+
     private final class Provider:
         HybridCarrierTransportProvider,
         HybridAudioAnalysisSource,
@@ -131,6 +186,7 @@ struct HybridPlaybackSessionTests {
         private var terminalError:
             HybridPlaybackSessionError?
         private var preparedGenerationFrameTimes: [Double]?
+        private var restartGate: RestartGate?
         private var terminalErrorHandler:
             (@Sendable (
                 HybridPlaybackSessionError
@@ -259,7 +315,11 @@ struct HybridPlaybackSessionTests {
             restartIntents.append(intent)
             currentGeneration = generation
             let forcedResult = forcedRestartResult
+            let restartGate = restartIntents.count == 1
+                ? self.restartGate
+                : nil
             lock.unlock()
+            restartGate?.wait()
             if let forcedResult {
                 return forcedResult
             }
@@ -323,6 +383,12 @@ struct HybridPlaybackSessionTests {
             lock.unlock()
         }
 
+        func configureRestartGate(_ gate: RestartGate) {
+            lock.lock()
+            restartGate = gate
+            lock.unlock()
+        }
+
         func failTerminally(
             _ error: HybridPlaybackSessionError
         ) {
@@ -373,6 +439,7 @@ struct HybridPlaybackSessionTests {
         private(set) var didStart = false
         private(set) var didStop = false
         private(set) var seekTargets: [CMTime] = []
+        var onSeek: (@MainActor (CMTime) -> Void)?
 
         func startPrepared() throws {
             didStart = true
@@ -388,6 +455,7 @@ struct HybridPlaybackSessionTests {
 
         func seek(to time: CMTime) async -> Bool {
             seekTargets.append(time)
+            onSeek?(time)
             return true
         }
 
@@ -403,10 +471,14 @@ struct HybridPlaybackSessionTests {
         private(set) var generation: UInt64 = 0
         private(set) var videoFormat: VideoFormat?
         private(set) var frames: [DecodedVideoFrame] = []
+        private(set) var acceptedFrameCount = 0
         private(set) var carrierClockValidationCount = 0
         private(set) var boundItem: AVPlayerItem?
         private(set) var boundTimebase: CMTimebase?
         private(set) var flushCount = 0
+        var retainsAcceptedFramesUntilCapacityCallback = false
+        var synchronouslyReleasesAcceptedFrames = false
+        private var frameDidLeaveMailbox: (@Sendable () -> Void)?
 
         func beginGeneration(
             _ generation: UInt64,
@@ -414,7 +486,11 @@ struct HybridPlaybackSessionTests {
         ) throws {
             self.generation = generation
             self.videoFormat = videoFormat
-            frames.removeAll()
+            if retainsAcceptedFramesUntilCapacityCallback {
+                releaseRetainedFrames()
+            } else {
+                frames.removeAll()
+            }
         }
 
         func enqueue(
@@ -424,6 +500,12 @@ struct HybridPlaybackSessionTests {
                 return .staleGeneration
             }
             frames.append(frame)
+            acceptedFrameCount += 1
+            if retainsAcceptedFramesUntilCapacityCallback,
+               synchronouslyReleasesAcceptedFrames {
+                frames.removeLast()
+                frameDidLeaveMailbox?()
+            }
             return .accepted
         }
 
@@ -450,13 +532,34 @@ struct HybridPlaybackSessionTests {
 
         func flush(removingDisplayedImage: Bool) {
             flushCount += 1
-            frames.removeAll()
+            if retainsAcceptedFramesUntilCapacityCallback {
+                releaseRetainedFrames()
+            } else {
+                frames.removeAll()
+            }
         }
 
         func invalidate() {
             flush(removingDisplayedImage: true)
             boundItem = nil
             boundTimebase = nil
+        }
+
+        func installMailboxCallbacks(
+            frameDidLeaveMailbox: @escaping @Sendable () -> Void,
+            asynchronousFailureHandler: @escaping @MainActor (
+                AetherHybridPresentationError
+            ) -> Void
+        ) {
+            self.frameDidLeaveMailbox = frameDidLeaveMailbox
+        }
+
+        func releaseRetainedFrames() {
+            let count = frames.count
+            frames.removeAll(keepingCapacity: true)
+            for _ in 0..<count {
+                frameDidLeaveMailbox?()
+            }
         }
     }
 
@@ -933,6 +1036,101 @@ struct HybridPlaybackSessionTests {
         )
     }
 
+    @MainActor
+    @Test("Frame relay pauses at high-water and generation flush releases the producer")
+    func boundedFrameRelayBackpressure() async throws {
+        let fixture = try makeSession(
+            retainsFramesUntilCapacityCallback: true
+        )
+        defer { fixture.session.stop() }
+        try await fixture.session.prepare(timeout: 10)
+        fixture.renderSurface.releaseRetainedFrames()
+        let baseline = fixture.renderSurface.acceptedFrameCount
+
+        let frames = try (0..<25).map { index in
+            try makeHybridPlaybackSessionFrame(
+                time: Double(index + 1) / 60,
+                duration: 1.0 / 60,
+                generation: fixture.session.generation
+            )
+        }
+        let emitted = ThreadSafeCounter()
+        let producer = Task.detached {
+            for frame in frames {
+                fixture.relay.emit(frame)
+                emitted.increment()
+            }
+        }
+
+        try await waitUntil {
+            emitted.snapshot() == 24
+                && fixture.renderSurface.frames.count == 24
+        }
+        #expect(fixture.renderSurface.frames.count == 24)
+        #expect(fixture.session.state != .failed(.cancelled))
+
+        fixture.renderSurface.flush(
+            removingDisplayedImage: false
+        )
+        await producer.value
+        try await waitUntil {
+            fixture.renderSurface.acceptedFrameCount
+                == baseline + 25
+        }
+        #expect(emitted.snapshot() == 25)
+        #expect(
+            fixture.renderSurface.acceptedFrameCount
+                == baseline + 25
+        )
+        fixture.renderSurface.releaseRetainedFrames()
+        try await waitUntil {
+            fixture.relay.diagnostics.mailboxDepth == 0
+        }
+        #expect(fixture.relay.diagnostics.mailboxDepth == 0)
+    }
+
+    @MainActor
+    @Test("Synchronous renderer release does not leak frame ownership")
+    func synchronousRendererReleaseOwnership() async throws {
+        let fixture = try makeSession(
+            retainsFramesUntilCapacityCallback: true,
+            synchronouslyReleasesAcceptedFrames: true
+        )
+        defer { fixture.session.stop() }
+        try await fixture.session.prepare(timeout: 1)
+        let baseline = fixture.renderSurface.acceptedFrameCount
+        #expect(fixture.relay.diagnostics.mailboxDepth == 0)
+
+        let frames = try (0..<96).map { index in
+            try makeHybridPlaybackSessionFrame(
+                time: Double(index + 1) / 60,
+                duration: 1.0 / 60,
+                generation: fixture.session.generation
+            )
+        }
+        let emitted = ThreadSafeCounter()
+        let producer = Task.detached {
+            for frame in frames {
+                fixture.relay.emit(frame)
+                emitted.increment()
+            }
+        }
+
+        let completed = await waitUntilResult {
+            emitted.snapshot() == frames.count
+                && fixture.renderSurface.acceptedFrameCount
+                    == baseline + frames.count
+        }
+        if !completed {
+            fixture.relay.detach()
+        }
+        await producer.value
+
+        #expect(completed)
+        #expect(emitted.snapshot() == frames.count)
+        #expect(fixture.relay.diagnostics.mailboxDepth == 0)
+    }
+
     @Test("Initial carrier and decoded frame must both become ready")
     @MainActor
     func initialReadinessAndClockDemand() async throws {
@@ -1251,6 +1449,115 @@ struct HybridPlaybackSessionTests {
         )
     }
 
+    @Test("Carrier lands before target decode can fill the renderer mailbox")
+    @MainActor
+    func carrierSeekPrecedesTargetDecodePressure() async throws {
+        let fixture = try makeSession(
+            retainsFramesUntilCapacityCallback: true
+        )
+        defer { fixture.session.stop() }
+        try await fixture.session.prepare(timeout: 1)
+        fixture.renderSurface.releaseRetainedFrames()
+
+        let target = CMTime(
+            seconds: 4.5,
+            preferredTimescale: 600
+        )
+        fixture.provider.configurePreparedGenerationFrameTimes(
+            Array(repeating: target.seconds, count: 120)
+        )
+        fixture.transport.onSeek = { _ in
+            fixture.renderSurface
+                .synchronouslyReleasesAcceptedFrames = true
+        }
+
+        let seekTask = Task { @MainActor in
+            try await fixture.session.seek(
+                to: target,
+                timeout: 2
+            )
+        }
+        let carrierLandedBeforePressure = await waitUntilResult {
+            fixture.transport.seekTargets == [target]
+        }
+        if !carrierLandedBeforePressure {
+            fixture.renderSurface
+                .synchronouslyReleasesAcceptedFrames = true
+            fixture.renderSurface.releaseRetainedFrames()
+        }
+        let result = try await seekTask.value
+
+        #expect(carrierLandedBeforePressure)
+        #expect(result == .applied(
+            generation: 1,
+            target: target
+        ))
+        #expect(fixture.provider.snapshot().restarts.count == 1)
+        #expect(fixture.relay.diagnostics.mailboxDepth == 0)
+    }
+
+    @Test("Rapid seeks keep one in-flight restart and only the latest pending target")
+    @MainActor
+    func rapidSeekCoalescing() async throws {
+        let fixture = try makeSession()
+        defer { fixture.session.stop() }
+        try await fixture.session.prepare(timeout: 1)
+        let gate = RestartGate()
+        fixture.provider.configureRestartGate(gate)
+
+        let targets = (0..<20).map { index in
+            CMTime(
+                seconds: 0.5 + Double(index) * 0.2,
+                preferredTimescale: 600
+            )
+        }
+        let first = Task { @MainActor in
+            try await fixture.session.seek(
+                to: targets[0],
+                timeout: 2
+            )
+        }
+        let firstRestartBlocked = await waitUntilResult {
+            gate.isWaiting
+        }
+        #expect(firstRestartBlocked)
+
+        let remaining = targets.dropFirst().map { target in
+            Task { @MainActor in
+                try await fixture.session.seek(
+                    to: target,
+                    timeout: 2
+                )
+            }
+        }
+        for _ in 0..<40 {
+            await Task.yield()
+        }
+        gate.release()
+
+        let firstResult = try await first.value
+        var laterResults: [HybridPlaybackSeekResult] = []
+        for task in remaining {
+            laterResults.append(try await task.value)
+        }
+
+        #expect(firstResult.isSuperseded)
+        let intermediateSeeksWereSuperseded =
+            laterResults.dropLast().allSatisfy {
+                $0.isSuperseded
+            }
+        #expect(intermediateSeeksWereSuperseded)
+        #expect(laterResults.last == .applied(
+            generation: 2,
+            target: targets.last!
+        ))
+        #expect(fixture.provider.snapshot().restarts.count == 2)
+        #expect(fixture.transport.seekTargets == [
+            targets[0],
+            targets.last!,
+        ])
+    }
+
     @Test("Route implementation reports decoder failure and tears down its generation")
     @MainActor
     func decoderFailureIsReportedToUnifiedCoordinator() async throws {
@@ -1532,7 +1839,9 @@ struct HybridPlaybackSessionTests {
 
     @MainActor
     private func makeSession(
-        videoFormat: VideoFormat = .sdr
+        videoFormat: VideoFormat = .sdr,
+        retainsFramesUntilCapacityCallback: Bool = false,
+        synchronouslyReleasesAcceptedFrames: Bool = false
     ) throws -> (
         session: HybridPlaybackSession,
         provider: Provider,
@@ -1554,6 +1863,10 @@ struct HybridPlaybackSessionTests {
         )
         let transport = Transport()
         let renderSurface = RenderSurface()
+        renderSurface.retainsAcceptedFramesUntilCapacityCallback =
+            retainsFramesUntilCapacityCallback
+        renderSurface.synchronouslyReleasesAcceptedFrames =
+            synchronouslyReleasesAcceptedFrames
         let session = try HybridPlaybackSession(
             provider: provider,
             transport: transport,
@@ -1581,5 +1894,18 @@ struct HybridPlaybackSessionTests {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         Issue.record("Timed out waiting for hybrid session state")
+    }
+
+    @MainActor
+    private func waitUntilResult(
+        _ condition: @escaping @MainActor () -> Bool
+    ) async -> Bool {
+        for _ in 0..<100 {
+            if condition() {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return false
     }
 }

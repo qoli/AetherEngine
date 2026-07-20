@@ -244,6 +244,22 @@ final class AetherHybridPlaybackSession: ObservableObject {
     @Published public private(set) var selectedAudioAnalysisTrackID:
         Int?
 
+    var audioTracks: [AetherPlaybackTrack] {
+        core.audioTracks
+    }
+
+    var subtitleTracks: [AetherPlaybackTrack] {
+        core.subtitleTracks
+    }
+
+    var selectedAudioTrackID: Int? {
+        core.selectedAudioTrackID
+    }
+
+    var selectedSubtitleTrackIdentifier: String? {
+        core.selectedSubtitleTrackIdentifier
+    }
+
     private let core: HybridPlaybackSession
     private let telemetryHub:
         AetherHybridPlaybackTelemetryHub
@@ -282,7 +298,7 @@ final class AetherHybridPlaybackSession: ObservableObject {
             #if os(tvOS)
             switch state {
             case .failed, .stopped:
-                self.detachCarrierPlayerViewControllerIfOwned()
+                self.releaseCarrierPlayerViewControllerContract()
             default:
                 break
             }
@@ -387,7 +403,11 @@ final class AetherHybridPlaybackSession: ObservableObject {
             throw HybridPlaybackSessionError.presentationFailed(error)
         } catch {
             throw HybridPlaybackSessionError.providerFailed(
-                reason: String(describing: error)
+                HybridPlaybackFailureEvidence(
+                    stage: .routeCreation,
+                    caseCode: "progressiveProvider",
+                    error: error
+                )
             )
         }
         guard core.sourceVideoFormat
@@ -605,7 +625,11 @@ final class AetherHybridPlaybackSession: ObservableObject {
         } catch {
             throw HybridPlaybackSessionError
                 .providerFailed(
-                    reason: String(describing: error)
+                    HybridPlaybackFailureEvidence(
+                        stage: .routeCreation,
+                        caseCode: "hlsProvider",
+                        error: error
+                    )
                 )
         }
         guard core.sourceVideoFormat
@@ -645,7 +669,10 @@ final class AetherHybridPlaybackSession: ObservableObject {
         bridgeMode: AudioBridgeMode = .surroundCompat,
         avPlayer: AVPlayer,
         decoderPreference: HybridVideoDecoderPreference = .automatic,
-        initialGeneration: UInt64 = 0
+        initialGeneration: UInt64 = 0,
+        transportRetryBudget: PlaybackTransportRetryBudget = .init(
+            maximumFailureAttempts: 3
+        )
     ) async throws -> AetherHybridPlaybackSession {
         guard preflight.result.route == .hybridCarrier else {
             throw HybridPlaybackSessionError.preflightRequiresHybrid(
@@ -681,7 +708,8 @@ final class AetherHybridPlaybackSession: ObservableObject {
             bridgeMode: bridgeMode,
             avPlayer: avPlayer,
             decoderPreference: decoderPreference,
-            initialGeneration: initialGeneration
+            initialGeneration: initialGeneration,
+            transportRetryBudget: transportRetryBudget
         )
         guard core.sourceVideoFormat == preflight.result.sourceProfile.videoFormat else {
             let decoded = core.sourceVideoFormat
@@ -865,6 +893,16 @@ final class AetherHybridPlaybackSession: ObservableObject {
         try core.selectOverlaySubtitleTrack(trackID)
     }
 
+    func selectAudioTrack(_ trackID: Int) async throws {
+        try await core.selectAudioTrack(trackID)
+    }
+
+    func selectNativeSubtitleTrack(
+        _ ordinal: Int?
+    ) async throws {
+        try await core.selectNativeSubtitleTrack(ordinal)
+    }
+
     public func stop() {
         core.stop()
         telemetryHub.finish()
@@ -903,14 +941,12 @@ final class AetherHybridPlaybackSession: ObservableObject {
         }
     }
 
-    private func detachCarrierPlayerViewControllerIfOwned() {
+    /// Releases Hybrid-specific menus and validation ownership without ever
+    /// clearing the stable AVPlayer binding owned by AetherPlaybackSession.
+    private func releaseCarrierPlayerViewControllerContract() {
         configuredCarrierPlayerViewController?
             .transportBarCustomMenuItems =
                 hostTransportBarCustomMenuItems
-        if configuredCarrierPlayerViewController?.player
-                === avPlayer {
-            configuredCarrierPlayerViewController?.player = nil
-        }
         configuredCarrierPlayerViewController = nil
         didConfigureCarrierPlayerViewController = false
         hostTransportBarCustomMenuItems = []
@@ -936,9 +972,10 @@ final class AetherHybridPlaybackSession: ObservableObject {
                 do {
                     try self?.selectOverlaySubtitleTrack(nil)
                 } catch {
+                    let nsError = error as NSError
                     EngineLog.emit(
                         "[AetherHybridPlaybackSession] overlay subtitle off failed: "
-                            + String(describing: error),
+                            + "domain=\(nsError.domain) code=\(nsError.code)",
                         category: .session
                     )
                 }
@@ -955,9 +992,10 @@ final class AetherHybridPlaybackSession: ObservableObject {
                     do {
                         try self?.selectOverlaySubtitleTrack(track.id)
                     } catch {
+                        let nsError = error as NSError
                         EngineLog.emit(
                             "[AetherHybridPlaybackSession] overlay subtitle selection failed trackID=\(track.id): "
-                                + String(describing: error),
+                                + "domain=\(nsError.domain) code=\(nsError.code)",
                             category: .session
                         )
                     }

@@ -122,6 +122,43 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         }
     }
 
+    func testTransportDispositionSeparatesTransientSecurityCancellationAndInvariant() {
+        XCTAssertEqual(
+            HLSVODOriginResourceLoader.transportDisposition(
+                for: .networkConnectionLost
+            ),
+            .transient
+        )
+        XCTAssertEqual(
+            HLSVODOriginResourceLoader.transportDisposition(
+                for: .cancelled
+            ),
+            .cancelled
+        )
+        XCTAssertEqual(
+            HLSVODOriginResourceLoader.transportDisposition(
+                for: .serverCertificateUntrusted
+            ),
+            .security
+        )
+        XCTAssertEqual(
+            HLSVODOriginResourceLoader.transportDisposition(
+                for: .badURL
+            ),
+            .invariant
+        )
+    }
+
+    func testRetryAfterDeltaSecondsIsPreserved() {
+        XCTAssertEqual(
+            HLSVODBoundedHTTPFetcher.retryAfterSeconds("4"),
+            4
+        )
+        XCTAssertNil(
+            HLSVODBoundedHTTPFetcher.retryAfterSeconds("not-a-date")
+        )
+    }
+
     func testPreflightEvidenceSeedsVideoAndAudioFetchIsSingleFlight()
         async throws
     {
@@ -252,6 +289,117 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
                 atPath: directory.path
             )
         )
+    }
+
+    func testCorruptExactCacheEntryRefetchesTheSameBoundResource()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let response = HLSVODOriginFetchResponse(
+            data: fixture.audioFirstSegmentData,
+            effectiveURL: fixture.audioFirstSegmentURL,
+            statusCode: 200,
+            contentLength: Int64(
+                fixture.audioFirstSegmentData.count
+            ),
+            contentEncoding: nil
+        )
+        let recorder = FetchRecorder(
+            responses: [
+                fixture.audioFirstSegmentURL: response,
+            ]
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [:],
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+        let key = HLSVODOriginResourceKey.audioSegment(
+            renditionOrdinal: 0,
+            index: 0
+        )
+        let first = try await loader.payload(for: key)
+        XCTAssertEqual(first.data, fixture.audioFirstSegmentData)
+
+        let directory = await loader.sessionDirectory
+        try Data("corrupt".utf8).write(
+            to: directory.appendingPathComponent(
+                "audio-0-segment-0"
+            ),
+            options: [.atomic]
+        )
+
+        let recovered = try await loader.payload(for: key)
+        XCTAssertEqual(recovered.data, fixture.audioFirstSegmentData)
+        XCTAssertEqual(
+            recovered.sha256,
+            HLSVODResourceDigest.sha256(
+                fixture.audioFirstSegmentData
+            )
+        )
+        let recoveredRequestCount = await recorder.requestCount
+        XCTAssertEqual(recoveredRequestCount, 2)
+        let snapshot = await loader.snapshot
+        XCTAssertTrue(snapshot.cacheIsAvailable)
+        XCTAssertEqual(snapshot.cacheFailureCount, 1)
+        XCTAssertEqual(snapshot.cachedResourceCount, 1)
+        try await loader.close()
+    }
+
+    func testUnavailableCacheDoesNotTerminateVerifiedOriginDelivery()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let basePath = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try Data("not-a-directory".utf8).write(to: basePath)
+        defer { try? FileManager.default.removeItem(at: basePath) }
+        let recorder = FetchRecorder(
+            responses: [
+                fixture.audioFirstSegmentURL:
+                    HLSVODOriginFetchResponse(
+                        data: fixture.audioFirstSegmentData,
+                        effectiveURL:
+                            fixture.audioFirstSegmentURL,
+                        statusCode: 200,
+                        contentLength: Int64(
+                            fixture.audioFirstSegmentData.count
+                        ),
+                        contentEncoding: nil
+                    ),
+            ]
+        )
+        let loader = try HLSVODOriginResourceLoader(
+            graph: fixture.graph,
+            httpHeaders: [:],
+            baseDirectory: basePath,
+            fetchOverride: { request, maximumBytes in
+                try await recorder.fetch(
+                    request,
+                    maximumBytes: maximumBytes
+                )
+            }
+        )
+
+        let payload = try await loader.payload(
+            for: .audioSegment(
+                renditionOrdinal: 0,
+                index: 0
+            )
+        )
+        XCTAssertEqual(payload.data, fixture.audioFirstSegmentData)
+        let requestCount = await recorder.requestCount
+        XCTAssertEqual(requestCount, 1)
+        let snapshot = await loader.snapshot
+        XCTAssertFalse(snapshot.cacheIsAvailable)
+        XCTAssertEqual(snapshot.cacheFailureCount, 1)
+        XCTAssertEqual(snapshot.cachedResourceCount, 0)
+        try await loader.close()
     }
 
     func testCancellingOneWaiterKeepsSharedFetchAlive()
@@ -1598,7 +1746,7 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         try await loader.close()
     }
 
-    func testServerFailureDoesNotInvalidateOrRetryAutomatically()
+    func testServerFailureUsesBoundedTransportRetriesWithoutInvalidatingGraph()
         async throws
     {
         let fixture = try makeFixture()
@@ -1643,21 +1791,21 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         let firstRequestCount = await recorder.requestCount
         XCTAssertEqual(
             firstRequestCount,
-            1,
-            "the loader must not automatically retry a failed request"
+            3,
+            "one transport operation may make at most three attempts"
         )
 
         do {
             _ = try await loader.payload(for: key)
             XCTFail("explicit second request unexpectedly produced bytes")
         } catch let error as HLSVODOriginResourceError {
-            XCTAssertEqual(error, .httpStatus(503))
+            XCTAssertEqual(error, .transportBudgetExhausted)
         }
         let secondRequestCount = await recorder.requestCount
         XCTAssertEqual(
             secondRequestCount,
-            2,
-            "only an explicit caller request may retry a non-generation HTTP failure"
+            3,
+            "the recovery episode owns one shared transport budget"
         )
         try await loader.close()
     }
@@ -1967,6 +2115,36 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
             recorded?["Accept-Encoding"],
             "identity"
         )
+    }
+
+    func testBoundedHTTPTransportReturnsRetryAfterEvidenceFor429()
+        async throws
+    {
+        let url = URL(
+            string: "https://origin.test/rate-limited.m4s"
+        )!
+        HLSVODOriginURLProtocol.reset()
+        HLSVODOriginURLProtocol.fixtures[
+            url.absoluteString
+        ] = .init(
+            statusCode: 429,
+            headers: ["Retry-After": "4"],
+            body: Data()
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [
+            HLSVODOriginURLProtocol.self,
+        ]
+
+        let response = try await HLSVODBoundedHTTPFetcher.fetch(
+            request: URLRequest(url: url),
+            maximumBytes: 4,
+            configuration: configuration
+        )
+
+        XCTAssertEqual(response.statusCode, 429)
+        XCTAssertEqual(response.retryAfterSeconds, 4)
+        XCTAssertTrue(response.data.isEmpty)
     }
 
     func testBoundedHTTPTransportRejectsCredentialedCrossOriginRedirect()

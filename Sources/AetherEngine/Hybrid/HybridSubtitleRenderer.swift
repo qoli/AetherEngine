@@ -80,6 +80,7 @@ public struct AetherHybridOverlaySubtitleTrack:
     public let language: String?
     public let isDefault: Bool
     public let isForced: Bool
+    public let isExternal: Bool
     public let kind: AetherHybridOverlaySubtitleKind
     public let availability:
         AetherHybridOverlaySubtitleAvailability
@@ -90,6 +91,7 @@ public struct AetherHybridOverlaySubtitleTrack:
         language: String?,
         isDefault: Bool,
         isForced: Bool,
+        isExternal: Bool = false,
         kind: AetherHybridOverlaySubtitleKind,
         availability:
             AetherHybridOverlaySubtitleAvailability = .available
@@ -99,6 +101,7 @@ public struct AetherHybridOverlaySubtitleTrack:
         self.language = language
         self.isDefault = isDefault
         self.isForced = isForced
+        self.isExternal = isExternal
         self.kind = kind
         self.availability = availability
     }
@@ -1189,6 +1192,7 @@ final class HybridSubtitleDecodeContract: @unchecked Sendable {
             language: info.language,
             isDefault: info.isDefault,
             isForced: info.isForced,
+            isExternal: info.isExternal,
             kind: kind
         )
         assHeader = info.assHeader
@@ -1561,6 +1565,7 @@ final class HybridSubtitleSessionController {
             language: contract.track.language,
             isDefault: contract.track.isDefault,
             isForced: contract.track.isForced,
+            isExternal: contract.track.isExternal,
             kind: contract.track.kind,
             availability: .unavailable(reason)
         )
@@ -1593,6 +1598,7 @@ final class HybridSubtitleSessionController {
                 language: track.language,
                 isDefault: track.isDefault,
                 isForced: track.isForced,
+                isExternal: track.isExternal,
                 kind: track.kind,
                 availability: .unavailable(reason)
             )

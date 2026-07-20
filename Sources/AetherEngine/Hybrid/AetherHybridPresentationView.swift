@@ -19,6 +19,91 @@ public enum AetherHybridVideoGravity: String, Sendable, Equatable {
 public enum HybridFrameEnqueueOutcome: Sendable, Equatable {
     case accepted
     case staleGeneration
+    case backpressured
+}
+
+enum HybridRendererStallAction: Sendable, Equatable {
+    case inactive
+    case wait(TimeInterval)
+    case fail(noProgressSeconds: TimeInterval)
+}
+
+struct HybridRendererStallDecision {
+    static func resolve(
+        detectionEnabled: Bool,
+        generationMatches: Bool,
+        pendingDepth: Int,
+        lowWaterMark: Int,
+        backpressureStartedAt: TimeInterval?,
+        detectionEnabledAt: TimeInterval?,
+        lastCapacityProgressAt: TimeInterval?,
+        now: TimeInterval,
+        threshold: TimeInterval
+    ) -> HybridRendererStallAction {
+        guard detectionEnabled,
+              generationMatches,
+              pendingDepth > lowWaterMark,
+              let backpressureStartedAt,
+              let detectionEnabledAt,
+              now.isFinite,
+              threshold.isFinite,
+              threshold > 0 else {
+            return .inactive
+        }
+        let lastProgress = max(
+            backpressureStartedAt,
+            detectionEnabledAt,
+            lastCapacityProgressAt ?? backpressureStartedAt
+        )
+        let noProgress = max(0, now - lastProgress)
+        guard noProgress >= threshold else {
+            return .wait(threshold - noProgress)
+        }
+        return .fail(noProgressSeconds: noProgress)
+    }
+}
+
+struct HybridRendererDrainWorkerDiagnostics: Sendable, Equatable {
+    let readyCallbacks: UInt64
+    let workersStarted: UInt64
+    let coalescedCallbacks: UInt64
+}
+
+final class HybridRendererDrainWorkerGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var workerIsScheduled = false
+    private var readyCallbacks: UInt64 = 0
+    private var workersStarted: UInt64 = 0
+    private var coalescedCallbacks: UInt64 = 0
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        readyCallbacks &+= 1
+        guard !workerIsScheduled else {
+            coalescedCallbacks &+= 1
+            return false
+        }
+        workerIsScheduled = true
+        workersStarted &+= 1
+        return true
+    }
+
+    func release() {
+        lock.lock()
+        workerIsScheduled = false
+        lock.unlock()
+    }
+
+    var diagnostics: HybridRendererDrainWorkerDiagnostics {
+        lock.lock()
+        defer { lock.unlock() }
+        return HybridRendererDrainWorkerDiagnostics(
+            readyCallbacks: readyCallbacks,
+            workersStarted: workersStarted,
+            coalescedCallbacks: coalescedCallbacks
+        )
+    }
 }
 
 /// Typed failures for the only Hybrid real-video presentation backend.
@@ -40,6 +125,8 @@ public enum AetherHybridPresentationError:
     case frameFormatDiverged(expected: VideoFormat, actual: VideoFormat)
     case pixelBufferNotIOSurfaceBacked
     case nonMonotonicPresentationTime(previous: CMTime, current: CMTime)
+    /// Legacy diagnostic retained for decoding old telemetry. Production
+    /// enqueue no longer throws when the bounded mailbox reaches high-water.
     case pendingQueueOverflow(limit: Int)
     case formatDescriptionCreationFailed(status: OSStatus)
     case sampleBufferCreationFailed(status: OSStatus)
@@ -47,6 +134,7 @@ public enum AetherHybridPresentationError:
     case carrierTimebaseUnavailable
     case carrierBindingChanged
     case displayLayerTimebaseChanged
+    case rendererStalled(durationSeconds: TimeInterval, queueDepth: Int)
     case rendererFailed(domain: String, code: Int, reason: String)
 
     public var errorDescription: String? {
@@ -81,6 +169,8 @@ public enum AetherHybridPresentationError:
             return "Hybrid carrier AVPlayerItem or timebase changed after presentation binding"
         case .displayLayerTimebaseChanged:
             return "Hybrid AVSampleBufferDisplayLayer controlTimebase no longer matches the carrier"
+        case .rendererStalled(let durationSeconds, let queueDepth):
+            return "Hybrid sample-buffer renderer made no capacity progress for \(durationSeconds) seconds at queue depth \(queueDepth)"
         case .rendererFailed(let domain, let code, let reason):
             return "Hybrid AVSampleBufferVideoRenderer failed: \(domain)(\(code)): \(reason)"
         }
@@ -106,6 +196,11 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         public let pendingSampleBuffers: Int
         public let staleGenerationDrops: Int
         public let backPressureObservations: Int
+        public let currentBackpressureDurationSeconds: TimeInterval?
+        public let lastCapacityProgressUptime: TimeInterval?
+        public let mediaDataReadyCallbacks: UInt64
+        public let drainWorkersStarted: UInt64
+        public let coalescedDrainCallbacks: UInt64
         public let enqueuedSampleBuffers: Int
         /// Samples actually enqueued into the active generation's
         /// AVSampleBufferDisplayLayer with the Apple HDR10+ attachment.
@@ -131,6 +226,11 @@ public final class AetherHybridPresentationView: PlatformBaseView {
             pendingSampleBuffers: Int,
             staleGenerationDrops: Int,
             backPressureObservations: Int,
+            currentBackpressureDurationSeconds: TimeInterval? = nil,
+            lastCapacityProgressUptime: TimeInterval? = nil,
+            mediaDataReadyCallbacks: UInt64 = 0,
+            drainWorkersStarted: UInt64 = 0,
+            coalescedDrainCallbacks: UInt64 = 0,
             enqueuedSampleBuffers: Int,
             hdr10PlusAttachedSampleBuffers: Int,
             firstHDR10PlusAttachmentTimeSeconds: Double?,
@@ -149,6 +249,13 @@ public final class AetherHybridPresentationView: PlatformBaseView {
             self.pendingSampleBuffers = pendingSampleBuffers
             self.staleGenerationDrops = staleGenerationDrops
             self.backPressureObservations = backPressureObservations
+            self.currentBackpressureDurationSeconds =
+                currentBackpressureDurationSeconds
+            self.lastCapacityProgressUptime =
+                lastCapacityProgressUptime
+            self.mediaDataReadyCallbacks = mediaDataReadyCallbacks
+            self.drainWorkersStarted = drainWorkersStarted
+            self.coalescedDrainCallbacks = coalescedDrainCallbacks
             self.enqueuedSampleBuffers = enqueuedSampleBuffers
             self.hdr10PlusAttachedSampleBuffers =
                 hdr10PlusAttachedSampleBuffers
@@ -185,7 +292,8 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         let hasHDR10PlusAttachment: Bool
     }
 
-    static let maximumPendingSampleBuffers = 24
+    nonisolated static let maximumPendingSampleBuffers = 24
+    nonisolated static let pendingSampleLowWaterMark = 8
 
     private let displayLayer = AVSampleBufferDisplayLayer()
     private var subtitleCanvas: HybridSubtitleOverlayCanvas!
@@ -205,6 +313,20 @@ public final class AetherHybridPresentationView: PlatformBaseView {
     private var enqueuedSampleBuffers = 0
     private var hdr10PlusAttachedSampleBuffers = 0
     private var firstHDR10PlusAttachmentTime: CMTime?
+    private let rendererDrainQueue = DispatchQueue(
+        label: "AetherEngine.HybridPresentationDrain",
+        qos: .userInteractive
+    )
+    private var isRequestingMediaData = false
+    private let drainWorkerGate = HybridRendererDrainWorkerGate()
+    private var backpressureStartedAt: TimeInterval?
+    private var backpressureWatchdog: Task<Void, Never>?
+    private var lastCapacityProgressUptime: TimeInterval?
+    private var rendererStallDetectionEnabled = false
+    private var rendererStallDetectionEnabledAt: TimeInterval?
+    private var frameDidLeaveMailbox: (@Sendable () -> Void)?
+    private var asynchronousFailureHandler:
+        (@MainActor (AetherHybridPresentationError) -> Void)?
 
     public var videoGravity: AetherHybridVideoGravity = .resizeAspect {
         didSet {
@@ -296,7 +418,9 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         flushRenderer(removingDisplayedImage: false)
         activeGeneration = generation
         activeVideoFormat = videoFormat
-        pendingSamples.removeAll(keepingCapacity: true)
+        releasePendingSamples()
+        stopRequestingMediaDataIfNeeded()
+        clearBackpressureIfNeeded(force: true)
         lastAcceptedPresentationTime = nil
         lastAcceptedFrameDurationSeconds = nil
         lastAcceptedGeometry = nil
@@ -321,6 +445,7 @@ public final class AetherHybridPresentationView: PlatformBaseView {
             }
             try validateCarrierClock(item: item, timebase: timebase)
             try drainPendingSamples()
+            requestMediaDataDrainIfNeeded()
             return
         }
         boundCarrierItem = item
@@ -328,6 +453,7 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         displayLayer.controlTimebase = timebase
         try validateCarrierClock(item: item, timebase: timebase)
         try drainPendingSamples()
+        requestMediaDataDrainIfNeeded()
     }
 
     func validateCarrierClock(
@@ -395,11 +521,12 @@ public final class AetherHybridPresentationView: PlatformBaseView {
                     current: frame.presentationTime
                 )
         }
+        try drainPendingSamples()
         guard pendingSamples.count
                 < Self.maximumPendingSampleBuffers else {
-            throw AetherHybridPresentationError.pendingQueueOverflow(
-                limit: Self.maximumPendingSampleBuffers
-            )
+            beginBackpressureIfNeeded()
+            requestMediaDataDrainIfNeeded()
+            return .backpressured
         }
         let sampleBuffer = try makeSampleBuffer(frame)
         pendingSamples.append(PendingSample(
@@ -412,11 +539,14 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         lastAcceptedGeometry = frame.geometry
         applyLayerGeometry()
         try drainPendingSamples()
+        requestMediaDataDrainIfNeeded()
         return .accepted
     }
 
     func flush(removingDisplayedImage: Bool) {
-        pendingSamples.removeAll(keepingCapacity: true)
+        releasePendingSamples()
+        stopRequestingMediaDataIfNeeded()
+        clearBackpressureIfNeeded(force: true)
         lastAcceptedPresentationTime = nil
         lastEnqueuedPresentationTime = nil
         subtitleCanvas.clear()
@@ -440,6 +570,18 @@ public final class AetherHybridPresentationView: PlatformBaseView {
             pendingSampleBuffers: pendingSamples.count,
             staleGenerationDrops: staleGenerationDrops,
             backPressureObservations: backPressureObservations,
+            currentBackpressureDurationSeconds:
+                backpressureStartedAt.map {
+                    ProcessInfo.processInfo.systemUptime - $0
+                },
+            lastCapacityProgressUptime:
+                lastCapacityProgressUptime,
+            mediaDataReadyCallbacks:
+                drainWorkerGate.diagnostics.readyCallbacks,
+            drainWorkersStarted:
+                drainWorkerGate.diagnostics.workersStarted,
+            coalescedDrainCallbacks:
+                drainWorkerGate.diagnostics.coalescedCallbacks,
             enqueuedSampleBuffers: enqueuedSampleBuffers,
             hdr10PlusAttachedSampleBuffers:
                 hdr10PlusAttachedSampleBuffers,
@@ -590,6 +732,9 @@ public final class AetherHybridPresentationView: PlatformBaseView {
               !pendingSamples.isEmpty {
             let pending = pendingSamples.removeFirst()
             target.enqueue(pending.sampleBuffer)
+            lastCapacityProgressUptime =
+                ProcessInfo.processInfo.systemUptime
+            frameDidLeaveMailbox?()
             enqueuedSampleBuffers += 1
             if pending.hasHDR10PlusAttachment {
                 hdr10PlusAttachedSampleBuffers += 1
@@ -603,7 +748,176 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         }
         if !pendingSamples.isEmpty {
             backPressureObservations += 1
+            beginBackpressureIfNeeded()
+        } else {
+            stopRequestingMediaDataIfNeeded()
+            clearBackpressureIfNeeded(force: false)
         }
+        if pendingSamples.count
+                <= Self.pendingSampleLowWaterMark {
+            clearBackpressureIfNeeded(force: false)
+        }
+    }
+
+    private func releasePendingSamples() {
+        let releasedCount = pendingSamples.count
+        pendingSamples.removeAll(keepingCapacity: true)
+        guard releasedCount > 0 else { return }
+        for _ in 0..<releasedCount {
+            frameDidLeaveMailbox?()
+        }
+        lastCapacityProgressUptime =
+            ProcessInfo.processInfo.systemUptime
+    }
+
+    func installMailboxCallbacks(
+        frameDidLeaveMailbox: @escaping @Sendable () -> Void,
+        asynchronousFailureHandler: @escaping @MainActor (
+            AetherHybridPresentationError
+        ) -> Void
+    ) {
+        self.frameDidLeaveMailbox = frameDidLeaveMailbox
+        self.asynchronousFailureHandler =
+            asynchronousFailureHandler
+    }
+
+    func setRendererStallDetectionEnabled(_ enabled: Bool) {
+        guard enabled != rendererStallDetectionEnabled else {
+            return
+        }
+        rendererStallDetectionEnabled = enabled
+        if enabled {
+            rendererStallDetectionEnabledAt =
+                ProcessInfo.processInfo.systemUptime
+            scheduleBackpressureWatchdogIfNeeded()
+        } else {
+            rendererStallDetectionEnabledAt = nil
+            backpressureWatchdog?.cancel()
+            backpressureWatchdog = nil
+        }
+    }
+
+    private func requestMediaDataDrainIfNeeded() {
+        guard !pendingSamples.isEmpty,
+              boundCarrierItem != nil,
+              boundCarrierTimebase != nil,
+              !isRequestingMediaData else {
+            return
+        }
+        isRequestingMediaData = true
+        let drainWorkerGate = drainWorkerGate
+        queueTarget.requestMediaDataWhenReady(
+            on: rendererDrainQueue
+        ) { [weak self] in
+            guard drainWorkerGate.claim() else { return }
+            Task { @MainActor [weak self] in
+                defer { drainWorkerGate.release() }
+                guard let self else { return }
+                guard self.isRequestingMediaData else { return }
+                do {
+                    try self.drainPendingSamples()
+                } catch let error as AetherHybridPresentationError {
+                    self.stopRequestingMediaDataIfNeeded()
+                    self.asynchronousFailureHandler?(error)
+                } catch {
+                    self.stopRequestingMediaDataIfNeeded()
+                    self.asynchronousFailureHandler?(
+                        .rendererFailed(
+                            domain: String(reflecting: type(of: error)),
+                            code: (error as NSError).code,
+                            reason: "asynchronous renderer drain failed"
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    private func stopRequestingMediaDataIfNeeded() {
+        guard isRequestingMediaData else { return }
+        queueTarget.stopRequestingMediaData()
+        isRequestingMediaData = false
+    }
+
+    private func beginBackpressureIfNeeded() {
+        guard backpressureStartedAt == nil else { return }
+        backpressureStartedAt = ProcessInfo.processInfo.systemUptime
+        scheduleBackpressureWatchdogIfNeeded()
+        EngineLog.emit(
+            "[AetherHybridPresentationView] mailbox high-water "
+                + "generation=\(activeGeneration) "
+                + "depth=\(pendingSamples.count)",
+            category: .session
+        )
+    }
+
+    private func scheduleBackpressureWatchdogIfNeeded() {
+        guard rendererStallDetectionEnabled,
+              backpressureStartedAt != nil,
+              backpressureWatchdog == nil else {
+            return
+        }
+        let generation = activeGeneration
+        backpressureWatchdog = Task { @MainActor [weak self] in
+            while !Task.isCancelled, let self {
+                let now = ProcessInfo.processInfo.systemUptime
+                let action = HybridRendererStallDecision.resolve(
+                    detectionEnabled:
+                        self.rendererStallDetectionEnabled,
+                    generationMatches:
+                        self.activeGeneration == generation,
+                    pendingDepth: self.pendingSamples.count,
+                    lowWaterMark: Self.pendingSampleLowWaterMark,
+                    backpressureStartedAt:
+                        self.backpressureStartedAt,
+                    detectionEnabledAt:
+                        self.rendererStallDetectionEnabledAt,
+                    lastCapacityProgressAt:
+                        self.lastCapacityProgressUptime,
+                    now: now,
+                    threshold: 3
+                )
+                switch action {
+                case .inactive:
+                    self.backpressureWatchdog = nil
+                    return
+                case .wait(let seconds):
+                    let nanoseconds = UInt64(
+                        max(0.001, seconds) * 1_000_000_000
+                    )
+                    try? await Task.sleep(nanoseconds: nanoseconds)
+                case .fail(let noProgressSeconds):
+                    self.backpressureWatchdog = nil
+                    self.asynchronousFailureHandler?(
+                        .rendererStalled(
+                            durationSeconds: noProgressSeconds,
+                            queueDepth: self.pendingSamples.count
+                        )
+                    )
+                    return
+                }
+            }
+        }
+    }
+
+    private func clearBackpressureIfNeeded(force: Bool) {
+        guard let startedAt = backpressureStartedAt,
+              force || pendingSamples.count
+                <= Self.pendingSampleLowWaterMark else {
+            return
+        }
+        let duration = ProcessInfo.processInfo.systemUptime - startedAt
+        let formattedDuration = String(format: "%.3f", duration)
+        backpressureStartedAt = nil
+        backpressureWatchdog?.cancel()
+        backpressureWatchdog = nil
+        EngineLog.emit(
+            "[AetherHybridPresentationView] mailbox capacity resumed "
+                + "generation=\(activeGeneration) "
+                + "depth=\(pendingSamples.count) "
+                + "duration=\(formattedDuration)",
+            category: .session
+        )
     }
 
     private func flushRenderer(removingDisplayedImage: Bool) {

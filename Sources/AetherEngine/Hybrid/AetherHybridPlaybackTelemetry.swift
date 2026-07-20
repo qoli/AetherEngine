@@ -38,6 +38,7 @@ public enum AetherHybridPlaybackTelemetryFailure:
         AetherHLSPreflightInvalidationReason
     )
     case providerFailed
+    case originFailed(HybridPlaybackOriginFailure)
     case carrierFailed
     case presentationFailed
     case decoderFailed
@@ -101,6 +102,8 @@ public enum AetherHybridPlaybackTelemetryFailure:
             .hlsPreflightGenerationInvalidated(reason)
         case .providerFailed:
             .providerFailed
+        case .originFailed(let failure):
+            .originFailed(failure)
         case .carrierFailed:
             .carrierFailed
         case .presentationFailed:

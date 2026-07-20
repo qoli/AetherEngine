@@ -82,8 +82,9 @@ public struct AetherHLSSubtitleRenditionPolicy:
 
 /// A runtime fact proving that the immutable HLS resource graph admitted by preflight is no longer valid.
 ///
-/// The current session must terminate. The host must run a new `AetherHLSPlaybackPreflight`; the engine
-/// never retries the old URL, refreshes credentials in place or selects another route.
+/// The old graph must be sealed. The owning Aether playback session may run
+/// one fresh preflight for the same canonical request; credentials, effective
+/// origin and media identity are never substituted in place.
 public enum AetherHLSPreflightInvalidationReason:
     Sendable,
     Equatable

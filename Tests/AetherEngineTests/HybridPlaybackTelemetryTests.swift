@@ -64,8 +64,12 @@ struct HybridPlaybackTelemetryTests {
     func providerFailureSanitization() {
         let sourceError = HybridPlaybackSessionError
             .providerFailed(
-                reason:
-                    "https://signed.example/video?token=secret Authorization=secret"
+                HybridPlaybackFailureEvidence(
+                    stage: .provider,
+                    caseCode: "runtime",
+                    underlyingDomain: "ProviderDomain",
+                    underlyingCode: 9
+                )
             )
         let state = AetherHybridPlaybackTelemetryState(
             .failed(sourceError)

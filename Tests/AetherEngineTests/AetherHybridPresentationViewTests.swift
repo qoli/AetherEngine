@@ -14,6 +14,84 @@ struct AetherHybridPresentationViewTests {
         case sampleAttachmentsMissing
     }
 
+    @Test("Renderer stall requires active intent and three seconds without capacity progress")
+    func rendererStallDecision() {
+        let paused = HybridRendererStallDecision.resolve(
+            detectionEnabled: false,
+            generationMatches: true,
+            pendingDepth: 24,
+            lowWaterMark: 8,
+            backpressureStartedAt: 0,
+            detectionEnabledAt: 0,
+            lastCapacityProgressAt: nil,
+            now: 30,
+            threshold: 3
+        )
+        #expect(paused == .inactive)
+
+        let slowButProgressing = HybridRendererStallDecision.resolve(
+            detectionEnabled: true,
+            generationMatches: true,
+            pendingDepth: 24,
+            lowWaterMark: 8,
+            backpressureStartedAt: 0,
+            detectionEnabledAt: 0,
+            lastCapacityProgressAt: 2.8,
+            now: 3.1,
+            threshold: 3
+        )
+        if case .wait(let remaining) = slowButProgressing {
+            #expect(abs(remaining - 2.7) < 0.000_001)
+        } else {
+            Issue.record("slow renderer progress was classified as stalled")
+        }
+
+        let stalled = HybridRendererStallDecision.resolve(
+            detectionEnabled: true,
+            generationMatches: true,
+            pendingDepth: 24,
+            lowWaterMark: 8,
+            backpressureStartedAt: 0,
+            detectionEnabledAt: 0,
+            lastCapacityProgressAt: nil,
+            now: 3.1,
+            threshold: 3
+        )
+        #expect(stalled == .fail(noProgressSeconds: 3.1))
+
+        let staleGeneration = HybridRendererStallDecision.resolve(
+            detectionEnabled: true,
+            generationMatches: false,
+            pendingDepth: 24,
+            lowWaterMark: 8,
+            backpressureStartedAt: 0,
+            detectionEnabledAt: 0,
+            lastCapacityProgressAt: nil,
+            now: 30,
+            threshold: 3
+        )
+        #expect(staleGeneration == .inactive)
+    }
+
+    @Test("Repeated media-data callbacks share one MainActor drain worker")
+    func rendererDrainWorkerGate() {
+        let gate = HybridRendererDrainWorkerGate()
+        let claims = (0..<100).map { _ in gate.claim() }
+        #expect(claims.filter { $0 }.count == 1)
+        #expect(gate.diagnostics ==
+            HybridRendererDrainWorkerDiagnostics(
+                readyCallbacks: 100,
+                workersStarted: 1,
+                coalescedCallbacks: 99
+            )
+        )
+
+        gate.release()
+        #expect(gate.claim())
+        #expect(gate.diagnostics.workersStarted == 2)
+        gate.release()
+    }
+
     @Test("Display layer binds to the exact carrier item timebase and rejects rebinding")
     func exactCarrierTimebaseBinding() throws {
         let view = AetherHybridPresentationView()
@@ -112,14 +190,16 @@ struct AetherHybridPresentationViewTests {
         }
 
         #expect(view.diagnostics.pendingSampleBuffers == 24)
-        #expect(throws: AetherHybridPresentationError
-            .pendingQueueOverflow(limit: 24)) {
+        #expect(
             try view.enqueue(makeSDRFrame(
                 timeValue: 24,
                 generation: 1
-            ))
-        }
+            )) == .backpressured
+        )
         #expect(view.diagnostics.pendingSampleBuffers == 24)
+        #expect(
+            view.diagnostics.currentBackpressureDurationSeconds != nil
+        )
     }
 
     @Test("Native WebVTT common-format text is owned by the Aether overlay and clears explicitly")

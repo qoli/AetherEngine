@@ -253,6 +253,9 @@ actor HLSVODMediaPump {
             HLSVODOriginResourceLoader.defaultCapacityBytes,
         baseDirectory: URL =
             FileManager.default.temporaryDirectory,
+        transportRetryBudget: PlaybackTransportRetryBudget = .init(
+            maximumFailureAttempts: 3
+        ),
         fetchOverride:
             HLSVODOriginResourceLoader.Fetch? = nil
     ) async throws -> HLSVODMediaPump {
@@ -276,6 +279,7 @@ actor HLSVODMediaPump {
                 maximumResourceBytes: maximumResourceBytes,
                 capacityBytes: capacityBytes,
                 baseDirectory: baseDirectory,
+                transportRetryBudget: transportRetryBudget,
                 fetchOverride: fetchOverride
             )
         } catch let error as HLSVODOriginResourceError {
@@ -295,6 +299,7 @@ actor HLSVODMediaPump {
                         maximumResourceBytes,
                     capacityBytes: capacityBytes,
                     baseDirectory: baseDirectory,
+                    transportRetryBudget: transportRetryBudget,
                     fetchOverride: fetchOverride
                 )
             } catch {

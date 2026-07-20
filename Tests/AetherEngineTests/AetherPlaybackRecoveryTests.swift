@@ -45,6 +45,22 @@ struct AetherPlaybackRecoveryTests {
         #expect(exhausted == .terminate)
     }
 
+    @Test("Classification preflight and origin share one failure budget")
+    func sharedTransportBudget() {
+        let budget = PlaybackTransportRetryBudget(
+            maximumFailureAttempts: 3
+        )
+        #expect(!budget.isExhausted)
+        #expect(budget.recordRetryableFailure() == 1)
+        #expect(budget.recordRetryableFailure() == 2)
+        #expect(budget.recordRetryableFailure() == 3)
+        #expect(budget.isExhausted)
+        #expect(budget.recordRetryableFailure() == 3)
+        budget.reset()
+        #expect(budget.currentFailureAttempt == 0)
+        #expect(!budget.isExhausted)
+    }
+
     @Test("Retry-After is honored but capped at five seconds")
     func retryAfterCap() {
         let action = PlaybackRecoveryDecision.resolve(
@@ -172,6 +188,80 @@ struct AetherPlaybackRecoveryTests {
         )
     }
 
+    @Test("Presentation evidence separates media, host, decoder and resource failures")
+    func presentationEvidenceMatrix() {
+        #expect(
+            PlaybackFailureEvidenceDecision.kind(
+                for: .invalidPresentationTime
+            ) == .malformedMedia
+        )
+        #expect(
+            PlaybackFailureEvidenceDecision.kind(
+                for: .frameFormatDiverged(
+                    expected: .sdr,
+                    actual: .hdr10
+                )
+            ) == .routeRuntimeFailure
+        )
+        #expect(
+            PlaybackFailureEvidenceDecision.kind(
+                for: .displayLayerTimebaseChanged
+            ) == .hostContractViolation
+        )
+        #expect(
+            PlaybackFailureEvidenceDecision.kind(
+                for: .pixelBufferNotIOSurfaceBacked
+            ) == .decoderRuntimeFailure
+        )
+        #expect(
+            PlaybackFailureEvidenceDecision.kind(
+                for: .rendererStalled(
+                    durationSeconds: 6,
+                    queueDepth: 24
+                )
+            ) == .routeRuntimeFailure
+        )
+    }
+
+    @Test("Only the unavailable selected video variant admits one lower variant")
+    func selectedVariantEvidenceMatrix() {
+        #expect(
+            PlaybackFailureEvidenceDecision.hlsGraphFailureCode(
+                .resourceUnavailable(
+                    statusCode: 404,
+                    resource: .videoSegment(index: 3)
+                )
+            ) == "hybrid.origin.selectedVariantUnavailable"
+        )
+        #expect(
+            PlaybackFailureEvidenceDecision.hlsGraphFailureCode(
+                .resourceUnavailable(
+                    statusCode: 410,
+                    resource: .videoInit
+                )
+            ) == "hybrid.origin.selectedVariantUnavailable"
+        )
+        #expect(
+            PlaybackFailureEvidenceDecision.hlsGraphFailureCode(
+                .resourceUnavailable(
+                    statusCode: 404,
+                    resource: .audioSegment(
+                        renditionOrdinal: 0,
+                        index: 3
+                    )
+                )
+            ) == "hybrid.hls.graph.resourceUnavailable"
+        )
+        #expect(
+            PlaybackFailureEvidenceDecision.hlsGraphFailureCode(
+                .credentialRejected(
+                    statusCode: 403,
+                    resource: .videoSegment(index: 3)
+                )
+            ) == "hybrid.hls.graph.credentialRejected"
+        )
+    }
+
     @Test("Episode reset retains original failure and terminal is claimed once")
     func coordinatorResetAndTerminalDeduplication() {
         var coordinator = PlaybackRecoveryCoordinator(now: 10)
@@ -191,6 +281,135 @@ struct AetherPlaybackRecoveryTests {
         let duplicateClaim = coordinator.claimTerminalOutcome()
         #expect(firstClaim)
         #expect(!duplicateClaim)
+    }
+
+    @Test("A newer Seek supersedes every older operation token")
+    func seekSupersession() {
+        var operations = PlaybackOperationCoordinator()
+        let first = operations.beginSeek()
+        #expect(operations.isCurrentSeek(first))
+        let second = operations.beginSeek()
+        #expect(!operations.isCurrentSeek(first))
+        #expect(operations.isCurrentSeek(second))
+    }
+
+    @Test("Same-route candidates commit only through the active transaction")
+    func routeTransactionIdentity() {
+        var transactions = PlaybackRouteTransactionCoordinator()
+        let first = transactions.begin()
+        let second = transactions.begin()
+        #expect(!transactions.isActive(first))
+        #expect(transactions.isActive(second))
+        transactions.invalidate()
+        #expect(!transactions.isActive(second))
+    }
+
+    @Test("Seek jumps never count as healthy playback progress")
+    func seekProgressEpoch() {
+        var progress = PlaybackProgressEpoch()
+        progress.begin()
+        let initialAnchor = progress.observe(
+            seconds: 10,
+            eligible: true,
+            requiredProgressSeconds: 2
+        )
+        let initialProgress = progress.observe(
+            seconds: 12,
+            eligible: true,
+            requiredProgressSeconds: 2
+        )
+        #expect(!initialAnchor)
+        #expect(initialProgress)
+
+        progress.begin()
+        let ineligibleSeekJump = progress.observe(
+            seconds: 120,
+            eligible: false,
+            requiredProgressSeconds: 2
+        )
+        let seekLandingAnchor = progress.observe(
+            seconds: 120,
+            eligible: true,
+            requiredProgressSeconds: 2
+        )
+        let shortPostSeekProgress = progress.observe(
+            seconds: 121.9,
+            eligible: true,
+            requiredProgressSeconds: 2
+        )
+        let healthyPostSeekProgress = progress.observe(
+            seconds: 122,
+            eligible: true,
+            requiredProgressSeconds: 2
+        )
+        #expect(!ineligibleSeekJump)
+        #expect(!seekLandingAnchor)
+        #expect(!shortPostSeekProgress)
+        #expect(healthyPostSeekProgress)
+
+        progress.begin()
+        let backwardSeekAnchor = progress.observe(
+            seconds: 20,
+            eligible: true,
+            requiredProgressSeconds: 2
+        )
+        let backwardClockMove = progress.observe(
+            seconds: 19,
+            eligible: true,
+            requiredProgressSeconds: 2
+        )
+        let recoveredMonotonicProgress = progress.observe(
+            seconds: 21,
+            eligible: true,
+            requiredProgressSeconds: 2
+        )
+        #expect(!backwardSeekAnchor)
+        #expect(!backwardClockMove)
+        #expect(recoveredMonotonicProgress)
+    }
+
+    @Test("Terminal report preserves distinct first and final evidence")
+    func terminalFailureEvidence() {
+        let terminal = AetherPlaybackTerminalFailure(
+            firstFailure: transient,
+            finalFailure: decoder,
+            exhaustionReason: "decoder recovery exhausted"
+        )
+        #expect(terminal.firstFailure == transient)
+        #expect(terminal.finalFailure == decoder)
+        #expect(
+            terminal.exhaustionReason
+                == "decoder recovery exhausted"
+        )
+    }
+
+    @Test("A recovery episode expires at thirty seconds")
+    func episodeTimeBudget() {
+        let action = PlaybackRecoveryDecision.resolve(
+            context: AetherPlaybackRecoveryContext(
+                failure: runtime,
+                activeRoute: .hybridCarrier,
+                positivelyAdmittedAlternateRoute:
+                    .nativeAVPlayer,
+                transportAttempt: 1,
+                sameRouteRebuildCount: 0,
+                routeTransitionCount: 0,
+                elapsedSeconds: 30
+            )
+        )
+        #expect(action == .terminate)
+    }
+
+    @Test("Recovery deadline distinguishes the final live instant from expiry")
+    func recoveryDeadlineBoundary() {
+        let deadline = PlaybackRecoveryDeadline(
+            startedAt: 100,
+            durationSeconds: 30
+        )
+        #expect(!deadline.isExpired(now: 129.9))
+        #expect(deadline.remainingSeconds(now: 129.9) > 0)
+        #expect(deadline.isExpired(now: 130.1))
+        #expect(deadline.remainingSeconds(now: 130.1) == 0)
     }
 
     @Test("Security and authentication failures are always terminal")
@@ -283,6 +502,10 @@ struct AetherPlaybackRecoveryTests {
         #expect(session.state == .idle)
         #expect(session.activeRoute == nil)
         #expect(session.avPlayer === player)
+        #expect(
+            session.capabilities.systemFeaturePolicy
+                .pictureInPictureVideo != .available
+        )
         session.stop()
         #expect(session.state == .stopped)
     }

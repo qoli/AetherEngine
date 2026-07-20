@@ -29,6 +29,31 @@ public enum AetherNativePlaybackSessionFailure:
     case engineFailed
 }
 
+enum AetherNativePlaybackFailureCategory:
+    String,
+    Sendable,
+    Equatable
+{
+    case transientTransport
+    case authentication
+    case security
+    case decoder
+    case malformed
+    case routeRuntime
+    case cancelled
+    case invariant
+}
+
+struct AetherNativePlaybackFailureEvidence:
+    Sendable,
+    Equatable
+{
+    let category: AetherNativePlaybackFailureCategory
+    let caseCode: String
+    let domain: String
+    let code: Int
+}
+
 enum AetherNativePlaybackSessionError:
     Error,
     Sendable,
@@ -48,6 +73,8 @@ enum AetherNativePlaybackSessionError:
     case stopped
     case invalidRate
     case invalidSeekTarget
+    case seekDidNotApply
+    case startupTimedOut
 
     public var errorDescription: String? {
         switch self {
@@ -71,6 +98,10 @@ enum AetherNativePlaybackSessionError:
             "The native playback rate is invalid"
         case .invalidSeekTarget:
             "The native playback seek target is invalid"
+        case .seekDidNotApply:
+            "The native playback seek did not apply to the active generation"
+        case .startupTimedOut:
+            "The native playback item did not become ready within three seconds"
         }
     }
 }
@@ -106,9 +137,44 @@ final class AetherNativePlaybackSession: ObservableObject {
     /// selection. `nil` means the option-to-source mapping is not proven.
     @Published public private(set) var selectedAudioAnalysisTrackID:
         Int?
+    private(set) var lastFailureEvidence:
+        AetherNativePlaybackFailureEvidence?
 
     public var audioAnalysisTrackIDs: [Int] {
         audioAnalysisBinding.publicTrackIDs
+    }
+
+    var audioTracks: [TrackInfo] {
+        engine?.audioTracks
+            ?? audioAnalysisBinding.tracks.compactMap { track in
+                track.sourceTrack.map {
+                    TrackInfo(
+                        id: track.publicTrackID,
+                        name: $0.name,
+                        codec: $0.codec,
+                        language: $0.language,
+                        channels: $0.channels,
+                        bitrate: $0.bitrate,
+                        isDefault: $0.isDefault,
+                        isCommentary: $0.isCommentary,
+                        isAtmos: $0.isAtmos
+                    )
+                }
+            }
+    }
+
+    var subtitleTracks: [TrackInfo] {
+        engine?.subtitleTracks ?? directSubtitleTracks
+    }
+
+    var selectedAudioTrackID: Int? {
+        engine?.activeAudioTrackIndex
+            ?? selectedAudioAnalysisTrackID
+    }
+
+    var selectedSubtitleTrackID: Int? {
+        engine?.activeSubtitleTrackIndex
+            ?? directSelectedSubtitleTrackID
     }
 
     public var audioAnalysisDurationSeconds: Double? {
@@ -137,7 +203,22 @@ final class AetherNativePlaybackSession: ObservableObject {
     private var currentItemObservation: NSKeyValueObservation?
     private var timeControlObservation: NSKeyValueObservation?
     private var endObserver: NSObjectProtocol?
+    private var failedToEndObserver: NSObjectProtocol?
     private var mediaSelectionObserver: NSObjectProtocol?
+    private var playbackStalledObserver: NSObjectProtocol?
+    private var progressObserver: Any?
+    private var directStallRecoveryTask: Task<Void, Never>?
+    private var directItemDeathConfirmationTask: Task<Void, Never>?
+    private var directFailedToEndConfirmationTask: Task<Void, Never>?
+    private var directItemReviveGate = ItemDeathReviveGate(
+        maxAttempts: 3
+    )
+    private var lastObservedPlayerTime: CMTime = .zero
+    private var directSubtitleTracks: [TrackInfo] = []
+    private var directSelectedSubtitleTrackID: Int?
+    private var directPlayIntent = false
+    private var directRateIntent: Float = 1
+    private var directExplicitAudioTrackID: Int?
     private var audioAnalysisSelectionResolutionTask:
         Task<Void, Never>?
     private var audioAnalysisSessions: [
@@ -330,8 +411,21 @@ final class AetherNativePlaybackSession: ObservableObject {
                 )
             } else {
                 await refreshSelectedAudioAnalysisTrackIDFromPlayer()
+                await refreshDirectSubtitleSelectionFromPlayer()
             }
             if avPlayerItem.status == .readyToPlay {
+                state = .ready
+            } else {
+                let deadline = ProcessInfo.processInfo.systemUptime + 3
+                while avPlayerItem.status == .unknown,
+                      ProcessInfo.processInfo.systemUptime < deadline {
+                    try await Task.sleep(nanoseconds: 50_000_000)
+                    try requireActive()
+                }
+                guard avPlayerItem.status == .readyToPlay else {
+                    state = .failed(.playerItemFailed)
+                    throw AetherNativePlaybackSessionError.startupTimedOut
+                }
                 state = .ready
             }
         } catch is CancellationError {
@@ -349,6 +443,7 @@ final class AetherNativePlaybackSession: ObservableObject {
         if let engine {
             engine.play()
         } else {
+            directPlayIntent = true
             avPlayer.play()
         }
         state = .playing
@@ -359,6 +454,7 @@ final class AetherNativePlaybackSession: ObservableObject {
         if let engine {
             engine.pause()
         } else {
+            directPlayIntent = false
             avPlayer.pause()
         }
         state = .paused
@@ -373,6 +469,7 @@ final class AetherNativePlaybackSession: ObservableObject {
             if let engine {
                 engine.pause()
             } else {
+                directPlayIntent = false
                 avPlayer.pause()
             }
             state = .paused
@@ -380,6 +477,8 @@ final class AetherNativePlaybackSession: ObservableObject {
             if let engine {
                 engine.setRate(rate)
             } else {
+                directPlayIntent = true
+                directRateIntent = rate
                 avPlayer.rate = rate
             }
             state = .playing
@@ -394,12 +493,16 @@ final class AetherNativePlaybackSession: ObservableObject {
               target.seconds >= 0 else {
             throw AetherNativePlaybackSessionError.invalidSeekTarget
         }
-        let shouldResume = avPlayer.rate > 0
+        let engineShouldResume = engine != nil && state == .playing
         state = .seeking
         let finished: Bool
         if let engine {
             await engine.seek(to: target.seconds)
-            finished = true
+            let delta = abs(engine.currentTime - target.seconds)
+            finished = engine.state != .idle
+                && engine.state != .ended
+                && delta.isFinite
+                && delta <= 0.5
         } else {
             finished = await withCheckedContinuation {
                 (continuation: CheckedContinuation<Bool, Never>) in
@@ -414,9 +517,101 @@ final class AetherNativePlaybackSession: ObservableObject {
         }
         try requireActive()
         guard finished else {
-            throw AetherNativePlaybackSessionError.invalidSeekTarget
+            throw AetherNativePlaybackSessionError.seekDidNotApply
         }
-        state = shouldResume ? .playing : .paused
+        if engine == nil {
+            if directPlayIntent {
+                avPlayer.rate = directRateIntent
+                state = .playing
+            } else {
+                avPlayer.pause()
+                state = .paused
+            }
+        } else {
+            state = engineShouldResume ? .playing : .paused
+        }
+    }
+
+    func selectAudioTrack(_ trackID: Int) async throws {
+        try requireActive()
+        if let engine {
+            guard engine.audioTracks.contains(where: {
+                $0.id == trackID
+            }) else {
+                throw AetherNativePlaybackSessionError
+                    .sourceFactsDiverged
+            }
+            engine.selectAudioTrack(index: trackID)
+            for _ in 0..<300 {
+                try requireActive()
+                if engine.activeAudioTrackIndex == trackID {
+                    directExplicitAudioTrackID = trackID
+                    return
+                }
+                if case .error = engine.state {
+                    throw AetherNativePlaybackSessionError.engineRouteContractDiverged
+                }
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+            throw AetherNativePlaybackSessionError
+                .engineRouteContractDiverged
+        }
+        guard let optionIndex = audioAnalysisBinding.optionTrackIDs
+                .firstIndex(of: trackID),
+              let group = try await avPlayerItem.asset
+                .loadMediaSelectionGroup(for: .audible),
+              group.options.indices.contains(optionIndex) else {
+            throw AetherNativePlaybackSessionError
+                .sourceFactsDiverged
+        }
+        avPlayerItem.select(
+            group.options[optionIndex],
+            in: group
+        )
+        for _ in 0..<100 {
+            await refreshSelectedAudioAnalysisTrackIDFromPlayer()
+            if selectedAudioAnalysisTrackID == trackID {
+                directExplicitAudioTrackID = trackID
+                return
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        throw AetherNativePlaybackSessionError
+            .engineRouteContractDiverged
+    }
+
+    func selectSubtitleTrack(_ trackID: Int?) async throws {
+        try requireActive()
+        if let engine {
+            guard let trackID else {
+                engine.clearSubtitle()
+                return
+            }
+            guard engine.subtitleTracks.contains(where: {
+                $0.id == trackID
+            }) else {
+                throw AetherNativePlaybackSessionError
+                    .sourceFactsDiverged
+            }
+            engine.selectSubtitleTrack(index: trackID)
+            return
+        }
+        guard let group = try await avPlayerItem.asset
+                .loadMediaSelectionGroup(for: .legible) else {
+            if trackID == nil { return }
+            throw AetherNativePlaybackSessionError
+                .sourceFactsDiverged
+        }
+        if let trackID {
+            guard group.options.indices.contains(trackID) else {
+                throw AetherNativePlaybackSessionError
+                    .sourceFactsDiverged
+            }
+            avPlayerItem.select(group.options[trackID], in: group)
+        } else {
+            avPlayerItem.select(nil, in: group)
+        }
+        await refreshDirectSubtitleSelectionFromPlayer()
     }
 
     #if os(tvOS)
@@ -528,6 +723,20 @@ final class AetherNativePlaybackSession: ObservableObject {
             )
             self.mediaSelectionObserver = nil
         }
+        if let playbackStalledObserver {
+            NotificationCenter.default.removeObserver(
+                playbackStalledObserver
+            )
+            self.playbackStalledObserver = nil
+        }
+        if let progressObserver {
+            avPlayer.removeTimeObserver(progressObserver)
+            self.progressObserver = nil
+        }
+        directStallRecoveryTask?.cancel()
+        directStallRecoveryTask = nil
+        directItemDeathConfirmationTask?.cancel()
+        directItemDeathConfirmationTask = nil
         cancelAudioAnalysisStreams()
         audioAnalysisTelemetryHub.finish()
         engineCancellables.removeAll()
@@ -541,28 +750,7 @@ final class AetherNativePlaybackSession: ObservableObject {
     }
 
     private func installDirectObservers() {
-        itemStatusObservation = avPlayerItem.observe(
-            \.status,
-            options: [.initial, .new]
-        ) { [weak self] item, _ in
-            Task { @MainActor in
-                guard let self, !self.isStopped else { return }
-                switch item.status {
-                case .readyToPlay:
-                    if self.state == .idle
-                        || self.state == .preparing {
-                        self.state = .ready
-                    }
-                    self.handleMediaSelectionChange()
-                case .failed:
-                    self.state = .failed(.playerItemFailed)
-                case .unknown:
-                    break
-                @unknown default:
-                    self.state = .failed(.playerItemFailed)
-                }
-            }
-        }
+        installDirectItemObservers()
         timeControlObservation = avPlayer.observe(
             \.timeControlStatus,
             options: [.new]
@@ -573,13 +761,59 @@ final class AetherNativePlaybackSession: ObservableObject {
                 case .playing:
                     self.state = .playing
                 case .paused:
-                    if self.state == .playing {
+                    if !self.directPlayIntent,
+                       self.state == .playing {
                         self.state = .paused
                     }
                 case .waitingToPlayAtSpecifiedRate:
                     break
                 @unknown default:
                     break
+                }
+            }
+        }
+        progressObserver = avPlayer.addPeriodicTimeObserver(
+            forInterval: CMTime(
+                seconds: 0.5,
+                preferredTimescale: 600
+            ),
+            queue: .main
+        ) { [weak self] time in
+            MainActor.assumeIsolated {
+                guard time.isValid,
+                      time.isNumeric,
+                      time.seconds.isFinite else { return }
+                self?.lastObservedPlayerTime = time
+            }
+        }
+    }
+
+    private func installDirectItemObservers() {
+        itemStatusObservation = avPlayerItem.observe(
+            \.status,
+            options: [.initial, .new]
+        ) { [weak self] item, _ in
+            Task { @MainActor in
+                guard let self, !self.isStopped else { return }
+                switch item.status {
+                case .readyToPlay:
+                    self.directItemDeathConfirmationTask?.cancel()
+                    self.directItemDeathConfirmationTask = nil
+                    if self.state == .idle
+                        || self.state == .preparing {
+                        self.state = .ready
+                    }
+                    self.handleMediaSelectionChange()
+                case .failed:
+                    self.lastFailureEvidence = Self.failureEvidence(
+                        error: item.error,
+                        caseCode: "itemStatusFailed"
+                    )
+                    self.handleDirectItemDeath()
+                case .unknown:
+                    break
+                @unknown default:
+                    self.state = .failed(.playerItemFailed)
                 }
             }
         }
@@ -593,6 +827,21 @@ final class AetherNativePlaybackSession: ObservableObject {
                 self.state = .ended
             }
         }
+        failedToEndObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemFailedToPlayToEndTime,
+            object: avPlayerItem,
+            queue: .main
+        ) { [weak self, weak item = avPlayerItem] _ in
+            MainActor.assumeIsolated {
+                guard let self, let item, !self.isStopped else {
+                    return
+                }
+                self.handleDirectFailedToEnd(
+                    item: item,
+                    error: item.error
+                )
+            }
+        }
         mediaSelectionObserver = NotificationCenter.default
             .addObserver(
                 forName: AVPlayerItem
@@ -604,6 +853,295 @@ final class AetherNativePlaybackSession: ObservableObject {
                     self?.handleMediaSelectionChange()
                 }
             }
+        playbackStalledObserver = NotificationCenter.default
+            .addObserver(
+                forName: AVPlayerItem.playbackStalledNotification,
+                object: avPlayerItem,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.handleDirectPlaybackStall()
+                }
+            }
+    }
+
+    private func removeDirectItemObservers() {
+        directFailedToEndConfirmationTask?.cancel()
+        directFailedToEndConfirmationTask = nil
+        itemStatusObservation?.invalidate()
+        itemStatusObservation = nil
+        if let endObserver {
+            NotificationCenter.default.removeObserver(endObserver)
+            self.endObserver = nil
+        }
+        if let failedToEndObserver {
+            NotificationCenter.default.removeObserver(
+                failedToEndObserver
+            )
+            self.failedToEndObserver = nil
+        }
+        if let mediaSelectionObserver {
+            NotificationCenter.default.removeObserver(
+                mediaSelectionObserver
+            )
+            self.mediaSelectionObserver = nil
+        }
+        if let playbackStalledObserver {
+            NotificationCenter.default.removeObserver(
+                playbackStalledObserver
+            )
+            self.playbackStalledObserver = nil
+        }
+    }
+
+    private func handleDirectItemDeath() {
+        guard engine == nil,
+              directItemDeathConfirmationTask == nil,
+              !isStopped else { return }
+        let failedItem = avPlayerItem
+        directItemDeathConfirmationTask = Task {
+            @MainActor [weak self, weak failedItem] in
+            guard let self, let failedItem else { return }
+            do {
+                try await Task.sleep(nanoseconds: 3_000_000_000)
+            } catch {
+                self.directItemDeathConfirmationTask = nil
+                return
+            }
+            guard !self.isStopped,
+                  self.avPlayerItem === failedItem,
+                  failedItem.status == .failed else {
+                self.directItemDeathConfirmationTask = nil
+                return
+            }
+            let observed = self.lastObservedPlayerTime.seconds
+            let frozenPosition = observed.isFinite ? observed : 0
+            guard self.directItemReviveGate.admit(
+                position: frozenPosition
+            ) else {
+                self.directItemDeathConfirmationTask = nil
+                self.state = .failed(.playerItemFailed)
+                return
+            }
+            let attempt = self.directItemReviveGate.attempts
+            self.directItemDeathConfirmationTask = nil
+            EngineLog.emit(
+                "[AetherNativePlaybackSession] direct item revive "
+                    + "attempt=\(attempt) position="
+                    + String(format: "%.3f", frozenPosition),
+                category: .session
+            )
+            await self.reviveDirectItem(
+                failedItem,
+                at: CMTime(
+                    seconds: frozenPosition,
+                    preferredTimescale: 600
+                )
+            )
+        }
+    }
+
+    private func handleDirectFailedToEnd(
+        item: AVPlayerItem,
+        error: Error?
+    ) {
+        guard engine == nil,
+              avPlayerItem === item,
+              !isStopped else { return }
+        directFailedToEndConfirmationTask?.cancel()
+        let frozenTime = lastObservedPlayerTime
+        let nsError = error as NSError?
+        lastFailureEvidence = Self.failureEvidence(
+            error: error,
+            caseCode: "failedToPlayToEnd"
+        )
+        EngineLog.emit(
+            "[AetherNativePlaybackSession] failed-to-end evidence "
+                + "domain=\(nsError?.domain ?? "AVFoundation") "
+                + "code=\(nsError?.code ?? -1)",
+            category: .session
+        )
+        directFailedToEndConfirmationTask = Task {
+            @MainActor [weak self, weak item] in
+            guard let self, let item else { return }
+            do {
+                try await Task.sleep(nanoseconds: 3_000_000_000)
+            } catch {
+                return
+            }
+            guard !self.isStopped,
+                  self.avPlayerItem === item,
+                  !Self.madeProgress(
+                    from: frozenTime,
+                    to: self.lastObservedPlayerTime
+                  ) else {
+                self.directFailedToEndConfirmationTask = nil
+                return
+            }
+            self.directFailedToEndConfirmationTask = nil
+            self.state = .failed(.playerItemFailed)
+        }
+    }
+
+    private static func failureEvidence(
+        error: Error?,
+        caseCode: String
+    ) -> AetherNativePlaybackFailureEvidence {
+        var current = error as NSError?
+        var selected = current
+        var category = AetherNativePlaybackFailureCategory
+            .routeRuntime
+        for _ in 0..<6 {
+            guard let evidenceError = current else { break }
+            selected = evidenceError
+            if let response = evidenceError.userInfo.values
+                .compactMap({ $0 as? HTTPURLResponse })
+                .first {
+                selected = NSError(
+                    domain: "HTTP",
+                    code: response.statusCode
+                )
+                category = if response.statusCode == 401
+                    || response.statusCode == 403 {
+                    .authentication
+                } else if response.statusCode == 408
+                    || response.statusCode == 425
+                    || response.statusCode == 429
+                    || response.statusCode >= 500 {
+                    .transientTransport
+                } else {
+                    .routeRuntime
+                }
+                break
+            }
+            if evidenceError.domain == NSURLErrorDomain {
+                let code = URLError.Code(
+                    rawValue: evidenceError.code
+                )
+                category = switch HLSVODOriginResourceLoader
+                    .transportDisposition(for: code) {
+                case .transient: .transientTransport
+                case .cancelled: .cancelled
+                case .security: .security
+                case .invariant: .invariant
+                }
+                break
+            }
+            current = evidenceError.userInfo[NSUnderlyingErrorKey]
+                as? NSError
+        }
+        return AetherNativePlaybackFailureEvidence(
+            category: category,
+            caseCode: caseCode,
+            domain: selected?.domain ?? "AVFoundation",
+            code: selected?.code ?? -1
+        )
+    }
+
+    private func reviveDirectItem(
+        _ failedItem: AVPlayerItem,
+        at position: CMTime
+    ) async {
+        guard !isStopped,
+              avPlayerItem === failedItem else { return }
+        let selectedAudio = directExplicitAudioTrackID
+        let selectedSubtitle = directSelectedSubtitleTrackID
+        removeDirectItemObservers()
+        let freshItem = AVPlayerItem(asset: failedItem.asset)
+        avPlayerItem = freshItem
+        avPlayer.replaceCurrentItem(with: freshItem)
+        installDirectItemObservers()
+        state = .preparing
+
+        let deadline = ProcessInfo.processInfo.systemUptime + 3
+        while freshItem.status == .unknown,
+              ProcessInfo.processInfo.systemUptime < deadline,
+              !isStopped {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        guard !isStopped else { return }
+        guard freshItem.status == .readyToPlay else {
+            if freshItem.status == .failed {
+                handleDirectItemDeath()
+            } else {
+                state = .failed(.playerItemFailed)
+            }
+            return
+        }
+        if let selectedAudio {
+            do {
+                try await selectAudioTrack(selectedAudio)
+            } catch {
+                state = .failed(.playerItemFailed)
+                return
+            }
+        }
+        if let selectedSubtitle {
+            try? await selectSubtitleTrack(selectedSubtitle)
+        }
+        let landed = await withCheckedContinuation {
+            (continuation: CheckedContinuation<Bool, Never>) in
+            avPlayer.seek(
+                to: position,
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            ) { finished in
+                continuation.resume(returning: finished)
+            }
+        }
+        guard landed else {
+            state = .failed(.playerItemFailed)
+            return
+        }
+        if directPlayIntent {
+            avPlayer.rate = directRateIntent
+            state = .playing
+        } else {
+            avPlayer.pause()
+            state = .paused
+        }
+    }
+
+    private func handleDirectPlaybackStall() {
+        guard engine == nil,
+              directStallRecoveryTask == nil,
+              !isStopped else { return }
+        let frozenTime = lastObservedPlayerTime
+        directStallRecoveryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.directStallRecoveryTask = nil }
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            guard !Task.isCancelled, !self.isStopped,
+                  !Self.madeProgress(
+                    from: frozenTime,
+                    to: self.lastObservedPlayerTime
+                  ) else { return }
+            let shouldPlay = self.directPlayIntent
+            if shouldPlay {
+                self.avPlayer.play()
+            }
+            let nudgeTime = self.lastObservedPlayerTime
+            EngineLog.emit(
+                "[AetherNativePlaybackSession] direct stall nudge",
+                category: .session
+            )
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            guard !Task.isCancelled, !self.isStopped,
+                  !Self.madeProgress(
+                    from: nudgeTime,
+                    to: self.lastObservedPlayerTime
+                  ) else { return }
+            self.state = .failed(.playerItemFailed)
+        }
+    }
+
+    private static func madeProgress(
+        from oldTime: CMTime,
+        to newTime: CMTime
+    ) -> Bool {
+        guard oldTime.isNumeric,
+              newTime.isNumeric else { return false }
+        return CMTimeSubtract(newTime, oldTime).seconds > 0.1
     }
 
     private func installEngineObservers(_ engine: AetherEngine) {
@@ -656,6 +1194,7 @@ final class AetherNativePlaybackSession: ObservableObject {
             @MainActor [weak self] in
             guard let self else { return }
             await refreshSelectedAudioAnalysisTrackIDFromPlayer()
+            await refreshDirectSubtitleSelectionFromPlayer()
             audioAnalysisSelectionResolutionTask = nil
         }
     }
@@ -712,6 +1251,47 @@ final class AetherNativePlaybackSession: ObservableObject {
         } catch {
             guard !Task.isCancelled, !isStopped else { return }
             applySelectedAudioAnalysisTrackID(nil)
+        }
+    }
+
+    private func refreshDirectSubtitleSelectionFromPlayer()
+        async
+    {
+        guard engine == nil,
+              !Task.isCancelled,
+              !isStopped else { return }
+        do {
+            guard let group = try await avPlayerItem.asset
+                    .loadMediaSelectionGroup(for: .legible) else {
+                directSubtitleTracks = []
+                directSelectedSubtitleTrackID = nil
+                return
+            }
+            directSubtitleTracks = group.options.enumerated().map {
+                index,
+                option in
+                TrackInfo(
+                    id: index,
+                    name: option.displayName,
+                    codec: "native",
+                    language: option.locale?.identifier,
+                    isDefault: false,
+                    isForced: option.hasMediaCharacteristic(
+                        .containsOnlyForcedSubtitles
+                    )
+                )
+            }
+            let selected = avPlayerItem.currentMediaSelection
+                .selectedMediaOption(in: group)
+            directSelectedSubtitleTrackID = selected.flatMap {
+                selected in
+                group.options.firstIndex(where: {
+                    $0.isEqual(selected)
+                })
+            }
+        } catch {
+            directSubtitleTracks = []
+            directSelectedSubtitleTrackID = nil
         }
     }
 
