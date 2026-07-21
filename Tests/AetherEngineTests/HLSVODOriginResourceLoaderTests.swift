@@ -2253,6 +2253,10 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
             forHTTPHeaderField: "User-Agent"
         )
         request.setValue(
+            "https://catalog.example/title/1",
+            forHTTPHeaderField: "Referer"
+        )
+        request.setValue(
             "identity",
             forHTTPHeaderField: "Accept-Encoding"
         )
@@ -2282,7 +2286,10 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         )
         XCTAssertNil(recorded["Authorization"])
         XCTAssertNil(recorded["Cookie"])
-        XCTAssertNil(recorded["Referer"])
+        XCTAssertEqual(
+            recorded["Referer"],
+            "https://catalog.example/title/1"
+        )
     }
 
     func testBoundedHTTPTransportKeepsHeadersOnSameOriginRedirect()

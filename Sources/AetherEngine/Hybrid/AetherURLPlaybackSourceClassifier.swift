@@ -47,10 +47,24 @@ public enum AetherURLPlaybackSourceClassificationError:
 
 /// Content-backed URL source classification used before Aether route preflight.
 ///
-/// This classifier never uses a path extension, MIME type or declared codec. HLS is recognized only by
-/// the `#EXTM3U` signature in the fetched bytes; every other non-empty payload is classified as a
-/// progressive resource and must still pass Aether's FFmpeg probe. No error path selects another source
-/// kind or playback backend.
+/// This classifier never uses a path extension, MIME type or declared codec. HLS and ISO-BMFF are
+/// recognized only by signatures in the fetched bytes; every other non-empty payload is classified as
+/// a progressive resource. No error path selects another source kind or playback backend.
+enum AetherURLPlaybackSourceSignature: Sendable, Equatable {
+    case hls
+    case isoBaseMedia
+    case progressive
+
+    var sourceKind: AetherMediaSourceKind {
+        switch self {
+        case .hls:
+            .hls
+        case .isoBaseMedia, .progressive:
+            .progressive
+        }
+    }
+}
+
 public enum AetherURLPlaybackSourceClassifier {
     public static let defaultMaximumPrefixBytes = 64 * 1024
 
@@ -59,6 +73,18 @@ public enum AetherURLPlaybackSourceClassifier {
         options: LoadOptions = .init(),
         maximumPrefixBytes: Int = defaultMaximumPrefixBytes
     ) async throws -> AetherMediaSourceKind {
+        try await inspect(
+            url: url,
+            options: options,
+            maximumPrefixBytes: maximumPrefixBytes
+        ).sourceKind
+    }
+
+    static func inspect(
+        url: URL,
+        options: LoadOptions = .init(),
+        maximumPrefixBytes: Int = defaultMaximumPrefixBytes
+    ) async throws -> AetherURLPlaybackSourceSignature {
         guard maximumPrefixBytes > 0 else {
             throw AetherURLPlaybackSourceClassificationError.emptyResource
         }
@@ -91,25 +117,37 @@ public enum AetherURLPlaybackSourceClassifier {
                 maximumBytes: maximumPrefixBytes
             )
         }
-        return try classify(prefix: data)
+        return try inspect(prefix: data)
     }
 
     /// Pure signature classifier exposed for contract tests and catalog adapters.
     public static func classify(prefix: Data) throws -> AetherMediaSourceKind {
+        try inspect(prefix: prefix).sourceKind
+    }
+
+    static func inspect(
+        prefix: Data
+    ) throws -> AetherURLPlaybackSourceSignature {
         guard !prefix.isEmpty else {
             throw AetherURLPlaybackSourceClassificationError.emptyResource
+        }
+        if prefix.count >= 8,
+           prefix.dropFirst(4).prefix(4).elementsEqual([
+               0x66, 0x74, 0x79, 0x70,
+           ]) {
+            return .isoBaseMedia
         }
         var bytes = prefix
         if bytes.starts(with: [0xEF, 0xBB, 0xBF]) {
             bytes.removeFirst(3)
         }
         guard let text = String(data: bytes, encoding: .utf8) else {
-            return .progressive
+            return AetherURLPlaybackSourceSignature.progressive
         }
         let firstNonWhitespace = text.drop(while: { $0.isWhitespace })
         return firstNonWhitespace.hasPrefix("#EXTM3U")
-            ? .hls
-            : .progressive
+            ? AetherURLPlaybackSourceSignature.hls
+            : AetherURLPlaybackSourceSignature.progressive
     }
 }
 
@@ -344,6 +382,7 @@ private final class AetherURLPlaybackPrefixFetcher:
         "accept-encoding",
         "accept-language",
         "range",
+        "referer",
         "user-agent",
     ]
 

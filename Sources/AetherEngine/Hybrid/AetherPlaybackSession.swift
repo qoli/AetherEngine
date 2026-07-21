@@ -1356,12 +1356,12 @@ public final class AetherPlaybackSession: ObservableObject {
         variantSelectionOverride:
             HLSPreflightVariantSelection? = nil
     ) async throws -> AetherResolvedPlaybackSource {
-        let sourceKind: AetherMediaSourceKind
+        let sourceSignature: AetherURLPlaybackSourceSignature
         do {
-            sourceKind = try await retryTransport(
+            sourceSignature = try await retryTransport(
                 stage: .classification
             ) {
-                try await AetherURLPlaybackSourceClassifier.classify(
+                try await AetherURLPlaybackSourceClassifier.inspect(
                     url: self.url,
                     options: self.options
                 )
@@ -1376,7 +1376,14 @@ public final class AetherPlaybackSession: ObservableObject {
             throw failure
         }
 
-        switch sourceKind {
+        if allowProvisionalNative,
+           sourceSignature == .isoBaseMedia {
+            return provisionalNativeSource(
+                sourceContainer: .isoBaseMedia
+            )
+        }
+
+        switch sourceSignature.sourceKind {
         case .hls:
             do {
                 let preflight = try await retryTransport(
@@ -1467,13 +1474,16 @@ public final class AetherPlaybackSession: ObservableObject {
         }
     }
 
-    private func provisionalNativeSource()
+    private func provisionalNativeSource(
+        sourceContainer: AetherSourceContainer = .unknown
+    )
         -> AetherResolvedPlaybackSource
     {
         let profile = AetherSourceProfile(
             sourceKind: .unclassifiedURL,
             isSeekableVOD: true,
             videoCodec: .unknown,
+            sourceContainer: sourceContainer,
             // Ignored by the provisional Native-only contract.
             videoFormat: .sdr
         )

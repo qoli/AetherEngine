@@ -1869,6 +1869,7 @@ final class HLSVODBoundedHTTPFetcher:
         "accept-encoding",
         "accept-language",
         "range",
+        "referer",
         "user-agent",
     ]
 

@@ -104,7 +104,40 @@ enum AetherNativePlaybackSessionError:
         case .seekTimedOut(let seconds):
             "The native playback seek exceeded its \(seconds)-second recovery deadline"
         case .startupTimedOut:
-            "The native playback item did not become ready within three seconds"
+            "The native playback item did not become ready within its bounded startup window"
+        }
+    }
+}
+
+enum AetherNativeItemReadinessDecision: Sendable, Equatable {
+    case wait
+    case ready
+    case failed
+    case timedOut
+}
+
+struct AetherNativeItemReadinessGate: Sendable, Equatable {
+    static let defaultTimeout: TimeInterval = 15
+
+    let timeout: TimeInterval
+
+    init(timeout: TimeInterval = Self.defaultTimeout) {
+        self.timeout = timeout
+    }
+
+    func decide(
+        status: AVPlayerItem.Status,
+        elapsed: TimeInterval
+    ) -> AetherNativeItemReadinessDecision {
+        switch status {
+        case .readyToPlay:
+            return .ready
+        case .failed:
+            return .failed
+        case .unknown:
+            return elapsed < timeout ? .wait : .timedOut
+        @unknown default:
+            return .failed
         }
     }
 }
@@ -271,6 +304,7 @@ final class AetherNativePlaybackSession: ObservableObject {
     private var playbackStalledObserver: NSObjectProtocol?
     private var progressObserver: Any?
     private var directStallRecoveryTask: Task<Void, Never>?
+    private var directStartupProgressTask: Task<Void, Never>?
     private var directItemDeathConfirmationTask: Task<Void, Never>?
     private var directFailedToEndConfirmationTask: Task<Void, Never>?
     private var directItemReviveGate = ItemDeathReviveGate(
@@ -297,6 +331,7 @@ final class AetherNativePlaybackSession: ObservableObject {
     private let engine: AetherEngine?
     private var engineCancellables = Set<AnyCancellable>()
     private var isStopped = false
+    private let itemReadinessGate = AetherNativeItemReadinessGate()
 
     private init(
         preflightResult: PlaybackPreflightResult,
@@ -479,22 +514,24 @@ final class AetherNativePlaybackSession: ObservableObject {
                 await refreshSelectedAudioAnalysisTrackIDFromPlayer()
                 await refreshDirectSubtitleSelectionFromPlayer()
             }
-            if avPlayerItem.status == .readyToPlay {
-                state = .ready
-            } else {
-                let deadline = ProcessInfo.processInfo.systemUptime + 3
-                while avPlayerItem.status == .unknown,
-                      ProcessInfo.processInfo.systemUptime < deadline {
-                    try await Task.sleep(nanoseconds: 50_000_000)
-                    try requireActive()
-                }
-                guard avPlayerItem.status == .readyToPlay else {
-                    state = .failed(.playerItemFailed)
-                    throw AetherNativePlaybackSessionError
-                        .startupTimedOut
-                }
-                state = .ready
+            if avPlayerItem.status == .failed {
+                recordReadinessFailure(
+                    item: avPlayerItem,
+                    elapsed: 0,
+                    phase: "prepare"
+                )
+                state = .failed(.playerItemFailed)
+                throw AetherNativePlaybackSessionError
+                    .startupTimedOut
             }
+            if avPlayerItem.status == .unknown {
+                EngineLog.emit(
+                    "[AetherNativePlaybackSession] prepare delegates "
+                        + "unknown item readiness to AVPlayer playback",
+                    category: .session
+                )
+            }
+            state = .ready
         } catch is CancellationError {
             throw CancellationError()
         } catch let error as AetherNativePlaybackSessionError {
@@ -512,6 +549,7 @@ final class AetherNativePlaybackSession: ObservableObject {
         } else {
             directPlayIntent = true
             avPlayer.play()
+            scheduleDirectStartupProgressCheck()
         }
         state = .playing
     }
@@ -522,6 +560,8 @@ final class AetherNativePlaybackSession: ObservableObject {
             engine.pause()
         } else {
             directPlayIntent = false
+            directStartupProgressTask?.cancel()
+            directStartupProgressTask = nil
             avPlayer.pause()
         }
         state = .paused
@@ -537,6 +577,8 @@ final class AetherNativePlaybackSession: ObservableObject {
                 engine.pause()
             } else {
                 directPlayIntent = false
+                directStartupProgressTask?.cancel()
+                directStartupProgressTask = nil
                 avPlayer.pause()
             }
             state = .paused
@@ -547,6 +589,7 @@ final class AetherNativePlaybackSession: ObservableObject {
                 directPlayIntent = true
                 directRateIntent = rate
                 avPlayer.rate = rate
+                scheduleDirectStartupProgressCheck()
             }
             state = .playing
         }
@@ -900,6 +943,8 @@ final class AetherNativePlaybackSession: ObservableObject {
         }
         directStallRecoveryTask?.cancel()
         directStallRecoveryTask = nil
+        directStartupProgressTask?.cancel()
+        directStartupProgressTask = nil
         directItemDeathConfirmationTask?.cancel()
         directItemDeathConfirmationTask = nil
         cancelAudioAnalysisStreams()
@@ -1218,14 +1263,23 @@ final class AetherNativePlaybackSession: ObservableObject {
         installDirectItemObservers()
         state = .preparing
 
-        let deadline = ProcessInfo.processInfo.systemUptime + 3
-        while freshItem.status == .unknown,
-              ProcessInfo.processInfo.systemUptime < deadline,
+        let readinessStartedAt = ProcessInfo.processInfo.systemUptime
+        while itemReadinessGate.decide(
+            status: freshItem.status,
+            elapsed: ProcessInfo.processInfo.systemUptime
+                - readinessStartedAt
+        ) == .wait,
               !isStopped {
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
         guard !isStopped else { return }
         guard freshItem.status == .readyToPlay else {
+            recordReadinessFailure(
+                item: freshItem,
+                elapsed: ProcessInfo.processInfo.systemUptime
+                    - readinessStartedAt,
+                phase: "revive"
+            )
             if freshItem.status == .failed {
                 handleDirectItemDeath()
             } else {
@@ -1267,6 +1321,24 @@ final class AetherNativePlaybackSession: ObservableObject {
         }
     }
 
+    private func recordReadinessFailure(
+        item: AVPlayerItem,
+        elapsed: TimeInterval,
+        phase: String
+    ) {
+        let error = item.error as NSError?
+        EngineLog.emit(
+            "[AetherNativePlaybackSession] readiness exhausted "
+                + "phase=\(phase) "
+                + "elapsed=\(String(format: "%.3f", elapsed)) "
+                + "status=\(item.status.rawValue) "
+                + "loadedRanges=\(item.loadedTimeRanges.count) "
+                + "errorDomain=\(error?.domain ?? "none") "
+                + "errorCode=\(error?.code ?? 0)",
+            category: .session
+        )
+    }
+
     private func handleDirectPlaybackStall() {
         guard engine == nil,
               directStallRecoveryTask == nil,
@@ -1296,6 +1368,48 @@ final class AetherNativePlaybackSession: ObservableObject {
                     from: nudgeTime,
                     to: self.lastObservedPlayerTime
                   ) else { return }
+            self.state = .failed(.playerItemFailed)
+        }
+    }
+
+    private func scheduleDirectStartupProgressCheck() {
+        guard engine == nil,
+              directStartupProgressTask == nil,
+              !isStopped else { return }
+        let item = avPlayerItem
+        let baseline = lastObservedPlayerTime
+        directStartupProgressTask = Task {
+            @MainActor [weak self, weak item] in
+            guard let self, let item else { return }
+            defer { self.directStartupProgressTask = nil }
+            do {
+                try await Task.sleep(
+                    nanoseconds: 30_000_000_000
+                )
+            } catch {
+                return
+            }
+            guard !self.isStopped,
+                  self.directPlayIntent,
+                  self.avPlayerItem === item,
+                  !Self.madeProgress(
+                    from: baseline,
+                    to: self.lastObservedPlayerTime
+                  ) else { return }
+            self.lastFailureEvidence =
+                AetherNativePlaybackFailureEvidence(
+                    category: .routeRuntime,
+                    caseCode: "startupNoProgress",
+                    domain: "AVFoundation",
+                    code: item.error.map { ($0 as NSError).code }
+                        ?? 0
+                )
+            EngineLog.emit(
+                "[AetherNativePlaybackSession] startup no-progress "
+                    + "elapsed=30.000 status=\(item.status.rawValue) "
+                    + "loadedRanges=\(item.loadedTimeRanges.count)",
+                category: .session
+            )
             self.state = .failed(.playerItemFailed)
         }
     }

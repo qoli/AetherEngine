@@ -5,6 +5,38 @@ import Testing
 
 @Suite("Aether playback launch boundary")
 struct AetherPlaybackLaunchBoundaryTests {
+    @Test("Native readiness keeps a slow item inside its bounded startup window")
+    func nativeReadinessAllowsSlowItem() {
+        let gate = AetherNativeItemReadinessGate()
+
+        #expect(
+            gate.decide(status: .unknown, elapsed: 3)
+                == .wait
+        )
+        #expect(
+            gate.decide(status: .unknown, elapsed: 14.999)
+                == .wait
+        )
+        #expect(
+            gate.decide(status: .readyToPlay, elapsed: 14.999)
+                == .ready
+        )
+    }
+
+    @Test("Native readiness remains bounded and preserves explicit item failure")
+    func nativeReadinessTimesOutOrFails() {
+        let gate = AetherNativeItemReadinessGate()
+
+        #expect(
+            gate.decide(status: .unknown, elapsed: 15)
+                == .timedOut
+        )
+        #expect(
+            gate.decide(status: .failed, elapsed: 0)
+                == .failed
+        )
+    }
+
     private func makeWAV(
         sampleRate: Int = 48_000,
         channels: Int = 1,
@@ -117,6 +149,24 @@ struct AetherPlaybackLaunchBoundaryTests {
         #expect(
             try AetherURLPlaybackSourceClassifier
                 .classify(prefix: progressivePrefix)
+                == .progressive
+        )
+    }
+
+    @Test("ISO-BMFF signature positively admits the initial direct Native asset")
+    func isoBaseMediaSignatureIsDistinctFromGenericProgressive() throws {
+        let prefix = Data([
+            0x00, 0x00, 0x00, 0x18,
+            0x66, 0x74, 0x79, 0x70,
+            0x69, 0x73, 0x6F, 0x6D,
+        ])
+
+        #expect(
+            try AetherURLPlaybackSourceClassifier.inspect(prefix: prefix)
+                == .isoBaseMedia
+        )
+        #expect(
+            try AetherURLPlaybackSourceClassifier.classify(prefix: prefix)
                 == .progressive
         )
     }
@@ -268,8 +318,8 @@ struct AetherPlaybackLaunchBoundaryTests {
     }
 
     @MainActor
-    @Test("Progressive Native admission remuxes to local HLS on the stable player")
-    func progressiveNativeUsesLocalHLSRemux() async throws {
+    @Test("Progressive Native admission preserves container-appropriate execution on the stable player")
+    func progressiveNativeUsesContainerAppropriateExecution() async throws {
         let originURL = ProcessInfo.processInfo.environment[
             "AETHER_NATIVE_REMUX_TEST_SOURCE"
         ].map(URL.init(fileURLWithPath:)) ?? blackCarrierSourceURL()
@@ -283,9 +333,13 @@ struct AetherPlaybackLaunchBoundaryTests {
         #expect(session.avPlayer === stablePlayer)
         #expect(session.presentationView === stablePresentation)
         #expect(session.activeRoute == .nativeAVPlayer)
+        let expectsRemux = originURL.pathExtension.lowercased()
+            == "mkv"
         #expect(
             session.preflightResult?.reason
-                == .nativeHLSFMP4Remux
+                == (expectsRemux
+                    ? .nativeHLSFMP4Remux
+                    : .nativeProvisionalURL)
         )
         let expectedContainer: AetherSourceContainer =
             originURL.pathExtension.lowercased() == "mkv"
@@ -301,11 +355,15 @@ struct AetherPlaybackLaunchBoundaryTests {
             session.stop()
             return
         }
-        #expect(asset.url != originURL)
-        #expect(
-            asset.url.host == "127.0.0.1"
-                || asset.url.host == "localhost"
-        )
+        if expectsRemux {
+            #expect(asset.url != originURL)
+            #expect(
+                asset.url.host == "127.0.0.1"
+                    || asset.url.host == "localhost"
+            )
+        } else {
+            #expect(asset.url == originURL)
+        }
 
         session.stop()
         #expect(stablePlayer.currentItem == nil)
