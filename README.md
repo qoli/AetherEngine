@@ -108,6 +108,22 @@ audio-only item reports `notExpected` with codec `none`. Native pixel polling is
 active only for that bounded wait and adds no continuous sampling to ordinary
 playback.
 
+For transport diagnostics, `AetherPlaybackSession.transportSnapshot` reports
+the latest command and route generation, desired and actual rate, closed
+application/time-control/item/waiting phases, media time, loaded-range count,
+recovery sequence, and bounded reassert evidence. It contains no URL, headers,
+credentials, or payload data and is not playback-success evidence. Positive
+rate intent always calls `play()` first; non-1x speed is applied afterward. A
+ready route parked at rate zero is reasserted once after one second, while one
+outer watchdog covers Native, Audio Bridge, and Hybrid and requires real media
+time within `AetherPlaybackRecoveryBudget.startupProgressObservationSeconds`.
+Hosts should derive their outer guard from
+`AetherPlaybackRecoveryBudget.production.maximumStartupOutcomeSeconds` (60.25
+seconds) plus only their own observation granularity, so Aether can publish its
+typed outcome first. Startup `transportIntentNotApplied` and
+`startupNoProgress` may rebuild the admitted route once, but never transition
+to another route; exhaustion is terminal.
+
 ## What it handles
 
 A scannable summary; the depth for each row lives in **[docs/formats.md](docs/formats.md)**.

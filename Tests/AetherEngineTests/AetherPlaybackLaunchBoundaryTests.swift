@@ -1122,7 +1122,14 @@ struct AetherPlaybackLaunchBoundaryTests {
             preflightResult: audioOnlyPreflight
         )
         try await session.prepare()
+        try session.setRate(1.5)
+        #expect(session.activeTransportRate == 1.5)
+        try session.pause()
         try session.play()
+        // This audio-only fixture runs through the Native Audio Bridge, so
+        // assert the engine-owned host rather than the otherwise idle carrier
+        // AVPlayer. Canonical route play must discard the old 1.5x host rate.
+        #expect(session.activeTransportRate == 1)
 
         // AVPlayer reports rate zero while buffering and while a Seek lands;
         // that transport fact must not overwrite the user's play intent.
@@ -1136,7 +1143,7 @@ struct AetherPlaybackLaunchBoundaryTests {
         )
         #expect(playingSeek == .applied)
         #expect(session.state == .playing)
-        #expect(session.avPlayer.rate > 0)
+        #expect(session.activeTransportRate > 0)
 
         try session.pause()
         let pausedSeek = try await session.seek(

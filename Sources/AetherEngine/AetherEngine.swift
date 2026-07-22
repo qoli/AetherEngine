@@ -1962,6 +1962,13 @@ public final class AetherEngine: ObservableObject {
         return nativeHost
     }
 
+    /// Route-internal transport truth used by the unified playback boundary.
+    /// This does not expose source or host identity and remains internal to
+    /// AetherEngine and its semantic transport tests.
+    var activeTransportRate: Float {
+        activeTransportHost?.rate ?? 0
+    }
+
     public func play() {
         activeTransportHost?.play()
         if state == .paused || state == .loading {

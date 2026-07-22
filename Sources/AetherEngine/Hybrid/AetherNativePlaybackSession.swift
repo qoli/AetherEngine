@@ -431,6 +431,78 @@ private final class AetherNativeEngineSeekDeadlineRace {
     }
 }
 
+/// Pure admission gate for the Direct-Native runtime stall nudge. Startup
+/// no-progress belongs to the outer session's 30-second watchdog; this path
+/// is admitted only after the exact item and transport epoch have already
+/// demonstrated real media-time progress.
+enum AetherNativeDirectStallDecision {
+    static func shouldAct(
+        requestedTransportGeneration: UInt64,
+        currentTransportGeneration: UInt64,
+        itemMatches: Bool,
+        directPlayIntent: Bool,
+        demonstratedProgressInEpoch: Bool,
+        madeProgressSinceCheckpoint: Bool,
+        isStopped: Bool
+    ) -> Bool {
+        requestedTransportGeneration == currentTransportGeneration
+            && itemMatches
+            && directPlayIntent
+            && demonstratedProgressInEpoch
+            && !madeProgressSinceCheckpoint
+            && !isStopped
+    }
+}
+
+/// Media-time evidence for one Direct-Native transport epoch. Explicit seek
+/// and item-revive landings are discontinuities: they reset the baseline but
+/// never count the jump itself as demonstrated playback progress.
+struct AetherNativeDirectProgressEpoch: Sendable, Equatable {
+    private(set) var sample: CMTime?
+    private(set) var wasDemonstrated = false
+
+    mutating func begin(at time: CMTime) {
+        wasDemonstrated = false
+        sample = Self.isFiniteNumeric(time) ? time : nil
+    }
+
+    mutating func land(at time: CMTime) {
+        begin(at: time)
+    }
+
+    mutating func observe(
+        _ time: CMTime,
+        isEligiblePlayback: Bool
+    ) {
+        guard Self.isFiniteNumeric(time) else { return }
+        if let sample {
+            let delta = CMTimeSubtract(time, sample).seconds
+            // AVPlayer may deliver an already-queued pre-seek periodic tick
+            // after seek completion. It belongs to the retired timeline and
+            // must not move the new epoch baseline backwards; otherwise the
+            // next landed tick would recreate the exact false-positive jump.
+            guard delta >= -0.1 else { return }
+            if isEligiblePlayback, delta > 0.1 {
+                wasDemonstrated = true
+            }
+        }
+        sample = time
+    }
+
+    static func madeProgress(
+        from oldTime: CMTime,
+        to newTime: CMTime
+    ) -> Bool {
+        guard isFiniteNumeric(oldTime),
+              isFiniteNumeric(newTime) else { return false }
+        return CMTimeSubtract(newTime, oldTime).seconds > 0.1
+    }
+
+    private static func isFiniteNumeric(_ time: CMTime) -> Bool {
+        time.isNumeric && time.seconds.isFinite
+    }
+}
+
 /// Aether-owned AVPlayer lifecycle for a preflight-admitted `.nativeAVPlayer` route.
 ///
 /// The host may mount `avPlayer` in AVPlayerViewController and observe `state`, but it does not create or
@@ -531,7 +603,6 @@ final class AetherNativePlaybackSession: ObservableObject {
     private var progressObserver: Any?
     private var videoTrackObservationTask: Task<Void, Never>?
     private var directStallRecoveryTask: Task<Void, Never>?
-    private var directStartupProgressTask: Task<Void, Never>?
     private var directItemDeathConfirmationTask: Task<Void, Never>?
     private var directFailedToEndConfirmationTask: Task<Void, Never>?
     private var directItemReviveGate = ItemDeathReviveGate(
@@ -542,6 +613,10 @@ final class AetherNativePlaybackSession: ObservableObject {
     private var directSelectedSubtitleTrackID: Int?
     private var directPlayIntent = false
     private var directRateIntent: Float = 1
+    private var directTransportGeneration: UInt64 = 0
+    private var directStallTaskGeneration: UInt64 = 0
+    private var directProgressEpoch =
+        AetherNativeDirectProgressEpoch()
     private var directExplicitAudioTrackID: Int?
     private var seekRequestSequence: UInt64 = 0
     private var activeEngineSeekDeadlineRace:
@@ -563,6 +638,10 @@ final class AetherNativePlaybackSession: ObservableObject {
     private var engineCancellables = Set<AnyCancellable>()
     private var isStopped = false
     private let itemReadinessGate = AetherNativeItemReadinessGate()
+
+    var activeTransportRate: Float {
+        engine?.activeTransportRate ?? avPlayer.rate
+    }
 
     private init(
         preflightResult: PlaybackPreflightResult,
@@ -856,14 +935,55 @@ final class AetherNativePlaybackSession: ObservableObject {
         }
     }
 
+    private func beginDirectTransportCommand() {
+        directTransportGeneration &+= 1
+        directProgressEpoch.begin(at: lastObservedPlayerTime)
+        cancelDirectStallRecovery()
+    }
+
+    private func resetDirectProgressAfterDiscontinuity(
+        fallbackTime: CMTime
+    ) {
+        let current = avPlayer.currentTime()
+        let currentIsUsable = current.isNumeric
+            && current.seconds.isFinite
+        let fallbackIsUsable = fallbackTime.isNumeric
+            && fallbackTime.seconds.isFinite
+        let currentMatchesLanding = currentIsUsable
+            && fallbackIsUsable
+            && abs(current.seconds - fallbackTime.seconds) <= 1
+        let landed = if currentMatchesLanding {
+            current
+        } else if fallbackIsUsable {
+            fallbackTime
+        } else {
+            current
+        }
+        directProgressEpoch.land(at: landed)
+        lastObservedPlayerTime = landed
+        cancelDirectStallRecovery()
+    }
+
+    private func cancelDirectStallRecovery() {
+        directStallTaskGeneration &+= 1
+        directStallRecoveryTask?.cancel()
+        directStallRecoveryTask = nil
+    }
+
     public func play() throws {
         try requireActive()
         if let engine {
             engine.play()
+            // Route-level play is the canonical 1x command. The outer
+            // session reapplies an explicit non-1x intent immediately after
+            // play(), so an earlier bridge-host lastRate must not leak into
+            // pause -> play or pause -> seek -> play.
+            engine.setRate(1)
         } else {
+            beginDirectTransportCommand()
             directPlayIntent = true
+            directRateIntent = 1
             avPlayer.play()
-            scheduleDirectStartupProgressCheck()
         }
         state = .playing
     }
@@ -873,9 +993,8 @@ final class AetherNativePlaybackSession: ObservableObject {
         if let engine {
             engine.pause()
         } else {
+            beginDirectTransportCommand()
             directPlayIntent = false
-            directStartupProgressTask?.cancel()
-            directStartupProgressTask = nil
             avPlayer.pause()
         }
         state = .paused
@@ -886,13 +1005,14 @@ final class AetherNativePlaybackSession: ObservableObject {
         guard rate.isFinite, rate >= 0 else {
             throw AetherNativePlaybackSessionError.invalidRate
         }
+        if engine == nil {
+            beginDirectTransportCommand()
+        }
         if rate == 0 {
             if let engine {
                 engine.pause()
             } else {
                 directPlayIntent = false
-                directStartupProgressTask?.cancel()
-                directStartupProgressTask = nil
                 avPlayer.pause()
             }
             state = .paused
@@ -903,7 +1023,6 @@ final class AetherNativePlaybackSession: ObservableObject {
                 directPlayIntent = true
                 directRateIntent = rate
                 avPlayer.rate = rate
-                scheduleDirectStartupProgressCheck()
             }
             state = .playing
         }
@@ -921,6 +1040,9 @@ final class AetherNativePlaybackSession: ObservableObject {
               timeout.isFinite,
               timeout > 0 else {
             throw AetherNativePlaybackSessionError.invalidSeekTarget
+        }
+        if engine == nil {
+            beginDirectTransportCommand()
         }
         seekRequestSequence &+= 1
         let requestSequence = seekRequestSequence
@@ -999,7 +1121,9 @@ final class AetherNativePlaybackSession: ObservableObject {
             }
             switch outcome {
             case .applied:
-                break
+                resetDirectProgressAfterDiscontinuity(
+                    fallbackTime: target
+                )
             case .rejected:
                 throw AetherNativePlaybackSessionError.seekDidNotApply
             case .timedOut:
@@ -1251,6 +1375,8 @@ final class AetherNativePlaybackSession: ObservableObject {
     public func stop() {
         guard !isStopped else { return }
         isStopped = true
+        directTransportGeneration &+= 1
+        cancelDirectStallRecovery()
         seekRequestSequence &+= 1
         activeEngineSeekDeadlineRace?.cancel()
         activeEngineSeekDeadlineRace = nil
@@ -1285,10 +1411,6 @@ final class AetherNativePlaybackSession: ObservableObject {
         videoTrackObservationTask?.cancel()
         videoTrackObservationTask = nil
         videoOutputMonitor.unbind()
-        directStallRecoveryTask?.cancel()
-        directStallRecoveryTask = nil
-        directStartupProgressTask?.cancel()
-        directStartupProgressTask = nil
         directItemDeathConfirmationTask?.cancel()
         directItemDeathConfirmationTask = nil
         cancelAudioAnalysisStreams()
@@ -1367,6 +1489,7 @@ final class AetherNativePlaybackSession: ObservableObject {
         if let engine {
             engine.stop()
         } else {
+            beginDirectTransportCommand()
             avPlayer.pause()
             avPlayer.replaceCurrentItem(with: nil)
         }
@@ -1527,10 +1650,17 @@ final class AetherNativePlaybackSession: ObservableObject {
             queue: .main
         ) { [weak self] time in
             MainActor.assumeIsolated {
-                guard time.isValid,
+                guard let self,
+                      time.isValid,
                       time.isNumeric,
                       time.seconds.isFinite else { return }
-                self?.lastObservedPlayerTime = time
+                self.directProgressEpoch.observe(
+                    time,
+                    isEligiblePlayback:
+                        self.directPlayIntent
+                            && self.state == .playing
+                )
+                self.lastObservedPlayerTime = time
             }
         }
     }
@@ -1841,6 +1971,7 @@ final class AetherNativePlaybackSession: ObservableObject {
     ) async {
         guard !isStopped,
               avPlayerItem === failedItem else { return }
+        beginDirectTransportCommand()
         let selectedAudio = directExplicitAudioTrackID
         let selectedSubtitle = directSelectedSubtitleTrackID
         removeDirectItemObservers()
@@ -1900,6 +2031,9 @@ final class AetherNativePlaybackSession: ObservableObject {
             state = .failed(.playerItemFailed)
             return
         }
+        resetDirectProgressAfterDiscontinuity(
+            fallbackTime: position
+        )
         if directPlayIntent {
             avPlayer.rate = directRateIntent
             state = .playing
@@ -1930,74 +2064,77 @@ final class AetherNativePlaybackSession: ObservableObject {
     private func handleDirectPlaybackStall() {
         guard engine == nil,
               directStallRecoveryTask == nil,
-              !isStopped else { return }
-        let frozenTime = lastObservedPlayerTime
-        directStallRecoveryTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.directStallRecoveryTask = nil }
-            try? await Task.sleep(nanoseconds: 6_000_000_000)
-            guard !Task.isCancelled, !self.isStopped,
-                  !Self.madeProgress(
-                    from: frozenTime,
-                    to: self.lastObservedPlayerTime
-                  ) else { return }
-            let shouldPlay = self.directPlayIntent
-            if shouldPlay {
-                self.avPlayer.play()
-            }
-            let nudgeTime = self.lastObservedPlayerTime
-            EngineLog.emit(
-                "[AetherNativePlaybackSession] direct stall nudge",
-                category: .session
-            )
-            try? await Task.sleep(nanoseconds: 6_000_000_000)
-            guard !Task.isCancelled, !self.isStopped,
-                  !Self.madeProgress(
-                    from: nudgeTime,
-                    to: self.lastObservedPlayerTime
-                  ) else { return }
-            self.state = .failed(.playerItemFailed)
-        }
-    }
-
-    private func scheduleDirectStartupProgressCheck() {
-        guard engine == nil,
-              directStartupProgressTask == nil,
-              !isStopped else { return }
+              !isStopped,
+              directPlayIntent,
+              directProgressEpoch.wasDemonstrated,
+              avPlayer.currentItem === avPlayerItem else { return }
         let item = avPlayerItem
-        let baseline = lastObservedPlayerTime
-        directStartupProgressTask = Task {
+        let transportGeneration = directTransportGeneration
+        directStallTaskGeneration &+= 1
+        let taskGeneration = directStallTaskGeneration
+        let frozenTime = lastObservedPlayerTime
+        directStallRecoveryTask = Task {
             @MainActor [weak self, weak item] in
             guard let self, let item else { return }
-            defer { self.directStartupProgressTask = nil }
+            defer {
+                if self.directStallTaskGeneration == taskGeneration {
+                    self.directStallRecoveryTask = nil
+                }
+            }
             do {
-                try await Task.sleep(
-                    nanoseconds: 30_000_000_000
-                )
+                try await Task.sleep(nanoseconds: 6_000_000_000)
             } catch {
                 return
             }
-            guard !self.isStopped,
-                  self.directPlayIntent,
-                  self.avPlayerItem === item,
-                  !Self.madeProgress(
-                    from: baseline,
+            let madeInitialProgress = Self.madeProgress(
+                    from: frozenTime,
                     to: self.lastObservedPlayerTime
-                  ) else { return }
-            self.lastFailureEvidence =
-                AetherNativePlaybackFailureEvidence(
-                    category: .routeRuntime,
-                    caseCode: "startupNoProgress",
-                    domain: "AVFoundation",
-                    code: item.error.map { ($0 as NSError).code }
-                        ?? 0
                 )
+            guard self.directStallTaskGeneration == taskGeneration,
+                  AetherNativeDirectStallDecision.shouldAct(
+                    requestedTransportGeneration: transportGeneration,
+                    currentTransportGeneration:
+                        self.directTransportGeneration,
+                    itemMatches: self.avPlayerItem === item
+                        && self.avPlayer.currentItem === item,
+                    directPlayIntent: self.directPlayIntent,
+                    demonstratedProgressInEpoch:
+                        self.directProgressEpoch.wasDemonstrated,
+                    madeProgressSinceCheckpoint: madeInitialProgress,
+                    isStopped: self.isStopped
+                  ) else { return }
+            self.avPlayer.play()
+            if self.directRateIntent != 1 {
+                self.avPlayer.rate = self.directRateIntent
+            }
+            let nudgeTime = self.lastObservedPlayerTime
             EngineLog.emit(
-                "[AetherNativePlaybackSession] startup no-progress "
-                    + "elapsed=30.000 status=\(item.status.rawValue) "
-                    + "loadedRanges=\(item.loadedTimeRanges.count)",
+                "[AetherNativePlaybackSession] direct runtime stall nudge "
+                    + "transportGeneration=\(transportGeneration)",
                 category: .session
             )
+            do {
+                try await Task.sleep(nanoseconds: 6_000_000_000)
+            } catch {
+                return
+            }
+            let madePostNudgeProgress = Self.madeProgress(
+                    from: nudgeTime,
+                    to: self.lastObservedPlayerTime
+                )
+            guard self.directStallTaskGeneration == taskGeneration,
+                  AetherNativeDirectStallDecision.shouldAct(
+                    requestedTransportGeneration: transportGeneration,
+                    currentTransportGeneration:
+                        self.directTransportGeneration,
+                    itemMatches: self.avPlayerItem === item
+                        && self.avPlayer.currentItem === item,
+                    directPlayIntent: self.directPlayIntent,
+                    demonstratedProgressInEpoch:
+                        self.directProgressEpoch.wasDemonstrated,
+                    madeProgressSinceCheckpoint: madePostNudgeProgress,
+                    isStopped: self.isStopped
+                  ) else { return }
             self.state = .failed(.playerItemFailed)
         }
     }
@@ -2006,9 +2143,10 @@ final class AetherNativePlaybackSession: ObservableObject {
         from oldTime: CMTime,
         to newTime: CMTime
     ) -> Bool {
-        guard oldTime.isNumeric,
-              newTime.isNumeric else { return false }
-        return CMTimeSubtract(newTime, oldTime).seconds > 0.1
+        AetherNativeDirectProgressEpoch.madeProgress(
+            from: oldTime,
+            to: newTime
+        )
     }
 
     private func installEngineObservers(_ engine: AetherEngine) {

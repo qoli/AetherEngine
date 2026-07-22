@@ -125,6 +125,56 @@ struct BlackCarrierFreshDemuxRestartTests {
         }
     }
 
+    private final class FreshFactoryGate: @unchecked Sendable {
+        private let condition = NSCondition()
+        private var waiterPresent = false
+        private var isOpen = false
+
+        func wait() {
+            condition.lock()
+            waiterPresent = true
+            condition.broadcast()
+            while !isOpen {
+                condition.wait()
+            }
+            condition.unlock()
+        }
+
+        func waitUntilBlocked(timeout: TimeInterval) -> Bool {
+            condition.lock()
+            defer { condition.unlock() }
+            let deadline = Date().addingTimeInterval(timeout)
+            while !waiterPresent, Date() < deadline {
+                condition.wait(until: deadline)
+            }
+            return waiterPresent && !isOpen
+        }
+
+        func release() {
+            condition.lock()
+            isOpen = true
+            condition.broadcast()
+            condition.unlock()
+        }
+    }
+
+    private final class DemuxerBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: Demuxer?
+
+        func store(_ demuxer: Demuxer) {
+            lock.lock()
+            value = demuxer
+            lock.unlock()
+        }
+
+        func load() -> Demuxer? {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
     @Test("Explicit seek cancels a blocked old demux before opening the new generation")
     func preemptsBlockedRead() throws {
         let sourceData = makeWAV(seconds: 12.25)
@@ -187,6 +237,71 @@ struct BlackCarrierFreshDemuxRestartTests {
         )
         #expect(!restarted.isEmpty)
         #expect(pump.generation == 1)
+    }
+
+    @MainActor
+    @Test("Close returns while fresh open is blocked and rejects its late generation")
+    func closeRejectsLateFreshOpen() throws {
+        let sourceData = makeWAV(seconds: 12.25)
+        let initialDemuxer = Demuxer()
+        try initialDemuxer.open(reader: DataIOReader(data: sourceData))
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(seconds: 12.25, preferredTimescale: 90_000)
+        )
+        let gate = FreshFactoryGate()
+        let freshDemuxerBox = DemuxerBox()
+        defer { gate.release() }
+        let pump = try BlackCarrierMediaFanoutPump(
+            demuxer: initialDemuxer,
+            timeline: timeline,
+            freshDemuxerFactory: {
+                gate.wait()
+                let fresh = Demuxer()
+                try fresh.open(reader: DataIOReader(data: sourceData))
+                freshDemuxerBox.store(fresh)
+                return fresh
+            },
+            ownsInitialDemuxer: true
+        )
+        _ = try #require(try pump.initSegment(ordinal: 0))
+
+        var classifier = HybridSeekIntentClassifier(timeline: timeline)
+        let intent = try classifier.registerExplicitHostSeek(
+            to: CMTime(seconds: 8.25, preferredTimescale: 90_000)
+        )
+        let restartResult = ProduceResultBox()
+        let restartFinished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            restartResult.store(Result {
+                _ = try pump.restart(for: intent)
+            })
+            restartFinished.signal()
+        }
+        #expect(gate.waitUntilBlocked(timeout: 2))
+
+        let closeStartedAt = ProcessInfo.processInfo.systemUptime
+        pump.close()
+        let closeElapsed = ProcessInfo.processInfo.systemUptime
+            - closeStartedAt
+        #expect(closeElapsed < 0.25)
+        #expect(pump.generation == 0)
+
+        gate.release()
+        #expect(restartFinished.wait(timeout: .now() + 1) == .success)
+        let result = try #require(restartResult.load())
+        switch result {
+        case .success:
+            Issue.record("Late fresh open committed after close")
+        case .failure(let error):
+            #expect(
+                error as? BlackCarrierMediaFanoutPumpError == .closed
+            )
+        }
+        #expect(pump.generation == 0)
+        let rejectedFreshDemuxer = try #require(
+            freshDemuxerBox.load()
+        )
+        #expect(rejectedFreshDemuxer.sourceContainer == .unknown)
     }
 
     @Test("Fresh-demux open failure is terminal and preserves the original cause")

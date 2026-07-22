@@ -65,6 +65,235 @@ public enum AetherPlaybackSeekResult: Sendable, Equatable {
     case superseded
 }
 
+/// Privacy-safe phase of the latest outer-session transport intent.
+public enum AetherPlaybackTransportApplicationPhase:
+    String,
+    Sendable,
+    Equatable
+{
+    case idle
+    case preparing
+    case ready
+    case applying
+    case waiting
+    case playing
+    case parkedPaused
+    case paused
+    case recovering
+    case ended
+    case failed
+    case stopped
+}
+
+public enum AetherPlaybackTimeControlStatus:
+    String,
+    Sendable,
+    Equatable
+{
+    case paused
+    case waitingToPlay
+    case playing
+    case unknown
+}
+
+public enum AetherPlaybackWaitingReason:
+    String,
+    Sendable,
+    Equatable
+{
+    case none
+    case evaluatingBufferingRate
+    case noItemToPlay
+    case minimizingStalls
+    case other
+}
+
+public enum AetherPlaybackItemStatus:
+    String,
+    Sendable,
+    Equatable
+{
+    case absent
+    case unknown
+    case readyToPlay
+    case failed
+}
+
+/// Read-only transport evidence for host diagnostics and acceptance runners.
+/// It deliberately excludes source URLs, request fields and media payloads.
+public struct AetherPlaybackTransportSnapshot:
+    Sendable,
+    Equatable
+{
+    public let commandSequence: UInt64
+    public let routeGeneration: UInt64
+    public let desiredPlaying: Bool
+    public let desiredRate: Float
+    public let route: PlaybackRenderRoute?
+    public let applicationPhase: AetherPlaybackTransportApplicationPhase
+    public let actualRate: Float
+    public let timeControlStatus: AetherPlaybackTimeControlStatus
+    public let waitingReason: AetherPlaybackWaitingReason
+    public let itemStatus: AetherPlaybackItemStatus
+    public let mediaTimeSeconds: Double?
+    public let loadedTimeRangeCount: Int
+    public let recoverySequence: UInt64
+    public let reassertCount: Int
+    public let lastReassertedCommandSequence: UInt64?
+
+    public init(
+        commandSequence: UInt64,
+        routeGeneration: UInt64,
+        desiredPlaying: Bool,
+        desiredRate: Float,
+        route: PlaybackRenderRoute?,
+        applicationPhase: AetherPlaybackTransportApplicationPhase,
+        actualRate: Float,
+        timeControlStatus: AetherPlaybackTimeControlStatus,
+        waitingReason: AetherPlaybackWaitingReason,
+        itemStatus: AetherPlaybackItemStatus,
+        mediaTimeSeconds: Double?,
+        loadedTimeRangeCount: Int,
+        recoverySequence: UInt64,
+        reassertCount: Int,
+        lastReassertedCommandSequence: UInt64?
+    ) {
+        precondition(desiredRate.isFinite && desiredRate >= 0)
+        precondition(actualRate.isFinite && actualRate >= 0)
+        if let mediaTimeSeconds {
+            precondition(
+                mediaTimeSeconds.isFinite && mediaTimeSeconds >= 0
+            )
+        }
+        precondition(loadedTimeRangeCount >= 0)
+        precondition(reassertCount >= 0)
+        self.commandSequence = commandSequence
+        self.routeGeneration = routeGeneration
+        self.desiredPlaying = desiredPlaying
+        self.desiredRate = desiredRate
+        self.route = route
+        self.applicationPhase = applicationPhase
+        self.actualRate = actualRate
+        self.timeControlStatus = timeControlStatus
+        self.waitingReason = waitingReason
+        self.itemStatus = itemStatus
+        self.mediaTimeSeconds = mediaTimeSeconds
+        self.loadedTimeRangeCount = loadedTimeRangeCount
+        self.recoverySequence = recoverySequence
+        self.reassertCount = reassertCount
+        self.lastReassertedCommandSequence =
+            lastReassertedCommandSequence
+    }
+}
+
+enum AetherPlaybackTransportOperation: Sendable, Equatable {
+    case play
+    case pause
+    case setRate(Float)
+}
+
+enum AetherPlaybackStartupFailureCase: String, Sendable, Equatable {
+    case transportIntentNotApplied
+    case startupNoProgress
+}
+
+/// Pure policy used by the async transport tasks. Keeping timing and command
+/// validity out of the Task bodies makes stale-intent and no-progress behavior
+/// deterministic under unit test.
+enum AetherPlaybackTransportDecision {
+    static func operations(
+        desiredPlaying: Bool,
+        desiredRate: Float
+    ) -> [AetherPlaybackTransportOperation] {
+        guard desiredPlaying, desiredRate.isFinite, desiredRate > 0 else {
+            return [.pause]
+        }
+        if desiredRate == 1 { return [.play] }
+        return [.play, .setRate(desiredRate)]
+    }
+
+    static func shouldReassert(
+        requestedSequence: UInt64,
+        currentSequence: UInt64,
+        requestedGeneration: UInt64,
+        currentGeneration: UInt64,
+        desiredPlaying: Bool,
+        desiredRate: Float,
+        itemIsReady: Bool,
+        actualRate: Float,
+        timeControlStatus: AetherPlaybackTimeControlStatus,
+        reassertCount: Int
+    ) -> Bool {
+        requestedSequence == currentSequence
+            && requestedGeneration == currentGeneration
+            && desiredPlaying
+            && desiredRate.isFinite
+            && desiredRate > 0
+            && itemIsReady
+            && actualRate == 0
+            && timeControlStatus == .paused
+            && reassertCount == 0
+    }
+
+    static func startupFailure(
+        requestedSequence: UInt64,
+        currentSequence: UInt64,
+        requestedGeneration: UInt64,
+        currentGeneration: UInt64,
+        desiredPlaying: Bool,
+        madeProgress: Bool,
+        itemIsReady: Bool,
+        actualRate: Float,
+        timeControlStatus: AetherPlaybackTimeControlStatus
+    ) -> AetherPlaybackStartupFailureCase? {
+        guard requestedSequence == currentSequence,
+              requestedGeneration == currentGeneration,
+              desiredPlaying,
+              !madeProgress else { return nil }
+        if itemIsReady,
+           actualRate == 0,
+           timeControlStatus == .paused {
+            return .transportIntentNotApplied
+        }
+        return .startupNoProgress
+    }
+
+    static func startupObservationDelay(
+        configuredSeconds: TimeInterval,
+        recoveryRemainingSeconds: TimeInterval?,
+        publicationHeadroomSeconds: TimeInterval
+    ) -> TimeInterval {
+        guard let recoveryRemainingSeconds else {
+            return configuredSeconds
+        }
+        return min(
+            configuredSeconds,
+            max(
+                0,
+                recoveryRemainingSeconds
+                    - publicationHeadroomSeconds
+            )
+        )
+    }
+
+    static func reconciledState(
+        requestedSequence: UInt64,
+        currentSequence: UInt64,
+        requestedGeneration: UInt64,
+        currentGeneration: UInt64,
+        desiredPlaying: Bool,
+        timeControlStatus: AetherPlaybackTimeControlStatus
+    ) -> AetherPlaybackSessionState? {
+        guard requestedSequence == currentSequence,
+              requestedGeneration == currentGeneration,
+              desiredPlaying else { return nil }
+        return switch timeControlStatus {
+        case .waitingToPlay, .playing: .playing
+        case .paused, .unknown: nil
+        }
+    }
+}
+
 public enum AetherPlaybackTrackKind: String, Sendable, Equatable {
     case audio
     case subtitle
@@ -237,8 +466,27 @@ public final class AetherPlaybackPresentationView:
     }
 }
 
+/// Narrow route boundary used by the outer session's transport coordinator.
+/// Production dispatch remains backed by `AetherActiveRouteSession`; package
+/// tests can supply a controllable route without constructing media or a
+/// second player implementation.
 @MainActor
-private enum AetherActiveRouteSession {
+protocol AetherPlaybackTransportRoute {
+    var transportIdentity: ObjectIdentifier { get }
+
+    func play() throws
+    func pause() throws
+    func setRate(_ rate: Float) throws
+    func seek(
+        to target: CMTime,
+        timeout: TimeInterval
+    ) async throws -> AetherPlaybackSeekResult
+}
+
+@MainActor
+private enum AetherActiveRouteSession:
+    AetherPlaybackTransportRoute
+{
     case native(AetherNativePlaybackSession)
     case hybrid(AetherHybridPlaybackSession)
 
@@ -246,6 +494,13 @@ private enum AetherActiveRouteSession {
         switch self {
         case .native: .nativeAVPlayer
         case .hybrid: .hybridCarrier
+        }
+    }
+
+    var transportIdentity: ObjectIdentifier {
+        switch self {
+        case .native(let session): ObjectIdentifier(session)
+        case .hybrid(let session): ObjectIdentifier(session)
         }
     }
 
@@ -633,13 +888,57 @@ private enum AetherResolvedPlaybackSource {
     }
 }
 
-private enum AetherNativePlaybackExecutionMode:
+enum AetherNativePlaybackExecutionMode:
     String,
     Sendable,
     Equatable
 {
     case directAsset
     case aetherRemux
+}
+
+/// Closed identity for the three execution paths monitored by the one outer
+/// startup watchdog. The Native render route intentionally has two execution
+/// modes; keeping them explicit here proves that neither owns a private
+/// startup watchdog or escapes Aether's same-route recovery boundary.
+enum AetherPlaybackStartupWatchdogTarget:
+    String,
+    Sendable,
+    Equatable
+{
+    case directNative
+    case nativeAudioBridge
+    case hybrid
+
+    var route: PlaybackRenderRoute {
+        switch self {
+        case .directNative, .nativeAudioBridge: .nativeAVPlayer
+        case .hybrid: .hybridCarrier
+        }
+    }
+
+    static func resolve(
+        activeRoute: PlaybackRenderRoute?,
+        nativeExecutionMode: AetherNativePlaybackExecutionMode?
+    ) -> Self? {
+        switch (activeRoute, nativeExecutionMode) {
+        case (.nativeAVPlayer, .directAsset): .directNative
+        case (.nativeAVPlayer, .aetherRemux): .nativeAudioBridge
+        case (.hybridCarrier, _): .hybrid
+        case (.nativeAVPlayer, nil), (.unsupported, _), (nil, _): nil
+        }
+    }
+}
+
+private struct AetherPendingTransportMonitoringRequest {
+    let sequence: UInt64
+    let generation: UInt64
+}
+
+private struct AetherPendingTransportStartupFailure {
+    let sequence: UInt64
+    let generation: UInt64
+    let failure: AetherPlaybackFailure
 }
 
 @MainActor
@@ -760,10 +1059,15 @@ final class AetherPlaybackOperationDeadlineRace<Value: Sendable> {
 /// transitions remain entirely inside this object.
 @MainActor
 public final class AetherPlaybackSession: ObservableObject {
-    /// Leaves the MainActor enough time to publish the typed Aether terminal
-    /// before Syncnext's outer 45-second integration guard observes the same
-    /// session. This is not an additional retry budget.
-    nonisolated static let recoveryTerminalPublicationHeadroomSeconds = 0.25
+    /// Production publication allowance retained for source compatibility
+    /// with focused policy tests. The recovery budget is the single source of
+    /// truth; this is not an additional retry window.
+    nonisolated static var recoveryTerminalPublicationHeadroomSeconds:
+        TimeInterval
+    {
+        AetherPlaybackRecoveryBudget.production
+            .startupTerminalPublicationHeadroomSeconds
+    }
 
     /// Public admission catalog for the internally owned Hybrid route.
     /// Hosts may display capability information, but cannot construct or
@@ -831,6 +1135,48 @@ public final class AetherPlaybackSession: ObservableObject {
         return session.diagnostics
     }
 
+    /// Current privacy-safe transport evidence. This is observational only;
+    /// media-time progress and presented frames remain the acceptance proof.
+    public var transportSnapshot: AetherPlaybackTransportSnapshot {
+        let item = avPlayer.currentItem
+        let time = avPlayer.currentTime()
+        let seconds = Self.transportSnapshotMediaTime(time)
+        return AetherPlaybackTransportSnapshot(
+            commandSequence: transportCommandSequence,
+            routeGeneration: transportRouteGeneration,
+            desiredPlaying: desiredPlaying,
+            desiredRate: desiredRate,
+            route: activeSession?.route ?? activeRoute,
+            applicationPhase: transportApplicationPhase(
+                item: item
+            ),
+            actualRate: avPlayer.rate,
+            timeControlStatus: Self.timeControlStatus(
+                avPlayer.timeControlStatus
+            ),
+            waitingReason: Self.waitingReason(
+                avPlayer.reasonForWaitingToPlay
+            ),
+            itemStatus: Self.itemStatus(item),
+            mediaTimeSeconds: seconds,
+            loadedTimeRangeCount: item?.loadedTimeRanges.count ?? 0,
+            recoverySequence: eventSequence,
+            reassertCount: transportReassertCount,
+            lastReassertedCommandSequence:
+                lastReassertedTransportCommandSequence
+        )
+    }
+
+    nonisolated static func transportSnapshotMediaTime(
+        _ time: CMTime
+    ) -> Double? {
+        guard time.isValid,
+              time.isNumeric,
+              time.seconds.isFinite,
+              time.seconds >= 0 else { return nil }
+        return time.seconds
+    }
+
     private let url: URL
     private let options: LoadOptions
     private let variantSelection: HLSPreflightVariantSelection
@@ -842,12 +1188,22 @@ public final class AetherPlaybackSession: ObservableObject {
     #endif
     private var resolvedSource: AetherResolvedPlaybackSource?
     private var activeSession: AetherActiveRouteSession?
+    private var transportTestRoute:
+        (any AetherPlaybackTransportRoute)?
+    private var transportRoute:
+        (any AetherPlaybackTransportRoute)?
+    {
+        if let transportTestRoute { return transportTestRoute }
+        return activeSession
+    }
     private var activeNativeExecutionMode:
         AetherNativePlaybackExecutionMode?
     private var routeCancellables = Set<AnyCancellable>()
     private var videoOutputReducer =
         AetherSessionVideoOutputReducer()
     private var currentItemObservation: NSKeyValueObservation?
+    private var transportTimeControlObservation:
+        NSKeyValueObservation?
     private var healthyProgressObserver: Any?
     private var playbackProgressEpoch = PlaybackProgressEpoch()
     private var lastConfirmedMediaTime: CMTime = .zero
@@ -857,6 +1213,18 @@ public final class AetherPlaybackSession: ObservableObject {
     private var didCompleteInitialPrepare = false
     private var desiredPlaying = false
     private var desiredRate: Float = 1
+    private var transportCommandSequence: UInt64 = 0
+    private var transportRouteGeneration: UInt64 = 0
+    private var transportReassertCount = 0
+    private var lastReassertedTransportCommandSequence: UInt64?
+    private var transportIsApplying = false
+    private var transportMonitoringGeneration: UInt64 = 0
+    private var transportReassertTask: Task<Void, Never>?
+    private var startupProgressTask: Task<Void, Never>?
+    private var pendingTransportMonitoringRequest:
+        AetherPendingTransportMonitoringRequest?
+    private var pendingTransportStartupFailure:
+        AetherPendingTransportStartupFailure?
     private var desiredSeekTarget: CMTime?
     private var desiredAudioTrackID: String?
     private var desiredSubtitleTrackID: String?
@@ -934,6 +1302,23 @@ public final class AetherPlaybackSession: ObservableObject {
                 self?.publishCurrentItem(player.currentItem)
             }
         }
+        transportTimeControlObservation = avPlayer.observe(
+            \.timeControlStatus,
+            options: [.initial, .new]
+        ) { [weak self] player, _ in
+            Task { @MainActor [weak self, weak player] in
+                guard let self, let player else { return }
+                let sequence = self.transportCommandSequence
+                let generation = self.transportRouteGeneration
+                self.reconcileObservedTransport(
+                    Self.timeControlStatus(
+                        player.timeControlStatus
+                    ),
+                    commandSequence: sequence,
+                    routeGeneration: generation
+                )
+            }
+        }
         healthyProgressObserver = avPlayer.addPeriodicTimeObserver(
             forInterval: CMTime(
                 seconds: 0.5,
@@ -968,6 +1353,13 @@ public final class AetherPlaybackSession: ObservableObject {
             didCompleteInitialPrepare = true
             isPreparingOrRecovering = false
             state = .ready
+            if desiredPlaying {
+                try applyTransportIntent(
+                    sequence: transportCommandSequence,
+                    expectedRouteGeneration:
+                        transportRouteGeneration
+                )
+            }
             resetRecoveryEpisode()
         } catch is CancellationError {
             isPreparingOrRecovering = false
@@ -1004,15 +1396,10 @@ public final class AetherPlaybackSession: ObservableObject {
         }
         desiredPlaying = true
         if desiredRate <= 0 { desiredRate = 1 }
-        guard !isPreparingOrRecovering else { return }
-        guard let activeSession else {
-            throw AetherPlaybackSessionError.noActiveRoute
-        }
-        try activeSession.play()
-        if desiredRate != 1 {
-            try activeSession.setRate(desiredRate)
-        }
-        state = .playing
+        let sequence = beginTransportCommand()
+        guard !isPreparingOrRecovering,
+              activeSeekOperationSequence == nil else { return }
+        try applyTransportIntent(sequence: sequence)
     }
 
     public func pause() throws {
@@ -1021,12 +1408,10 @@ public final class AetherPlaybackSession: ObservableObject {
             throw AetherPlaybackSessionError.invalidState
         }
         desiredPlaying = false
-        guard !isPreparingOrRecovering else { return }
-        guard let activeSession else {
-            throw AetherPlaybackSessionError.noActiveRoute
-        }
-        try activeSession.pause()
-        state = .paused
+        let sequence = beginTransportCommand()
+        guard !isPreparingOrRecovering,
+              activeSeekOperationSequence == nil else { return }
+        try applyTransportIntent(sequence: sequence)
     }
 
     public func setRate(_ rate: Float) throws {
@@ -1037,12 +1422,472 @@ public final class AetherPlaybackSession: ObservableObject {
         }
         desiredRate = rate == 0 ? max(desiredRate, 1) : rate
         desiredPlaying = rate > 0
-        guard !isPreparingOrRecovering else { return }
-        guard let activeSession else {
+        let sequence = beginTransportCommand()
+        guard !isPreparingOrRecovering,
+              activeSeekOperationSequence == nil else { return }
+        try applyTransportIntent(sequence: sequence)
+    }
+
+    @discardableResult
+    private func beginTransportCommand() -> UInt64 {
+        transportCommandSequence &+= 1
+        transportReassertCount = 0
+        lastReassertedTransportCommandSequence = nil
+        pendingTransportMonitoringRequest = nil
+        pendingTransportStartupFailure = nil
+        cancelTransportMonitoring()
+        return transportCommandSequence
+    }
+
+    /// The single outer-session transport application boundary. Every
+    /// positive-rate intent starts the route through `play()`; speed is a
+    /// second operation only when it differs from canonical 1x playback.
+    private func applyTransportIntent(
+        sequence: UInt64,
+        expectedRouteGeneration: UInt64? = nil,
+        isReassertion: Bool = false,
+        deferMonitoringUntilRecoveryHandoff: Bool = false
+    ) throws {
+        guard sequence == transportCommandSequence,
+              expectedRouteGeneration == nil
+                || expectedRouteGeneration == transportRouteGeneration else {
+            return
+        }
+        guard let transportRoute else {
             throw AetherPlaybackSessionError.noActiveRoute
         }
-        try activeSession.setRate(rate)
-        state = rate == 0 ? .paused : .playing
+        let generation = transportRouteGeneration
+        let routeIdentity = transportRoute.transportIdentity
+        transportIsApplying = true
+        defer { transportIsApplying = false }
+        for operation in AetherPlaybackTransportDecision.operations(
+            desiredPlaying: desiredPlaying,
+            desiredRate: desiredRate
+        ) {
+            switch operation {
+            case .play:
+                try transportRoute.play()
+            case .pause:
+                try transportRoute.pause()
+            case .setRate(let rate):
+                try transportRoute.setRate(rate)
+            }
+            guard sequence == transportCommandSequence,
+                  generation == transportRouteGeneration,
+                  self.transportRoute?.transportIdentity
+                    == routeIdentity else {
+                return
+            }
+        }
+        if desiredPlaying {
+            state = Self.stateAfterAppliedSeek(
+                desiredPlaying: desiredPlaying,
+                desiredRate: desiredRate,
+                carrierRate: avPlayer.rate,
+                carrierTimeControlStatus: avPlayer.timeControlStatus
+            )
+            if isReassertion {
+                transportReassertCount += 1
+                lastReassertedTransportCommandSequence = sequence
+                EngineLog.emit(
+                    "[AetherPlaybackSession] transport reasserted "
+                        + "session=\(sessionID.uuidString.prefix(8)) "
+                        + "command=\(sequence) generation=\(generation) "
+                        + "count=\(transportReassertCount)",
+                    category: .session
+                )
+            } else if deferMonitoringUntilRecoveryHandoff {
+                pendingTransportMonitoringRequest =
+                    AetherPendingTransportMonitoringRequest(
+                        sequence: sequence,
+                        generation: generation
+                    )
+            } else {
+                scheduleTransportMonitoring(
+                    sequence: sequence,
+                    generation: generation
+                )
+            }
+        } else {
+            cancelTransportMonitoring()
+            state = .paused
+        }
+    }
+
+    private func cancelTransportMonitoring() {
+        transportMonitoringGeneration &+= 1
+        transportReassertTask?.cancel()
+        transportReassertTask = nil
+        startupProgressTask?.cancel()
+        startupProgressTask = nil
+    }
+
+    private func reconcileObservedTransport(
+        _ observedStatus: AetherPlaybackTimeControlStatus,
+        commandSequence: UInt64,
+        routeGeneration: UInt64
+    ) {
+        guard !isStopped,
+              terminalFailure == nil,
+              !isPreparingOrRecovering,
+              activeSeekOperationSequence == nil else { return }
+        switch state {
+        case .ended, .failed, .stopped:
+            return
+        case .idle, .preparing, .ready, .playing, .paused,
+             .seeking, .recovering:
+            break
+        }
+        guard let reconciled = AetherPlaybackTransportDecision
+            .reconciledState(
+                requestedSequence: commandSequence,
+                currentSequence: transportCommandSequence,
+                requestedGeneration: routeGeneration,
+                currentGeneration: transportRouteGeneration,
+                desiredPlaying: desiredPlaying,
+                timeControlStatus: observedStatus
+            ) else { return }
+        state = reconciled
+    }
+
+    private func scheduleTransportMonitoring(
+        sequence: UInt64,
+        generation: UInt64
+    ) {
+        cancelTransportMonitoring()
+        let monitoringGeneration = transportMonitoringGeneration
+        let baseline = avPlayer.currentTime()
+        let watchdogTarget = AetherPlaybackStartupWatchdogTarget
+            .resolve(
+                activeRoute: activeRoute,
+                nativeExecutionMode: activeNativeExecutionMode
+            )
+        let recoveryRemaining = recoveryCoordinator
+            .episodeFirstFailure == nil ? nil
+            : currentRecoveryDeadline.remainingSeconds(
+                now: ProcessInfo.processInfo.systemUptime
+            )
+        let observation = AetherPlaybackTransportDecision
+            .startupObservationDelay(
+                configuredSeconds: recoveryBudget
+                    .startupProgressObservationSeconds,
+                recoveryRemainingSeconds: recoveryRemaining,
+                publicationHeadroomSeconds: recoveryBudget
+                    .startupTerminalPublicationHeadroomSeconds
+            )
+        transportReassertTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.transportMonitoringGeneration
+                    == monitoringGeneration {
+                    self.transportReassertTask = nil
+                }
+            }
+            do {
+                let readinessDeadline =
+                    ProcessInfo.processInfo.systemUptime + observation
+                while self.avPlayer.currentItem?.status != .readyToPlay {
+                    guard self.transportMonitoringGeneration
+                            == monitoringGeneration,
+                          self.avPlayer.currentItem?.status != .failed,
+                          ProcessInfo.processInfo.systemUptime
+                            < readinessDeadline else { return }
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                }
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+            } catch {
+                return
+            }
+            guard self.transportMonitoringGeneration
+                    == monitoringGeneration else { return }
+            let item = self.avPlayer.currentItem
+            guard AetherPlaybackTransportDecision.shouldReassert(
+                requestedSequence: sequence,
+                currentSequence: self.transportCommandSequence,
+                requestedGeneration: generation,
+                currentGeneration: self.transportRouteGeneration,
+                desiredPlaying: self.desiredPlaying,
+                desiredRate: self.desiredRate,
+                itemIsReady: item?.status == .readyToPlay,
+                actualRate: self.avPlayer.rate,
+                timeControlStatus: Self.timeControlStatus(
+                    self.avPlayer.timeControlStatus
+                ),
+                reassertCount: self.transportReassertCount
+            ) else { return }
+            do {
+                try self.applyTransportIntent(
+                    sequence: sequence,
+                    expectedRouteGeneration: generation,
+                    isReassertion: true
+                )
+            } catch {
+                self.scheduleTransportStartupRecovery(
+                    .transportIntentNotApplied,
+                    sequence: sequence,
+                    generation: generation,
+                    watchdogTarget: watchdogTarget,
+                    underlyingError: error
+                )
+            }
+        }
+
+        startupProgressTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.transportMonitoringGeneration
+                    == monitoringGeneration {
+                    self.startupProgressTask = nil
+                }
+            }
+            do {
+                if observation > 0 {
+                    try await Task.sleep(
+                        nanoseconds:
+                            UInt64(observation * 1_000_000_000)
+                    )
+                }
+            } catch {
+                return
+            }
+            guard self.transportMonitoringGeneration
+                    == monitoringGeneration else { return }
+            let item = self.avPlayer.currentItem
+            let madeProgress = Self.madeStartupProgress(
+                from: baseline,
+                to: self.avPlayer.currentTime()
+            )
+            guard let failureCase =
+                    AetherPlaybackTransportDecision.startupFailure(
+                requestedSequence: sequence,
+                currentSequence: self.transportCommandSequence,
+                requestedGeneration: generation,
+                currentGeneration: self.transportRouteGeneration,
+                desiredPlaying: self.desiredPlaying,
+                madeProgress: madeProgress,
+                itemIsReady: item?.status == .readyToPlay,
+                actualRate: self.avPlayer.rate,
+                timeControlStatus: Self.timeControlStatus(
+                    self.avPlayer.timeControlStatus
+                )
+            ) else { return }
+            let snapshot = self.transportSnapshot
+            EngineLog.emit(
+                "[AetherPlaybackSession] startup no-progress "
+                    + "session=\(self.sessionID.uuidString.prefix(8)) "
+                    + "command=\(sequence) generation=\(generation) "
+                    + "case=\(failureCase.rawValue) "
+                    + "execution=\(watchdogTarget?.rawValue ?? "unknown") "
+                    + "route=\(snapshot.route?.rawValue ?? "none") "
+                    + "phase=\(snapshot.applicationPhase.rawValue) "
+                    + "item=\(snapshot.itemStatus.rawValue) "
+                    + "timeControl=\(snapshot.timeControlStatus.rawValue) "
+                    + "loadedRanges=\(snapshot.loadedTimeRangeCount)",
+                category: .session
+            )
+            self.scheduleTransportStartupRecovery(
+                failureCase,
+                sequence: sequence,
+                generation: generation,
+                watchdogTarget: watchdogTarget
+            )
+        }
+    }
+
+    private func scheduleTransportStartupRecovery(
+        _ failureCase: AetherPlaybackStartupFailureCase,
+        sequence: UInt64,
+        generation: UInt64,
+        watchdogTarget: AetherPlaybackStartupWatchdogTarget?,
+        underlyingError: Error? = nil
+    ) {
+        guard sequence == transportCommandSequence,
+              generation == transportRouteGeneration,
+              desiredPlaying,
+              !isStopped,
+              terminalFailure == nil else { return }
+        let failure = transportStartupFailure(
+            failureCase,
+            underlyingError: underlyingError
+        )
+        EngineLog.emit(
+            "[AetherPlaybackSession] outer startup recovery "
+                + "execution=\(watchdogTarget?.rawValue ?? "unknown") "
+                + "route=\(watchdogTarget?.route.rawValue ?? activeRoute?.rawValue ?? "none") "
+                + "case=\(failureCase.rawValue)",
+            category: .session
+        )
+        if recoveryTask != nil {
+            pendingTransportStartupFailure =
+                AetherPendingTransportStartupFailure(
+                    sequence: sequence,
+                    generation: generation,
+                    failure: failure
+                )
+            EngineLog.emit(
+                "[AetherPlaybackSession] startup recovery latched "
+                    + "command=\(sequence) generation=\(generation)",
+                category: .session
+            )
+            return
+        }
+        scheduleRuntimeRecovery(failure)
+    }
+
+    @discardableResult
+    private func drainPendingTransportStartupFailure() -> Bool {
+        guard let pending = pendingTransportStartupFailure else {
+            return false
+        }
+        pendingTransportStartupFailure = nil
+        guard pending.sequence == transportCommandSequence,
+              pending.generation == transportRouteGeneration,
+              desiredPlaying,
+              !isStopped,
+              terminalFailure == nil else { return false }
+        scheduleRuntimeRecovery(pending.failure)
+        return recoveryTask != nil || terminalFailure != nil
+    }
+
+    private func drainPendingTransportMonitoringRequest() {
+        guard let pending = pendingTransportMonitoringRequest else {
+            return
+        }
+        pendingTransportMonitoringRequest = nil
+        guard recoveryTask == nil,
+              pending.sequence == transportCommandSequence,
+              pending.generation == transportRouteGeneration,
+              desiredPlaying,
+              !isStopped,
+              terminalFailure == nil else { return }
+        scheduleTransportMonitoring(
+            sequence: pending.sequence,
+            generation: pending.generation
+        )
+    }
+
+    private func completeRecoveryTransportHandoff() {
+        guard recoveryTask == nil else { return }
+        if !drainPendingTransportStartupFailure() {
+            drainPendingTransportMonitoringRequest()
+        }
+    }
+
+    private func transportStartupFailure(
+        _ failureCase: AetherPlaybackStartupFailureCase,
+        underlyingError: Error? = nil
+    ) -> AetherPlaybackFailure {
+        let nsError = underlyingError.map { $0 as NSError }
+        return AetherPlaybackFailure(
+            stage: .playback,
+            kind: .routeRuntimeFailure,
+            domain: nsError?.domain ?? "AetherPlaybackTransport",
+            code: nsError?.code ?? 0,
+            caseCode: failureCase.rawValue,
+            reason: "aether.playback.\(failureCase.rawValue)"
+        )
+    }
+
+    nonisolated static func madeStartupProgress(
+        from baseline: CMTime,
+        to current: CMTime
+    ) -> Bool {
+        guard baseline.isNumeric, current.isNumeric else { return false }
+        return CMTimeSubtract(current, baseline).seconds > 0.1
+    }
+
+    /// Package-test seam for exercising the real async outer-session command
+    /// coordinator. The controllable fake remains in the test target; this
+    /// method only installs its narrow transport boundary.
+    func installTransportRaceTestHarness(
+        _ route: any AetherPlaybackTransportRoute,
+        renderRoute: PlaybackRenderRoute = .nativeAVPlayer
+    ) {
+        precondition(state == .idle)
+        precondition(activeSession == nil)
+        precondition(transportTestRoute == nil)
+        transportTestRoute = route
+        activeRoute = renderRoute
+        didCompleteInitialPrepare = true
+        transportRouteGeneration &+= 1
+        state = .ready
+    }
+
+    /// Models a committed route rebuild for the transport race harness. The
+    /// latest outer intent is applied to the successor generation before a
+    /// delayed predecessor seek is allowed to finish.
+    func replaceTransportRaceTestRoute(
+        with route: any AetherPlaybackTransportRoute
+    ) throws {
+        precondition(transportTestRoute != nil)
+        cancelTransportMonitoring()
+        transportRouteGeneration &+= 1
+        transportTestRoute = route
+        try applyTransportIntent(
+            sequence: transportCommandSequence,
+            expectedRouteGeneration: transportRouteGeneration
+        )
+    }
+
+    /// Package-test harness for the outer watchdog boundary. It installs the
+    /// same route/execution identity and fixed AVPlayer clock observed in
+    /// production without constructing a second player implementation.
+    /// Recovery still runs through `scheduleRuntimeRecovery`, history and the
+    /// typed terminal publisher.
+    func installStartupWatchdogTestHarness(
+        target: AetherPlaybackStartupWatchdogTarget,
+        holdRecoveryOwner: Bool = false,
+        deferMonitoringUntilRecoveryHandoff: Bool = false
+    ) {
+        precondition(state == .idle)
+        resolvedSource = provisionalNativeSource()
+        activeRoute = target.route
+        activeNativeExecutionMode = switch target {
+        case .directNative: .directAsset
+        case .nativeAudioBridge: .aetherRemux
+        case .hybrid: nil
+        }
+        didCompleteInitialPrepare = true
+        desiredPlaying = true
+        desiredRate = 1
+        transportCommandSequence &+= 1
+        transportRouteGeneration &+= 1
+        let item = AVPlayerItem(
+            asset: AVURLAsset(
+                url: URL(
+                    fileURLWithPath:
+                        "/tmp/aether-startup-watchdog-test-missing"
+                )
+            )
+        )
+        avPlayer.replaceCurrentItem(with: item)
+        state = .playing
+        if holdRecoveryOwner {
+            beginRecoveryEpisodeIfNeeded(
+                transportStartupFailure(.startupNoProgress)
+            )
+            isPreparingOrRecovering = true
+            recoveryTask = Task {}
+        }
+        let request = AetherPendingTransportMonitoringRequest(
+            sequence: transportCommandSequence,
+            generation: transportRouteGeneration
+        )
+        if deferMonitoringUntilRecoveryHandoff {
+            pendingTransportMonitoringRequest = request
+        } else {
+            scheduleTransportMonitoring(
+                sequence: request.sequence,
+                generation: request.generation
+            )
+        }
+    }
+
+    func releaseStartupWatchdogTestRecoveryOwner() {
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        isPreparingOrRecovering = false
+        completeRecoveryTransportHandoff()
     }
 
     public func seek(
@@ -1058,6 +1903,10 @@ public final class AetherPlaybackSession: ObservableObject {
               terminalFailure == nil else {
             throw AetherPlaybackSessionError.invalidState
         }
+        // Seek is a new user operation even though it preserves play/pause
+        // and rate. Advance the command sequence so a pre-seek reassert or
+        // watchdog can never act on the seeking route.
+        _ = beginTransportCommand()
         resetRecoveryEpisode()
         let operationSequence = operationCoordinator.beginSeek()
         desiredSeekTarget = target
@@ -1088,14 +1937,15 @@ public final class AetherPlaybackSession: ObservableObject {
             desiredSeekTarget = nil
             return .applied
         }
-        guard let activeSession else {
+        guard let transportRoute else {
             throw AetherPlaybackSessionError.noActiveRoute
         }
+        let routeIdentity = transportRoute.transportIdentity
 
         state = .seeking
         activeSeekOperationSequence = operationSequence
         do {
-            let result = try await activeSession.seek(
+            let result = try await transportRoute.seek(
                 to: target,
                 timeout: try remainingRecoveryOperationTimeout()
             )
@@ -1108,31 +1958,20 @@ public final class AetherPlaybackSession: ObservableObject {
             guard result == .applied else {
                 return .superseded
             }
-            guard let current = self.activeSession,
-                  current.isIdentical(to: activeSession) else {
+            guard self.transportRoute?.transportIdentity
+                    == routeIdentity else {
                 throw CancellationError()
             }
-            // The route owns its seek mechanics, while the stable outer
-            // session owns the user's latest transport intent. Reassert that
-            // intent after an ended-generation seek so the public state never
-            // claims `.playing` while the real AVPlayer is still parked at
-            // rate zero. This does not select another route or source.
-            if desiredPlaying {
-                try activeSession.play()
-                try activeSession.setRate(desiredRate)
-            } else {
-                try activeSession.pause()
-            }
+            // The route owns seek mechanics; the stable outer session owns
+            // the newest transport command. A late seek completion may only
+            // apply that still-current command to the still-current route.
+            try applyTransportIntent(
+                sequence: transportCommandSequence,
+                expectedRouteGeneration: transportRouteGeneration
+            )
             lastConfirmedMediaTime = target
             lastAppliedSeekOperationSequence = operationSequence
             desiredSeekTarget = nil
-            state = Self.stateAfterAppliedSeek(
-                desiredPlaying: desiredPlaying,
-                desiredRate: desiredRate,
-                carrierRate: avPlayer.rate,
-                carrierTimeControlStatus:
-                    avPlayer.timeControlStatus
-            )
             return .applied
         } catch is CancellationError {
             if activeSeekOperationSequence == operationSequence {
@@ -1230,6 +2069,81 @@ public final class AetherPlaybackSession: ObservableObject {
             (carrierRate.isFinite && carrierRate > 0)
                 || carrierTimeControlStatus != .paused
         return carrierHasPlaybackIntent ? .playing : .paused
+    }
+
+    nonisolated static func timeControlStatus(
+        _ status: AVPlayer.TimeControlStatus
+    ) -> AetherPlaybackTimeControlStatus {
+        switch status {
+        case .paused: .paused
+        case .waitingToPlayAtSpecifiedRate: .waitingToPlay
+        case .playing: .playing
+        @unknown default: .unknown
+        }
+    }
+
+    nonisolated static func waitingReason(
+        _ reason: AVPlayer.WaitingReason?
+    ) -> AetherPlaybackWaitingReason {
+        guard let reason else { return .none }
+        if reason == .evaluatingBufferingRate {
+            return .evaluatingBufferingRate
+        }
+        if reason == .noItemToPlay {
+            return .noItemToPlay
+        }
+        if reason == .toMinimizeStalls {
+            return .minimizingStalls
+        }
+        return .other
+    }
+
+    nonisolated static func itemStatus(
+        _ item: AVPlayerItem?
+    ) -> AetherPlaybackItemStatus {
+        guard let item else { return .absent }
+        switch item.status {
+        case .unknown: return .unknown
+        case .readyToPlay: return .readyToPlay
+        case .failed: return .failed
+        @unknown default: return .unknown
+        }
+    }
+
+    private func transportApplicationPhase(
+        item: AVPlayerItem?
+    ) -> AetherPlaybackTransportApplicationPhase {
+        if isStopped { return .stopped }
+        if terminalFailure != nil { return .failed }
+        if state == .ended { return .ended }
+        if isPreparingOrRecovering {
+            return didCompleteInitialPrepare ? .recovering : .preparing
+        }
+        if transportIsApplying { return .applying }
+        guard desiredPlaying, desiredRate > 0 else {
+            return switch state {
+            case .idle: .idle
+            case .preparing: .preparing
+            case .ready: .ready
+            case .recovering: .recovering
+            case .ended: .ended
+            case .failed: .failed
+            case .stopped: .stopped
+            case .playing, .paused, .seeking: .paused
+            }
+        }
+        switch avPlayer.timeControlStatus {
+        case .playing:
+            return .playing
+        case .waitingToPlayAtSpecifiedRate:
+            return .waiting
+        case .paused:
+            if avPlayer.rate > 0 { return .playing }
+            return item?.status == .readyToPlay
+                ? .parkedPaused : .applying
+        @unknown default:
+            return .applying
+        }
     }
 
     /// Recovery capability differences are meaningful only after the outer
@@ -1732,12 +2646,15 @@ public final class AetherPlaybackSession: ObservableObject {
     public func stop() {
         guard !isStopped else { return }
         isStopped = true
+        cancelTransportMonitoring()
+        transportRouteGeneration &+= 1
         routeTransactions.invalidate()
         recoveryTask?.cancel()
         recoveryTask = nil
         routeCancellables.removeAll()
         activeSession?.stop()
         activeSession = nil
+        transportTestRoute = nil
         restoreRouteNeutralPlayerCapabilities()
         invalidateVideoOutputRoute()
         activeNativeExecutionMode = nil
@@ -1746,6 +2663,8 @@ public final class AetherPlaybackSession: ObservableObject {
         avPlayer.replaceCurrentItem(with: nil)
         currentItemObservation?.invalidate()
         currentItemObservation = nil
+        transportTimeControlObservation?.invalidate()
+        transportTimeControlObservation = nil
         if let healthyProgressObserver {
             avPlayer.removeTimeObserver(healthyProgressObserver)
             self.healthyProgressObserver = nil
@@ -1920,29 +2839,57 @@ public final class AetherPlaybackSession: ObservableObject {
         // that exact admitted route without inventing another source.
         resolvedSource = source
         let transaction = routeTransactions.begin()
-        let route = try await makeRouteSession(
-            source,
-            decoderPreference: decoderPreference,
-            transaction: transaction
-        )
+        let route: AetherActiveRouteSession
+        do {
+            route = try await makeRouteSession(
+                source,
+                decoderPreference: decoderPreference,
+                transaction: transaction
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw failure(stage: .routeCreation, error: error)
+                .recordingRecoveryDiagnostic(step: .install)
+        }
         do {
             try requireCurrentRouteTransaction(transaction)
+            try install(
+                route,
+                source: source,
+                transaction: transaction
+            )
+        } catch is CancellationError {
+            route.stop()
+            throw CancellationError()
         } catch {
             route.stop()
-            throw error
+            throw failure(stage: .routeCreation, error: error)
+                .recordingRecoveryDiagnostic(step: .install)
         }
-        try install(
-            route,
-            source: source,
-            transaction: transaction
-        )
-        try await route.prepare()
-        try requireCurrentRouteTransaction(transaction)
-        try commit(
-            route,
-            source: source,
-            transaction: transaction
-        )
+        do {
+            try await route.prepare()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw failure(stage: .preparation, error: error)
+                .recordingRecoveryDiagnostic(step: .prepare)
+        }
+        do {
+            try requireCurrentRouteTransaction(transaction)
+            try commit(
+                route,
+                source: source,
+                transaction: transaction
+            )
+        } catch is CancellationError {
+            route.stop()
+            throw CancellationError()
+        } catch {
+            route.stop()
+            throw failure(stage: .routeCreation, error: error)
+                .recordingRecoveryDiagnostic(step: .install)
+        }
         publishCurrentItem(avPlayer.currentItem)
     }
 
@@ -2096,6 +3043,8 @@ public final class AetherPlaybackSession: ObservableObject {
         guard routeTransactions.isActive(transaction) else {
             throw CancellationError()
         }
+        cancelTransportMonitoring()
+        transportRouteGeneration &+= 1
         routeCancellables.removeAll()
         activeSession = session
         resolvedSource = source
@@ -2254,7 +3203,9 @@ public final class AetherPlaybackSession: ObservableObject {
         case .playing: if !isPreparingOrRecovering { state = .playing }
         case .paused: if !isPreparingOrRecovering { state = .paused }
         case .seeking: if !isPreparingOrRecovering { state = .seeking }
-        case .ended: state = .ended
+        case .ended:
+            cancelTransportMonitoring()
+            state = .ended
         case .failed(let failure):
             guard didCompleteInitialPrepare,
                   !isPreparingOrRecovering,
@@ -2281,6 +3232,7 @@ public final class AetherPlaybackSession: ObservableObject {
         case .seeking:
             if !isPreparingOrRecovering { state = .seeking }
         case .ended:
+            cancelTransportMonitoring()
             state = .ended
         case .failed(let error):
             guard didCompleteInitialPrepare,
@@ -2372,6 +3324,7 @@ public final class AetherPlaybackSession: ObservableObject {
                 )
             }
             self.recoveryTask = nil
+            self.completeRecoveryTransportHandoff()
         }
     }
 
@@ -2656,7 +3609,10 @@ public final class AetherPlaybackSession: ObservableObject {
         let selectionCompatibleAlternate:
             AetherResolvedPlaybackSource? = alternate.flatMap {
                 source -> AetherResolvedPlaybackSource? in
-            guard permitsRouteTransition(after: latestFailure) else {
+            guard permitsRouteTransition(after: latestFailure),
+                  PlaybackRecoveryDecision.permitsRouteTransition(
+                    afterInitialFailure: initialFailure
+                  ) else {
                 return nil
             }
             return source
@@ -2748,6 +3704,7 @@ public final class AetherPlaybackSession: ObservableObject {
                 from: initialFailure,
                 duringInitialPrepare: duringInitialPrepare
             ) {
+                completeRecoveryTransportHandoff()
                 return
             }
             let terminal = finishRecoveryAsTerminal(
@@ -2831,25 +3788,44 @@ public final class AetherPlaybackSession: ObservableObject {
     ) async throws {
         let stage: AetherPlaybackRecoveryStage =
             duringInitialPrepare ? .preparation : .playback
-        let deadline = try operationDeadline(stage: stage)
-        let race = AetherPlaybackOperationDeadlineRace<Void>()
-        try await race.run(
-            timeout: deadline.timeout,
-            timeoutFailure: deadline.failure,
-            onAbandon: { [weak self] in
-                self?.teardownActiveRoute()
+        let episodeRemaining = currentRecoveryDeadline.remainingSeconds(
+            now: ProcessInfo.processInfo.systemUptime
+        )
+        let envelope = try Self.recoveryContextRestoreDeadline(
+            stage: stage,
+            firstStep: duringInitialPrepare
+                ? .contextApply
+                : .contextSeek,
+            budget: recoveryBudget,
+            episodeRemainingSeconds: episodeRemaining,
+            now: ProcessInfo.processInfo.systemUptime
+        )
+        if !duringInitialPrepare {
+            try await performRecoveryContextOperation(
+                step: .contextSeek,
+                stage: stage,
+                deadline: envelope.deadline,
+                timeoutFailure: envelope.failure
+            ) { [self] in
+                try await restorePlaybackContextSeek(
+                    context,
+                    deadline: envelope.deadline
+                )
             }
+        }
+        try await performRecoveryContextOperation(
+            step: .contextApply,
+            stage: stage,
+            deadline: envelope.deadline,
+            timeoutFailure: envelope.failure
         ) { [self] in
-            try await restorePlaybackContextWithoutDeadline(
-                context,
-                duringInitialPrepare: duringInitialPrepare
-            )
+            try await applyRestoredPlaybackContext()
         }
     }
 
-    private func restorePlaybackContextWithoutDeadline(
+    private func restorePlaybackContextSeek(
         _ context: AetherPlaybackContextSnapshot,
-        duringInitialPrepare: Bool
+        deadline: PlaybackRecoveryDeadline
     ) async throws {
         guard let activeSession else {
             throw AetherPlaybackSessionError.noActiveRoute
@@ -2865,23 +3841,49 @@ public final class AetherPlaybackSession: ObservableObject {
             }
         }
         let resumeTime = desiredSeekTarget ?? context.position
-        if !duringInitialPrepare,
-           resumeTime.isValid,
-           resumeTime.isNumeric,
-           resumeTime.seconds.isFinite,
-           resumeTime.seconds >= 0 {
-            let seekResult = try await activeSession.seek(
-                to: resumeTime,
-                timeout: try remainingRecoveryOperationTimeout()
-            )
-            guard seekResult == .applied else {
+        guard resumeTime.isValid,
+              resumeTime.isNumeric,
+              resumeTime.seconds.isFinite,
+              resumeTime.seconds >= 0 else {
+            return
+        }
+        let seekTimeout = deadline.remainingSeconds(
+            now: ProcessInfo.processInfo.systemUptime
+        )
+        guard seekTimeout > 0 else {
+            throw AetherPlaybackSessionError
+                .recoveryDeadlineExceeded(
+                    seconds:
+                        recoveryBudget.maximumEpisodeDurationSeconds
+                )
+        }
+        let seekResult = try await activeSession.seek(
+            to: resumeTime,
+            timeout: seekTimeout
+        )
+        guard seekResult == .applied else {
+            throw CancellationError()
+        }
+        try requireCurrentRoute()
+        lastConfirmedMediaTime = resumeTime
+        if desiredSeekTarget != nil {
+            lastAppliedSeekOperationSequence =
+                operationCoordinator.latestSeekSequence
+        }
+    }
+
+    private func applyRestoredPlaybackContext() async throws {
+        guard let activeSession else {
+            throw AetherPlaybackSessionError.noActiveRoute
+        }
+        guard let routeTransaction = routeTransactions.activeSequence else {
+            throw CancellationError()
+        }
+        func requireCurrentRoute() throws {
+            guard routeTransactions.isActive(routeTransaction),
+                  let current = self.activeSession,
+                  current.isIdentical(to: activeSession) else {
                 throw CancellationError()
-            }
-            try requireCurrentRoute()
-            lastConfirmedMediaTime = resumeTime
-            if desiredSeekTarget != nil {
-                lastAppliedSeekOperationSequence =
-                    operationCoordinator.latestSeekSequence
             }
         }
         try requireCurrentRoute()
@@ -2941,14 +3943,77 @@ public final class AetherPlaybackSession: ObservableObject {
         try requireCurrentRoute()
         publishTrackState(from: activeSession)
         publishCapabilities()
-        if desiredPlaying {
-            try activeSession.play()
-            if desiredRate != 1 {
-                try activeSession.setRate(desiredRate)
-            }
-            state = .playing
+        if desiredPlaying || didCompleteInitialPrepare {
+            try applyTransportIntent(
+                sequence: transportCommandSequence,
+                expectedRouteGeneration: transportRouteGeneration,
+                deferMonitoringUntilRecoveryHandoff: true
+            )
         } else {
-            state = didCompleteInitialPrepare ? .paused : .ready
+            state = .ready
+        }
+    }
+
+    nonisolated static func recoveryContextRestoreDeadline(
+        stage: AetherPlaybackRecoveryStage,
+        firstStep: AetherPlaybackRecoveryStep,
+        budget: AetherPlaybackRecoveryBudget,
+        episodeRemainingSeconds: TimeInterval,
+        now: TimeInterval
+    ) throws -> (
+        deadline: PlaybackRecoveryDeadline,
+        failure: AetherPlaybackFailure
+    ) {
+        precondition(now.isFinite)
+        let failure = Self.operationDeadlineFailure(
+            stage: stage,
+            seconds: budget.maximumEpisodeDurationSeconds
+        ).recordingRecoveryDiagnostic(step: firstStep)
+        guard let timeout = budget
+                .recoveryContextRestoreTimeout(
+                    episodeRemainingSeconds: episodeRemainingSeconds
+                ) else {
+            throw failure
+        }
+        return (
+            PlaybackRecoveryDeadline(
+                startedAt: now,
+                durationSeconds: timeout
+            ),
+            failure
+        )
+    }
+
+    private func performRecoveryContextOperation<Value: Sendable>(
+        step: AetherPlaybackRecoveryStep,
+        stage: AetherPlaybackRecoveryStage,
+        deadline: PlaybackRecoveryDeadline,
+        timeoutFailure: AetherPlaybackFailure,
+        operation: @escaping @MainActor @Sendable () async throws -> Value
+    ) async throws -> Value {
+        let timeout = deadline.remainingSeconds(
+            now: ProcessInfo.processInfo.systemUptime
+        )
+        let steppedTimeout = timeoutFailure
+            .recordingRecoveryDiagnostic(step: step)
+        guard timeout > 0 else { throw steppedTimeout }
+        do {
+            return try await AetherPlaybackOperationDeadlineRace<Value>()
+                .run(
+                    timeout: timeout,
+                    timeoutFailure: steppedTimeout,
+                    onAbandon: { [weak self] in
+                        self?.teardownActiveRoute()
+                    },
+                    operation: operation
+                )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let failure as AetherPlaybackFailure {
+            throw failure.recordingRecoveryDiagnostic(step: step)
+        } catch {
+            throw failure(stage: stage, error: error)
+                .recordingRecoveryDiagnostic(step: step)
         }
     }
 
@@ -3211,7 +4276,8 @@ public final class AetherPlaybackSession: ObservableObject {
                 0,
                 currentRecoveryDeadline.remainingSeconds(
                     now: ProcessInfo.processInfo.systemUptime
-                ) - Self.recoveryTerminalPublicationHeadroomSeconds
+                ) - recoveryBudget
+                    .startupTerminalPublicationHeadroomSeconds
             )
         } else if let initialPreparationDeadline {
             totalBudget = recoveryBudget.initialPreparationSettleSeconds
@@ -3434,6 +4500,8 @@ public final class AetherPlaybackSession: ObservableObject {
             domain: evidence.underlyingDomain,
             code: evidence.underlyingCode,
             caseCode: publicHybridCaseCode(evidence.caseCode),
+            recoveryTrigger: evidence.recoveryTrigger,
+            recoveryStep: evidence.recoveryStep,
             reason: "hybrid.\(evidence.stage.rawValue).\(evidence.caseCode)"
         )
     }
@@ -3444,7 +4512,8 @@ public final class AetherPlaybackSession: ObservableObject {
         _ caseCode: String
     ) -> String? {
         switch caseCode {
-        case "progressive.audioMuxer.emptySegment": caseCode
+        case "progressive.audioMuxer.emptySegment",
+             "presentationRebuildTimedOut": caseCode
         default: nil
         }
     }
@@ -3886,11 +4955,14 @@ public final class AetherPlaybackSession: ObservableObject {
     }
 
     private func teardownActiveRoute() {
+        cancelTransportMonitoring()
+        transportRouteGeneration &+= 1
         routeTransactions.invalidate()
         routeCancellables.removeAll()
         activeSession?.cancelAudioAnalysisStreams()
         activeSession?.stop()
         activeSession = nil
+        transportTestRoute = nil
         restoreRouteNeutralPlayerCapabilities()
         invalidateVideoOutputRoute()
         presentationView.install(nil)

@@ -158,6 +158,47 @@ struct HybridPlaybackSessionTests {
         }
     }
 
+    private final class CloseProbeIOReader:
+        IOReader,
+        @unchecked Sendable
+    {
+        private let base: DataIOReader
+        private let lock = NSLock()
+        private var closed = false
+
+        init(data: Data) {
+            base = DataIOReader(data: data)
+        }
+
+        func read(
+            _ buffer: UnsafeMutablePointer<UInt8>?,
+            size: Int32
+        ) -> Int32 {
+            base.read(buffer, size: size)
+        }
+
+        func seek(offset: Int64, whence: Int32) -> Int64 {
+            base.seek(offset: offset, whence: whence)
+        }
+
+        func cancel() {
+            base.cancel()
+        }
+
+        func close() {
+            base.close()
+            lock.lock()
+            closed = true
+            lock.unlock()
+        }
+
+        var wasClosed: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return closed
+        }
+    }
+
     private class Provider:
         HybridCarrierTransportProvider,
         HybridAudioAnalysisSource,
@@ -485,6 +526,7 @@ struct HybridPlaybackSessionTests {
         private(set) var didStop = false
         private(set) var seekTargets: [CMTime] = []
         var onSeek: (@MainActor (CMTime) -> Void)?
+        var onStop: (@MainActor () -> Void)?
 
         func startPrepared() throws {
             didStart = true
@@ -513,6 +555,7 @@ struct HybridPlaybackSessionTests {
             didStop = true
             avPlayer.pause()
             avPlayer.replaceCurrentItem(with: nil)
+            onStop?()
         }
     }
 
@@ -2162,6 +2205,231 @@ struct HybridPlaybackSessionTests {
         #expect(fixture.transport.didStop)
     }
 
+    @Test("Timed-out production restart tears down before blocked fresh open returns")
+    @MainActor
+    func productionRestartTimeoutRejectsLateFreshOpen() async throws {
+        let sourceData = makeAnalysisWAV(seconds: 5.25)
+        let initialDemuxer = Demuxer()
+        try initialDemuxer.open(
+            reader: DataIOReader(data: sourceData)
+        )
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(
+                seconds: 5.25,
+                preferredTimescale: 90_000
+            )
+        )
+        let freshOpenGate = RestartGate()
+        let freshReader = CloseProbeIOReader(data: sourceData)
+        let pump = try BlackCarrierMediaFanoutPump(
+            demuxer: initialDemuxer,
+            timeline: timeline,
+            freshDemuxerFactory: {
+                freshOpenGate.wait()
+                let fresh = Demuxer()
+                try fresh.open(reader: freshReader)
+                fresh.adoptOwnedReader(freshReader)
+                return fresh
+            },
+            ownsInitialDemuxer: true
+        )
+        let provider = try BlackCarrierLazyCompositeProvider(
+            videoProvider: try BlackCarrierVideoProvider(
+                timeline: timeline
+            ),
+            pump: pump
+        )
+        let relay = HybridPlaybackFrameRelay()
+        let transport = Transport()
+        transport.onStop = { provider.close() }
+        let session = try HybridPlaybackSession(
+            provider: provider,
+            transport: transport,
+            renderSurface: RenderSurface(),
+            timeline: timeline,
+            relay: relay,
+            allowsAudioOnlyCarrier: true,
+            internalPresentationRebuildTimeout: 0.05
+        )
+        defer {
+            freshOpenGate.release()
+            session.stop()
+            provider.close()
+        }
+        try await session.prepare(timeout: 1)
+
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        session.handleCarrierStall()
+        let freshOpenBlocked = await waitUntilResult {
+            freshOpenGate.isWaiting
+        }
+        #expect(freshOpenBlocked, "Production fresh open was not entered")
+        let terminalPublished = await waitUntilResult {
+            if case .failed = session.state { return true }
+            return false
+        }
+        #expect(terminalPublished, "Restart timeout did not publish terminal state")
+        let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
+
+        guard case .failed(.providerFailed(let evidence)) =
+                session.state else {
+            Issue.record("Expected typed production restart timeout")
+            return
+        }
+        #expect(evidence.caseCode == "presentationRebuildTimedOut")
+        #expect(evidence.recoveryTrigger == .playbackStalled)
+        #expect(evidence.recoveryStep == .providerRestart)
+        #expect(transport.didStop)
+        #expect(elapsed < 0.5)
+        #expect(freshOpenGate.isWaiting)
+        #expect(pump.generation == 0)
+
+        freshOpenGate.release()
+        let rejectedFreshWasClosed = await waitUntilResult {
+            freshReader.wasClosed
+        }
+        #expect(rejectedFreshWasClosed, "Rejected fresh demuxer was not closed")
+        #expect(pump.generation == 0)
+    }
+
+    @Test("Paused seek enters restart before a blocked decode demand retires")
+    @MainActor
+    func pausedSeekPreemptsBlockedDecodeDemand() async throws {
+        let fixture = try makeSession()
+        defer { fixture.session.stop() }
+        try await fixture.session.prepare(timeout: 1)
+        try await waitUntil {
+            !fixture.provider.snapshot().demands.isEmpty
+        }
+        try fixture.session.pause()
+
+        let gate = RestartGate()
+        defer { gate.release() }
+        fixture.provider.configureDecodeDemandGate(gate)
+        fixture.session.handleClockTick(
+            CMTime(
+                seconds: 1,
+                preferredTimescale: 600
+            )
+        )
+        try await waitUntil { gate.isWaiting }
+
+        let target = CMTime(
+            seconds: 1.25,
+            preferredTimescale: 600
+        )
+        let seek = Task { @MainActor in
+            try await fixture.session.seek(
+                to: target,
+                timeout: 2
+            )
+        }
+
+        // Production restart marks the retiring progressive demuxer closed
+        // before waiting on its pump lock. Reaching this provider call while
+        // the old demand is still blocked proves the control operation is no
+        // longer queued behind that demand on the coordinator actor.
+        let restartEnteredBeforeDemandRetired = await waitUntilResult {
+            !fixture.provider.snapshot().restarts.isEmpty
+                && gate.isWaiting
+        }
+        #expect(restartEnteredBeforeDemandRetired)
+
+        gate.release()
+        #expect(
+            try await seek.value
+                == .applied(generation: 1, target: target)
+        )
+        #expect(fixture.session.state == .ready(generation: 1))
+        #expect(fixture.provider.snapshot().restarts.count == 1)
+    }
+
+    @Test("Playback stall rebuild timeout retains a closed trigger and step")
+    @MainActor
+    func playbackStallRebuildTimeoutEvidence() async throws {
+        let fixture = try makeSession(
+            internalPresentationRebuildTimeout: 0.05
+        )
+        defer { fixture.session.stop() }
+        try await fixture.session.prepare(timeout: 1)
+        fixture.provider.configurePreparedGenerationFrameTimes([])
+
+        fixture.session.handleCarrierStall()
+        try await waitUntil {
+            if case .failed = fixture.session.state { return true }
+            return false
+        }
+
+        guard case .failed(.providerFailed(let evidence)) =
+                fixture.session.state else {
+            Issue.record("Expected typed presentation rebuild timeout")
+            return
+        }
+        #expect(evidence.caseCode == "presentationRebuildTimedOut")
+        #expect(evidence.recoveryTrigger == .playbackStalled)
+        #expect(evidence.recoveryStep == .presentationReadiness)
+    }
+
+    @Test("Time jump rebuild timeout retains a closed trigger and step")
+    @MainActor
+    func timeJumpRebuildTimeoutEvidence() async throws {
+        let fixture = try makeSession(
+            internalPresentationRebuildTimeout: 0.05
+        )
+        defer { fixture.session.stop() }
+        try await fixture.session.prepare(timeout: 1)
+        fixture.provider.configurePreparedGenerationFrameTimes([])
+        fixture.session.handleClockTick(.zero)
+        fixture.transport.setCurrentTime(
+            CMTime(seconds: 1, preferredTimescale: 600)
+        )
+        let item = try #require(fixture.session.avPlayer.currentItem)
+
+        NotificationCenter.default.post(
+            name: AVPlayerItem.timeJumpedNotification,
+            object: item
+        )
+        try await waitUntil {
+            if case .failed = fixture.session.state { return true }
+            return false
+        }
+
+        guard case .failed(.providerFailed(let evidence)) =
+                fixture.session.state else {
+            Issue.record("Expected typed presentation rebuild timeout")
+            return
+        }
+        #expect(evidence.recoveryTrigger == .timeJump)
+        #expect(evidence.recoveryStep == .presentationReadiness)
+    }
+
+    @Test("Media selection rebuild timeout retains a closed trigger and step")
+    @MainActor
+    func mediaSelectionRebuildTimeoutEvidence() async throws {
+        let fixture = try makeSession(
+            internalPresentationRebuildTimeout: 0.05
+        )
+        defer { fixture.session.stop() }
+        try await fixture.session.prepare(timeout: 1)
+        fixture.provider.configurePreparedGenerationFrameTimes([])
+
+        fixture.session.handleCarrierMediaSelectionChange(
+            selectedAudioOptionIndex: nil
+        )
+        try await waitUntil {
+            if case .failed = fixture.session.state { return true }
+            return false
+        }
+
+        guard case .failed(.providerFailed(let evidence)) =
+                fixture.session.state else {
+            Issue.record("Expected typed presentation rebuild timeout")
+            return
+        }
+        #expect(evidence.recoveryTrigger == .mediaSelection)
+        #expect(evidence.recoveryStep == .presentationReadiness)
+    }
+
     @Test("Route implementation reports decoder failure and tears down its generation")
     @MainActor
     func decoderFailureIsReportedToUnifiedCoordinator() async throws {
@@ -2366,6 +2634,30 @@ struct HybridPlaybackSessionTests {
         #expect(fixture.session.state == .ready(generation: 0))
     }
 
+    @Test("Hybrid route play canonicalizes a stale non-unit rate")
+    @MainActor
+    func canonicalPlayResetsHybridResumeRate() async throws {
+        let fixture = try makeSession()
+        defer { fixture.session.stop() }
+        try await fixture.session.prepare(timeout: 1)
+
+        try fixture.session.setRate(1.5)
+        #expect(fixture.session.transportWantsPlayback)
+        #expect(fixture.session.transportResumeRate == 1.5)
+        try fixture.session.pause()
+        #expect(!fixture.session.transportWantsPlayback)
+        #expect(fixture.session.transportResumeRate == 1.5)
+
+        try fixture.session.play()
+        #expect(fixture.session.transportWantsPlayback)
+        #expect(fixture.session.transportResumeRate == 1)
+
+        // The unified outer session preserves an explicit non-1x command by
+        // applying it after canonical play.
+        try fixture.session.setRate(1.25)
+        #expect(fixture.session.transportResumeRate == 1.25)
+    }
+
     @Test("Repeated unit rate never synchronously samples provider telemetry")
     @MainActor
     func repeatedUnitRateDoesNotSynchronouslySampleProviderTelemetry()
@@ -2527,7 +2819,8 @@ struct HybridPlaybackSessionTests {
     private func makeSession(
         videoFormat: VideoFormat = .sdr,
         retainsFramesUntilCapacityCallback: Bool = false,
-        synchronouslyReleasesAcceptedFrames: Bool = false
+        synchronouslyReleasesAcceptedFrames: Bool = false,
+        internalPresentationRebuildTimeout: TimeInterval = 15
     ) throws -> (
         session: HybridPlaybackSession,
         provider: Provider,
@@ -2558,7 +2851,9 @@ struct HybridPlaybackSessionTests {
             transport: transport,
             renderSurface: renderSurface,
             timeline: timeline,
-            relay: relay
+            relay: relay,
+            internalPresentationRebuildTimeout:
+                internalPresentationRebuildTimeout
         )
         return (
             session,

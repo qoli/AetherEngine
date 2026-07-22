@@ -6,6 +6,7 @@ protocol TransportControllable: AnyObject {
     func play()
     func pause()
     func setRate(_ rate: Float)
+    var rate: Float { get }
     var volume: Float { get set }
 }
 

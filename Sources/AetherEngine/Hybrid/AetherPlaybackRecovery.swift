@@ -33,6 +33,36 @@ public enum AetherPlaybackFailureKind:
     case invariantViolation
 }
 
+/// Closed, privacy-safe cause for an engine-owned presentation rebuild.
+/// Values describe only the local AVPlayer signal; no source identity or
+/// framework-provided reason text crosses the public boundary.
+public enum AetherPlaybackRecoveryTrigger:
+    String,
+    Sendable,
+    Equatable
+{
+    case playbackStalled
+    case timeJump
+    case mediaSelection
+}
+
+/// Closed operation phase attached to recovery failures and history. This is
+/// diagnostic evidence only and never grants another route, source or retry.
+public enum AetherPlaybackRecoveryStep:
+    String,
+    Sendable,
+    Equatable
+{
+    case providerRestart
+    case carrierSeek
+    case providerPrepare
+    case presentationReadiness
+    case install
+    case prepare
+    case contextSeek
+    case contextApply
+}
+
 /// Privacy-safe failure retained by the unified playback session.
 ///
 /// URL values, HTTP fields, cookies and arbitrary server response bodies are
@@ -51,6 +81,8 @@ public struct AetherPlaybackFailure:
     /// Optional closed machine code for the concrete failure case. It never
     /// contains a URL, response text, request field or credential.
     public let caseCode: String?
+    public let recoveryTrigger: AetherPlaybackRecoveryTrigger?
+    public let recoveryStep: AetherPlaybackRecoveryStep?
     public let reason: String
 
     public init(
@@ -59,6 +91,8 @@ public struct AetherPlaybackFailure:
         domain: String,
         code: Int,
         caseCode: String? = nil,
+        recoveryTrigger: AetherPlaybackRecoveryTrigger? = nil,
+        recoveryStep: AetherPlaybackRecoveryStep? = nil,
         reason: String
     ) {
         self.stage = stage
@@ -66,10 +100,30 @@ public struct AetherPlaybackFailure:
         self.domain = domain
         self.code = code
         self.caseCode = caseCode
+        self.recoveryTrigger = recoveryTrigger
+        self.recoveryStep = recoveryStep
         self.reason = reason
     }
 
     public var errorDescription: String? { reason }
+}
+
+extension AetherPlaybackFailure {
+    func recordingRecoveryDiagnostic(
+        trigger: AetherPlaybackRecoveryTrigger? = nil,
+        step: AetherPlaybackRecoveryStep
+    ) -> AetherPlaybackFailure {
+        AetherPlaybackFailure(
+            stage: stage,
+            kind: kind,
+            domain: domain,
+            code: code,
+            caseCode: caseCode,
+            recoveryTrigger: trigger ?? recoveryTrigger,
+            recoveryStep: step,
+            reason: reason
+        )
+    }
 }
 
 /// The single terminal outcome issued by a playback session. The first
@@ -120,7 +174,35 @@ public struct AetherPlaybackRecoveryBudget:
     public let initialPreparationSettleSeconds: TimeInterval
     /// Wall-clock limit shared by every action in one recovery episode.
     public let maximumEpisodeDurationSeconds: TimeInterval
+    /// Time allowed for a positive transport intent to demonstrate real
+    /// media-time progress before Aether begins one recovery episode.
+    public let startupProgressObservationSeconds: TimeInterval
+    /// MainActor publication allowance after the recovery episode closes.
+    /// This is not an additional retry or observation budget.
+    public let startupTerminalPublicationHeadroomSeconds: TimeInterval
     public let healthyProgressResetSeconds: TimeInterval
+
+    /// Maximum time from a startup transport command to Aether's typed
+    /// progress or terminal outcome. Hosts may add only their own polling
+    /// granularity; they must not pre-empt this engine-owned window.
+    public var maximumStartupOutcomeSeconds: TimeInterval {
+        startupProgressObservationSeconds
+            + maximumEpisodeDurationSeconds
+            + startupTerminalPublicationHeadroomSeconds
+    }
+
+    /// The context restore is part of the already-open recovery episode, not
+    /// a fresh preparation operation. It may use the episode's actual
+    /// remaining time while preserving the terminal publication allowance.
+    /// Returning nil means no operation may start without stealing headroom.
+    func recoveryContextRestoreTimeout(
+        episodeRemainingSeconds: TimeInterval
+    ) -> TimeInterval? {
+        guard episodeRemainingSeconds.isFinite else { return nil }
+        let timeout = episodeRemainingSeconds
+            - startupTerminalPublicationHeadroomSeconds
+        return timeout > 0 ? timeout : nil
+    }
 
     public init(
         maximumTransportAttempts: Int = 3,
@@ -129,6 +211,8 @@ public struct AetherPlaybackRecoveryBudget:
         maximumRouteTransitions: Int = 1,
         initialPreparationSettleSeconds: TimeInterval = 15,
         maximumEpisodeDurationSeconds: TimeInterval = 30,
+        startupProgressObservationSeconds: TimeInterval = 30,
+        startupTerminalPublicationHeadroomSeconds: TimeInterval = 0.25,
         healthyProgressResetSeconds: TimeInterval = 2
     ) {
         precondition(maximumTransportAttempts > 0)
@@ -137,6 +221,14 @@ public struct AetherPlaybackRecoveryBudget:
         precondition(maximumRouteTransitions >= 0)
         precondition(initialPreparationSettleSeconds > 0)
         precondition(maximumEpisodeDurationSeconds > 0)
+        precondition(
+            startupProgressObservationSeconds.isFinite
+                && startupProgressObservationSeconds > 0
+        )
+        precondition(
+            startupTerminalPublicationHeadroomSeconds.isFinite
+                && startupTerminalPublicationHeadroomSeconds >= 0
+        )
         precondition(healthyProgressResetSeconds > 0)
         self.maximumTransportAttempts = maximumTransportAttempts
         self.maximumSameRouteRebuilds = maximumSameRouteRebuilds
@@ -146,6 +238,10 @@ public struct AetherPlaybackRecoveryBudget:
         self.initialPreparationSettleSeconds =
             initialPreparationSettleSeconds
         self.maximumEpisodeDurationSeconds = maximumEpisodeDurationSeconds
+        self.startupProgressObservationSeconds =
+            startupProgressObservationSeconds
+        self.startupTerminalPublicationHeadroomSeconds =
+            startupTerminalPublicationHeadroomSeconds
         self.healthyProgressResetSeconds = healthyProgressResetSeconds
     }
 
@@ -310,6 +406,25 @@ public enum AetherPlaybackRecoveryAction:
 /// the caller must provide an alternate route that fresh evidence has already
 /// admitted for the same canonical request.
 public enum PlaybackRecoveryDecision {
+    /// Startup transport recovery may rebuild the exact admitted route once,
+    /// but it must never reinterpret a parked/no-progress player as evidence
+    /// for another route. The original failure remains authoritative even if
+    /// the rebuild later fails with a different preparation error.
+    public static func requiresSameRouteTransportRecovery(
+        failure: AetherPlaybackFailure
+    ) -> Bool {
+        failure.stage == .playback
+            && failure.kind == .routeRuntimeFailure
+            && (failure.caseCode == "transportIntentNotApplied"
+                || failure.caseCode == "startupNoProgress")
+    }
+
+    public static func permitsRouteTransition(
+        afterInitialFailure failure: AetherPlaybackFailure
+    ) -> Bool {
+        !requiresSameRouteTransportRecovery(failure: failure)
+    }
+
     /// Positive runtime HEVC evidence invalidates Native itself, not merely
     /// the current item generation. The coordinator must never rebuild the
     /// same Native route after this closed case code; it may only enter a
@@ -375,6 +490,11 @@ public enum PlaybackRecoveryDecision {
             if context.sameRouteRebuildCount
                     < budget.maximumSameRouteRebuilds {
                 return .rebuildSameRoute
+            }
+            if requiresSameRouteTransportRecovery(
+                failure: context.failure
+            ) {
+                return .terminate
             }
             if context.failure.kind == .decoderRuntimeFailure,
                context.softwareDecoderRecoveryEligible,

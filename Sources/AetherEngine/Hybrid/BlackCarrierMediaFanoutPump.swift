@@ -727,45 +727,94 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         demuxerReferenceLock.unlock()
         retiringDemuxer.markClosed()
 
+        let restartFactory: FreshDemuxerFactory
+        let expectedSegmentIndex: Int
         lock.lock()
-        var freshDemuxerToClose: Demuxer?
-        var retiredDemuxerToClose: Demuxer?
-        defer {
-            lock.unlock()
-            freshDemuxerToClose?.close()
-            retiredDemuxerToClose?.close()
-        }
-
         guard !isClosed else {
             clearRequestedRestart()
+            lock.unlock()
             throw BlackCarrierMediaFanoutPumpError.closed
         }
         if let terminalError {
             clearRequestedRestart()
+            lock.unlock()
             throw terminalError
         }
         guard let freshDemuxerFactory else {
             let error = BlackCarrierMediaFanoutPumpError
                 .freshDemuxerFactoryMissing
             failWhileLocked(error)
+            lock.unlock()
             throw error
         }
-        guard let expectedSegmentIndex = timeline.segmentIndex(
+        guard let resolvedSegmentIndex = timeline.segmentIndex(
             containing: target
         ) else {
             let error = BlackCarrierMediaFanoutPumpError
                 .invalidSegmentIndex(index: requestedSegmentIndex)
             failWhileLocked(error)
+            lock.unlock()
             throw error
         }
-        guard requestedSegmentIndex == expectedSegmentIndex else {
+        guard requestedSegmentIndex == resolvedSegmentIndex else {
             let error = BlackCarrierMediaFanoutPumpError
                 .seekIntentSegmentMismatch(
-                    expected: expectedSegmentIndex,
+                    expected: resolvedSegmentIndex,
                     actual: requestedSegmentIndex
                 )
             failWhileLocked(error)
+            lock.unlock()
             throw error
+        }
+        restartFactory = freshDemuxerFactory
+        expectedSegmentIndex = resolvedSegmentIndex
+        lock.unlock()
+
+        // Fresh source open may contain a non-cooperative synchronous read.
+        // It must not hold the production lock: timeout teardown first marks
+        // the retiring demuxer closed, then acquires this lock to publish
+        // `isClosed` and clear the generation token. A late factory result is
+        // revalidated below and can only be closed, never installed.
+        let freshDemuxer: Demuxer
+        do {
+            freshDemuxer = try restartFactory()
+        } catch {
+            let typed = BlackCarrierMediaFanoutPumpError
+                .freshDemuxerOpenFailed(
+                    reason: String(describing: error)
+                )
+            lock.lock()
+            if isClosed {
+                lock.unlock()
+                throw BlackCarrierMediaFanoutPumpError.closed
+            }
+            failWhileLocked(typed)
+            lock.unlock()
+            throw typed
+        }
+
+        lock.lock()
+        var freshDemuxerToClose: Demuxer? = freshDemuxer
+        var retiredDemuxerToClose: Demuxer?
+        defer {
+            lock.unlock()
+            freshDemuxerToClose?.close()
+            retiredDemuxerToClose?.close()
+        }
+        guard !isClosed else {
+            throw BlackCarrierMediaFanoutPumpError.closed
+        }
+        if let terminalError {
+            throw terminalError
+        }
+        generationLock.lock()
+        let restartIsCurrent = requestedRestartGeneration
+            == requestedGeneration
+            && requestedGeneration > currentGeneration
+        generationLock.unlock()
+        guard restartIsCurrent else {
+            throw BlackCarrierMediaFanoutPumpError
+                .generationSuperseded(generation: requestedGeneration)
         }
 
         do {
@@ -779,16 +828,6 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                 }
                 return offset
             }
-            let freshDemuxer: Demuxer
-            do {
-                freshDemuxer = try freshDemuxerFactory()
-            } catch {
-                throw BlackCarrierMediaFanoutPumpError
-                    .freshDemuxerOpenFailed(
-                        reason: String(describing: error)
-                    )
-            }
-            freshDemuxerToClose = freshDemuxer
             guard freshDemuxer !== retiringDemuxer else {
                 throw BlackCarrierMediaFanoutPumpError
                     .restartTrackContractMismatch

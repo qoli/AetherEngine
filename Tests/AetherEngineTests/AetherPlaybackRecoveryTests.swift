@@ -111,6 +111,82 @@ struct AetherPlaybackRecoveryTests {
         #expect(exhausted == .terminate)
     }
 
+    @Test("Startup transport recovery rebuilds only the admitted route")
+    func startupTransportRecoveryNeverTransitionsRoute() {
+        let routeCases: [(
+            target: AetherPlaybackStartupWatchdogTarget,
+            active: PlaybackRenderRoute,
+            nativeExecutionMode: AetherNativePlaybackExecutionMode?,
+            alternate: PlaybackRenderRoute
+        )] = [
+            (
+                .directNative,
+                .nativeAVPlayer,
+                .directAsset,
+                .hybridCarrier
+            ),
+            (
+                .nativeAudioBridge,
+                .nativeAVPlayer,
+                .aetherRemux,
+                .hybridCarrier
+            ),
+            (
+                .hybrid,
+                .hybridCarrier,
+                nil,
+                .nativeAVPlayer
+            ),
+        ]
+        for caseCode in [
+            "transportIntentNotApplied",
+            "startupNoProgress",
+        ] {
+            for routeCase in routeCases {
+                let target = AetherPlaybackStartupWatchdogTarget
+                    .resolve(
+                        activeRoute: routeCase.active,
+                        nativeExecutionMode:
+                            routeCase.nativeExecutionMode
+                    )
+                #expect(target == routeCase.target)
+                #expect(target?.route == routeCase.active)
+
+                let failure = AetherPlaybackFailure(
+                    stage: .playback,
+                    kind: .routeRuntimeFailure,
+                    domain: "AetherPlaybackTransport",
+                    code: 0,
+                    caseCode: caseCode,
+                    reason: "aether.playback.\(caseCode)"
+                )
+                let rebuild = PlaybackRecoveryDecision.resolve(
+                    context: context(
+                        failure: failure,
+                        activeRoute: routeCase.active,
+                        alternate: routeCase.alternate
+                    )
+                )
+                let exhausted = PlaybackRecoveryDecision.resolve(
+                    context: context(
+                        failure: failure,
+                        activeRoute: routeCase.active,
+                        alternate: routeCase.alternate,
+                        sameRouteRebuildCount: 1
+                    )
+                )
+
+                #expect(rebuild == .rebuildSameRoute)
+                #expect(exhausted == .terminate)
+                #expect(
+                    !PlaybackRecoveryDecision.permitsRouteTransition(
+                        afterInitialFailure: failure
+                    )
+                )
+            }
+        }
+    }
+
     @Test("Positive runtime HEVC never rebuilds Native")
     func runtimeHEVCExitsNativeImmediately() {
         let observedHEVC = AetherPlaybackFailure(
@@ -947,6 +1023,98 @@ struct AetherPlaybackRecoveryTests {
         )
         #expect(preparation.kind == .routeRuntimeFailure)
         #expect(preparation.code == 30)
+    }
+
+    @Test("Context restore consumes the remaining episode, not the preparation cap")
+    func recoveryContextRestoreDeadlineUsesEpisodeRemainder() throws {
+        let budget = AetherPlaybackRecoveryBudget.production
+
+        let belowPreparationCap = try AetherPlaybackSession
+            .recoveryContextRestoreDeadline(
+                stage: .playback,
+                firstStep: .contextSeek,
+                budget: budget,
+                episodeRemainingSeconds: 10,
+                now: 100
+            )
+        #expect(
+            abs(belowPreparationCap.deadline.durationSeconds - 9.75)
+                < 0.000_001
+        )
+
+        let abovePreparationCap = try AetherPlaybackSession
+            .recoveryContextRestoreDeadline(
+                stage: .playback,
+                firstStep: .contextSeek,
+                budget: budget,
+                episodeRemainingSeconds: 24,
+                now: 200
+            )
+        #expect(
+            abs(abovePreparationCap.deadline.durationSeconds - 23.75)
+                < 0.000_001
+        )
+        #expect(abovePreparationCap.deadline.durationSeconds > 15)
+        let innerSeekTimeout = abovePreparationCap.deadline
+            .remainingSeconds(now: 205)
+        #expect(innerSeekTimeout > 0)
+        #expect(
+            innerSeekTimeout
+                <= abovePreparationCap.deadline.durationSeconds
+        )
+        #expect(abovePreparationCap.failure.code == 30)
+        #expect(
+            abovePreparationCap.failure.recoveryStep == .contextSeek
+        )
+    }
+
+    @Test("Context restore fails typed before consuming publication headroom")
+    func recoveryContextRestoreRejectsHeadroomTheft() {
+        let budget = AetherPlaybackRecoveryBudget.production
+        do {
+            _ = try AetherPlaybackSession
+                .recoveryContextRestoreDeadline(
+                    stage: .playback,
+                    firstStep: .contextApply,
+                    budget: budget,
+                    episodeRemainingSeconds: 0.25,
+                    now: 100
+                )
+            Issue.record("Context restore started without publication headroom")
+        } catch let failure as AetherPlaybackFailure {
+            #expect(failure.kind == .routeRuntimeFailure)
+            #expect(failure.caseCode == "operation.deadlineExceeded")
+            #expect(failure.code == 30)
+            #expect(failure.recoveryStep == .contextApply)
+        } catch {
+            Issue.record("Unexpected context restore error: \(error)")
+        }
+    }
+
+    @Test("Recovery diagnostics retain only closed trigger and step values")
+    func closedRecoveryDiagnostics() {
+        #expect(
+            AetherPlaybackRecoveryTrigger.playbackStalled.rawValue
+                == "playbackStalled"
+        )
+        #expect(
+            AetherPlaybackRecoveryTrigger.timeJump.rawValue
+                == "timeJump"
+        )
+        #expect(
+            AetherPlaybackRecoveryTrigger.mediaSelection.rawValue
+                == "mediaSelection"
+        )
+        #expect(AetherPlaybackRecoveryStep.install.rawValue == "install")
+        #expect(AetherPlaybackRecoveryStep.prepare.rawValue == "prepare")
+        #expect(
+            AetherPlaybackRecoveryStep.contextSeek.rawValue
+                == "contextSeek"
+        )
+        #expect(
+            AetherPlaybackRecoveryStep.contextApply.rawValue
+                == "contextApply"
+        )
     }
 
     @Test("Security and authentication failures are always terminal")

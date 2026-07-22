@@ -60,30 +60,40 @@ public struct HybridPlaybackFailureEvidence:
     public let caseCode: String
     public let underlyingDomain: String
     public let underlyingCode: Int
+    public let recoveryTrigger: AetherPlaybackRecoveryTrigger?
+    public let recoveryStep: AetherPlaybackRecoveryStep?
 
     public init(
         stage: HybridPlaybackFailureStage,
         caseCode: String,
         underlyingDomain: String,
-        underlyingCode: Int
+        underlyingCode: Int,
+        recoveryTrigger: AetherPlaybackRecoveryTrigger? = nil,
+        recoveryStep: AetherPlaybackRecoveryStep? = nil
     ) {
         self.stage = stage
         self.caseCode = caseCode
         self.underlyingDomain = underlyingDomain
         self.underlyingCode = underlyingCode
+        self.recoveryTrigger = recoveryTrigger
+        self.recoveryStep = recoveryStep
     }
 
     init(
         stage: HybridPlaybackFailureStage,
         caseCode: String,
-        error: Error
+        error: Error,
+        recoveryTrigger: AetherPlaybackRecoveryTrigger? = nil,
+        recoveryStep: AetherPlaybackRecoveryStep? = nil
     ) {
         let nsError = error as NSError
         self.init(
             stage: stage,
             caseCode: caseCode,
             underlyingDomain: nsError.domain,
-            underlyingCode: nsError.code
+            underlyingCode: nsError.code,
+            recoveryTrigger: recoveryTrigger,
+            recoveryStep: recoveryStep
         )
     }
 }
@@ -478,7 +488,13 @@ private final class HybridSeekDeadlineRace<Value: Sendable> {
 }
 
 actor HybridPlaybackProviderCoordinator {
-    private let provider: any HybridCarrierTransportProvider
+    /// The provider is Sendable and owns the lock/generation boundary that
+    /// linearizes a restart against in-flight production. Restart must not be
+    /// queued behind `advanceDecodeDemand`: the progressive pump begins a
+    /// restart by marking its retiring demuxer closed, which is what unblocks
+    /// an AVIO read before the pump lock can be acquired.
+    private nonisolated let provider:
+        any HybridCarrierTransportProvider
     private let analysisPlaybackPressureSink:
         (any HybridAudioAnalysisPlaybackPressureSink)?
     private let terminalErrorSource:
@@ -497,10 +513,18 @@ actor HybridPlaybackProviderCoordinator {
         try provider.prepareForTransportStart()
     }
 
-    func restart(
+    nonisolated func restart(
         for intent: HybridSeekIntent
-    ) throws -> BlackCarrierMediaFanoutRestartResult {
-        try provider.restartMedia(for: intent)
+    ) async throws -> BlackCarrierMediaFanoutRestartResult {
+        let task = Task.detached(priority: .userInitiated) {
+            [provider] in
+            try provider.restartMedia(for: intent)
+        }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
 
     func prepareGeneration(segmentIndex: Int) throws {
@@ -844,6 +868,7 @@ final class HybridPlaybackSession {
     private let providerTelemetrySampler:
         HybridProviderTelemetrySampler
     private let timeline: BlackCarrierTimeline
+    private let internalPresentationRebuildTimeout: TimeInterval
     /// False only for positively admitted source-audio-only carrier sessions.
     /// The AVPlayer black carrier remains the clock, but no decoded source
     /// video or presentation readiness is invented.
@@ -892,6 +917,12 @@ final class HybridPlaybackSession {
         wasPlaying: false,
         rate: 1
     )
+    var transportResumeRate: Float {
+        transportResumeIntent.rate
+    }
+    var transportWantsPlayback: Bool {
+        transportResumeIntent.wasPlaying
+    }
     private var seekRequestSequence: UInt64 = 0
     private var latestSeekRequestSequence: UInt64 = 0
     private var queuedSeekOperation: QueuedSeekOperation?
@@ -1054,8 +1085,14 @@ final class HybridPlaybackSession {
         timeline: BlackCarrierTimeline,
         initialGeneration: UInt64 = 0,
         relay: HybridPlaybackFrameRelay,
-        allowsAudioOnlyCarrier: Bool = false
+        allowsAudioOnlyCarrier: Bool = false,
+        internalPresentationRebuildTimeout: TimeInterval = 15
     ) throws {
+        guard internalPresentationRebuildTimeout.isFinite,
+              internalPresentationRebuildTimeout > 0 else {
+            provider.close()
+            throw HybridPlaybackSessionError.invalidReadinessTimeout
+        }
         let resolvedVideoFormat = provider.hybridVideoFormat
         guard resolvedVideoFormat != nil || allowsAudioOnlyCarrier else {
             provider.close()
@@ -1072,6 +1109,8 @@ final class HybridPlaybackSession {
         providerTelemetrySampler =
             HybridProviderTelemetrySampler(provider: provider)
         self.timeline = timeline
+        self.internalPresentationRebuildTimeout =
+            internalPresentationRebuildTimeout
         videoExpected = resolvedVideoFormat != nil
         // `.sdr` is an internal no-display placeholder for audio-only. The
         // public output contract remains `videoExpected=false/.notExpected`.
@@ -1626,15 +1665,11 @@ final class HybridPlaybackSession {
             throw currentAvailabilityError()
         }
         try validateCarrierClock()
-        let intendedRate = transportResumeIntent.rate
         transportResumeIntent = ResumeIntent(
             wasPlaying: true,
-            rate: intendedRate
+            rate: 1
         )
         avPlayer.play()
-        if intendedRate != 1 {
-            avPlayer.rate = intendedRate
-        }
         renderSurface.setRendererStallDetectionEnabled(true)
         requestProviderTelemetryRefresh()
         telemetryDidChange?(.transportChanged)
@@ -1916,7 +1951,9 @@ final class HybridPlaybackSession {
         applySelectedAudioAnalysisTrackID(
             carrierOptionIndex: ordinal
         )
-        rebuildPresentationAtCarrierTime()
+        rebuildPresentationAtCarrierTime(
+            trigger: .mediaSelection
+        )
     }
 
     func selectNativeSubtitleTrack(
@@ -1957,7 +1994,9 @@ final class HybridPlaybackSession {
             item.select(nil, in: group)
             selectedNativeSubtitleTrackID = nil
         }
-        rebuildPresentationAtCarrierTime()
+        rebuildPresentationAtCarrierTime(
+            trigger: .mediaSelection
+        )
     }
 
     func stop() {
@@ -2155,7 +2194,8 @@ final class HybridPlaybackSession {
     private func performSeek(
         to target: CMTime,
         issueCarrierSeek: Bool,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        recoveryTrigger: AetherPlaybackRecoveryTrigger? = nil
     ) async throws -> HybridPlaybackSeekResult {
         guard timeout.isFinite, timeout > 0 else {
             throw HybridPlaybackSessionError.invalidReadinessTimeout
@@ -2194,6 +2234,7 @@ final class HybridPlaybackSession {
         didEmitPlaybackCompletedTelemetry = false
 
         let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        var recoveryStep: AetherPlaybackRecoveryStep = .providerRestart
         let resumeIntent: ResumeIntent
         if let pendingResumeIntent {
             resumeIntent = pendingResumeIntent
@@ -2240,7 +2281,7 @@ final class HybridPlaybackSession {
                 )
             }
             let restart = try await performWithinSeekDeadline(
-                step: "providerRestart",
+                step: .providerRestart,
                 generation: generation,
                 deadline: deadline,
                 originalTimeout: timeout
@@ -2269,6 +2310,7 @@ final class HybridPlaybackSession {
             }
 
             if issueCarrierSeek {
+                recoveryStep = .carrierSeek
                 managedTimeJumpSuppressionTarget = target
                 managedTimeJumpSuppressionDeadline =
                     ProcessInfo.processInfo.systemUptime + 2
@@ -2307,8 +2349,9 @@ final class HybridPlaybackSession {
             // produce many target frames. Running it first can deadlock when
             // the paused, pre-seek renderer cannot release those frames until
             // the carrier timebase reaches the target.
+            recoveryStep = .providerPrepare
             try await performWithinSeekDeadline(
-                step: "providerPrepareGeneration",
+                step: .providerPrepare,
                 generation: generation,
                 deadline: deadline,
                 originalTimeout: timeout
@@ -2324,6 +2367,7 @@ final class HybridPlaybackSession {
             }
 
             if videoExpected {
+                recoveryStep = .presentationReadiness
                 try await waitForPresentationReadiness(
                     generation: generation,
                     deadline: deadline,
@@ -2359,6 +2403,20 @@ final class HybridPlaybackSession {
                 )
             }
             let typed = await mapSeekError(error)
+            if let recoveryTrigger,
+               case .readinessTimedOut(let seconds) = typed {
+                throw HybridPlaybackSessionError.providerFailed(
+                    HybridPlaybackFailureEvidence(
+                        stage: .runtime,
+                        caseCode: "presentationRebuildTimedOut",
+                        underlyingDomain:
+                            "AetherEngine.HybridPresentationRebuild",
+                        underlyingCode: Int(seconds.rounded(.up)),
+                        recoveryTrigger: recoveryTrigger,
+                        recoveryStep: recoveryStep
+                    )
+                )
+            }
             throw typed
         }
     }
@@ -2513,7 +2571,8 @@ final class HybridPlaybackSession {
                 _ = try await self.performSeek(
                     to: target,
                     issueCarrierSeek: false,
-                    timeout: 15
+                    timeout: internalPresentationRebuildTimeout,
+                    recoveryTrigger: .timeJump
                 )
             } catch let error as HybridPlaybackSessionError {
                 if error != .cancelled {
@@ -2604,7 +2663,9 @@ final class HybridPlaybackSession {
         reevaluateAudioAnalysisPlaybackPressure(
             allowClearingStall: false
         )
-        rebuildPresentationAtCarrierTime()
+        rebuildPresentationAtCarrierTime(
+            trigger: .playbackStalled
+        )
     }
 
     func handleCarrierMediaSelectionChange() {
@@ -2617,7 +2678,9 @@ final class HybridPlaybackSession {
                 .refreshSelectedAudioAnalysisTrackIDFromCarrier()
             self.audioAnalysisSelectionResolutionTask = nil
         }
-        rebuildPresentationAtCarrierTime()
+        rebuildPresentationAtCarrierTime(
+            trigger: .mediaSelection
+        )
     }
 
     /// Deterministic internal seam used by source-level tests. Production
@@ -2629,7 +2692,9 @@ final class HybridPlaybackSession {
             carrierOptionIndex: selectedAudioOptionIndex
         )
         nativeWebVTTBridge?.mediaSelectionDidChange()
-        rebuildPresentationAtCarrierTime()
+        rebuildPresentationAtCarrierTime(
+            trigger: .mediaSelection
+        )
     }
 
     private func refreshSelectedAudioAnalysisTrackIDFromCarrier()
@@ -2714,7 +2779,9 @@ final class HybridPlaybackSession {
             .setOverlaySubtitleActive(false)
     }
 
-    private func rebuildPresentationAtCarrierTime() {
+    private func rebuildPresentationAtCarrierTime(
+        trigger: AetherPlaybackRecoveryTrigger
+    ) {
         guard externalJumpTask == nil,
               managedSeekGeneration == nil,
               case .ready = state else {
@@ -2732,7 +2799,8 @@ final class HybridPlaybackSession {
                 _ = try await self.performSeek(
                     to: target,
                     issueCarrierSeek: false,
-                    timeout: 15
+                    timeout: internalPresentationRebuildTimeout,
+                    recoveryTrigger: trigger
                 )
             } catch let error as HybridPlaybackSessionError {
                 if error != .cancelled {
@@ -3265,7 +3333,7 @@ final class HybridPlaybackSession {
     }
 
     private func performWithinSeekDeadline<Value: Sendable>(
-        step: String,
+        step: AetherPlaybackRecoveryStep,
         generation: UInt64,
         deadline: TimeInterval,
         originalTimeout: TimeInterval,
