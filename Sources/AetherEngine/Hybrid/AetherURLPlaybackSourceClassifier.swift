@@ -1,4 +1,15 @@
 import Foundation
+import Libavformat
+
+/// Closed, privacy-safe dependency capabilities checked from source-byte facts
+/// before a progressive demux is attempted.
+public enum AetherPlaybackDependencyCapability:
+    String,
+    Sendable,
+    Equatable
+{
+    case libavformatASFDemuxer = "libavformat.asfDemuxer"
+}
 
 /// Failure while determining the media family from the source bytes.
 ///
@@ -17,6 +28,10 @@ public enum AetherURLPlaybackSourceClassificationError:
     case httpStatus(Int)
     case unsupportedContentEncoding
     case redirectCredentialScopeViolation
+    case dependencyCapabilityUnavailable(
+        AetherPlaybackDependencyCapability
+    )
+    case nonMediaPayload(AetherURLPlaybackNonMediaPayloadFamily)
     case transport(code: Int?)
 
     public var errorDescription: String? {
@@ -35,6 +50,10 @@ public enum AetherURLPlaybackSourceClassificationError:
             "Playback source classification requires identity content encoding"
         case .redirectCredentialScopeViolation:
             "Playback source classification rejected a cross-origin credential redirect"
+        case .dependencyCapabilityUnavailable(let capability):
+            "Playback dependency capability is unavailable: \(capability.rawValue)"
+        case .nonMediaPayload(let family):
+            "Playback source classification rejected a non-media \(family.rawValue) payload"
         case .transport(let code):
             if let code {
                 "Playback source classification transport failed with URL error \(code)"
@@ -45,11 +64,25 @@ public enum AetherURLPlaybackSourceClassificationError:
     }
 }
 
+/// High-confidence text response families which cannot be a playable media
+/// source. Values are intentionally coarse and safe to retain as typed
+/// evidence; response text, URLs and headers remain private.
+public enum AetherURLPlaybackNonMediaPayloadFamily:
+    String,
+    Sendable,
+    Equatable
+{
+    case html
+    case json
+}
+
 /// Content-backed URL source classification used before Aether route preflight.
 ///
 /// This classifier never uses a path extension, MIME type or declared codec. HLS and ISO-BMFF are
-/// recognized only by signatures in the fetched bytes; every other non-empty payload is classified as
-/// a progressive resource. No error path selects another source kind or playback backend.
+/// recognized only by signatures in the fetched bytes. High-confidence HTML
+/// and complete JSON responses fail as typed non-media payloads; every other
+/// non-empty payload is classified as a progressive resource. No error path
+/// selects another source kind or playback backend.
 enum AetherURLPlaybackSourceSignature: Sendable, Equatable {
     case hls
     case isoBaseMedia
@@ -63,10 +96,48 @@ enum AetherURLPlaybackSourceSignature: Sendable, Equatable {
             .progressive
         }
     }
+
+    var canonicalResolutionStep:
+        AetherURLPlaybackSourceResolutionStep
+    {
+        switch self {
+        case .hls:
+            .inspectHLS
+        case .isoBaseMedia, .progressive:
+            // ISO-BMFF identifies a container, not a codec or playback
+            // route. It must reach the same source probe as every other
+            // progressive resource before Aether can admit Native or Hybrid.
+            .probeProgressive
+        }
+    }
+}
+
+enum AetherURLPlaybackSourceResolutionStep:
+    Sendable,
+    Equatable
+{
+    case inspectHLS
+    case probeProgressive
 }
 
 public enum AetherURLPlaybackSourceClassifier {
     public static let defaultMaximumPrefixBytes = 64 * 1024
+
+    /// ASF Header Object GUID in its on-wire byte order. Unlike a `.wmv`
+    /// suffix or MIME declaration, this is positive container evidence.
+    private static let asfHeaderObjectSignature: [UInt8] = [
+        0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11,
+        0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C,
+    ]
+
+    static func isDependencyCapabilityAvailable(
+        _ capability: AetherPlaybackDependencyCapability
+    ) -> Bool {
+        switch capability {
+        case .libavformatASFDemuxer:
+            av_find_input_format("asf") != nil
+        }
+    }
 
     public static func classify(
         url: URL,
@@ -126,10 +197,22 @@ public enum AetherURLPlaybackSourceClassifier {
     }
 
     static func inspect(
-        prefix: Data
+        prefix: Data,
+        dependencyCapabilityIsAvailable:
+            (AetherPlaybackDependencyCapability) -> Bool =
+                isDependencyCapabilityAvailable
     ) throws -> AetherURLPlaybackSourceSignature {
         guard !prefix.isEmpty else {
             throw AetherURLPlaybackSourceClassificationError.emptyResource
+        }
+        if prefix.starts(with: asfHeaderObjectSignature) {
+            let capability = AetherPlaybackDependencyCapability
+                .libavformatASFDemuxer
+            guard dependencyCapabilityIsAvailable(capability) else {
+                throw AetherURLPlaybackSourceClassificationError
+                    .dependencyCapabilityUnavailable(capability)
+            }
+            return .progressive
         }
         if prefix.count >= 8,
            prefix.dropFirst(4).prefix(4).elementsEqual([
@@ -145,9 +228,34 @@ public enum AetherURLPlaybackSourceClassifier {
             return AetherURLPlaybackSourceSignature.progressive
         }
         let firstNonWhitespace = text.drop(while: { $0.isWhitespace })
-        return firstNonWhitespace.hasPrefix("#EXTM3U")
-            ? AetherURLPlaybackSourceSignature.hls
-            : AetherURLPlaybackSourceSignature.progressive
+        if firstNonWhitespace.hasPrefix("#EXTM3U") {
+            return AetherURLPlaybackSourceSignature.hls
+        }
+
+        let leadingText = firstNonWhitespace
+            .prefix(512)
+            .lowercased()
+        if leadingText.hasPrefix("<!doctype html")
+            || leadingText.hasPrefix("<html")
+            || leadingText.hasPrefix("<head")
+            || leadingText.hasPrefix("<body")
+            || leadingText.hasPrefix("<script")
+            || leadingText.hasPrefix("<meta")
+            || (leadingText.hasPrefix("<?xml")
+                && leadingText.contains("<html")) {
+            throw AetherURLPlaybackSourceClassificationError
+                .nonMediaPayload(.html)
+        }
+
+        // A prefix may be a truncated progressive resource, so JSON is only
+        // rejected when the fetched bytes form one complete JSON value.
+        if (firstNonWhitespace.hasPrefix("{")
+                || firstNonWhitespace.hasPrefix("[")),
+           (try? JSONSerialization.jsonObject(with: bytes)) != nil {
+            throw AetherURLPlaybackSourceClassificationError
+                .nonMediaPayload(.json)
+        }
+        return AetherURLPlaybackSourceSignature.progressive
     }
 }
 

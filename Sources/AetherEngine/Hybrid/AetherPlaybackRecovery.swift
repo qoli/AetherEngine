@@ -48,6 +48,9 @@ public struct AetherPlaybackFailure:
     public let kind: AetherPlaybackFailureKind
     public let domain: String
     public let code: Int
+    /// Optional closed machine code for the concrete failure case. It never
+    /// contains a URL, response text, request field or credential.
+    public let caseCode: String?
     public let reason: String
 
     public init(
@@ -55,12 +58,14 @@ public struct AetherPlaybackFailure:
         kind: AetherPlaybackFailureKind,
         domain: String,
         code: Int,
+        caseCode: String? = nil,
         reason: String
     ) {
         self.stage = stage
         self.kind = kind
         self.domain = domain
         self.code = code
+        self.caseCode = caseCode
         self.reason = reason
     }
 
@@ -95,6 +100,14 @@ public struct AetherPlaybackTerminalFailure:
     }
 }
 
+/// Bounded policy for Aether-owned recovery of one canonical playback request.
+///
+/// Production allows 15 seconds for the complete initial preparation window
+/// and 30 seconds for a later recovery episode. Session operations are clamped
+/// to the applicable remaining window. Expiry is reported through failure
+/// domain `AetherPlaybackOperationDeadline` and case code
+/// `operation.deadlineExceeded`; it is never permission to substitute another
+/// source, media identity, credential scope, DRM meaning, or server URL.
 public struct AetherPlaybackRecoveryBudget:
     Sendable,
     Equatable
@@ -103,6 +116,9 @@ public struct AetherPlaybackRecoveryBudget:
     public let maximumSameRouteRebuilds: Int
     public let maximumSoftwareDecoderTransitions: Int
     public let maximumRouteTransitions: Int
+    /// Wall-clock limit shared by canonical resolution and route preparation.
+    public let initialPreparationSettleSeconds: TimeInterval
+    /// Wall-clock limit shared by every action in one recovery episode.
     public let maximumEpisodeDurationSeconds: TimeInterval
     public let healthyProgressResetSeconds: TimeInterval
 
@@ -111,6 +127,7 @@ public struct AetherPlaybackRecoveryBudget:
         maximumSameRouteRebuilds: Int = 1,
         maximumSoftwareDecoderTransitions: Int = 1,
         maximumRouteTransitions: Int = 1,
+        initialPreparationSettleSeconds: TimeInterval = 15,
         maximumEpisodeDurationSeconds: TimeInterval = 30,
         healthyProgressResetSeconds: TimeInterval = 2
     ) {
@@ -118,6 +135,7 @@ public struct AetherPlaybackRecoveryBudget:
         precondition(maximumSameRouteRebuilds >= 0)
         precondition(maximumSoftwareDecoderTransitions >= 0)
         precondition(maximumRouteTransitions >= 0)
+        precondition(initialPreparationSettleSeconds > 0)
         precondition(maximumEpisodeDurationSeconds > 0)
         precondition(healthyProgressResetSeconds > 0)
         self.maximumTransportAttempts = maximumTransportAttempts
@@ -125,10 +143,15 @@ public struct AetherPlaybackRecoveryBudget:
         self.maximumSoftwareDecoderTransitions =
             maximumSoftwareDecoderTransitions
         self.maximumRouteTransitions = maximumRouteTransitions
+        self.initialPreparationSettleSeconds =
+            initialPreparationSettleSeconds
         self.maximumEpisodeDurationSeconds = maximumEpisodeDurationSeconds
         self.healthyProgressResetSeconds = healthyProgressResetSeconds
     }
 
+    /// The production same-request recovery policy: 15-second preparation,
+    /// 30-second recovery episodes, and two seconds of healthy progress before
+    /// an episode budget may reset.
     public static let production = AetherPlaybackRecoveryBudget()
 }
 
@@ -287,6 +310,19 @@ public enum AetherPlaybackRecoveryAction:
 /// the caller must provide an alternate route that fresh evidence has already
 /// admitted for the same canonical request.
 public enum PlaybackRecoveryDecision {
+    /// Positive runtime HEVC evidence invalidates Native itself, not merely
+    /// the current item generation. The coordinator must never rebuild the
+    /// same Native route after this closed case code; it may only enter a
+    /// freshly admitted same-source Hybrid route or terminate.
+    public static func requiresImmediateNativeExit(
+        failure: AetherPlaybackFailure,
+        activeRoute: PlaybackRenderRoute?
+    ) -> Bool {
+        activeRoute == .nativeAVPlayer
+            && failure.caseCode
+                == "native.observedHEVCRequiresHybrid"
+    }
+
     public static func permitsSoftwareHEVCRecovery(
         sourceProfile: AetherSourceProfile
     ) -> Bool {
@@ -322,6 +358,20 @@ public enum PlaybackRecoveryDecision {
             return .retrySameOperation(afterSeconds: delay)
 
         case .routeRuntimeFailure, .decoderRuntimeFailure:
+            if requiresImmediateNativeExit(
+                failure: context.failure,
+                activeRoute: context.activeRoute
+            ) {
+                guard context.routeTransitionCount
+                        < budget.maximumRouteTransitions,
+                      context.positivelyAdmittedAlternateRoute
+                        == .hybridCarrier,
+                      !context.systemActivity
+                        .blocksHybridTransition else {
+                    return .terminate
+                }
+                return .transition(to: .hybridCarrier)
+            }
             if context.sameRouteRebuildCount
                     < budget.maximumSameRouteRebuilds {
                 return .rebuildSameRoute

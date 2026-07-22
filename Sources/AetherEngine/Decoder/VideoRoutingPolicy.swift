@@ -11,6 +11,18 @@ enum VideoRoutingPolicy {
         AV_FIELD_TT, AV_FIELD_BB, AV_FIELD_TB, AV_FIELD_BT
     ]
 
+    static func scanType(
+        fieldOrder: AVFieldOrder
+    ) -> AetherVideoScanType {
+        if interlacedFieldOrders.contains(fieldOrder) {
+            return .interlaced
+        }
+        if fieldOrder == AV_FIELD_PROGRESSIVE {
+            return .progressive
+        }
+        return .unknown
+    }
+
     /// True when a video codec must use the software decode path (SoftwarePlaybackHost) instead of
     /// native AVPlayer. `av1Available` is `VTCapabilityProbe.av1Available` (HW AV1 decode support).
     static func requiresSoftwarePath(

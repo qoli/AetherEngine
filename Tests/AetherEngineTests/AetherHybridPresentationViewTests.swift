@@ -170,6 +170,25 @@ struct AetherHybridPresentationViewTests {
         #expect(view.diagnostics.generation == 5)
         #expect(view.diagnostics.pendingSampleBuffers == 0)
         #expect(view.diagnostics.lastEnqueuedTimeSeconds == nil)
+        #expect(!view.diagnostics.metricsSampleInFlight)
+        #expect(
+            view.diagnostics
+                .lastMetricsRequestCarrierTimeSeconds == nil
+        )
+        #expect(
+            view.diagnostics
+                .lastMetricsCompletionCarrierTimeSeconds == nil
+        )
+        #expect(view.diagnostics.metricsCompletionCount == 0)
+        #expect(
+            view.diagnostics.lastMetricsCompletionHadCounters == nil
+        )
+        #expect(
+            view.diagnostics.lastRendererDisplayedFrameCount == nil
+        )
+        #expect(
+            view.diagnostics.lastPublishedEvidenceTimeSeconds == nil
+        )
         #expect(
             view.diagnostics.lastAcceptedFrameDurationSeconds == nil
         )

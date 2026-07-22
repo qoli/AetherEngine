@@ -5,7 +5,9 @@ import Combine
 
 /// NativeAVPlayerHost: AVPlayer + AVPlayerLayer wrapper for the HLS-fMP4 loopback path.
 /// tvOS exposes the HDMI DV/HDR handshake only through AVPlayer-rooted playback, not AVSampleBufferDisplayLayer.
-/// Covers HEVC, H.264, and HW-AV1; SW fallback (AV1/VP9) lives in SoftwarePlaybackHost.
+/// The lower-level host covers HEVC, H.264, and HW-AV1; this is capability,
+/// not unified AetherPlaybackSession route permission. Positive HEVC is owned
+/// by the unified Hybrid route. SW fallback (AV1/VP9) lives in SoftwarePlaybackHost.
 /// DisplayCriteriaController writes preferredDisplayCriteria before item load so the handshake is in flight first.
 @MainActor
 final class NativeAVPlayerHost {
@@ -748,8 +750,11 @@ final class NativeAVPlayerHost {
         // Pause before item swap: keepNativeHost reload carries rate=1.0 across replaceCurrentItem; without this the new item auto-resumes and beats the waitForSwitch gate (audio leads video on episode autoplay, issue #15).
         // Clear playIntent so the previous session can't restart the next item at ITS readyToPlay.
         playIntent = false
-        avPlayer.pause()
-        avPlayer.replaceCurrentItem(with: nil)
+        if let playerItem,
+           avPlayer.currentItem === playerItem {
+            avPlayer.pause()
+            avPlayer.replaceCurrentItem(with: nil)
+        }
         playerItem = nil
         isReady = false
         currentTime = 0

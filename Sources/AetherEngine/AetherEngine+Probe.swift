@@ -20,9 +20,10 @@ enum AetherPreparedURLSourceError: Error, LocalizedError {
 }
 
 /// Owns the exact FFmpeg demuxer that established a progressive URL's
-/// preflight facts. A native HLS-fMP4 route consumes it once, transferring
-/// ownership into `HLSVideoEngine`; all other routes discard it explicitly.
-/// This prevents a second origin open between route admission and playback.
+/// preflight facts. A Native HLS-fMP4 or progressive Hybrid route consumes it
+/// once, transferring ownership into that route's first demux generation;
+/// unsupported/direct routes discard it explicitly. This prevents a second
+/// origin open between route admission and playback.
 final class AetherPreparedURLSource: @unchecked Sendable {
     let url: URL
     let httpHeaders: [String: String]
@@ -161,6 +162,7 @@ extension AetherEngine {
         var detectedFormat: VideoFormat = .sdr
         var detectedRate: Double? = nil
         var detectedCodecID: AVCodecID = AV_CODEC_ID_NONE
+        var detectedScanType: AetherVideoScanType = .unknown
         var width: Int32 = 0
         var height: Int32 = 0
         var dvProfileNum: Int? = nil
@@ -172,6 +174,9 @@ extension AetherEngine {
             detectedFormat = Self.detectVideoFormat(stream: stream)
             detectedRate = Self.detectFrameRate(stream: stream)
             detectedCodecID = stream.pointee.codecpar.pointee.codec_id
+            detectedScanType = VideoRoutingPolicy.scanType(
+                fieldOrder: stream.pointee.codecpar.pointee.field_order
+            )
             width = stream.pointee.codecpar.pointee.width
             height = stream.pointee.codecpar.pointee.height
             dvProfileNum = Self.dvProfile(stream: stream)
@@ -208,6 +213,7 @@ extension AetherEngine {
             videoWidth: width,
             videoHeight: height,
             videoFrameRate: snappedRate,
+            videoScanType: detectedScanType,
             isDolbyVision: detectedFormat == .dolbyVision,
             dvProfile: dvProfileNum,
             dolbyVisionConfiguration:
@@ -217,7 +223,12 @@ extension AetherEngine {
             audioTracks: demuxer.audioTrackInfos(),
             subtitleTracks: demuxer.subtitleTrackInfos(),
             metadata: demuxer.mediaMetadata(),
-            isLive: isLive
+            isSourceSeekable: demuxer.isSourceSeekable,
+            isLive: isLive,
+            videoStreamPresence:
+                demuxer.hasAnyVideoStreamByType
+                    ? .provenPresent
+                    : .provenAbsent
         )
     }
 

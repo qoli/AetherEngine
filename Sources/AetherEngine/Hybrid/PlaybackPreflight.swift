@@ -51,6 +51,21 @@ public enum AetherVideoCodec: String, Sendable, Equatable {
     }
 }
 
+/// Positive audio codec identity used only where the render route depends on
+/// an Aether-owned audio backend. Unknown or unlisted codecs never imply that
+/// the bridge can decode them.
+public enum AetherAudioCodec: String, Sendable, Equatable, Hashable {
+    case vorbis
+    case unknown
+
+    init(codecName: String?) {
+        self = switch codecName?.lowercased() {
+        case "vorbis": .vorbis
+        default: .unknown
+        }
+    }
+}
+
 /// Immutable source facts needed to select a playback route.
 ///
 /// `isSeekableVOD` is intentionally a positive fact instead of a derived `!isLive`: the hybrid contract
@@ -58,8 +73,19 @@ public enum AetherVideoCodec: String, Sendable, Equatable {
 public struct AetherSourceProfile: Sendable, Equatable {
     public let sourceKind: AetherMediaSourceKind
     public let isSeekableVOD: Bool
+    /// Exact stream inventory. Only `provenAbsent` may admit an audio-only
+    /// route; `unknown` remains fail-closed.
+    public let videoStreamPresence: AetherVideoStreamPresence
+    public var hasVideoStream: Bool {
+        videoStreamPresence == .provenPresent
+    }
     public let videoCodec: AetherVideoCodec
+    /// Bridge-relevant codec families copied from the completed demux
+    /// inventory. Unlisted codecs remain `.unknown`; no codec is inferred from
+    /// a container or filename.
+    public let audioCodecs: Set<AetherAudioCodec>
     public let sourceContainer: AetherSourceContainer
+    public let videoScanType: AetherVideoScanType
     public let videoFormat: VideoFormat
     public let dolbyVisionConfiguration:
         AetherDolbyVisionConfiguration?
@@ -68,8 +94,42 @@ public struct AetherSourceProfile: Sendable, Equatable {
     public init(
         sourceKind: AetherMediaSourceKind,
         isSeekableVOD: Bool,
+        hasVideoStream: Bool = true,
         videoCodec: AetherVideoCodec,
+        audioCodecs: Set<AetherAudioCodec> = [],
         sourceContainer: AetherSourceContainer = .unknown,
+        videoScanType: AetherVideoScanType = .unknown,
+        videoFormat: VideoFormat,
+        dolbyVisionConfiguration:
+            AetherDolbyVisionConfiguration? = nil,
+        hasVerifiedDolbyVisionProfile84BaseLayer: Bool = false
+    ) {
+        self.init(
+            sourceKind: sourceKind,
+            isSeekableVOD: isSeekableVOD,
+            videoStreamPresence: hasVideoStream
+                ? .provenPresent
+                : .provenAbsent,
+            videoCodec: videoCodec,
+            audioCodecs: audioCodecs,
+            sourceContainer: sourceContainer,
+            videoScanType: videoScanType,
+            videoFormat: videoFormat,
+            dolbyVisionConfiguration:
+                dolbyVisionConfiguration,
+            hasVerifiedDolbyVisionProfile84BaseLayer:
+                hasVerifiedDolbyVisionProfile84BaseLayer
+        )
+    }
+
+    public init(
+        sourceKind: AetherMediaSourceKind,
+        isSeekableVOD: Bool,
+        videoStreamPresence: AetherVideoStreamPresence,
+        videoCodec: AetherVideoCodec,
+        audioCodecs: Set<AetherAudioCodec> = [],
+        sourceContainer: AetherSourceContainer = .unknown,
+        videoScanType: AetherVideoScanType = .unknown,
         videoFormat: VideoFormat,
         dolbyVisionConfiguration:
             AetherDolbyVisionConfiguration? = nil,
@@ -77,8 +137,16 @@ public struct AetherSourceProfile: Sendable, Equatable {
     ) {
         self.sourceKind = sourceKind
         self.isSeekableVOD = isSeekableVOD
+        // A non-unknown codec is itself positive video evidence. Normalizing
+        // here prevents a contradictory caller flag from disguising HEVC as
+        // audio-only and bypassing the Hybrid route invariant.
+        self.videoStreamPresence = videoCodec != .unknown
+            ? .provenPresent
+            : videoStreamPresence
         self.videoCodec = videoCodec
+        self.audioCodecs = audioCodecs
         self.sourceContainer = sourceContainer
+        self.videoScanType = videoScanType
         self.videoFormat = videoFormat
         self.dolbyVisionConfiguration =
             dolbyVisionConfiguration
@@ -96,14 +164,130 @@ public struct AetherSourceProfile: Sendable, Equatable {
         self.init(
             sourceKind: sourceKind,
             isSeekableVOD: isSeekableVOD,
+            videoStreamPresence: probe.videoStreamPresence,
             videoCodec: AetherVideoCodec(codecName: probe.videoCodecName),
+            audioCodecs: Set(
+                probe.audioTracks.map {
+                    AetherAudioCodec(codecName: $0.codec)
+                }
+            ),
             sourceContainer: probe.sourceContainer,
+            videoScanType: probe.videoScanType,
             videoFormat: probe.videoFormat,
             dolbyVisionConfiguration:
                 probe.dolbyVisionConfiguration,
             hasVerifiedDolbyVisionProfile84BaseLayer:
                 probe.hasVerifiedDolbyVisionProfile84BaseLayer
         )
+    }
+}
+
+/// Immutable progressive facts pinned between the exact preflight demuxer
+/// and the first Hybrid generation. URL identity alone is insufficient: an
+/// origin can return different bytes on a second request while keeping the
+/// same path and color format.
+struct AetherProgressiveSourceFacts: Sendable, Equatable {
+    let durationMicroseconds: Int64
+    let videoStreamPresence: AetherVideoStreamPresence
+    let videoCodec: AetherVideoCodec
+    let audioCodecs: Set<AetherAudioCodec>
+    let sourceContainer: AetherSourceContainer
+    let videoScanType: AetherVideoScanType
+    let isSourceSeekable: Bool
+    let isLive: Bool
+    let videoFormat: VideoFormat
+    let dolbyVisionConfiguration:
+        AetherDolbyVisionConfiguration?
+    let hasVerifiedDolbyVisionProfile84BaseLayer: Bool
+
+    init(probe: SourceProbe) {
+        if probe.durationSeconds.isFinite,
+           probe.durationSeconds > 0,
+           probe.durationSeconds
+                <= Double(Int64.max) / 1_000_000 {
+            durationMicroseconds = Int64(
+                (probe.durationSeconds * 1_000_000).rounded()
+            )
+        } else {
+            durationMicroseconds = -1
+        }
+        videoStreamPresence = probe.videoStreamPresence
+        videoCodec = AetherVideoCodec(
+            codecName: probe.videoCodecName
+        )
+        audioCodecs = Set(
+            probe.audioTracks.map {
+                AetherAudioCodec(codecName: $0.codec)
+            }
+        )
+        sourceContainer = probe.sourceContainer
+        videoScanType = probe.videoScanType
+        isSourceSeekable = probe.isSourceSeekable
+        isLive = probe.isLive
+        videoFormat = probe.videoFormat
+        dolbyVisionConfiguration =
+            probe.dolbyVisionConfiguration
+        hasVerifiedDolbyVisionProfile84BaseLayer =
+            probe.hasVerifiedDolbyVisionProfile84BaseLayer
+    }
+
+    func matches(
+        preflightProfile: AetherSourceProfile,
+        timelineDurationSeconds: Double
+    ) -> Bool {
+        guard timelineDurationSeconds.isFinite,
+              timelineDurationSeconds > 0,
+              durationMicroseconds >= 0,
+              timelineDurationSeconds
+                <= Double(Int64.max) / 1_000_000 else {
+            return false
+        }
+        let expectedDuration = Int64(
+            (timelineDurationSeconds * 1_000_000).rounded()
+        )
+        let durationDelta = abs(
+            Double(durationMicroseconds) - Double(expectedDuration)
+        )
+        return durationDelta <= 1_000
+            && videoStreamPresence
+                == preflightProfile.videoStreamPresence
+            && videoCodec == preflightProfile.videoCodec
+            && audioCodecs == preflightProfile.audioCodecs
+            && sourceContainer == preflightProfile.sourceContainer
+            && videoScanType == preflightProfile.videoScanType
+            && isSourceSeekable
+            && !isLive
+            && preflightProfile.isSeekableVOD
+            && videoFormat == preflightProfile.videoFormat
+            && dolbyVisionConfiguration
+                == preflightProfile.dolbyVisionConfiguration
+            && hasVerifiedDolbyVisionProfile84BaseLayer
+                == preflightProfile
+                    .hasVerifiedDolbyVisionProfile84BaseLayer
+    }
+
+    func hasSameMediaIdentity(
+        as other: AetherProgressiveSourceFacts
+    ) -> Bool {
+        let durationDelta = abs(
+            Double(durationMicroseconds)
+                - Double(other.durationMicroseconds)
+        )
+        return durationMicroseconds >= 0
+            && other.durationMicroseconds >= 0
+            && durationDelta <= 1_000
+            && videoStreamPresence == other.videoStreamPresence
+            && videoCodec == other.videoCodec
+            && audioCodecs == other.audioCodecs
+            && sourceContainer == other.sourceContainer
+            && videoScanType == other.videoScanType
+            && isSourceSeekable == other.isSourceSeekable
+            && isLive == other.isLive
+            && videoFormat == other.videoFormat
+            && dolbyVisionConfiguration
+                == other.dolbyVisionConfiguration
+            && hasVerifiedDolbyVisionProfile84BaseLayer
+                == other.hasVerifiedDolbyVisionProfile84BaseLayer
     }
 }
 
@@ -168,6 +352,13 @@ public struct HLSVideoPackaging: Sendable, Equatable {
     public let actualVideoCodec: AetherVideoCodec
     public let codecVerification: HLSManifestCodecVerification
     public let contentProtection: HLSContentProtection
+    /// Root-master evidence that an uninspected alternate variant advertises
+    /// HEVC. A Native session receives the root master and may select that
+    /// different variant, so this fact requires graph-bound Hybrid playback
+    /// even when the selected segment is positively H.264. The selected
+    /// variant is excluded because its segment evidence already resolves stale
+    /// or mismatched manifest metadata.
+    public let masterContainsUninspectedHEVCVariant: Bool
 
     public init(
         container: HLSVideoContainer,
@@ -175,7 +366,8 @@ public struct HLSVideoPackaging: Sendable, Equatable {
         manifestCodecs: [String],
         actualVideoCodec: AetherVideoCodec,
         codecVerification: HLSManifestCodecVerification,
-        contentProtection: HLSContentProtection
+        contentProtection: HLSContentProtection,
+        masterContainsUninspectedHEVCVariant: Bool = false
     ) {
         self.container = container
         self.sampleEntry = sampleEntry
@@ -183,6 +375,8 @@ public struct HLSVideoPackaging: Sendable, Equatable {
         self.actualVideoCodec = actualVideoCodec
         self.codecVerification = codecVerification
         self.contentProtection = contentProtection
+        self.masterContainsUninspectedHEVCVariant =
+            masterContainsUninspectedHEVCVariant
     }
 }
 
@@ -193,6 +387,7 @@ public struct HLSVideoPackaging: Sendable, Equatable {
 public struct HybridPlaybackCapabilities: Sendable, Equatable {
     public let hasDirectVideoDecoder: Bool
     public let hasSampleBufferRenderer: Bool
+    public let hasAudioBridgeCarrier: Bool
     public let supportedVideoFormats: Set<VideoFormat>
     public let supportedDolbyVisionProfiles:
         Set<AetherDolbyVisionProfile>
@@ -201,6 +396,7 @@ public struct HybridPlaybackCapabilities: Sendable, Equatable {
     public init(
         hasDirectVideoDecoder: Bool,
         hasSampleBufferRenderer: Bool,
+        hasAudioBridgeCarrier: Bool = false,
         supportedVideoFormats: Set<VideoFormat>,
         supportedDolbyVisionProfiles:
             Set<AetherDolbyVisionProfile> = [],
@@ -212,6 +408,7 @@ public struct HybridPlaybackCapabilities: Sendable, Equatable {
     ) {
         self.hasDirectVideoDecoder = hasDirectVideoDecoder
         self.hasSampleBufferRenderer = hasSampleBufferRenderer
+        self.hasAudioBridgeCarrier = hasAudioBridgeCarrier
         self.supportedVideoFormats = supportedVideoFormats
         self.supportedDolbyVisionProfiles =
             supportedDolbyVisionProfiles
@@ -221,15 +418,20 @@ public struct HybridPlaybackCapabilities: Sendable, Equatable {
 
 /// Stable diagnostic reason accompanying every preflight route.
 public enum PlaybackRouteReason: String, Sendable, Equatable {
+    case nativeAudioOnly
     case nativeHLSContractVerified
     case nativeProtectedHLSContractVerified
     case nativeHLSFMP4Remux
     case nativeProvisionalURL
     case hybridRecoveryAfterNativeFailure
+    case hybridAudioBridge
+    case hybridInterlacedH264
+    case hybridHEVC
     case hybridHEV1SampleEntry
     case hybridHEVCInMPEGTransport
     case hybridHLSManifestMissingCodecs
     case hybridHLSManifestSegmentMismatch
+    case hybridHLSMasterContainsHEVCVariant
     case hybridNonAVPlayerCodec
     case unsupportedHLSPreflightMissing
     case unsupportedHLSSegmentNotInspected
@@ -239,8 +441,11 @@ public enum PlaybackRouteReason: String, Sendable, Equatable {
     case unsupportedHybridSourceKind
     case unsupportedHybridDecoderUnavailable
     case unsupportedHybridSampleBufferRendererUnavailable
+    case unsupportedHybridAudioBridgeUnavailable
     case unsupportedHybridVideoFormat
     case unsupportedProgressiveContainerUnverified
+    case unsupportedProvisionalURLFactsResolved
+    case unsupportedVideoStreamPresenceInconclusive
     case unsupportedDolbyVisionConfigurationMissing
     case unsupportedDolbyVisionProfile
     case unsupportedDolbyVisionConfigurationMismatch
@@ -291,6 +496,30 @@ public enum PlaybackPreflight {
                 hybridCapabilities: hybridCapabilities
             )
         case .unclassifiedURL:
+            guard sourceProfile.videoStreamPresence == .unknown,
+                  sourceProfile.videoCodec == .unknown,
+                  sourceProfile.audioCodecs.isEmpty,
+                  sourceProfile.sourceContainer == .unknown,
+                  sourceProfile.videoScanType == .unknown,
+                  sourceProfile.videoFormat == .sdr,
+                  sourceProfile.dolbyVisionConfiguration == nil,
+                  !sourceProfile
+                    .hasVerifiedDolbyVisionProfile84BaseLayer else {
+                return result(
+                    sourceProfile,
+                    nil,
+                    .unsupported,
+                    .unsupportedProvisionalURLFactsResolved
+                )
+            }
+            guard hlsPackaging == nil else {
+                return result(
+                    sourceProfile,
+                    hlsPackaging,
+                    .unsupported,
+                    .unsupportedProvisionalURLFactsResolved
+                )
+            }
             return result(
                 sourceProfile,
                 nil,
@@ -298,8 +527,40 @@ public enum PlaybackPreflight {
                 .nativeProvisionalURL
             )
         case .progressive, .custom:
+            switch sourceProfile.videoStreamPresence {
+            case .provenAbsent:
+                if sourceProfile.audioCodecs == [.vorbis] {
+                    return hybridAudioResult(
+                        sourceProfile: sourceProfile,
+                        capabilities: hybridCapabilities
+                    )
+                }
+                return result(
+                    sourceProfile,
+                    nil,
+                    .nativeAVPlayer,
+                    .nativeAudioOnly
+                )
+            case .unknown:
+                return result(
+                    sourceProfile,
+                    nil,
+                    .unsupported,
+                    .unsupportedVideoStreamPresenceInconclusive
+                )
+            case .provenPresent:
+                break
+            }
             switch sourceProfile.videoCodec {
-            case .h264, .hevc:
+            case .h264:
+                if sourceProfile.videoScanType == .interlaced {
+                    return hybridResult(
+                        sourceProfile: sourceProfile,
+                        hlsPackaging: nil,
+                        reason: .hybridInterlacedH264,
+                        capabilities: hybridCapabilities
+                    )
+                }
                 guard sourceProfile.sourceContainer
                         .supportsNativeHLSFMP4Remux else {
                     return result(
@@ -314,6 +575,13 @@ public enum PlaybackPreflight {
                     nil,
                     .nativeAVPlayer,
                     .nativeHLSFMP4Remux
+                )
+            case .hevc:
+                return hybridResult(
+                    sourceProfile: sourceProfile,
+                    hlsPackaging: nil,
+                    reason: .hybridHEVC,
+                    capabilities: hybridCapabilities
                 )
             case .unknown:
                 return result(sourceProfile, nil, .unsupported, .unsupportedVideoCodec)
@@ -429,6 +697,49 @@ public enum PlaybackPreflight {
         guard hlsPackaging.actualVideoCodec == sourceProfile.videoCodec else {
             return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHLSVideoPackaging)
         }
+        if hlsPackaging.masterContainsUninspectedHEVCVariant,
+           sourceProfile.videoCodec != .hevc {
+            guard hlsPackaging.contentProtection == .none else {
+                return result(
+                    sourceProfile,
+                    hlsPackaging,
+                    .unsupported,
+                    .unsupportedHLSContentProtection
+                )
+            }
+            return hybridResult(
+                sourceProfile: sourceProfile,
+                hlsPackaging: hlsPackaging,
+                reason: .hybridHLSMasterContainsHEVCVariant,
+                capabilities: hybridCapabilities
+            )
+        }
+        if sourceProfile.videoCodec == .hevc,
+           hlsPackaging.codecVerification == .mismatch {
+            return result(
+                sourceProfile,
+                hlsPackaging,
+                .unsupported,
+                .unsupportedHLSVideoPackaging
+            )
+        }
+        if sourceProfile.videoCodec == .h264,
+           sourceProfile.videoScanType == .interlaced {
+            guard hlsPackaging.contentProtection == .none else {
+                return result(
+                    sourceProfile,
+                    hlsPackaging,
+                    .unsupported,
+                    .unsupportedHLSContentProtection
+                )
+            }
+            return hybridResult(
+                sourceProfile: sourceProfile,
+                hlsPackaging: hlsPackaging,
+                reason: .hybridInterlacedH264,
+                capabilities: hybridCapabilities
+            )
+        }
 
         let nativeContractVerified: Bool
         switch sourceProfile.videoCodec {
@@ -437,19 +748,7 @@ public enum PlaybackPreflight {
                 hlsPackaging.codecVerification == .verified
                 || hlsPackaging.codecVerification
                     == .protectedManifestVerified
-        case .hevc:
-            nativeContractVerified =
-                hlsPackaging.container == .fragmentedMP4
-                && (
-                    hlsPackaging.sampleEntry == .hvc1
-                    || hlsPackaging.sampleEntry == .dvh1
-                )
-                && (
-                    hlsPackaging.codecVerification == .verified
-                    || hlsPackaging.codecVerification
-                        == .protectedManifestVerified
-                )
-        case .av1, .vp9, .vp8, .mpeg2, .mpeg4Part2, .vc1,
+        case .hevc, .av1, .vp9, .vp8, .mpeg2, .mpeg4Part2, .vc1,
              .unknown:
             nativeContractVerified = false
         }
@@ -480,28 +779,22 @@ public enum PlaybackPreflight {
             )
 
         case .hevc:
-            if hlsPackaging.container == .fragmentedMP4,
-               hlsPackaging.sampleEntry == .hvc1 || hlsPackaging.sampleEntry == .dvh1 {
-                return result(sourceProfile, hlsPackaging, .nativeAVPlayer, .nativeHLSContractVerified)
+            let reason: PlaybackRouteReason
+            if hlsPackaging.codecVerification
+                    == .manifestMissingButSegmentVerified {
+                reason = .hybridHLSManifestMissingCodecs
+            } else if hlsPackaging.container == .mpegTransport {
+                reason = .hybridHEVCInMPEGTransport
+            } else if hlsPackaging.sampleEntry == .hev1 {
+                reason = .hybridHEV1SampleEntry
+            } else {
+                reason = .hybridHEVC
             }
-            if let reason = nativeCodecMetadataFailure(
-                sourceProfile
-            ) {
-                return result(
-                    sourceProfile,
-                    hlsPackaging,
-                    .unsupported,
-                    reason
-                )
-            }
-            // HEVC remains an AVPlayer decoder capability. Packaging that AVPlayer cannot consume is a
-            // positive packaging boundary, not evidence for the Hybrid codec route and not permission to
-            // invent remote-HLS normalization inside the adapter.
-            return result(
-                sourceProfile,
-                hlsPackaging,
-                .unsupported,
-                .unsupportedHLSVideoPackaging
+            return hybridResult(
+                sourceProfile: sourceProfile,
+                hlsPackaging: hlsPackaging,
+                reason: reason,
+                capabilities: hybridCapabilities
             )
 
         case .unknown:
@@ -517,29 +810,56 @@ public enum PlaybackPreflight {
         }
     }
 
-    private static func nativeCodecMetadataFailure(
-        _ sourceProfile: AetherSourceProfile
-    ) -> PlaybackRouteReason? {
-        if sourceProfile.videoFormat == .dolbyVision {
-            guard let configuration =
-                    sourceProfile.dolbyVisionConfiguration else {
-                return .unsupportedDolbyVisionConfigurationMissing
-            }
-            guard configuration.profile == 8,
-                  configuration.baseLayerSignalCompatibilityID == 4 else {
-                return .unsupportedDolbyVisionProfile
-            }
-            guard configuration.verifiedHybridProfile != nil,
-                  sourceProfile
-                    .hasVerifiedDolbyVisionProfile84BaseLayer else {
-                return .unsupportedDolbyVisionConfigurationMismatch
-            }
-        } else if sourceProfile.dolbyVisionConfiguration != nil
-                    || sourceProfile
-                        .hasVerifiedDolbyVisionProfile84BaseLayer {
-            return .unsupportedDolbyVisionConfigurationMismatch
+    /// Audio-only Hybrid admission uses AVPlayer only for the Aether-owned
+    /// black carrier while `AudioBridge` decodes the exact source audio and
+    /// emits a truthful carrier rendition. It has no real-video decoder or
+    /// presentation-surface requirement.
+    private static func hybridAudioResult(
+        sourceProfile: AetherSourceProfile,
+        capabilities: HybridPlaybackCapabilities
+    ) -> PlaybackPreflightResult {
+        guard sourceProfile.videoStreamPresence == .provenAbsent,
+              sourceProfile.videoCodec == .unknown,
+              sourceProfile.audioCodecs == [.vorbis] else {
+            return result(
+                sourceProfile,
+                nil,
+                .unsupported,
+                .unsupportedVideoStreamPresenceInconclusive
+            )
         }
-        return nil
+        guard sourceProfile.isSeekableVOD else {
+            return result(
+                sourceProfile,
+                nil,
+                .unsupported,
+                .unsupportedHybridRequiresSeekableVOD
+            )
+        }
+        guard capabilities.supportedSourceKinds.contains(
+            sourceProfile.sourceKind
+        ) else {
+            return result(
+                sourceProfile,
+                nil,
+                .unsupported,
+                .unsupportedHybridSourceKind
+            )
+        }
+        guard capabilities.hasAudioBridgeCarrier else {
+            return result(
+                sourceProfile,
+                nil,
+                .unsupported,
+                .unsupportedHybridAudioBridgeUnavailable
+            )
+        }
+        return result(
+            sourceProfile,
+            nil,
+            .hybridCarrier,
+            .hybridAudioBridge
+        )
     }
 
     private static func hybridResult(

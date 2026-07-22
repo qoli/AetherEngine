@@ -142,8 +142,19 @@ public final class Demuxer: @unchecked Sendable {
               let formatName = ctx.pointee.iformat?.pointee.name else {
             return .unknown
         }
+        return Self.sourceContainer(
+            formatName: String(cString: formatName)
+        )
+    }
+
+    /// Pure adapter from FFmpeg's exact comma-separated input-format names to
+    /// the closed route-policy container vocabulary. No filename or MIME
+    /// metadata participates in this decision.
+    static func sourceContainer(
+        formatName: String
+    ) -> AetherSourceContainer {
         let names = Set(
-            String(cString: formatName)
+            formatName
                 .lowercased()
                 .split(separator: ",")
                 .map(String.init)
@@ -158,6 +169,9 @@ public final class Demuxer: @unchecked Sendable {
         }
         if names.contains("mpegts") {
             return .mpegTransport
+        }
+        if names.contains("flv") {
+            return .flashVideo
         }
         return .other
     }
@@ -614,6 +628,26 @@ public final class Demuxer: @unchecked Sendable {
     var videoStreamIndex: Int32 {
         guard let ctx = formatContext else { return -1 }
         return max(-1, av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0))
+    }
+
+    /// Exact stream-inventory presence independent of best-stream selection.
+    /// `av_find_best_stream` may reject an incomplete or unidentified video
+    /// stream; that failure must never be reinterpreted as proven audio-only.
+    var hasAnyVideoStreamByType: Bool {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        guard let ctx = formatContext else { return false }
+        for index in 0..<Int(ctx.pointee.nb_streams) {
+            guard let stream = ctx.pointee.streams[index],
+                  let codecParameters = stream.pointee.codecpar else {
+                continue
+            }
+            if codecParameters.pointee.codec_type
+                    == AVMEDIA_TYPE_VIDEO {
+                return true
+            }
+        }
+        return false
     }
 
     /// True if `index` names a video stream. Live producer uses this to detect
@@ -1276,4 +1310,13 @@ enum DemuxerError: Error {
     case openFailed(code: Int32)
     case streamInfoFailed(code: Int32)
     case readFailed(code: Int32)
+
+    var ffmpegCode: Int32 {
+        switch self {
+        case .openFailed(let code),
+             .streamInfoFailed(let code),
+             .readFailed(let code):
+            code
+        }
+    }
 }

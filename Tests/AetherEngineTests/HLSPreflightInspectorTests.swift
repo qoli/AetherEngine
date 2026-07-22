@@ -166,6 +166,77 @@ final class HLSPreflightInspectorTests: XCTestCase {
         XCTAssertNil(inspected.resourceGraph)
     }
 
+    func testMixedH264HEVCMasterUsesBoundHybridRoute()
+        async throws
+    {
+        let rootURL = URL(
+            string: "https://example.com/master.m3u8"
+        )!
+        let selectedURL = URL(
+            string: "https://example.com/high-h264.m3u8"
+        )!
+        let segmentURL = URL(
+            string: "https://example.com/high-h264.ts"
+        )!
+        let responses: [URL: HLSPreflightFetchResponse] = [
+            rootURL: .init(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="hvc1.2.4.L120.B0,mp4a.40.2"
+                    low-hevc.m3u8
+                    #EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS="avc1.640028,mp4a.40.2"
+                    high-h264.m3u8
+                    """.utf8
+                ),
+                effectiveURL: rootURL
+            ),
+            selectedURL: .init(
+                data: Data(
+                    """
+                    #EXTM3U
+                    #EXT-X-VERSION:3
+                    #EXT-X-TARGETDURATION:1
+                    #EXT-X-PLAYLIST-TYPE:VOD
+                    #EXTINF:0.2,
+                    high-h264.ts
+                    #EXT-X-ENDLIST
+                    """.utf8
+                ),
+                effectiveURL: selectedURL
+            ),
+            segmentURL: .init(
+                data: try Self.mpegTransportFixture(),
+                effectiveURL: segmentURL
+            ),
+        ]
+
+        let inspected = try await HLSPreflightInspector(
+            httpHeaders: [:],
+            fetchOverride: { url, _ in
+                try XCTUnwrap(responses[url])
+            }
+        ).inspect(
+            rootURL: rootURL,
+            sourceIsSeekableVOD: true,
+            variantSelection: .highestBandwidth,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+
+        XCTAssertEqual(inspected.result.route, .hybridCarrier)
+        XCTAssertEqual(
+            inspected.result.reason,
+            .hybridHLSMasterContainsHEVCVariant
+        )
+        XCTAssertEqual(
+            inspected.result.hlsPackaging?
+                .masterContainsUninspectedHEVCVariant,
+            true
+        )
+        XCTAssertNotNil(inspected.resourceGraph)
+    }
+
     func testNextLowerCompatibleVariantStaysOnSameMaster()
         async throws
     {
@@ -389,6 +460,12 @@ final class HLSPreflightInspectorTests: XCTestCase {
             line: line
         )
         XCTAssertEqual(
+            inspected.result.sourceProfile.videoScanType,
+            .progressive,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(
             inspected.result.hlsPackaging?.container,
             .mpegTransport,
             file: file,
@@ -460,7 +537,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
         AAAAGHN0eXBtc2RoAAAAAG1zZGhtc2l4AAAANHNpZHgBAAAAAAAAAQAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAI0AAEAAgAAAAAAAAGhtb29mAAAAEG1maGQAAAAAAAAAAQAAAFB0cmFmAAAAHHRmaGQAAgA4AAAAAQAAQAAAAAAdAQEAAAAAABR0ZmR0AQAAAAAAAAAAAAAAAAAAGHRydW4AAAAFAAAAAQAAAHACAAAAAAAAJW1kYXQKCgAAAAKv/4lfIAgyDxAArAIFFCCBAAADJP/MgA==
         """
 
-    func testProtectedNativeHLSUsesManifestContractWithoutFetchingMedia()
+    func testProtectedHEVCHLSIsUnsupportedWithoutFetchingMedia()
         async throws
     {
         let rootURL = URL(
@@ -516,10 +593,10 @@ final class HLSPreflightInspectorTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(inspected.result.route, .nativeAVPlayer)
+        XCTAssertEqual(inspected.result.route, .unsupported)
         XCTAssertEqual(
             inspected.result.reason,
-            .nativeProtectedHLSContractVerified
+            .unsupportedHLSContentProtection
         )
         XCTAssertEqual(
             inspected.result.sourceProfile.videoFormat,
@@ -655,7 +732,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
                     #EXTM3U
                     #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Clear",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,URI="clear.m3u8"
                     #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Protected",LANGUAGE="ja",DEFAULT=NO,AUTOSELECT=YES,URI="protected.m3u8"
-                    #EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS="hvc1.2.4.L150",AUDIO="audio"
+                    #EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS="avc1.640028",AUDIO="audio"
                     video.m3u8
                     """.utf8
                 ),
@@ -797,7 +874,7 @@ final class HLSPreflightInspectorTests: XCTestCase {
                     """
                     #EXTM3U
                     #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Broken",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,URI="broken.m3u8"
-                    #EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS="hvc1.2.4.L150",AUDIO="audio"
+                    #EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS="avc1.640028",AUDIO="audio"
                     video.m3u8
                     """.utf8
                 ),

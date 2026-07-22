@@ -52,6 +52,10 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
     private let sourceByteStore: SourceByteStore?
     private let lock = NSLock()
     private var isClosed = false
+    /// Exact demuxer that established progressive preflight facts. The first
+    /// Hybrid generation consumes it instead of reopening the URL between
+    /// admission and commit; later explicit generations use `backing`.
+    private var preparedInitialDemuxer: Demuxer?
 
     init(
         source: MediaSource,
@@ -68,6 +72,7 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
         switch source {
         case .url(let url):
             sourceByteStore = try SourceByteStore()
+            preparedInitialDemuxer = nil
             backing = .url(
                 url,
                 headers: options.httpHeaders,
@@ -76,6 +81,7 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
             )
         case .custom(let reader, let formatHint):
             sourceByteStore = nil
+            preparedInitialDemuxer = nil
             backing = .custom(
                 reader,
                 formatHint: formatHint,
@@ -84,6 +90,31 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
                 discCacheKey: nil
             )
         }
+    }
+
+    private init(
+        preparedURLSource: AetherPreparedURLSource,
+        url: URL,
+        options: LoadOptions
+    ) throws {
+        guard !options.isLive else {
+            throw BlackCarrierDemuxSourceFactoryError.seekableVODRequired
+        }
+        let profile = DemuxerOpenProfile.playback.withProbeBudget(
+            probesize: options.probesize,
+            maxAnalyzeDuration: options.maxAnalyzeDuration
+        )
+        sourceByteStore = try SourceByteStore()
+        backing = .url(
+            url,
+            headers: options.httpHeaders,
+            profile: profile,
+            selectTitleID: nil
+        )
+        preparedInitialDemuxer = try preparedURLSource.consume(
+            url: url,
+            options: options
+        )
     }
 
     static func adopting(
@@ -105,19 +136,38 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
         }
     }
 
+    static func adopting(
+        preparedURLSource: AetherPreparedURLSource,
+        url: URL,
+        options: LoadOptions
+    ) throws -> BlackCarrierDemuxSourceFactory {
+        try BlackCarrierDemuxSourceFactory(
+            preparedURLSource: preparedURLSource,
+            url: url,
+            options: options
+        )
+    }
+
     deinit {
         close()
     }
 
     func openDemuxer() throws -> Demuxer {
         let source: Backing
+        let preparedDemuxer: Demuxer?
         lock.lock()
         guard !isClosed else {
             lock.unlock()
             throw BlackCarrierDemuxSourceFactoryError.closed
         }
         source = backing
+        preparedDemuxer = preparedInitialDemuxer
+        preparedInitialDemuxer = nil
         lock.unlock()
+
+        if let preparedDemuxer {
+            return preparedDemuxer
+        }
 
         let demuxer = Demuxer()
         do {
@@ -202,18 +252,22 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
 
     func close() {
         let customReader: IOReader?
+        let initialDemuxer: Demuxer?
         lock.lock()
         guard !isClosed else {
             lock.unlock()
             return
         }
         isClosed = true
+        initialDemuxer = preparedInitialDemuxer
+        preparedInitialDemuxer = nil
         if case .custom(let reader, _, _, _, _) = backing {
             customReader = reader
         } else {
             customReader = nil
         }
         lock.unlock()
+        initialDemuxer?.close()
         customReader?.close()
         sourceByteStore?.close()
     }

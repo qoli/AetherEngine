@@ -40,6 +40,8 @@ final class BlackCarrierLazyCompositeProvider:
     private var isClosed = false
     private let failureLock = NSLock()
     private var _terminalError: BlackCarrierLazyCompositeProviderError?
+    private var terminalHybridPlaybackErrorHandler:
+        (@Sendable (HybridPlaybackSessionError) -> Void)?
 
     init(
         videoProvider: BlackCarrierVideoProvider,
@@ -67,6 +69,7 @@ final class BlackCarrierLazyCompositeProvider:
     static func buildSeekableVOD(
         videoProvider: BlackCarrierVideoProvider,
         source: MediaSource,
+        preparedURLSource: AetherPreparedURLSource? = nil,
         options: LoadOptions,
         timeline: BlackCarrierTimeline,
         bridgeMode: AudioBridgeMode = .surroundCompat,
@@ -79,11 +82,25 @@ final class BlackCarrierLazyCompositeProvider:
     ) throws -> BlackCarrierLazyCompositeProvider {
         let sourceFactory: BlackCarrierDemuxSourceFactory
         do {
-            sourceFactory = try BlackCarrierDemuxSourceFactory.adopting(
-                source: source,
-                options: options,
-                selectTitleID: selectTitleID
-            )
+            if let preparedURLSource {
+                guard case .url(let url) = source,
+                      selectTitleID == nil else {
+                    throw AetherPreparedURLSourceError.identityMismatch
+                }
+                sourceFactory = try BlackCarrierDemuxSourceFactory
+                    .adopting(
+                        preparedURLSource: preparedURLSource,
+                        url: url,
+                        options: options
+                    )
+            } else {
+                sourceFactory = try BlackCarrierDemuxSourceFactory
+                    .adopting(
+                        source: source,
+                        options: options,
+                        selectTitleID: selectTitleID
+                    )
+            }
         } catch {
             videoProvider.close()
             throw error
@@ -130,6 +147,63 @@ final class BlackCarrierLazyCompositeProvider:
         return _terminalError
     }
 
+    var terminalHybridPlaybackError: HybridPlaybackSessionError? {
+        guard let terminalError else { return nil }
+        return Self.hybridPlaybackSessionError(from: terminalError)
+    }
+
+    func setTerminalHybridPlaybackErrorHandler(
+        _ handler:
+            (@Sendable (HybridPlaybackSessionError) -> Void)?
+    ) {
+        failureLock.lock()
+        terminalHybridPlaybackErrorHandler = handler
+        let existing = _terminalError.flatMap {
+            Self.hybridPlaybackSessionError(from: $0)
+        }
+        failureLock.unlock()
+        if let existing {
+            handler?(existing)
+        }
+    }
+
+    static func hybridPlaybackSessionError(
+        from error: Error
+    ) -> HybridPlaybackSessionError? {
+        let typed: BlackCarrierLazyCompositeProviderError
+        if let existing = error as? BlackCarrierLazyCompositeProviderError {
+            typed = existing
+        } else if let pump = error as? BlackCarrierMediaFanoutPumpError {
+            typed = .pump(pump)
+        } else {
+            return nil
+        }
+
+        switch typed {
+        case .startupResourceMissing:
+            return .providerFailed(
+                HybridPlaybackFailureEvidence(
+                    stage: .preparation,
+                    caseCode: "progressive.startupResourceMissing",
+                    underlyingDomain:
+                        "AetherEngine.BlackCarrierLazyCompositeProvider",
+                    underlyingCode: 1
+                )
+            )
+        case .pump(.generationSuperseded):
+            return nil
+        case .pump(let pump):
+            return .providerFailed(
+                HybridPlaybackFailureEvidence(
+                    stage: .provider,
+                    caseCode: "progressive.\(pump.failureCaseCode)",
+                    underlyingDomain: pump.failureDomain,
+                    underlyingCode: pump.failureCode
+                )
+            )
+        }
+    }
+
     var hybridVideoFormat: VideoFormat? {
         pump.hybridVideoFormat
     }
@@ -142,6 +216,10 @@ final class BlackCarrierLazyCompositeProvider:
 
     var hybridVideoFrameRate: Double? {
         pump.hybridVideoFrameRate
+    }
+
+    var progressiveSourceFacts: AetherProgressiveSourceFacts? {
+        pump.progressiveSourceFacts
     }
 
     var hybridSubtitleContracts:
@@ -450,6 +528,18 @@ final class BlackCarrierLazyCompositeProvider:
     }
 
     private func record(_ error: BlackCarrierLazyCompositeProviderError) {
+        // `pump.close()` first interrupts an in-flight `av_read_frame` via
+        // `Demuxer.markClosed()`. That intentional abort returns -1 (not
+        // AVERROR_EOF) and may reach this request path while `close()` waits
+        // for the pump lock. Linearize terminal recording against the
+        // provider lifecycle so teardown noise cannot replace the real error
+        // that caused the session to close. Errors that win this lock before
+        // close remain genuine active-session failures and are still kept.
+        closeLock.lock()
+        guard !isClosed else {
+            closeLock.unlock()
+            return
+        }
         failureLock.lock()
         let isFirstError: Bool
         if _terminalError == nil {
@@ -458,13 +548,23 @@ final class BlackCarrierLazyCompositeProvider:
         } else {
             isFirstError = false
         }
+        let mappedError = isFirstError
+            ? Self.hybridPlaybackSessionError(from: error)
+            : nil
+        let handler = isFirstError
+            ? terminalHybridPlaybackErrorHandler
+            : nil
         failureLock.unlock()
+        closeLock.unlock()
         guard isFirstError else { return }
         EngineLog.emit(
             "[BlackCarrierLazyCompositeProvider] terminal error: "
                 + error.localizedDescription,
             category: .session
         )
+        if let mappedError {
+            handler?(mappedError)
+        }
     }
 
     private func recordIfTerminal(
@@ -490,3 +590,7 @@ final class BlackCarrierLazyCompositeProvider:
         }
     }
 }
+
+extension BlackCarrierLazyCompositeProvider:
+    HybridPlaybackTerminalErrorSource
+{}

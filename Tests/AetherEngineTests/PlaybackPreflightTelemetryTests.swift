@@ -12,6 +12,7 @@ struct PlaybackPreflightTelemetryTests {
             expectedReason: PlaybackRouteReason
         )] = [
             (.h264, .nativeAVPlayer, .nativeHLSFMP4Remux),
+            (.hevc, .hybridCarrier, .hybridHEVC),
             (.vp9, .hybridCarrier, .hybridNonAVPlayerCodec),
             (.unknown, .unsupported, .unsupportedVideoCodec),
         ]
@@ -63,7 +64,7 @@ struct PlaybackPreflightTelemetryTests {
         }
     }
 
-    @Test("Successful HLS inspection exposes typed evidence without URL or credentials")
+    @Test("Protected HEVC is typed unsupported without exposing URL or credentials")
     func successfulHLSInspectionIsPrivacySafe() async throws {
         let rootURL = URL(
             string:
@@ -125,7 +126,7 @@ struct PlaybackPreflightTelemetryTests {
         )
         let events = await collect(stream)
 
-        #expect(preflight.result.route == .nativeAVPlayer)
+        #expect(preflight.result.route == .unsupported)
         #expect(events.map(\.kind) == [.started, .completed])
         let description = String(describing: events)
         #expect(!description.contains("secret-token"))
@@ -137,10 +138,10 @@ struct PlaybackPreflightTelemetryTests {
             Issue.record("Missing HLS completed event")
             return
         }
-        #expect(completed.route == .nativeAVPlayer)
+        #expect(completed.route == .unsupported)
         #expect(
             completed.reason
-                == .nativeProtectedHLSContractVerified
+                == .unsupportedHLSContentProtection
         )
         #expect(
             completed.hlsPackaging?.contentProtection

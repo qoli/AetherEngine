@@ -20,7 +20,17 @@ struct VideoRoutingPolicyTests {
             codecID: AV_CODEC_ID_H264, fieldOrder: AV_FIELD_UNKNOWN, av1Available: true))
     }
 
-    @Test("interlaced HEVC stays native (documents the intentional limit)")
+    @Test("field order maps to explicit unified scan evidence")
+    func fieldOrderScanEvidence() {
+        #expect(VideoRoutingPolicy.scanType(
+            fieldOrder: AV_FIELD_BT) == .interlaced)
+        #expect(VideoRoutingPolicy.scanType(
+            fieldOrder: AV_FIELD_PROGRESSIVE) == .progressive)
+        #expect(VideoRoutingPolicy.scanType(
+            fieldOrder: AV_FIELD_UNKNOWN) == .unknown)
+    }
+
+    @Test("low-level interlaced HEVC stays native; unified routing is stricter")
     func interlacedHEVCNative() {
         #expect(!VideoRoutingPolicy.requiresSoftwarePath(
             codecID: AV_CODEC_ID_HEVC, fieldOrder: AV_FIELD_TT, av1Available: true))

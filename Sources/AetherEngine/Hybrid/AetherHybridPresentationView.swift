@@ -208,6 +208,28 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         /// PTS of the first enqueued HDR10+ sample in the active generation.
         public let firstHDR10PlusAttachmentTimeSeconds: Double?
         public let lastEnqueuedTimeSeconds: Double?
+        /// Whether one asynchronous AVFoundation video-performance-metrics
+        /// request is currently outstanding for the active generation.
+        public let metricsSampleInFlight: Bool
+        /// Carrier media time captured when the latest metrics request began.
+        public let lastMetricsRequestCarrierTimeSeconds: Double?
+        /// Carrier media time re-read when the latest metrics request retired.
+        public let lastMetricsCompletionCarrierTimeSeconds: Double?
+        /// Number of metrics requests retired in the active generation.
+        public let metricsCompletionCount: UInt64
+        /// `nil` before any completion, `false` when AVFoundation completed
+        /// with no counters, and `true` when the latest completion had them.
+        public let lastMetricsCompletionHadCounters: Bool?
+        /// Latest cumulative renderer counters returned by AVFoundation.
+        public let lastRendererTotalFrameCount: Int?
+        public let lastRendererDroppedFrameCount: Int?
+        public let lastRendererDisplayedFrameCount: Int?
+        /// Signed displayed-counter change at the latest metrics completion.
+        /// A negative value records a renderer counter reset.
+        public let lastRendererDisplayedFrameDelta: Int?
+        /// PTS of the latest frame for which Aether published actual renderer
+        /// evidence. Enqueueing alone never updates this value.
+        public let lastPublishedEvidenceTimeSeconds: Double?
         /// Source-derived duration of the newest frame admitted in the active generation.
         public let lastAcceptedFrameDurationSeconds: Double?
         /// Geometry from the newest frame admitted in the active generation.
@@ -235,6 +257,16 @@ public final class AetherHybridPresentationView: PlatformBaseView {
             hdr10PlusAttachedSampleBuffers: Int,
             firstHDR10PlusAttachmentTimeSeconds: Double?,
             lastEnqueuedTimeSeconds: Double?,
+            metricsSampleInFlight: Bool,
+            lastMetricsRequestCarrierTimeSeconds: Double?,
+            lastMetricsCompletionCarrierTimeSeconds: Double?,
+            metricsCompletionCount: UInt64,
+            lastMetricsCompletionHadCounters: Bool?,
+            lastRendererTotalFrameCount: Int?,
+            lastRendererDroppedFrameCount: Int?,
+            lastRendererDisplayedFrameCount: Int?,
+            lastRendererDisplayedFrameDelta: Int?,
+            lastPublishedEvidenceTimeSeconds: Double?,
             lastAcceptedFrameDurationSeconds: Double?,
             lastAcceptedGeometry:
                 DecodedVideoFrameGeometry?,
@@ -262,6 +294,24 @@ public final class AetherHybridPresentationView: PlatformBaseView {
             self.firstHDR10PlusAttachmentTimeSeconds =
                 firstHDR10PlusAttachmentTimeSeconds
             self.lastEnqueuedTimeSeconds = lastEnqueuedTimeSeconds
+            self.metricsSampleInFlight = metricsSampleInFlight
+            self.lastMetricsRequestCarrierTimeSeconds =
+                lastMetricsRequestCarrierTimeSeconds
+            self.lastMetricsCompletionCarrierTimeSeconds =
+                lastMetricsCompletionCarrierTimeSeconds
+            self.metricsCompletionCount = metricsCompletionCount
+            self.lastMetricsCompletionHadCounters =
+                lastMetricsCompletionHadCounters
+            self.lastRendererTotalFrameCount =
+                lastRendererTotalFrameCount
+            self.lastRendererDroppedFrameCount =
+                lastRendererDroppedFrameCount
+            self.lastRendererDisplayedFrameCount =
+                lastRendererDisplayedFrameCount
+            self.lastRendererDisplayedFrameDelta =
+                lastRendererDisplayedFrameDelta
+            self.lastPublishedEvidenceTimeSeconds =
+                lastPublishedEvidenceTimeSeconds
             self.lastAcceptedFrameDurationSeconds =
                 lastAcceptedFrameDurationSeconds
             self.lastAcceptedGeometry = lastAcceptedGeometry
@@ -327,6 +377,18 @@ public final class AetherHybridPresentationView: PlatformBaseView {
     private var frameDidLeaveMailbox: (@Sendable () -> Void)?
     private var asynchronousFailureHandler:
         (@MainActor (AetherHybridPresentationError) -> Void)?
+    private let displayedFrameEvidence =
+        AetherHybridDisplayedFrameEvidenceReducer()
+    private var presentedFrameCallback:
+        (@MainActor (AetherHybridPresentedFrameEvidence) -> Void)?
+    private var metricsSamplingTask: Task<Void, Never>?
+    private var metricsSamplingGate =
+        AetherHybridMetricsSamplingGate()
+    private var metricsDiagnostics =
+        AetherHybridRendererMetricsDiagnosticsReducer()
+    private var lastMetricsSampleRequestUptime: TimeInterval?
+    private var hasBegunVideoGeneration = false
+    private var directDisplayedPixelEvidenceAllowed = false
 
     public var videoGravity: AetherHybridVideoGravity = .resizeAspect {
         didSet {
@@ -417,6 +479,20 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         try throwIfRendererFailed()
         flushRenderer(removingDisplayedImage: false)
         activeGeneration = generation
+        // `flush(removingDisplayedImage: false)` intentionally preserves the
+        // previous picture across seeks. Because the renderer does not expose
+        // that pixel buffer's generation, direct pixel evidence is safe only
+        // for this view's first generation. Later generations require a
+        // displayed-frame metrics advance.
+        directDisplayedPixelEvidenceAllowed =
+            !hasBegunVideoGeneration
+        hasBegunVideoGeneration = true
+        metricsSamplingTask?.cancel()
+        metricsSamplingTask = nil
+        metricsSamplingGate.invalidate()
+        metricsDiagnostics.beginGeneration(generation)
+        lastMetricsSampleRequestUptime = nil
+        displayedFrameEvidence.beginGeneration(generation)
         activeVideoFormat = videoFormat
         releasePendingSamples()
         stopRequestingMediaDataIfNeeded()
@@ -554,6 +630,10 @@ public final class AetherHybridPresentationView: PlatformBaseView {
     }
 
     func invalidate() {
+        metricsSamplingTask?.cancel()
+        metricsSamplingTask = nil
+        metricsSamplingGate.invalidate()
+        metricsDiagnostics.invalidate()
         flush(removingDisplayedImage: true)
         displayLayer.controlTimebase = nil
         boundCarrierItem = nil
@@ -589,6 +669,29 @@ public final class AetherHybridPresentationView: PlatformBaseView {
                 firstHDR10PlusAttachmentTime?.seconds,
             lastEnqueuedTimeSeconds:
                 lastEnqueuedPresentationTime?.seconds,
+            metricsSampleInFlight:
+                metricsSamplingGate.hasActiveSample,
+            lastMetricsRequestCarrierTimeSeconds:
+                metricsDiagnostics
+                    .lastRequestCarrierTimeSeconds,
+            lastMetricsCompletionCarrierTimeSeconds:
+                metricsDiagnostics
+                    .lastCompletionCarrierTimeSeconds,
+            metricsCompletionCount:
+                metricsDiagnostics.completionCount,
+            lastMetricsCompletionHadCounters:
+                metricsDiagnostics.lastCompletionHadCounters,
+            lastRendererTotalFrameCount:
+                metricsDiagnostics.lastTotalFrameCount,
+            lastRendererDroppedFrameCount:
+                metricsDiagnostics.lastDroppedFrameCount,
+            lastRendererDisplayedFrameCount:
+                metricsDiagnostics.lastDisplayedFrameCount,
+            lastRendererDisplayedFrameDelta:
+                metricsDiagnostics.lastDisplayedFrameDelta,
+            lastPublishedEvidenceTimeSeconds:
+                metricsDiagnostics
+                    .lastPublishedEvidenceTimeSeconds,
             lastAcceptedFrameDurationSeconds:
                 lastAcceptedFrameDurationSeconds,
             lastAcceptedGeometry: lastAcceptedGeometry,
@@ -732,6 +835,10 @@ public final class AetherHybridPresentationView: PlatformBaseView {
               !pendingSamples.isEmpty {
             let pending = pendingSamples.removeFirst()
             target.enqueue(pending.sampleBuffer)
+            displayedFrameEvidence.recordEnqueued(
+                presentationTime: pending.presentationTime,
+                generation: activeGeneration
+            )
             lastCapacityProgressUptime =
                 ProcessInfo.processInfo.systemUptime
             frameDidLeaveMailbox?()
@@ -779,6 +886,102 @@ public final class AetherHybridPresentationView: PlatformBaseView {
         self.frameDidLeaveMailbox = frameDidLeaveMailbox
         self.asynchronousFailureHandler =
             asynchronousFailureHandler
+    }
+
+    func installPresentedFrameCallback(
+        _ callback: @escaping @MainActor (
+            AetherHybridPresentedFrameEvidence
+        ) -> Void
+    ) {
+        presentedFrameCallback = callback
+    }
+
+    /// Samples the actual AVSampleBufferVideoRenderer output. A queued sample
+    /// is only timestamp inventory; it becomes evidence after either a real
+    /// displayed pixel buffer (paused rate) or a displayed-frame metrics
+    /// advance from AVFoundation.
+    func pollPresentedFrame(
+        generation: UInt64,
+        carrierTime: CMTime
+    ) {
+        guard generation == activeGeneration,
+              carrierTime.isValid,
+              carrierTime.isNumeric else { return }
+        guard #available(
+            tvOS 17.4,
+            iOS 17.4,
+            macOS 14.4,
+            *
+        ) else {
+            // Older systems expose enqueue state but no truthful displayed
+            // surface. Keep the public result `missing`.
+            return
+        }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        if directDisplayedPixelEvidenceAllowed,
+           let timebase = boundCarrierTimebase,
+           CMTimebaseGetRate(timebase) == 0,
+           displayLayer.sampleBufferRenderer
+                .displayedPixelBuffer() != nil,
+           let evidence = displayedFrameEvidence
+                .observeDisplayedPixelBuffer(
+                    carrierTime: carrierTime,
+                    now: now
+                ) {
+            metricsDiagnostics.recordPublishedEvidence(evidence)
+            presentedFrameCallback?(evidence)
+        }
+
+        guard !metricsSamplingGate.hasActiveSample,
+              lastMetricsSampleRequestUptime.map({
+                now - $0 >= 0.20
+              }) ?? true,
+              let sampleToken = metricsSamplingGate
+                .beginSample() else { return }
+        lastMetricsSampleRequestUptime = now
+        metricsDiagnostics.recordRequest(carrierTime: carrierTime)
+        metricsSamplingTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let metrics = await self.displayLayer
+                .sampleBufferRenderer.videoPerformanceMetrics
+            guard self.metricsSamplingGate
+                    .complete(sampleToken) else { return }
+            self.metricsSamplingTask = nil
+            guard !Task.isCancelled,
+                  generation == self.activeGeneration else { return }
+            let completionCarrierTime =
+                self.boundCarrierItem?.currentTime()
+            let counters = metrics.map {
+                AetherHybridDisplayedFrameCounters(
+                    total: $0.totalNumberOfFrames,
+                    dropped: $0.numberOfDroppedFrames
+                )
+            }
+            self.metricsDiagnostics.recordCompletion(
+                carrierTime: completionCarrierTime,
+                counters: counters
+            )
+            guard self.boundCarrierItem != nil,
+                  let boundCarrierTimebase = self.boundCarrierTimebase,
+                  let layerTimebase = self.displayLayer.controlTimebase,
+                  Self.isSameTimebase(
+                    boundCarrierTimebase,
+                    layerTimebase
+                  ) else { return }
+            guard let completionCarrierTime,
+                  let counters,
+                  let evidence = self.displayedFrameEvidence
+                    .observeMetrics(
+                        counters,
+                        requestCarrierTime: carrierTime,
+                        completionCarrierTime:
+                            completionCarrierTime,
+                        now: ProcessInfo.processInfo.systemUptime
+                    ) else { return }
+            self.metricsDiagnostics.recordPublishedEvidence(evidence)
+            self.presentedFrameCallback?(evidence)
+        }
     }
 
     func setRendererStallDetectionEnabled(_ enabled: Bool) {

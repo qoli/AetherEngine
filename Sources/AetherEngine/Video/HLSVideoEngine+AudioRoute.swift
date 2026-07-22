@@ -210,7 +210,10 @@ extension HLSVideoEngine {
             }
         }
 
-        // Video-only fallback: illegal for demuxed-audio sessions (silent playback); fail and let the host fall back to server-muxed.
+        // A video-only continuation is valid only when this same request has no
+        // companion-audio contract. Dropping a present demuxed-audio rendition
+        // would manufacture silent success, so fail this Aether path explicitly;
+        // the failure does not authorize a host-selected server-muxed URL.
         if sideAudioDemuxer != nil {
             throw HLSVideoEngineError.openFailed(
                 reason: "demuxed-audio companion present but no audio pipeline could be built")

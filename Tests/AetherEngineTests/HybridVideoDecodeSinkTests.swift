@@ -169,6 +169,95 @@ struct HybridVideoDecodeSinkTests {
         #expect(sink.failure == nil)
     }
 
+    @Test("A frame retained for source reorder delay cannot satisfy target readiness")
+    func retainedReorderFrameDoesNotSatisfyTargetReadiness() throws {
+        let data = try BlackCarrierEncodedSample.verifiedMP4Data()
+        let demuxer = try openDemuxer(data: data)
+        defer { demuxer.close() }
+        let stream = try #require(demuxer.stream(
+            at: demuxer.videoStreamIndex
+        ))
+        let codecParameters = try #require(stream.pointee.codecpar)
+        codecParameters.pointee.video_delay = 2
+        let frames = FrameBox()
+        let sink = try HybridVideoDecodeSink(
+            demuxer: demuxer,
+            initialGeneration: 0,
+            onFrame: { frames.append($0) }
+        )
+        defer { sink.close() }
+        let packet = try #require(try demuxer.readPacket())
+        defer {
+            var packetToFree: UnsafeMutablePointer<AVPacket>? = packet
+            trackedPacketFree(&packetToFree)
+        }
+
+        try sink.consume(packet)
+
+        #expect(frames.snapshot().isEmpty)
+        #expect(!sink.isTargetFrameReady)
+
+        try sink.finish()
+
+        #expect(frames.snapshot().count == 1)
+        #expect(sink.isTargetFrameReady)
+    }
+
+    @Test("Generation rebuild retires buffered old frames before admitting the new display order")
+    func generationRebuildRetiresBufferedOldFrames() throws {
+        let data = try BlackCarrierEncodedSample.verifiedMP4Data()
+        let firstDemuxer = try openDemuxer(data: data)
+        defer { firstDemuxer.close() }
+        let firstStream = try #require(firstDemuxer.stream(
+            at: firstDemuxer.videoStreamIndex
+        ))
+        let firstCodecParameters = try #require(
+            firstStream.pointee.codecpar
+        )
+        firstCodecParameters.pointee.video_delay = 2
+        let frames = FrameBox()
+        let sink = try HybridVideoDecodeSink(
+            demuxer: firstDemuxer,
+            initialGeneration: 7,
+            onFrame: { frames.append($0) }
+        )
+        defer { sink.close() }
+        let firstPacket = try #require(try firstDemuxer.readPacket())
+        var firstPacketToFree: UnsafeMutablePointer<AVPacket>? =
+            firstPacket
+        defer { trackedPacketFree(&firstPacketToFree) }
+        try sink.consume(firstPacket)
+        #expect(frames.snapshot().isEmpty)
+
+        let secondDemuxer = try openDemuxer(data: data)
+        defer { secondDemuxer.close() }
+        let secondStream = try #require(secondDemuxer.stream(
+            at: secondDemuxer.videoStreamIndex
+        ))
+        let secondCodecParameters = try #require(
+            secondStream.pointee.codecpar
+        )
+        secondCodecParameters.pointee.video_delay = 2
+        try sink.beginGeneration(
+            8,
+            targetTime: .zero,
+            restartDecodeAnchorTime: .zero,
+            demuxer: secondDemuxer,
+            stream: secondStream
+        )
+        #expect(frames.snapshot().isEmpty)
+        let secondPacket = try #require(try secondDemuxer.readPacket())
+        var secondPacketToFree: UnsafeMutablePointer<AVPacket>? =
+            secondPacket
+        defer { trackedPacketFree(&secondPacketToFree) }
+        try sink.consume(secondPacket)
+        try sink.finish()
+
+        let snapshot = frames.snapshot()
+        #expect(snapshot.count == 1)
+        #expect(snapshot[0].generation == 8)
+    }
+
     @Test("Closed sink fails explicitly")
     func closedSinkFails() throws {
         let data = try BlackCarrierEncodedSample.verifiedMP4Data()
@@ -267,6 +356,31 @@ struct HybridVideoDecodeSinkTests {
 
         #expect(throws: HybridVideoDecodeSinkError
             .invalidPacketTimeBase) {
+            _ = try HybridVideoDecodeSink(
+                demuxer: demuxer,
+                initialGeneration: 0,
+                onFrame: { _ in }
+            )
+        }
+    }
+
+    @Test("Unsupported presentation reorder depth fails instead of inventing a window")
+    func invalidPresentationReorderDepthFails() throws {
+        let data = try BlackCarrierEncodedSample.verifiedMP4Data()
+        let demuxer = try openDemuxer(data: data)
+        defer { demuxer.close() }
+        let stream = try #require(demuxer.stream(
+            at: demuxer.videoStreamIndex
+        ))
+        let codecParameters = try #require(stream.pointee.codecpar)
+        let depth = HybridVideoStreamContract
+            .maximumPresentationReorderDepth + 1
+        codecParameters.pointee.video_delay = Int32(depth)
+
+        #expect(throws:
+            HybridVideoDecodeSinkError
+                .invalidPresentationReorderDepth(depth)
+        ) {
             _ = try HybridVideoDecodeSink(
                 demuxer: demuxer,
                 initialGeneration: 0,
@@ -676,6 +790,111 @@ struct HybridVideoDecodeSinkTests {
         #expect(
             provider.realVideoBitrateTelemetry
                 .observedAverageBitrate != nil
+        )
+        #expect(provider.terminalError == nil)
+    }
+
+    @Test("Decode demand advances a fresh generation beyond cached carrier segments")
+    func decodeDemandAdvancesFreshGenerationPastCarrierCache()
+        throws
+    {
+        let duration = 5.25
+        let sourceData = try makeAVSource(seconds: duration)
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(
+                seconds: duration,
+                preferredTimescale: 90_000
+            )
+        )
+        #expect(timeline.segments.count == 2)
+        let videoProvider = try BlackCarrierVideoProvider(
+            timeline: timeline
+        )
+        let frames = FrameBox()
+        let provider = try BlackCarrierLazyCompositeProvider
+            .buildSeekableVOD(
+                videoProvider: videoProvider,
+                source: .custom(
+                    ClonableDataReader(data: sourceData),
+                    formatHint: "mp4"
+                ),
+                options: LoadOptions(),
+                timeline: timeline,
+                decodedFrameHandler: { frames.append($0) }
+            )
+        defer { provider.close() }
+
+        try provider.prepareForTransportStart()
+        _ = try #require(provider.alternateAudioMediaSegment(
+            ordinal: 0,
+            index: 1
+        ))
+
+        // Model a backward seek after AVPlayer has cached both stable carrier
+        // segment URLs. The new source generation prepares only segment zero;
+        // no segment-one carrier URL is requested again.
+        var classifier = HybridSeekIntentClassifier(timeline: timeline)
+        let target = CMTime(
+            seconds: 0.9,
+            preferredTimescale: 90_000
+        )
+        let intent = try classifier.registerExplicitHostSeek(to: target)
+        #expect(try provider.restartMedia(for: intent) == .applied(
+            generation: 1,
+            segmentIndex: 0
+        ))
+        try provider.prepareHybridGeneration(segmentIndex: 0)
+
+        let secondSegmentStart = timeline.segments[1].startTime
+        let terminalFrameTime = CMTime(
+            seconds: 5,
+            preferredTimescale: 90_000
+        )
+        #expect(!frames.snapshot().contains(where: {
+            $0.generation == 1
+                && CMTimeCompare(
+                    $0.presentationTime,
+                    secondSegmentStart
+                ) >= 0
+        }))
+
+        // Decode demand, not a repeated carrier request, must drive the fresh
+        // demuxer across the carrier-segment boundary during steady playback.
+        try provider.advanceVideoDecodeDemand(to: CMTime(
+            seconds: 4.5,
+            preferredTimescale: 90_000
+        ))
+
+        #expect(frames.snapshot().contains(where: {
+            $0.generation == 1
+                && CMTimeCompare(
+                    $0.presentationTime,
+                    secondSegmentStart
+                ) >= 0
+        }))
+        #expect(!frames.snapshot().contains(where: {
+            $0.generation == 1
+                && CMTimeCompare(
+                    $0.presentationTime,
+                    terminalFrameTime
+                ) >= 0
+        }))
+
+        // Exact-end return is the generation's decoded-frame/relay handoff
+        // barrier, including the final source frame rather than merely the
+        // first frame on the second carrier segment.
+        try provider.advanceVideoDecodeDemand(to: timeline.duration)
+
+        #expect(frames.snapshot().contains(where: {
+            $0.generation == 1
+                && CMTimeCompare(
+                    $0.presentationTime,
+                    terminalFrameTime
+                ) >= 0
+        }))
+        #expect(
+            provider.realVideoBitrateTelemetry.state
+                == .complete
         )
         #expect(provider.terminalError == nil)
     }

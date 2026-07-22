@@ -606,6 +606,7 @@ public final class AetherEngine: ObservableObject {
     /// Throws CancellationError when the captured generation is stale. Callers must clean up local resources
     /// before calling; shared state belongs to the successor.
     func checkLoadCurrent(_ gen: UInt64) throws {
+        try Task.checkCancellation()
         guard loadGeneration == gen else {
             EngineLog.emit(
                 "[AetherEngine] load superseded (gen \(gen) -> \(loadGeneration)); unwinding",
@@ -1477,6 +1478,7 @@ public final class AetherEngine: ObservableObject {
         // below can activate the session: AVKit on the native/remote-HLS paths, activateRendererAudioSession()
         // on the SW and audio paths. The task is short and typically already complete, so this rarely suspends.
         await awaitAudioSessionCategoryConfigured()
+        try checkLoadCurrent(gen)
 
         // nativeRemoteHLS: skip probe + loopback; play HLS URL directly with AVPlayer (Jellyfin already serves HLS).
         // Routed before the probe because we never demux the m3u8.
@@ -1577,7 +1579,7 @@ public final class AetherEngine: ObservableObject {
         }
 
         // Superseded during probe: close the local probe (detached, can block) and unwind.
-        if loadGeneration != gen {
+        if Task.isCancelled || loadGeneration != gen {
             probe.markClosed()
             if probeOpened {
                 Task.detached { [probe] in probe.close() }
@@ -1651,7 +1653,11 @@ public final class AetherEngine: ObservableObject {
         // 1.5 Audio-only fast path: no display-criteria handshake, no video dispatch.
         //     Native sub-branch closes the probe and reopens via AVPlayer; FFmpeg sub-branch reuses the probe
         //     (required for custom sources).
-        let hasVideoStream = probeOpened && probe.videoStreamIndex >= 0
+        // Best-stream selection can reject an incomplete or unidentified
+        // video stream. Only the complete demux stream inventory may prove
+        // that this is audio-only media.
+        let hasVideoStream = probeOpened
+            && probe.hasAnyVideoStreamByType
         if Self.shouldUseAudioOnlyPath(audioOnlyRequested: options.audioOnly, probeOpened: probeOpened, hasVideoStream: hasVideoStream) {
             // Read codec before closing the probe; custom sources always use FFmpeg (AVPlayer can't consume a custom demuxer).
             let audioCodecID: AVCodecID = (probeOpened && resolvedInitialAudio >= 0)
@@ -1742,7 +1748,7 @@ public final class AetherEngine: ObservableObject {
                 didSwitchPanel = true
                 await displayCriteria.waitForSwitch()
                 // Superseded during panel handshake: close local probe and unwind.
-                if loadGeneration != gen {
+                if Task.isCancelled || loadGeneration != gen {
                     probe.markClosed()
                     if probeOpened {
                         Task.detached { [probe] in probe.close() }
@@ -1784,7 +1790,9 @@ public final class AetherEngine: ObservableObject {
         #endif
 
         // 3. Dispatch by codec.
-        //    Native: HEVC/H.264 (unconditional) and AV1 on platforms with HW decode (iOS 17+/macOS 14+).
+        //    Lower-level load route: Native handles HEVC/H.264 and HW AV1.
+        //    This is not unified AetherPlaybackSession policy; that boundary
+        //    admits every positive HEVC source through Hybrid instead.
         //    SW (SoftwarePlaybackHost / dav1d / libavcodec):
         //    - AV1 on tvOS: no Apple-shipped dav1d, no HW AV1 on any Apple TV chip.
         //    - VP9/VP8: AVPlayer's HLS manifest parser rejects vp09/vp8 CODECS attributes even when VT can

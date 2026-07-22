@@ -433,9 +433,11 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         let session = self.session
         lock.unlock()
         guard let session else { return }
-        // Drain in-flight frames then signal a discontinuity so VT drops its reference picture state.
-        VTDecompressionSessionWaitForAsynchronousFrames(session)
+        // Ask VT to emit its temporally delayed display-order frames first,
+        // then wait for every asynchronous callback. Reversing these calls
+        // leaves delayed B-frames able to cross a Hybrid generation rebuild.
         VTDecompressionSessionFinishDelayedFrames(session)
+        VTDecompressionSessionWaitForAsynchronousFrames(session)
     }
 
     func synchronize() {

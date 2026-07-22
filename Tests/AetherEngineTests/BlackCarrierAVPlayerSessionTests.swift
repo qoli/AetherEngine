@@ -33,6 +33,23 @@ struct BlackCarrierAVPlayerSessionTests {
         var playlistType: HLSPlaylistType { .vod }
     }
 
+    private final class TrackingProvider:
+        BlackCarrierTransportProvider,
+        @unchecked Sendable
+    {
+        private(set) var didClose = false
+
+        func close() {
+            didClose = true
+        }
+
+        func initSegment() -> Data? { Data([0]) }
+        func mediaSegment(at index: Int) -> Data? { Data([0]) }
+        var segmentCount: Int { 1 }
+        func segmentDuration(at index: Int) -> Double { 1 }
+        var playlistType: HLSPlaylistType { .vod }
+    }
+
     private final class FrameCounter: @unchecked Sendable {
         private let lock = NSLock()
         private var value = 0
@@ -82,6 +99,10 @@ struct BlackCarrierAVPlayerSessionTests {
             audioStores: [audioStore]
         )
         let stablePlayer = AVPlayer()
+        stablePlayer.allowsExternalPlayback = true
+        #if os(iOS) || os(tvOS)
+        stablePlayer.usesExternalPlaybackWhileExternalScreenIsActive = true
+        #endif
         let session = BlackCarrierAVPlayerSession(
             provider: provider,
             avPlayer: stablePlayer
@@ -89,12 +110,19 @@ struct BlackCarrierAVPlayerSessionTests {
 
         #expect(session.avPlayer === stablePlayer)
         #expect(session.avPlayer.currentItem == nil)
-        #expect(!session.avPlayer.allowsExternalPlayback)
+        #expect(session.avPlayer.allowsExternalPlayback)
         #expect(session.transportState == .idle)
         await #expect(throws: BlackCarrierAVPlayerSessionError.notStarted) {
             try await session.prepare()
         }
         try session.start()
+        #expect(!session.avPlayer.allowsExternalPlayback)
+        #if os(iOS) || os(tvOS)
+        #expect(
+            !session.avPlayer
+                .usesExternalPlaybackWhileExternalScreenIsActive
+        )
+        #endif
 
         let playlistURL = try #require(session.playlistURL)
         #expect(playlistURL.lastPathComponent == "master.m3u8")
@@ -137,6 +165,13 @@ struct BlackCarrierAVPlayerSessionTests {
 
         session.stop()
         #expect(session.avPlayer.currentItem == nil)
+        #expect(session.avPlayer.allowsExternalPlayback)
+        #if os(iOS) || os(tvOS)
+        #expect(
+            session.avPlayer
+                .usesExternalPlaybackWhileExternalScreenIsActive
+        )
+        #endif
         #expect(session.playlistURL == nil)
         #expect(session.transportState == .stopped)
         #expect(!FileManager.default.fileExists(atPath: videoDirectory.path))
@@ -205,6 +240,44 @@ struct BlackCarrierAVPlayerSessionTests {
         #expect(provider.didClose)
         #expect(session.playlistURL == nil)
         #expect(session.transportState == .stopped)
+    }
+
+    @Test("A late carrier stop cannot clear a successor AVPlayer item")
+    @MainActor
+    func stopPreservesSuccessorItem() throws {
+        let provider = TrackingProvider()
+        let player = AVPlayer()
+        player.allowsExternalPlayback = true
+        #if os(iOS) || os(tvOS)
+        player.usesExternalPlaybackWhileExternalScreenIsActive = true
+        #endif
+        let session = BlackCarrierAVPlayerSession(
+            provider: provider,
+            avPlayer: player
+        )
+        try session.start()
+        #expect(!player.allowsExternalPlayback)
+        let ownedItem = try #require(player.currentItem)
+        let successor = AVPlayerItem(asset: AVMutableComposition())
+
+        player.replaceCurrentItem(with: successor)
+        player.allowsExternalPlayback = true
+        #if os(iOS) || os(tvOS)
+        player.usesExternalPlaybackWhileExternalScreenIsActive = true
+        #endif
+        #expect(player.currentItem === successor)
+        #expect(player.currentItem !== ownedItem)
+
+        session.stop()
+
+        #expect(provider.didClose)
+        #expect(player.currentItem === successor)
+        #expect(player.allowsExternalPlayback)
+        #if os(iOS) || os(tvOS)
+        #expect(player.usesExternalPlaybackWhileExternalScreenIsActive)
+        #endif
+        #expect(session.transportState == .stopped)
+        player.replaceCurrentItem(with: nil)
     }
 
     @Test("Video-only carrier reaches AVPlayer readiness without silent audio")

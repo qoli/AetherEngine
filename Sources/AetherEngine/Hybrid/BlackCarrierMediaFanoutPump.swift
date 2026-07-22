@@ -75,6 +75,88 @@ enum BlackCarrierMediaFanoutPumpError:
             return "Black carrier requested segment \(index) was not produced"
         }
     }
+
+    /// Stable, exhaustive identity used when the progressive Hybrid provider
+    /// publishes terminal evidence. This intentionally preserves the nested
+    /// audio-muxer case instead of relying on Swift's synthesized NSError code.
+    var failureCaseCode: String {
+        switch self {
+        case .videoStreamMissing: "videoStreamMissing"
+        case .invalidRenditionOrdinal: "invalidRenditionOrdinal"
+        case .invalidSegmentIndex: "invalidSegmentIndex"
+        case .restartRequiresUserSeek: "restartRequiresUserSeek"
+        case .seekIntentSegmentMismatch: "seekIntentSegmentMismatch"
+        case .demuxSeekFailed: "demuxSeekFailed"
+        case .restartTimelineOffsetUnavailable:
+            "restartTimelineOffsetUnavailable"
+        case .freshDemuxerFactoryMissing: "freshDemuxerFactoryMissing"
+        case .analysisSourceFactoryMissing: "analysisSourceFactoryMissing"
+        case .freshDemuxerOpenFailed: "freshDemuxerOpenFailed"
+        case .restartSourceContractMismatch:
+            "restartSourceContractMismatch"
+        case .restartTrackContractMismatch:
+            "restartTrackContractMismatch"
+        case .generationSuperseded: "generationSuperseded"
+        case .closed: "closed"
+        case .demuxFailed: "demuxFailed"
+        case .videoPacketSinkFailed: "videoPacketSinkFailed"
+        case .audioMuxerFailed(_, let error):
+            "audioMuxer.\(error.failureCaseCode)"
+        case .audioStoreFailed(let error):
+            switch error {
+            case .muxer(let nested):
+                "audioStore.muxer.\(nested.failureCaseCode)"
+            case .segmentStoreFailed: "audioStore.segmentStoreFailed"
+            case .incompleteStorage: "audioStore.incompleteStorage"
+            case .unexpected: "audioStore.unexpected"
+            }
+        case .requestedSegmentUnavailable:
+            "requestedSegmentUnavailable"
+        }
+    }
+
+    var failureDomain: String {
+        switch self {
+        case .audioMuxerFailed,
+             .audioStoreFailed(.muxer):
+            "AetherEngine.BlackCarrierAudioRenditionMuxer"
+        case .audioStoreFailed:
+            "AetherEngine.BlackCarrierAudioRenditionStore"
+        default:
+            "AetherEngine.BlackCarrierMediaFanoutPump"
+        }
+    }
+
+    var failureCode: Int {
+        switch self {
+        case .videoStreamMissing: 1
+        case .invalidRenditionOrdinal: 2
+        case .invalidSegmentIndex: 3
+        case .restartRequiresUserSeek: 4
+        case .seekIntentSegmentMismatch: 5
+        case .demuxSeekFailed: 6
+        case .restartTimelineOffsetUnavailable: 7
+        case .freshDemuxerFactoryMissing: 8
+        case .analysisSourceFactoryMissing: 9
+        case .freshDemuxerOpenFailed: 10
+        case .restartSourceContractMismatch: 11
+        case .restartTrackContractMismatch: 12
+        case .generationSuperseded: 13
+        case .closed: 14
+        case .demuxFailed: 15
+        case .videoPacketSinkFailed: 16
+        case .audioMuxerFailed(_, let error):
+            error.failureCode
+        case .audioStoreFailed(let error):
+            switch error {
+            case .muxer(let nested): nested.failureCode
+            case .segmentStoreFailed: 1
+            case .incompleteStorage: 2
+            case .unexpected: 3
+            }
+        case .requestedSegmentUnavailable: 17
+        }
+    }
 }
 
 enum BlackCarrierMediaFanoutRestartResult: Sendable, Equatable {
@@ -86,6 +168,7 @@ struct BlackCarrierDemuxContract: Sendable, Equatable {
     let durationMicroseconds: Int64
     let formatStartTime: Int64
     let containerBitRate: Int64
+    let progressiveSourceFacts: AetherProgressiveSourceFacts
 
     init(demuxer: Demuxer) {
         durationMicroseconds = Int64(
@@ -93,6 +176,14 @@ struct BlackCarrierDemuxContract: Sendable, Equatable {
         )
         formatStartTime = demuxer.formatStartTime
         containerBitRate = demuxer.bitRate
+        progressiveSourceFacts = AetherProgressiveSourceFacts(
+            probe: AetherEngine.makeSourceProbe(
+                demuxer: demuxer,
+                displayURL: URL(
+                    string: "aether-hybrid://source"
+                )!
+            )
+        )
     }
 }
 
@@ -166,6 +257,9 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     let nativeSubtitleRenditionMetadata:
         [BlackCarrierNativeSubtitleRenditionMetadata]
     let sourceContract: BlackCarrierDemuxContract
+    var progressiveSourceFacts: AetherProgressiveSourceFacts {
+        sourceContract.progressiveSourceFacts
+    }
     let hybridSubtitleContracts:
         [HybridSubtitleDecodeContract]
     let hybridSubtitlePacketStore = SubtitlePacketStore()
@@ -1182,8 +1276,54 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
 
     func advanceVideoDecodeDemand(to time: CMTime) throws {
         guard let hybridVideoDecodeSink else { return }
+
+        // Update the sink first so packets read while producing the demand's
+        // carrier segment decode immediately up to the current clock horizon.
+        // A carrier resource may already be cached by AVPlayer after a seek,
+        // so loopback HTTP requests cannot be the only owner that advances the
+        // fresh generation's source demuxer.
         do {
             try hybridVideoDecodeSink.advanceDecodeDemand(to: time)
+        } catch {
+            let typed = BlackCarrierMediaFanoutPumpError
+                .videoPacketSinkFailed(
+                    reason: String(describing: error)
+                )
+            failAfterUnlock(typed)
+            throw typed
+        }
+
+        let reachesFiniteEnd = CMTimeCompare(
+            time,
+            timeline.duration
+        ) >= 0
+        let demandedSegmentIndex: Int?
+        if reachesFiniteEnd {
+            demandedSegmentIndex = timeline.segments.indices.last
+        } else {
+            demandedSegmentIndex = timeline.segmentIndex(
+                containing: time
+            )
+        }
+        guard let demandedSegmentIndex else {
+            let typed = BlackCarrierMediaFanoutPumpError
+                .invalidSegmentIndex(index: 0)
+            failAfterUnlock(typed)
+            throw typed
+        }
+
+        // Do not catch this call here. Source, demux, mux and generation
+        // failures are already typed by `produce` and must not be mislabeled
+        // as decoder/sink failures.
+        try produce(throughSegment: demandedSegmentIndex)
+
+        guard reachesFiniteEnd else { return }
+        // Exact-end demand is also the decoded-video completion barrier for
+        // this generation. `finish` drains queued packets, delayed decoder
+        // output and presentation ordering before returning; the renderer may
+        // still display relay-owned frames asynchronously.
+        do {
+            try hybridVideoDecodeSink.finish()
         } catch {
             let typed = BlackCarrierMediaFanoutPumpError
                 .videoPacketSinkFailed(

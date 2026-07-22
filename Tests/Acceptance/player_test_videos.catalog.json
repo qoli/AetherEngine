@@ -1,0 +1,4149 @@
+{
+  "schema_version": 1,
+  "catalog_id": "player-test-videos-2026-07-21",
+  "fixtures": [
+    {
+      "case_id": "format-network-audio-aacplus-file1",
+      "fixture_id": "network-audio-aacplus-file1",
+      "entry_path": "01-network-audio/aacplus-file1.aac",
+      "resources": [
+        {
+          "path": "01-network-audio/aacplus-file1.aac",
+          "sha256": "2b7312468bef3ba96a41b51e6e43b54a3edb1f6638d4c6cb96331efb757818b4"
+        }
+      ],
+      "expected_media": {
+        "container": "aac",
+        "duration_seconds": 7.756872,
+        "video_codecs": [],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 1
+      },
+      "seek": {
+        "forward_seek_seconds": 4.654,
+        "backward_seek_seconds": 1.164,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-network-audio-aacplus-file2",
+      "fixture_id": "network-audio-aacplus-file2",
+      "entry_path": "01-network-audio/aacplus-file2.mp4",
+      "resources": [
+        {
+          "path": "01-network-audio/aacplus-file2.mp4",
+          "sha256": "dcd2e94da030f048938c412f6f2025468628fbf33e6e3dcf427e443bd163d2bd"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 7.848345,
+        "video_codecs": [],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 1
+      },
+      "seek": {
+        "forward_seek_seconds": 4.709,
+        "backward_seek_seconds": 1.177,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-network-audio-aacplus-file3",
+      "fixture_id": "network-audio-aacplus-file3",
+      "entry_path": "01-network-audio/aacplus-file3.mp4",
+      "resources": [
+        {
+          "path": "01-network-audio/aacplus-file3.mp4",
+          "sha256": "f251f65bb38cd3f2d53bf0ef9da0a249b394263168312df97430e152064aa021"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 7.848345,
+        "video_codecs": [],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 1
+      },
+      "seek": {
+        "forward_seek_seconds": 4.709,
+        "backward_seek_seconds": 1.177,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-network-audio-aacplus-file4",
+      "fixture_id": "network-audio-aacplus-file4",
+      "entry_path": "01-network-audio/aacplus-file4.mp4",
+      "resources": [
+        {
+          "path": "01-network-audio/aacplus-file4.mp4",
+          "sha256": "c6303c32dbc4a47c27923578ee30b0f9182068c3496e74bef129d957a6ffbe01"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 7.848345,
+        "video_codecs": [],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 1
+      },
+      "seek": {
+        "forward_seek_seconds": 4.709,
+        "backward_seek_seconds": 1.177,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-network-audio-aacplus-file5",
+      "fixture_id": "network-audio-aacplus-file5",
+      "entry_path": "01-network-audio/aacplus-file5.mp4",
+      "resources": [
+        {
+          "path": "01-network-audio/aacplus-file5.mp4",
+          "sha256": "49595c57f80deae34c2570bc227658a8d856babd978cd8151f74d43054a63ba5"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 7.848345,
+        "video_codecs": [],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 1
+      },
+      "seek": {
+        "forward_seek_seconds": 4.709,
+        "backward_seek_seconds": 1.177,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-network-audio-aacplus-file6",
+      "fixture_id": "network-audio-aacplus-file6",
+      "entry_path": "01-network-audio/aacplus-file6.3gp",
+      "resources": [
+        {
+          "path": "01-network-audio/aacplus-file6.3gp",
+          "sha256": "bf4f1288fb3faa1dd23f6bfffad2bf6f3e8074a0c4d12e93e4982adfb2734058"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 7.848345,
+        "video_codecs": [],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 1
+      },
+      "seek": {
+        "forward_seek_seconds": 4.709,
+        "backward_seek_seconds": 1.177,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-network-audio-aacplus-file7",
+      "fixture_id": "network-audio-aacplus-file7",
+      "entry_path": "01-network-audio/aacplus-file7.3gp",
+      "resources": [
+        {
+          "path": "01-network-audio/aacplus-file7.3gp",
+          "sha256": "bee9c5c9cae168c2ce4cab43564c1f83739b6dd07fd9c27bb490525f4142f885"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 7.848345,
+        "video_codecs": [],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 1
+      },
+      "seek": {
+        "forward_seek_seconds": 4.709,
+        "backward_seek_seconds": 1.177,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-network-audio-avi-vc1-regression",
+      "fixture_id": "network-audio-avi-vc1-regression",
+      "entry_path": "01-network-audio/avi-vc1-regression.avi",
+      "resources": [
+        {
+          "path": "01-network-audio/avi-vc1-regression.avi",
+          "sha256": "9de31ffd7d674bf5856fededc9dd0c0e511ff21bf860c42fef7813dc05d5b37e"
+        }
+      ],
+      "expected_media": {
+        "container": "avi",
+        "duration_seconds": 2.24,
+        "video_codecs": [
+          "vc1"
+        ],
+        "audio_codecs": [],
+        "subtitle_codecs": [],
+        "track_count": 1
+      },
+      "seek": {
+        "forward_seek_seconds": 1.25,
+        "backward_seek_seconds": 0.25,
+        "minimum_post_seek_progress_seconds": 0.25
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-network-audio-ct_nero-heaac",
+      "fixture_id": "network-audio-ct_nero-heaac",
+      "entry_path": "01-network-audio/ct_nero-heaac.mp4",
+      "resources": [
+        {
+          "path": "01-network-audio/ct_nero-heaac.mp4",
+          "sha256": "e1890d642f7703961caa4954d59d858d755248d6118cb42c7d15c90bdf8b26a4"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 19.95161,
+        "video_codecs": [],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 1
+      },
+      "seek": {
+        "forward_seek_seconds": 11.971,
+        "backward_seek_seconds": 2.993,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-network-audio-wmv-vc1-1440x576-6mbps",
+      "fixture_id": "network-audio-wmv-vc1-1440x576-6mbps",
+      "entry_path": "01-network-audio/wmv-vc1-1440x576-6mbps.wmv",
+      "resources": [
+        {
+          "path": "01-network-audio/wmv-vc1-1440x576-6mbps.wmv",
+          "sha256": "4c8b9575cfbaf4099a0c8c667e7d4f3174ff6c07219960e360dfaafe21d4222d"
+        }
+      ],
+      "expected_media": {
+        "container": "asf",
+        "duration_seconds": 58.04,
+        "video_codecs": [
+          "vc1"
+        ],
+        "audio_codecs": [],
+        "subtitle_codecs": [],
+        "track_count": 1
+      },
+      "seek": {
+        "forward_seek_seconds": 34.824,
+        "backward_seek_seconds": 8.706,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-avi-mpeg4-part2-mp3",
+      "fixture_id": "progressive-avi-mpeg4-part2-mp3",
+      "entry_path": "02-progressive/avi-mpeg4-part2-mp3.avi",
+      "resources": [
+        {
+          "path": "02-progressive/avi-mpeg4-part2-mp3.avi",
+          "sha256": "6e6f5b28b6cbf52135152c9d17df63072ad665e736682c8acd0620bc22318c52"
+        }
+      ],
+      "expected_media": {
+        "container": "avi",
+        "duration_seconds": 6.041667,
+        "video_codecs": [
+          "mpeg4"
+        ],
+        "audio_codecs": [
+          "mp3"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.625,
+        "backward_seek_seconds": 0.906,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-flv-h264-aac",
+      "fixture_id": "progressive-flv-h264-aac",
+      "entry_path": "02-progressive/flv-h264-aac.flv",
+      "resources": [
+        {
+          "path": "02-progressive/flv-h264-aac.flv",
+          "sha256": "64846472bff83d42a33acc701c27a5d318e2a3b6c632635ca8db9198c645e14d"
+        }
+      ],
+      "expected_media": {
+        "container": "flv",
+        "duration_seconds": 6.021,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.613,
+        "backward_seek_seconds": 0.903,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mkv-av1-alac",
+      "fixture_id": "progressive-mkv-av1-alac",
+      "entry_path": "02-progressive/mkv-av1-alac.mkv",
+      "resources": [
+        {
+          "path": "02-progressive/mkv-av1-alac.mkv",
+          "sha256": "1650062da389f769afc1a42613604dc612b39e9e7372a8c57ac4d395259bb920"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 6.0,
+        "video_codecs": [
+          "av1"
+        ],
+        "audio_codecs": [
+          "alac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.6,
+        "backward_seek_seconds": 0.9,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mkv-h264-aac-eac3-dual-language",
+      "fixture_id": "progressive-mkv-h264-aac-eac3-dual-language",
+      "entry_path": "02-progressive/mkv-h264-aac-eac3-dual-language.mkv",
+      "resources": [
+        {
+          "path": "02-progressive/mkv-h264-aac-eac3-dual-language.mkv",
+          "sha256": "4f877e5cae79a30b163634f9e888f497bae670f581613151d79724191bbd0ae1"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 6.021,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "aac",
+          "eac3"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 3
+      },
+      "seek": {
+        "forward_seek_seconds": 3.613,
+        "backward_seek_seconds": 0.903,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mkv-h264-aac-srt",
+      "fixture_id": "progressive-mkv-h264-aac-srt",
+      "entry_path": "02-progressive/mkv-h264-aac-srt.mkv",
+      "resources": [
+        {
+          "path": "02-progressive/mkv-h264-aac-srt.mkv",
+          "sha256": "6e86530fb5f82ed60ed09b5522e4b70c4bbd12cbfd8da1fecdbd21e69f7dda82"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 5.503,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [
+          "subrip"
+        ],
+        "track_count": 3
+      },
+      "seek": {
+        "forward_seek_seconds": 3.302,
+        "backward_seek_seconds": 0.825,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mkv-h264-dts-core",
+      "fixture_id": "progressive-mkv-h264-dts-core",
+      "entry_path": "02-progressive/mkv-h264-dts-core.mkv",
+      "resources": [
+        {
+          "path": "02-progressive/mkv-h264-dts-core.mkv",
+          "sha256": "9e3560d7ba9df3d89bc1af20e77aa021afabe7c16c8bb5bd70ee12dafdaffc7b"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 6.0,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "dts"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.6,
+        "backward_seek_seconds": 0.9,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mkv-h264-flac",
+      "fixture_id": "progressive-mkv-h264-flac",
+      "entry_path": "02-progressive/mkv-h264-flac.mkv",
+      "resources": [
+        {
+          "path": "02-progressive/mkv-h264-flac.mkv",
+          "sha256": "87bdb5586adceb2ae3679b0f70463498defe6fd7b017a298f21bad11137d6dbb"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 6.0,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "flac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.6,
+        "backward_seek_seconds": 0.9,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mkv-h264-interlaced-aac",
+      "fixture_id": "progressive-mkv-h264-interlaced-aac",
+      "entry_path": "02-progressive/mkv-h264-interlaced-aac.mkv",
+      "resources": [
+        {
+          "path": "02-progressive/mkv-h264-interlaced-aac.mkv",
+          "sha256": "9a1214bb0b94e67f3c51c569d8b90e01129e622e2c6d917791b3f60294aae8bb"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 6.021,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.613,
+        "backward_seek_seconds": 0.903,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mkv-h264-mlp",
+      "fixture_id": "progressive-mkv-h264-mlp",
+      "entry_path": "02-progressive/mkv-h264-mlp.mkv",
+      "resources": [
+        {
+          "path": "02-progressive/mkv-h264-mlp.mkv",
+          "sha256": "870700984b34554dd9a7fc52eb0e0c31d9d3e88d9b77c32f45a6105970e09f38"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 6.0,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "mlp"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.6,
+        "backward_seek_seconds": 0.9,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mkv-h264-mp2",
+      "fixture_id": "progressive-mkv-h264-mp2",
+      "entry_path": "02-progressive/mkv-h264-mp2.mkv",
+      "resources": [
+        {
+          "path": "02-progressive/mkv-h264-mp2.mkv",
+          "sha256": "7fcf1fec5ae38b595f51e934cfd3151f92d2719029630f4d03cda55a6be49f8c"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 6.0,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "mp2"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.6,
+        "backward_seek_seconds": 0.9,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mkv-h264-pcm-s16le",
+      "fixture_id": "progressive-mkv-h264-pcm-s16le",
+      "entry_path": "02-progressive/mkv-h264-pcm-s16le.mkv",
+      "resources": [
+        {
+          "path": "02-progressive/mkv-h264-pcm-s16le.mkv",
+          "sha256": "7dbd44ae56ab13da85ec115c414aec11d7e6044f3539c55f35e3b6729e8ee59f"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 6.0,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "pcm_s16le"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.6,
+        "backward_seek_seconds": 0.9,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mkv-h264-truehd",
+      "fixture_id": "progressive-mkv-h264-truehd",
+      "entry_path": "02-progressive/mkv-h264-truehd.mkv",
+      "resources": [
+        {
+          "path": "02-progressive/mkv-h264-truehd.mkv",
+          "sha256": "342132eab403aae24369ae680ae984dca2737191a4967a5fa1790b8e8f698305"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 6.0,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "truehd"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.6,
+        "backward_seek_seconds": 0.9,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mkv-hevc-eac3-5.1",
+      "fixture_id": "progressive-mkv-hevc-eac3-5.1",
+      "entry_path": "02-progressive/mkv-hevc-eac3-5.1.mkv",
+      "resources": [
+        {
+          "path": "02-progressive/mkv-hevc-eac3-5.1.mkv",
+          "sha256": "b90222a2fbb08996925d276a8f4606a415cfa1c74eabdc890e7f6ba26cd22007"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 6.0,
+        "video_codecs": [
+          "hevc"
+        ],
+        "audio_codecs": [
+          "eac3"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.6,
+        "backward_seek_seconds": 0.9,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mkv-mpeg2-interlaced-ac3",
+      "fixture_id": "progressive-mkv-mpeg2-interlaced-ac3",
+      "entry_path": "02-progressive/mkv-mpeg2-interlaced-ac3.mkv",
+      "resources": [
+        {
+          "path": "02-progressive/mkv-mpeg2-interlaced-ac3.mkv",
+          "sha256": "124813f3c68fd1973bc7820bdfe68d782c6929d256acde22c395fe9169102788"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 6.0,
+        "video_codecs": [
+          "mpeg2video"
+        ],
+        "audio_codecs": [
+          "ac3"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.6,
+        "backward_seek_seconds": 0.9,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mkv-mpeg4-part2-mp3",
+      "fixture_id": "progressive-mkv-mpeg4-part2-mp3",
+      "entry_path": "02-progressive/mkv-mpeg4-part2-mp3.mkv",
+      "resources": [
+        {
+          "path": "02-progressive/mkv-mpeg4-part2-mp3.mkv",
+          "sha256": "64182d039f479113e59b11ebc4b419744c9182cf3a2a802789dab305230bc270"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 6.023,
+        "video_codecs": [
+          "mpeg4"
+        ],
+        "audio_codecs": [
+          "mp3"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.614,
+        "backward_seek_seconds": 0.903,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mp4-av1-aac",
+      "fixture_id": "progressive-mp4-av1-aac",
+      "entry_path": "02-progressive/mp4-av1-aac.mp4",
+      "resources": [
+        {
+          "path": "02-progressive/mp4-av1-aac.mp4",
+          "sha256": "daba186f8e875eb34078a6f4f4f5634d9c4185ec44af3cd22f34279b4c2e7b59"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 6.0,
+        "video_codecs": [
+          "av1"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.6,
+        "backward_seek_seconds": 0.9,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mp4-h264-aac-lc-5.1",
+      "fixture_id": "progressive-mp4-h264-aac-lc-5.1",
+      "entry_path": "02-progressive/mp4-h264-aac-lc-5.1.mp4",
+      "resources": [
+        {
+          "path": "02-progressive/mp4-h264-aac-lc-5.1.mp4",
+          "sha256": "ee82d8247086d637e7297cee25363edf2147bf76af5d2a3289ac491080b537c3"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 6.0,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.6,
+        "backward_seek_seconds": 0.9,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mp4-h264-aac-lc-stereo",
+      "fixture_id": "progressive-mp4-h264-aac-lc-stereo",
+      "entry_path": "02-progressive/mp4-h264-aac-lc-stereo.mp4",
+      "resources": [
+        {
+          "path": "02-progressive/mp4-h264-aac-lc-stereo.mp4",
+          "sha256": "cd6078de0333c1bc54a6ecb0975c3af7840bf790a65fca075fb53d723b9f49a9"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 6.0,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.6,
+        "backward_seek_seconds": 0.9,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mp4-h264-he-aac",
+      "fixture_id": "progressive-mp4-h264-he-aac",
+      "entry_path": "02-progressive/mp4-h264-he-aac.mp4",
+      "resources": [
+        {
+          "path": "02-progressive/mp4-h264-he-aac.mp4",
+          "sha256": "6d6553a006bf965f0c1d6df7444278ecb9396daf82aeecfc1697b3d3c970020b"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 6.0,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.6,
+        "backward_seek_seconds": 0.9,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mp4-h264-he-aacv2",
+      "fixture_id": "progressive-mp4-h264-he-aacv2",
+      "entry_path": "02-progressive/mp4-h264-he-aacv2.mp4",
+      "resources": [
+        {
+          "path": "02-progressive/mp4-h264-he-aacv2.mp4",
+          "sha256": "dd926e14a58aa5a2e97a27f842ead22889d25015ff5fa776e87cd3b05a4c217a"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 6.0,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.6,
+        "backward_seek_seconds": 0.9,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mp4-hevc-main10-hdr10-aac",
+      "fixture_id": "progressive-mp4-hevc-main10-hdr10-aac",
+      "entry_path": "02-progressive/mp4-hevc-main10-hdr10-aac.mp4",
+      "resources": [
+        {
+          "path": "02-progressive/mp4-hevc-main10-hdr10-aac.mp4",
+          "sha256": "6d3339905ccef5951501a57f9416aa3611736f6eb1d9bff197670e337a802a9b"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 6.0,
+        "video_codecs": [
+          "hevc"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.6,
+        "backward_seek_seconds": 0.9,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "hdr10_display",
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-mp4-hevc-main10-hlg-aac",
+      "fixture_id": "progressive-mp4-hevc-main10-hlg-aac",
+      "entry_path": "02-progressive/mp4-hevc-main10-hlg-aac.mp4",
+      "resources": [
+        {
+          "path": "02-progressive/mp4-hevc-main10-hlg-aac.mp4",
+          "sha256": "c0fea78c58eaa788a03689029142fbf590b308aab14de4e547d9e6eb67825827"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 6.0,
+        "video_codecs": [
+          "hevc"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.6,
+        "backward_seek_seconds": 0.9,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "hlg_display",
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-ogg-vorbis",
+      "fixture_id": "progressive-ogg-vorbis",
+      "entry_path": "02-progressive/ogg-vorbis.ogg",
+      "resources": [
+        {
+          "path": "02-progressive/ogg-vorbis.ogg",
+          "sha256": "5d6d3fbf19d7229ff3afc8b9736bc6052e8a4e8215c8738c561d3de5d7a4e329"
+        }
+      ],
+      "expected_media": {
+        "container": "ogg",
+        "duration_seconds": 6.0,
+        "video_codecs": [],
+        "audio_codecs": [
+          "vorbis"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 1
+      },
+      "seek": {
+        "forward_seek_seconds": 3.6,
+        "backward_seek_seconds": 0.9,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-ts-h264-aac",
+      "fixture_id": "progressive-ts-h264-aac",
+      "entry_path": "02-progressive/ts-h264-aac.ts",
+      "resources": [
+        {
+          "path": "02-progressive/ts-h264-aac.ts",
+          "sha256": "d50cb2b84566cd5a804cc4aae76f33ecc44ef95e3a241d8f9d831eaef87b6244"
+        }
+      ],
+      "expected_media": {
+        "container": "mpeg-ts",
+        "duration_seconds": 6.021333,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.613,
+        "backward_seek_seconds": 0.903,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-ts-h264-ac3",
+      "fixture_id": "progressive-ts-h264-ac3",
+      "entry_path": "02-progressive/ts-h264-ac3.ts",
+      "resources": [
+        {
+          "path": "02-progressive/ts-h264-ac3.ts",
+          "sha256": "2c261e1cb588c135138eed56548248c7fdab091ed86bee19f4d7a4ea2515871b"
+        }
+      ],
+      "expected_media": {
+        "container": "mpeg-ts",
+        "duration_seconds": 6.016,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "ac3"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.61,
+        "backward_seek_seconds": 0.902,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-ts-mpeg2-mp2",
+      "fixture_id": "progressive-ts-mpeg2-mp2",
+      "entry_path": "02-progressive/ts-mpeg2-mp2.ts",
+      "resources": [
+        {
+          "path": "02-progressive/ts-mpeg2-mp2.ts",
+          "sha256": "f5590754e12347b86fc91b92e3d45d4107260a8fc49e11c0018438eed6b446e9"
+        }
+      ],
+      "expected_media": {
+        "container": "mpeg-ts",
+        "duration_seconds": 6.010023,
+        "video_codecs": [
+          "mpeg2video"
+        ],
+        "audio_codecs": [
+          "mp2"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.606,
+        "backward_seek_seconds": 0.902,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-webm-vp8-vorbis",
+      "fixture_id": "progressive-webm-vp8-vorbis",
+      "entry_path": "02-progressive/webm-vp8-vorbis.webm",
+      "resources": [
+        {
+          "path": "02-progressive/webm-vp8-vorbis.webm",
+          "sha256": "97a98266836670b73b9635c37fb1a39937e3586c8f7eca64ebf3a27c1dc2349e"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 6.021,
+        "video_codecs": [
+          "vp8"
+        ],
+        "audio_codecs": [
+          "vorbis"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.613,
+        "backward_seek_seconds": 0.903,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-progressive-webm-vp9-opus",
+      "fixture_id": "progressive-webm-vp9-opus",
+      "entry_path": "02-progressive/webm-vp9-opus.webm",
+      "resources": [
+        {
+          "path": "02-progressive/webm-vp9-opus.webm",
+          "sha256": "08b157138865a8d6a2937c63f46a64413c9441be6010e6032805a3e83f9ee07d"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 6.008,
+        "video_codecs": [
+          "vp9"
+        ],
+        "audio_codecs": [
+          "opus"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 3.605,
+        "backward_seek_seconds": 0.901,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-hls-aether-hdr10-hev1-alt-audio-hls-master",
+      "fixture_id": "hls-aether-hdr10-hev1-alt-audio-hls-master",
+      "entry_path": "03-hls/aether-hdr10-hev1-alt-audio-hls/master.m3u8",
+      "resources": [
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/english/index.m3u8",
+          "sha256": "bc58873a6bbe917d967d59e738db7465ed5142142651858d7b46bf43878cd76a"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/english/init_1.mp4",
+          "sha256": "941be025f5fd63799c796fa08e0531381440625c750e1be95f44cc0dc1de1644"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/english/segment_000.m4s",
+          "sha256": "1579c9da51955d9f8bf6a71efcc8d160e25d1e2f9cef62325f3f7634d60e0d59"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/english/segment_001.m4s",
+          "sha256": "ea1a72cc7ab10c6f28fd6f46f91861b7d3b72641689bb7c789bcdc8555edc35a"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/english/segment_002.m4s",
+          "sha256": "ee14e85152d7e9a8c74d1628c4c9998082ff482f6b4d263f541c39b05a5cca43"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/english/segment_003.m4s",
+          "sha256": "a607b3525f2131e26a05422d4ca0f1aa5603d45f1bf3d71976c12334c3f3df6a"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/master.m3u8",
+          "sha256": "e45f0af4c2915fa93bb54573678a07f6040a3d016e816a7520778ab4924e4460"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/spanish/index.m3u8",
+          "sha256": "1124fb81cc1950ff509a12d4e9db222a04eeb0ca0266a7782b615090019e9aff"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/spanish/init_2.mp4",
+          "sha256": "6aad61c85144edd41d9441413d214e60c91d04e1ffb25f01cbdade2b0c9e893b"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/spanish/segment_000.m4s",
+          "sha256": "900de385a2e1dcf706a05de0ce6aae36f54c96d83229d129955981a1b0873414"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/spanish/segment_001.m4s",
+          "sha256": "e86f156c8935bb6870d95d52ec3849e0043652fd60daf465ad21717ba7ff0d99"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/spanish/segment_002.m4s",
+          "sha256": "7626a15e7f68420c6d920543c538b68090772b9dc91906a58b339d6d31a3a831"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/spanish/segment_003.m4s",
+          "sha256": "9af7833249dba178c51c04b1918cade3e8b0597087b4bfd398d2e6fab9db2bab"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/subtitles/index.m3u8",
+          "sha256": "2d7bc4e5c1988b0c4d615685ae15111eabf01b06f797ec2aa9eb653965eea898"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/subtitles/segment_000.vtt",
+          "sha256": "457bd75ad8d955ce88e42ab28bc5aad0275377c7521a88eea884852a32cb3fce"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/subtitles/segment_001.vtt",
+          "sha256": "329ed52bb839a05d6aabc7fadff176f1f5c7c40169f397f39702f7b3cd0d7fcd"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/subtitles/segment_002.vtt",
+          "sha256": "6af4ad2d70cd1b33715f52173252c8d3315cf001be5b9c46dae519d686e76136"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/subtitles/segment_003.vtt",
+          "sha256": "68df765d1b5bce561d71121ba44993a9d198787664acc653c7557a2efbb50024"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/video/index.m3u8",
+          "sha256": "1dc5709f5b7aba91c2fce056c34483d151abde1c73654796cd1479a10746cc63"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/video/init_0.mp4",
+          "sha256": "76aa052725a2c8b66667f3ef167ad4504cdbf8549cd83a11eced4abf44e1db56"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/video/segment_000.m4s",
+          "sha256": "85f57f94d26b9ec74572fef7aed89b11c6106582eb6833523c39c03cd1b2dd19"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/video/segment_001.m4s",
+          "sha256": "eb96be9edf4b07cbc48b94e3ff7d2f61587ab5cdfd3f7a3177e03e4b9ec730c4"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/video/segment_002.m4s",
+          "sha256": "e87535e7da5d07582ce20890e964789cac14cd115c8d3a9850fb3d0e333b5c3c"
+        },
+        {
+          "path": "03-hls/aether-hdr10-hev1-alt-audio-hls/video/segment_003.m4s",
+          "sha256": "60cac283df7826e4a0e4c0708c0a309d4924121455b4a86e8662c8c12f85f4f1"
+        }
+      ],
+      "expected_media": {
+        "container": "hls",
+        "duration_seconds": 16.0,
+        "video_codecs": [
+          "hevc"
+        ],
+        "audio_codecs": [
+          "aac",
+          "aac"
+        ],
+        "subtitle_codecs": [
+          "webvtt"
+        ],
+        "track_count": 4
+      },
+      "seek": {
+        "forward_seek_seconds": 9.6,
+        "backward_seek_seconds": 2.4,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "hdr10_display",
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-hls-hls-fmp4-h264-aac-index",
+      "fixture_id": "hls-hls-fmp4-h264-aac-index",
+      "entry_path": "03-hls/hls-fmp4-h264-aac/index.m3u8",
+      "resources": [
+        {
+          "path": "03-hls/hls-fmp4-h264-aac/index.m3u8",
+          "sha256": "26a2a652874a52baa70c0d1bc75e40082f128d04bc039acd64f10ee0745b464c"
+        },
+        {
+          "path": "03-hls/hls-fmp4-h264-aac/init.mp4",
+          "sha256": "c8a2b64dd03f45a2a4fd848b8e6eb8de808e8372a2a03cfb9580def2df39ef93"
+        },
+        {
+          "path": "03-hls/hls-fmp4-h264-aac/segment_000.m4s",
+          "sha256": "b69a55fe06dd2a5e5c6d06f9e361a84b80acbbbe5817032583349029ec169f8c"
+        },
+        {
+          "path": "03-hls/hls-fmp4-h264-aac/segment_001.m4s",
+          "sha256": "a7ad00b62a94c745106ebc119f15d4ba93048bce40d75bf8e231872c7c225733"
+        },
+        {
+          "path": "03-hls/hls-fmp4-h264-aac/segment_002.m4s",
+          "sha256": "4c4b8e6281f7cf3b6d1e7dffa2a09ff22424ff9a8a6c6ab6cc7b6b60ec0afec8"
+        },
+        {
+          "path": "03-hls/hls-fmp4-h264-aac/segment_003.m4s",
+          "sha256": "2ed03526bba86b08013cf7bc4133f00c37563b90831de83081c277253d9590ed"
+        },
+        {
+          "path": "03-hls/hls-fmp4-h264-aac/segment_004.m4s",
+          "sha256": "9aedff692be566057936e8fc54eebbb2d7052ff082764d5bbe1e692872667034"
+        },
+        {
+          "path": "03-hls/hls-fmp4-h264-aac/segment_005.m4s",
+          "sha256": "fff169d0a9359765a390085c92d32a86d5cbf086c82a068fc3639a17b7b338ab"
+        }
+      ],
+      "expected_media": {
+        "container": "hls",
+        "duration_seconds": 12.0,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 7.2,
+        "backward_seek_seconds": 1.8,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-hls-hls-ts-h264-aac-index",
+      "fixture_id": "hls-hls-ts-h264-aac-index",
+      "entry_path": "03-hls/hls-ts-h264-aac/index.m3u8",
+      "resources": [
+        {
+          "path": "03-hls/hls-ts-h264-aac/index.m3u8",
+          "sha256": "ff24919ffa7b3fa33320322950eeed96aad1ec8b36a0138a15de076fd3c2d1de"
+        },
+        {
+          "path": "03-hls/hls-ts-h264-aac/segment_000.ts",
+          "sha256": "0bb4b5a265a1cc9223c2c9f9b35b2b55ed0d118a20dddd50e7b25a466fb171d7"
+        },
+        {
+          "path": "03-hls/hls-ts-h264-aac/segment_001.ts",
+          "sha256": "28343742368c96337468485b4a70a517dbb820349333aa48f1c0f2287149320f"
+        },
+        {
+          "path": "03-hls/hls-ts-h264-aac/segment_002.ts",
+          "sha256": "769c07b56685c9c6717213d8bfdd46c9f04aac19bff4e75fc9246d4b345eab07"
+        },
+        {
+          "path": "03-hls/hls-ts-h264-aac/segment_003.ts",
+          "sha256": "7e493e4744a6f8e673805dca823b837284730408ab192dd196f809ed8f1c2c96"
+        },
+        {
+          "path": "03-hls/hls-ts-h264-aac/segment_004.ts",
+          "sha256": "2d3058fe349845d6e56a9b1ff3f9fce11246b14d215b21313cd1d690b87416df"
+        },
+        {
+          "path": "03-hls/hls-ts-h264-aac/segment_005.ts",
+          "sha256": "2fa9f820424740c281605af65837303ab8ecfd1cb26ad6633d014c57613d2bdd"
+        }
+      ],
+      "expected_media": {
+        "container": "hls",
+        "duration_seconds": 12.0,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 7.2,
+        "backward_seek_seconds": 1.8,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-subtitles-mkv-vp9-ass-aac",
+      "fixture_id": "subtitles-mkv-vp9-ass-aac",
+      "entry_path": "04-subtitles/mkv-vp9-ass-aac.mkv",
+      "resources": [
+        {
+          "path": "04-subtitles/mkv-vp9-ass-aac.mkv",
+          "sha256": "6089975c74e5fa0537b4b166be5813b99ba34ae474770a2a94a73d6631cc22fd"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 32.021,
+        "video_codecs": [
+          "vp9"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [
+          "ass"
+        ],
+        "track_count": 3
+      },
+      "seek": {
+        "forward_seek_seconds": 19.213,
+        "backward_seek_seconds": 4.803,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-subtitles-mkv-vp9-pgs-aac",
+      "fixture_id": "subtitles-mkv-vp9-pgs-aac",
+      "entry_path": "04-subtitles/mkv-vp9-pgs-aac.mkv",
+      "resources": [
+        {
+          "path": "04-subtitles/mkv-vp9-pgs-aac.mkv",
+          "sha256": "f1c07e28bb79762df24d2fc5834978da33732f5fdcf3f600279422e36826e8b7"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 32.021,
+        "video_codecs": [
+          "vp9"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [
+          "hdmv_pgs_subtitle"
+        ],
+        "track_count": 3
+      },
+      "seek": {
+        "forward_seek_seconds": 19.213,
+        "backward_seek_seconds": 4.803,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-bbb-av1-720p-10s",
+      "fixture_id": "bbb-av1-720p-10s",
+      "entry_path": "bbb-av1-720p-10s.mp4",
+      "resources": [
+        {
+          "path": "bbb-av1-720p-10s.mp4",
+          "sha256": "c36935958e4d2fcc0dfe66ae149e582aec544b5550fa9151f98ea7decb405d59"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 10.0,
+        "video_codecs": [
+          "av1"
+        ],
+        "audio_codecs": [],
+        "subtitle_codecs": [],
+        "track_count": 1
+      },
+      "seek": {
+        "forward_seek_seconds": 6.0,
+        "backward_seek_seconds": 1.5,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-bbb-h264-720p-10s",
+      "fixture_id": "bbb-h264-720p-10s",
+      "entry_path": "bbb-h264-720p-10s.mp4",
+      "resources": [
+        {
+          "path": "bbb-h264-720p-10s.mp4",
+          "sha256": "bfb0b4b07b8bb61b707a052e62daec31305a13276fcbebc714f2462f31d96210"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 10.0,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [],
+        "subtitle_codecs": [],
+        "track_count": 1
+      },
+      "seek": {
+        "forward_seek_seconds": 6.0,
+        "backward_seek_seconds": 1.5,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-bbb-hevc-720p-10s",
+      "fixture_id": "bbb-hevc-720p-10s",
+      "entry_path": "bbb-hevc-720p-10s.mp4",
+      "resources": [
+        {
+          "path": "bbb-hevc-720p-10s.mp4",
+          "sha256": "c428adace9fa0f08c987e886bc9e888597970df8c8cb8ffe38dbc1a3f97a65ff"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 10.0,
+        "video_codecs": [
+          "hevc"
+        ],
+        "audio_codecs": [],
+        "subtitle_codecs": [],
+        "track_count": 1
+      },
+      "seek": {
+        "forward_seek_seconds": 6.0,
+        "backward_seek_seconds": 1.5,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-bbb-vp9-720p-10s",
+      "fixture_id": "bbb-vp9-720p-10s",
+      "entry_path": "bbb-vp9-720p-10s.webm",
+      "resources": [
+        {
+          "path": "bbb-vp9-720p-10s.webm",
+          "sha256": "f4457bf8cee98b882c659f13883e58ad058d72b80516ecdf3f21b45ef70dd188"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 10.0,
+        "video_codecs": [
+          "vp9"
+        ],
+        "audio_codecs": [],
+        "subtitle_codecs": [],
+        "track_count": 1
+      },
+      "seek": {
+        "forward_seek_seconds": 6.0,
+        "backward_seek_seconds": 1.5,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-sintel-h264-aac-480p-52s",
+      "fixture_id": "sintel-h264-aac-480p-52s",
+      "entry_path": "sintel-h264-aac-480p-52s.mp4",
+      "resources": [
+        {
+          "path": "sintel-h264-aac-480p-52s.mp4",
+          "sha256": "b670602fa00934ca27c4351bb0efe7ea7a07fae57284e44226025eeed7c51254"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 52.208333,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 31.325,
+        "backward_seek_seconds": 7.831,
+        "minimum_post_seek_progress_seconds": 1.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-required-mkv-vc1-dts-hd-ma",
+      "fixture_id": "required-mkv-vc1-dts-hd-ma",
+      "entry_path": null,
+      "resources": [],
+      "expected_media": null,
+      "seek": null,
+      "expected_route": null,
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "blocked",
+      "completion_mode": "not_run",
+      "blocked_reason": "licensed or explicitly redistributable source, SHA-256, and probe evidence are absent",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-required-mkv-dolby-vision-profile-7-truehd-atmos",
+      "fixture_id": "required-mkv-dolby-vision-profile-7-truehd-atmos",
+      "entry_path": null,
+      "resources": [],
+      "expected_media": null,
+      "seek": null,
+      "expected_route": null,
+      "hardware_requirements": [
+        "atmos_output",
+        "dolby_vision_display",
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "blocked",
+      "completion_mode": "not_run",
+      "blocked_reason": "licensed or explicitly redistributable source, SHA-256, and probe evidence are absent",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-required-mp4-dolby-vision-profile-5-eac3",
+      "fixture_id": "required-mp4-dolby-vision-profile-5-eac3",
+      "entry_path": null,
+      "resources": [],
+      "expected_media": null,
+      "seek": null,
+      "expected_route": null,
+      "hardware_requirements": [
+        "dolby_vision_display",
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "blocked",
+      "completion_mode": "not_run",
+      "blocked_reason": "licensed or explicitly redistributable source, SHA-256, and probe evidence are absent",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-required-mp4-dolby-vision-profile-8.1-eac3-joc",
+      "fixture_id": "required-mp4-dolby-vision-profile-8.1-eac3-joc",
+      "entry_path": null,
+      "resources": [],
+      "expected_media": null,
+      "seek": null,
+      "expected_route": null,
+      "hardware_requirements": [
+        "atmos_output",
+        "dolby_vision_display",
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "blocked",
+      "completion_mode": "not_run",
+      "blocked_reason": "licensed or explicitly redistributable source, SHA-256, and probe evidence are absent",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-required-mp4-dolby-vision-profile-8.4-eac3-joc",
+      "fixture_id": "required-mp4-dolby-vision-profile-8.4-eac3-joc",
+      "entry_path": null,
+      "resources": [],
+      "expected_media": null,
+      "seek": null,
+      "expected_route": null,
+      "hardware_requirements": [
+        "atmos_output",
+        "dolby_vision_display",
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "blocked",
+      "completion_mode": "not_run",
+      "blocked_reason": "licensed or explicitly redistributable source, SHA-256, and probe evidence are absent",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-required-mkv-hdr10plus-hevc-eac3",
+      "fixture_id": "required-mkv-hdr10plus-hevc-eac3",
+      "entry_path": null,
+      "resources": [],
+      "expected_media": null,
+      "seek": null,
+      "expected_route": null,
+      "hardware_requirements": [
+        "hdr10_display",
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "blocked",
+      "completion_mode": "not_run",
+      "blocked_reason": "licensed or explicitly redistributable source, SHA-256, and probe evidence are absent",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-required-ts-cea608-h264-aac",
+      "fixture_id": "required-ts-cea608-h264-aac",
+      "entry_path": null,
+      "resources": [],
+      "expected_media": null,
+      "seek": null,
+      "expected_route": null,
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "blocked",
+      "completion_mode": "not_run",
+      "blocked_reason": "licensed or explicitly redistributable source, SHA-256, and probe evidence are absent",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-required-mkv-pgs-h264-aac",
+      "fixture_id": "required-mkv-pgs-h264-aac",
+      "entry_path": null,
+      "resources": [],
+      "expected_media": null,
+      "seek": null,
+      "expected_route": null,
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "blocked",
+      "completion_mode": "not_run",
+      "blocked_reason": "licensed or explicitly redistributable source, SHA-256, and probe evidence are absent",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-required-mkv-dvb-or-dvdsub-h264-aac",
+      "fixture_id": "required-mkv-dvb-or-dvdsub-h264-aac",
+      "entry_path": null,
+      "resources": [],
+      "expected_media": null,
+      "seek": null,
+      "expected_route": null,
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "blocked",
+      "completion_mode": "not_run",
+      "blocked_reason": "licensed or explicitly redistributable source, SHA-256, and probe evidence are absent",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-seek-5min-progressive-native-h264-aac",
+      "fixture_id": "seek-5min-progressive-native-h264-aac",
+      "entry_path": "06-seek-5min/progressive-native-h264-aac-5min.mp4",
+      "resources": [
+        {
+          "path": "06-seek-5min/progressive-native-h264-aac-5min.mp4",
+          "sha256": "bbc1167c5d3ccc5bcf7a90b2f5e5facbfb3a08b1f4ad9f7d7eca8590ed9e1f0e"
+        }
+      ],
+      "expected_media": {
+        "container": "mp4",
+        "duration_seconds": 300.0,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 150.0,
+        "backward_seek_seconds": 60.0,
+        "minimum_post_seek_progress_seconds": 2.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-seek-5min-progressive-audiobridge-h264-pcm",
+      "fixture_id": "seek-5min-progressive-audiobridge-h264-pcm",
+      "entry_path": "06-seek-5min/progressive-audiobridge-h264-pcm-5min.mkv",
+      "resources": [
+        {
+          "path": "06-seek-5min/progressive-audiobridge-h264-pcm-5min.mkv",
+          "sha256": "af58fd2ed1841503f99797c38e1e0841fb4d7bae5180972bfe0cca277e3064d4"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 300.0,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "pcm_s16le"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 150.0,
+        "backward_seek_seconds": 60.0,
+        "minimum_post_seek_progress_seconds": 2.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-seek-5min-progressive-hybrid-hevc-hdr10-eac3",
+      "fixture_id": "seek-5min-progressive-hybrid-hevc-hdr10-eac3",
+      "entry_path": "06-seek-5min/progressive-hybrid-hevc-hdr10-eac3-5min.mkv",
+      "resources": [
+        {
+          "path": "06-seek-5min/progressive-hybrid-hevc-hdr10-eac3-5min.mkv",
+          "sha256": "ab06f5f201efc136f8aec88f614616f9b9b5796109f373544eea3e7460355503"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 300.0,
+        "video_codecs": [
+          "hevc"
+        ],
+        "audio_codecs": [
+          "eac3"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 150.0,
+        "backward_seek_seconds": 60.0,
+        "minimum_post_seek_progress_seconds": 2.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "hdr10_display",
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-seek-5min-progressive-hybrid-mpeg2-interlaced-ac3",
+      "fixture_id": "seek-5min-progressive-hybrid-mpeg2-interlaced-ac3",
+      "entry_path": "06-seek-5min/progressive-hybrid-mpeg2-interlaced-ac3-5min.mkv",
+      "resources": [
+        {
+          "path": "06-seek-5min/progressive-hybrid-mpeg2-interlaced-ac3-5min.mkv",
+          "sha256": "ae6bb5166d01d2d7abeffbd80ca495f9a96bf94d3bd1a94a419430c0f6352f81"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 300.0,
+        "video_codecs": [
+          "mpeg2video"
+        ],
+        "audio_codecs": [
+          "ac3"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 150.0,
+        "backward_seek_seconds": 60.0,
+        "minimum_post_seek_progress_seconds": 2.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-seek-5min-progressive-hybrid-vp9-opus-ass",
+      "fixture_id": "seek-5min-progressive-hybrid-vp9-opus-ass",
+      "entry_path": "06-seek-5min/progressive-hybrid-vp9-opus-ass-5min.mkv",
+      "resources": [
+        {
+          "path": "06-seek-5min/progressive-hybrid-vp9-opus-ass-5min.mkv",
+          "sha256": "f8f2c6d276a946d364c87d2f865a05fac28140e057d5202a7a418b7570de236c"
+        }
+      ],
+      "expected_media": {
+        "container": "matroska",
+        "duration_seconds": 300.0,
+        "video_codecs": [
+          "vp9"
+        ],
+        "audio_codecs": [
+          "opus"
+        ],
+        "subtitle_codecs": [
+          "ass"
+        ],
+        "track_count": 3
+      },
+      "seek": {
+        "forward_seek_seconds": 150.0,
+        "backward_seek_seconds": 60.0,
+        "minimum_post_seek_progress_seconds": 2.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-seek-5min-hls-mpegts-h264-aac",
+      "fixture_id": "seek-5min-hls-mpegts-h264-aac",
+      "entry_path": "06-seek-5min/hls-mpegts-h264-aac-5min/index.m3u8",
+      "resources": [
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/index.m3u8",
+          "sha256": "eee8a3ddca9cfa3a6c1a0ff35cb8a3d8b55d0b32a5a7d568c7d69f79a14a229e"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_000.ts",
+          "sha256": "05e615820403cebfcd3a907cc9b4e54a9dd97eda7d02b1ea2f5835da45088f22"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_001.ts",
+          "sha256": "dc68adf8e1baa5e19fcbef0d3aef0d3cfeff1e6625a5ab3a2ccf01d6796ec741"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_002.ts",
+          "sha256": "bbc9bd616b54745e2640bdbbdcb5055b01d22a7820b6f2aa594f824f5bdb052e"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_003.ts",
+          "sha256": "a4f0fc49fd9e88f3694714385555c290689fabe16b62e5df73892524758e862f"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_004.ts",
+          "sha256": "4ba5996ef7500ed9a811de2bf363ebf0d2b75e40dce1d2b61adb8fb8a2100138"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_005.ts",
+          "sha256": "0da9d7b7b2a94ad0e686a5a696a5d2a96f2c2765d16a578776ea07dc4fd841fd"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_006.ts",
+          "sha256": "df6fb9b52a7fcb3e46a8b9bf95c6e16e00ac3dbd0bb9d52110603a7c16b382e0"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_007.ts",
+          "sha256": "747ce6dfd9aee7c81faff2eec2c497bb8905e6765bccdd81879838ae3d9756c9"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_008.ts",
+          "sha256": "1ab77f1e55080a1149315ece0c9e216ffa2b43a55b07a00b6f415701b3b42201"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_009.ts",
+          "sha256": "bcba95a5249205406948fe88c14661d1ddc0e02b1816511c93ebd98f4000b687"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_010.ts",
+          "sha256": "0211de5111c5f59847e1fd9aa7e5adddc17ab26a7553de9a487600819aa1c9ac"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_011.ts",
+          "sha256": "8bbece15f05bfd48710c4e7d3c32322f4d5d96f74c8d12518d88f4b0c27f9c53"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_012.ts",
+          "sha256": "1c73b6a06e92b47ec55e1160fded5640b2b61c39d8c844c3f3a8c62ea8c437f1"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_013.ts",
+          "sha256": "c0e25a729fd0d43c067ec96ee3de64dd20ebc4b6450f45a840e0de5f03be5afa"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_014.ts",
+          "sha256": "b2d897c92eba96c2cf5bd3851c982c00d71978714eb9df59306b90bbc44d2048"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_015.ts",
+          "sha256": "32ea38097041946d55712a18754f9b8992a2f932f27ce4aa328abda369853e81"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_016.ts",
+          "sha256": "dae007018a8ea9ba7b5f714a35d9d9b5b66d172eac903b41a7ac9dcdd3627e67"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_017.ts",
+          "sha256": "c346da1caa5d63ca6d4e3f6afdd78fe10945575e9687e02cc7b3541607b056c9"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_018.ts",
+          "sha256": "dd665da5ca39793086f5cd2c8560bf9a22f39810aee1a31099a1c22492f9cb98"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_019.ts",
+          "sha256": "f163a95cd6669fc8bf1e0d1ba149e4ee29c0fef8434498391d18b835d0d65b7b"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_020.ts",
+          "sha256": "5e96ec770a067e1dcd3e1688a535a75830e069e1dfa46038812b8daf04e67c29"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_021.ts",
+          "sha256": "5177ada47c5930d1951b5a1990e1e14a4eb8fe8d71ebe6b6e1dd0cfc2810e6b2"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_022.ts",
+          "sha256": "ac5692ec35c3c34e6cf13480a1dd55fc917c0fd42e09fa5f728385c2015de86c"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_023.ts",
+          "sha256": "a991c6b9357e4579038cee817d635abb9afd846c716c1908adb9762623816dc7"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_024.ts",
+          "sha256": "9b7f5ab91feb2e639372a7711d4644fc822f536050d644accf4647e928db180d"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_025.ts",
+          "sha256": "c7b52facf95d7e7571982f1f2d1380bd38cb71e191babcc26251dcf5b3246efa"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_026.ts",
+          "sha256": "49676c6aeb6815532d2d05788605f316cc127f58c4c8f2a5534ff10b443cfc6d"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_027.ts",
+          "sha256": "1ff55e1a41777f4e2fc18e8c85ee51a713534794491e49455602ee8bc0963e4a"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_028.ts",
+          "sha256": "02cdf0615e0353bd10e57434bff7623b6b419e147b15ca49d8034580a7018c45"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_029.ts",
+          "sha256": "5d95aa0dc4d9dfaae0ec777e478e3224a076b448fa243b637d15c8e234312f1b"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_030.ts",
+          "sha256": "22d20a894f6a6905652f7b31473f29c12ca7555063a5505781cf0e7ccd7f9ea0"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_031.ts",
+          "sha256": "a699c61f267b84d7399f360a7c8c207168f30790f240f8294fa354f2af536d29"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_032.ts",
+          "sha256": "9f6cec5b3958a34a9ca94856de44137d0da55377c50f7c775b6d3c97763d2de6"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_033.ts",
+          "sha256": "4067b2bd504c29ce1b6de6593af1234b59f0c8122b2caa772bca23412f89f9f7"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_034.ts",
+          "sha256": "7ed0c42b45836a0c23430d374475690e6aa72a0c88e4ee17876e4338c567a710"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_035.ts",
+          "sha256": "1b9b0347480847a5c3e324d5c7efe78ca4615ab62d8f97223b27879f4488ff28"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_036.ts",
+          "sha256": "6856d24ce508f4deab363df7128b2a299a44f67d6923112aece9ebeb64b4c1ef"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_037.ts",
+          "sha256": "ad05320b164b6f923c7877438e85fb4a986054b2402c4e49a136aa44a4f7130a"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_038.ts",
+          "sha256": "9eaefe86a12daf3b87a56c07fb1fd59809029d1d0cdd1eb21a681ea8aede4ede"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_039.ts",
+          "sha256": "78284737b640fced3f6e3fc9eafecfcdf3abb62c0d46eaf50fe654698e39ebbf"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_040.ts",
+          "sha256": "d06834d84d9d18ea764a28765878175a22447d2bc9edc21a191b54b113463305"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_041.ts",
+          "sha256": "d402fbff47737e406adc2f0b7eb02821a620b7bed995a0e3aff0fcfc0496148e"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_042.ts",
+          "sha256": "a72a826ffd5fa669f202730a183976bdbf1740d295abc7439ac53286fb2eb0af"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_043.ts",
+          "sha256": "9b8f4e2e36ce8b2a3ad28ac53015b61589bc6f76236528ed820c642893dbf834"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_044.ts",
+          "sha256": "48d7c0e6fe9635b58557f2cdc07c582da47e8971ef6db349395d707601a7262e"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_045.ts",
+          "sha256": "dbcd7261749d3fa7054413b0ff711e82e1c802eaefc12d10bbfee9bcd1e41d8e"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_046.ts",
+          "sha256": "768bbc027da79a4472eec51008ade711512ad2bccfdde1ad70da7b559d665466"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_047.ts",
+          "sha256": "46311aa53a2b4dd44525abf569bf7a5209a325b76daa0c5c08cdfdb5a2f19464"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_048.ts",
+          "sha256": "53c238fabdeda11dbc0986abf956cc42c3a138b6bd5a72cbff05b45d5741ac7e"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_049.ts",
+          "sha256": "e5465d47072d2f24ab25bc3fd0c9165aeeb3b19b15aef0ff01ddd1fd7fe2b0a9"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_050.ts",
+          "sha256": "450d1b7c00fa1cebd2f941b83a68dd0ebb64bd9248fc2e7abd48d2c277b2a5c3"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_051.ts",
+          "sha256": "a1ae5a0e242e63a19344ab48e1acb950f09dfc588f242bd259c3a198b45dabac"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_052.ts",
+          "sha256": "528c147d68836b15687dd9c97837b7c6c39fe39bf13577bdec0c20848d69dd52"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_053.ts",
+          "sha256": "9863c0b29518b785f4a5a3675bb7cfed7357ec64f2344379892cd6f81526dc3a"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_054.ts",
+          "sha256": "110d1769d565256c9bf164c5ba81ace675d064f9dbdf24a55457ced77c000e1b"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_055.ts",
+          "sha256": "0a7887edea808f85c31e04cb9744c64fdcb6b3bfd12eb31ab8e4977b1d27ef0a"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_056.ts",
+          "sha256": "d83c1cf30dacb753d9cf698751b3f67dcfa791ff9bd2408ed8074071d31ea06f"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_057.ts",
+          "sha256": "82e08a9f43351f199e67021c5446fdf887456ab1ea66f8a449946bf86cd44185"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_058.ts",
+          "sha256": "41d81a979b788ccbacbd4024bdf373327e66c4506806c59b8fec6ea8e17065db"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_059.ts",
+          "sha256": "33b487273c8984f6975b710e0ac09c6f98353021312ed35d84fb5dd06894ae5c"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_060.ts",
+          "sha256": "712c451fde0c04393644071d611b805d351310274f1d270877ed52c2f3c14487"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_061.ts",
+          "sha256": "bf713c6b0555a3a6caf85cbd2adecde53203505d0c6a70c9de7e9aeba3f056c6"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_062.ts",
+          "sha256": "daf93bed5c112a4eb00aa6a20b63d6a0019a30950721b47c115421cfdbc27905"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_063.ts",
+          "sha256": "1495b13b4976216451ba42e57a61eb4957e89e8a10d2c7e414e16623418f31aa"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_064.ts",
+          "sha256": "ab0ebc91a86671a31c6d16c2e9cfabfa11d3f6da45ce28e5d32334184e3aad9c"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_065.ts",
+          "sha256": "eda6b5c04acb827a8a0d01bc5910c27fc83bb1d1a7f3cda9f571fc7fd018d7a9"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_066.ts",
+          "sha256": "52cfe4f985621fd99c0ecb3f72cc0bff92891a77fa3e3e5e5da0cb6eee661f6c"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_067.ts",
+          "sha256": "820ad4356a700856a0e8f5977ebf017b82d128b48b8f7d738d0d019655cdf59a"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_068.ts",
+          "sha256": "6d3a0a379837352409f24c8d36e9acbb0c401db869f9ac6330d4211f6b37b7cb"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_069.ts",
+          "sha256": "ad254852bf50245badfa54687f125e7a701b9c0cc0a7724e1f11fc79efc05842"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_070.ts",
+          "sha256": "25b7336a9e8fd775d6e099010e828933edad56f59f1bbb280536b4d7756346ae"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_071.ts",
+          "sha256": "9d01fec4f71ebe3e94b63164f616bc41cefa54eb55d0da1c9d5da1fcf814bafb"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_072.ts",
+          "sha256": "4176e9f00cbd35206b97d7013e3f81e68007ee6da53da6d1d96244ff0049450b"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_073.ts",
+          "sha256": "25cdabbc8247e37a64a4daae13fe2acefed83293bc96c9b70c794cf33ecaf629"
+        },
+        {
+          "path": "06-seek-5min/hls-mpegts-h264-aac-5min/segment_074.ts",
+          "sha256": "e5150d40c732fda07ca33cb5f53d595d261f3088420dbf4b97389f65a894f60e"
+        }
+      ],
+      "expected_media": {
+        "container": "hls",
+        "duration_seconds": 300.0,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 150.0,
+        "backward_seek_seconds": 60.0,
+        "minimum_post_seek_progress_seconds": 2.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-seek-5min-hls-fmp4-h264-aac",
+      "fixture_id": "seek-5min-hls-fmp4-h264-aac",
+      "entry_path": "06-seek-5min/hls-fmp4-h264-aac-5min/index.m3u8",
+      "resources": [
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/index.m3u8",
+          "sha256": "c20388d596aaffe288b9f905a90c6b6767c66a2a3772007ab7df36d02ee935a6"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/init.mp4",
+          "sha256": "bcd778a7eb52203cd264eb0f3fbf58e321b278b25968dad774fe1d69034a1aed"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_000.m4s",
+          "sha256": "da80e708f1c9f8c0ad82bc905fae43c60ab796cf04511130ab7773b3ec9dd390"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_001.m4s",
+          "sha256": "ff1d5c4cf314d4ddbb81f7ae461f9394ebc2b4cd2c7794333e16012e8f9c36b1"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_002.m4s",
+          "sha256": "d69b720bf5dfbda60e387c894acd6eede0c1609e00e6807da5d1d48653e8dee4"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_003.m4s",
+          "sha256": "b2bb5b2c0e0841314c310b58a1e405a14e83c576a3adb16ce3a10ad499d1dcc6"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_004.m4s",
+          "sha256": "711d17d4be598fc2497273f0de8b2034c6326b9fa3f69caffbf34769c70fd82d"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_005.m4s",
+          "sha256": "9ac4ba34898614e9a93de15c22dc25fcc9fb602aa6657a99ee10c381da530a59"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_006.m4s",
+          "sha256": "58a5a72f91a2967b60fb275965e666133e89830e220ef358ab63c32bd9b2edc6"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_007.m4s",
+          "sha256": "058dda584d3988c2a43ac3015cf5815dee13b5d29a9296701f92e3e3a20a61d6"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_008.m4s",
+          "sha256": "bf61e5a4bb987d47bd68ed6d696ceeb24d454b56ced21be7336a21ce384585de"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_009.m4s",
+          "sha256": "89e049c3dab2f8e2e24b621de20f911a3c4ad8c9ee638deacca62100348f9088"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_010.m4s",
+          "sha256": "d5bf9658f8010a1a4805399ca6ab0e3b5c1eb41675383c4c90580be363ea2272"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_011.m4s",
+          "sha256": "af49f0f2e1b80a2dec2ce7e5c0fb9ecc2dbbb812b45f5f1ae7ae2cf9ac449922"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_012.m4s",
+          "sha256": "adc64cce1ca039b84d38c4b4cad32461b101de16f69bc05af04ed61eec1d60eb"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_013.m4s",
+          "sha256": "102a5b193e126f193958902012b047024a77b17527830191303cde2652c825f4"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_014.m4s",
+          "sha256": "51c4738a2e8cb94ec95acb4fd94739da6f4e6b43ca3394a3761cd6bf2aae4f25"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_015.m4s",
+          "sha256": "709d1655c1b1b40648d06d76bfcaac1d69c638c89e2c47c5cd889d79eeed7813"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_016.m4s",
+          "sha256": "7e5d9f718d6492558b5d1af2a34e81458422b364363a4656509f39ef3b1b6b11"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_017.m4s",
+          "sha256": "d037f734a064e6bf6a747ff6876f4d3c8c440e1ed873ad96e61134b5f3156248"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_018.m4s",
+          "sha256": "3a4bb0c580c79463ed0f5390b28920bc82440e9117957261bbd3f889c8fb46eb"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_019.m4s",
+          "sha256": "35f7951ea2d166b41bd225ed9df29e4ae3a140bfc5df9fa2f3e8c2c484d64949"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_020.m4s",
+          "sha256": "e38135ccf5eea1fb01e352684f5553e1a7b159c4466d48bf8d48c3ec53380b10"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_021.m4s",
+          "sha256": "cf9f6da6e84ed58b3e7d0ae5e86e362969435774bbd32280b578475c52bcae78"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_022.m4s",
+          "sha256": "550bf5eeab1571c25ba507e843539b12b50b6ddbce903d619b5a7fe4a5fc528c"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_023.m4s",
+          "sha256": "212a5346c402d5d4724b2b390390f534abd7f325fc31f34d25451b4787fbb275"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_024.m4s",
+          "sha256": "3459250c049f4d3aee59b3dd036f232e8a7cd08b9969d89e19c1df9077580f45"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_025.m4s",
+          "sha256": "d85b09346330327601091d4060d81c93b27d70e86d298676fb6ec601976945d1"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_026.m4s",
+          "sha256": "127053e08b97881294ce29fccf622943714ad475b90322309a821bb87a954650"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_027.m4s",
+          "sha256": "752a0b7d526c916e5479e83919dac7f93b798f30e9ab28ead1f627a424ad6ec4"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_028.m4s",
+          "sha256": "7a393a3db57f78d6a33f1ad122881c8b0adf35466664a861243a98a1ba3dc7a5"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_029.m4s",
+          "sha256": "c525c4c0933f62293baabd838a4bc47930f4cc55cec2c93e28aec719040a5c59"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_030.m4s",
+          "sha256": "50b5f54ba357ca99347160fed081b047f1561a49a1acb4874c65f7f6221fc100"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_031.m4s",
+          "sha256": "811e10d4752f5ce4a6fe14f6b7a82906d26d3b7c7c555f531cccc305c4af239a"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_032.m4s",
+          "sha256": "1fe0861864e3ccc9bc2e4e9d30bc1643a9ea2809d39762855df97212153ba141"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_033.m4s",
+          "sha256": "4cd5d9211e5cc5b456197153821abc0dca5b98f94eda6bece7debd313dcabba3"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_034.m4s",
+          "sha256": "18a15b2beddcf5d2035f4907534d175bd7c715d1bb6f4686b93816342fb1a853"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_035.m4s",
+          "sha256": "278d29fc87a6c0f890d0986d271dafec4d3469627e4d2dc76ecb3080d3906c89"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_036.m4s",
+          "sha256": "c3fd8c088f59af11a5f86ecbad63347d38ba4bf7a048a488e335dcff280b0b0c"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_037.m4s",
+          "sha256": "548b75cad6c656df3673411d37e4c512f8ff42439e2f878319225a077eb8d004"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_038.m4s",
+          "sha256": "86ae3318b8c8bd4da2e498398994436448bbce721821b1a831b672c45d2d31dd"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_039.m4s",
+          "sha256": "495b646930ec420ffc4c0857a66df3b65f572b9ae2ead1e63f90d316bcfc42d2"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_040.m4s",
+          "sha256": "53bab1f55cfe55827cb8762fe12819ba53bf551a0ffa4ee8415a6b62832f07ca"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_041.m4s",
+          "sha256": "2c6bb499346dc0c24d95449f865c0561b0c97148a242067048545dd1f5c11b56"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_042.m4s",
+          "sha256": "b4763aed2599aab0c9ad4a23e2fe7d06f1b7fe3beb2eaa6577152d5dfa4c99bb"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_043.m4s",
+          "sha256": "fa0fcdef78b535253baf1d4b336b1daefe9a5cebde0dfd2fed08939a64cf266c"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_044.m4s",
+          "sha256": "bad3aa41abd3f96dac50795b9d2bba765c5d82b62450f3295b151f562a792485"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_045.m4s",
+          "sha256": "97c31e33a1342d96582ae6166b60ec2a7142f9ad3c512eae75c87fa0b2ebbba5"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_046.m4s",
+          "sha256": "b7959db3acd4d6612d4050f665478c1211c75ffc8dadfc16743ff9a1fe48f773"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_047.m4s",
+          "sha256": "a021a41bffb59d97db602026112e73a75e696ad47452ac6f32c30c8b8595bceb"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_048.m4s",
+          "sha256": "61ede72042743a6cf307d346181543c797017930beb43e3fd22198a6f5d95651"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_049.m4s",
+          "sha256": "5cc2b2f4e16227e43a537a55dff760786840c4a10007a816d52fa5e2f206093e"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_050.m4s",
+          "sha256": "7d43ec4c5277cdcc564def726e217402449ec4dce3df164aff10af403ff15e89"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_051.m4s",
+          "sha256": "bb62cc6a0fc98b6f1cc39dfd1612f81ce4cf02da2677b51a4e5199bef01f787b"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_052.m4s",
+          "sha256": "45f3de83465882a5ee55d1e400bdb6384855922310828c8ee83695c9242c6232"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_053.m4s",
+          "sha256": "75d8f996497a1e0b77a96d0fe82c247849fb0bf3a76f633fab2a936e1ac0974a"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_054.m4s",
+          "sha256": "4091bfb3b43877fa63a0091c0f462bd09c99d9d03a2d4edf9a71d8492a880a7b"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_055.m4s",
+          "sha256": "bc3bf389c14df95786a804e5b70a89b105bff1bf02152cf295fff3a62677304b"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_056.m4s",
+          "sha256": "2f181d75d6b7b02aaefeddd5305c9ae48c3d7051c3b5c641abe0f76aff2ef621"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_057.m4s",
+          "sha256": "9b824bc297134ec1fdb3ff45c970d65b3f96a559474fb2d8c16d71f8420fe322"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_058.m4s",
+          "sha256": "dc09224672cec11b12907d0c9fad104d5f45fa0330670e43037596ce30b67eed"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_059.m4s",
+          "sha256": "70d3c84f25a0da1e1a0544a69b87d7053720e6d940e25a0477249b531ff17bb7"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_060.m4s",
+          "sha256": "ba5f0a485aa4934ae9812b16d776b24e8609d6d34ac9aef6e9bf2591d8b418ba"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_061.m4s",
+          "sha256": "528b45df8635a1d8bd0973e2a69f410debece230a4c6d1c3cd55c3954c982a53"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_062.m4s",
+          "sha256": "054e3b04613dafa2d0a4c634dc51f1025f2b5842ace5e2c7e8b30f9594694686"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_063.m4s",
+          "sha256": "d846884ba388758a62cf53945d8310ec9e229eafcfd437acd3e0977411c6d61e"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_064.m4s",
+          "sha256": "005faee7b93d22eb34a4d53024d5c3d3e6930f0452bd0ee9ecb7fd782063e311"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_065.m4s",
+          "sha256": "661e102b3391156d36e2d5bbd110a042deed7df95f9f2dfe08991b21c64aa2b4"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_066.m4s",
+          "sha256": "3a1d109e4231f3058b3e5f8bc2484b1cbef46bf257c385a146d8a3a57dedf427"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_067.m4s",
+          "sha256": "609af8297443634dd8efcff4076669afd6aa06b07cb347073b8c87b91a294d7b"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_068.m4s",
+          "sha256": "a0e51e219dc827a0468bcb98a4f63f2d78257ed035e8112f409fcb2d55a7e9ce"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_069.m4s",
+          "sha256": "031f727c8502027e811fd1444e0eab39fcc32d75a03d91a0b93dd69f1b4f8ec6"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_070.m4s",
+          "sha256": "2ce3812a7d2ed3356a839e7fba3a670e2362f23992bf28d03171db4b887d63a3"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_071.m4s",
+          "sha256": "8c52fea049ea6fdd5b91dbfcf48a1545fd65e74495b584da54a3fe0fe4c3fc56"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_072.m4s",
+          "sha256": "c7ee4705c4ff8225f2e7a10bb80cd356aea424fabfcb3c1e3e1b69dc37ec4c0d"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_073.m4s",
+          "sha256": "366f27b12bb065d6ddb17889be09cd26ab65e65aeff5866d13745ec66550fbfe"
+        },
+        {
+          "path": "06-seek-5min/hls-fmp4-h264-aac-5min/segment_074.m4s",
+          "sha256": "1a67f204cea9d03420955abe6bdc49b491d3df89cb3544bcb623be4242099a42"
+        }
+      ],
+      "expected_media": {
+        "container": "hls",
+        "duration_seconds": 300.0,
+        "video_codecs": [
+          "h264"
+        ],
+        "audio_codecs": [
+          "aac"
+        ],
+        "subtitle_codecs": [],
+        "track_count": 2
+      },
+      "seek": {
+        "forward_seek_seconds": 150.0,
+        "backward_seek_seconds": 60.0,
+        "minimum_post_seek_progress_seconds": 2.0
+      },
+      "expected_route": "nativeAVPlayer",
+      "hardware_requirements": [
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    },
+    {
+      "case_id": "format-seek-5min-aether-hdr10-sar43-hev1-alt-audio-hls",
+      "fixture_id": "seek-5min-aether-hdr10-sar43-hev1-alt-audio-hls",
+      "entry_path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/master.m3u8",
+      "resources": [
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/index.m3u8",
+          "sha256": "c06cc3fe11258bbe14269d2771e5a08c20628192543a56817ca90a3e07993c03"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/init_1.mp4",
+          "sha256": "941be025f5fd63799c796fa08e0531381440625c750e1be95f44cc0dc1de1644"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_000.m4s",
+          "sha256": "1579c9da51955d9f8bf6a71efcc8d160e25d1e2f9cef62325f3f7634d60e0d59"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_001.m4s",
+          "sha256": "ea1a72cc7ab10c6f28fd6f46f91861b7d3b72641689bb7c789bcdc8555edc35a"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_002.m4s",
+          "sha256": "ee14e85152d7e9a8c74d1628c4c9998082ff482f6b4d263f541c39b05a5cca43"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_003.m4s",
+          "sha256": "a50d71940593c88393e6c6401fd10f9d64c896c50d78ce9bfedf270decdef67b"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_004.m4s",
+          "sha256": "4ec740f41986fc911d9fa9e8f3feee73c1721399caf40c25f1c141a27cc2a27b"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_005.m4s",
+          "sha256": "363814cb102f10f5e73292f99ec9e9723564634b2edb0b96a451eb52eb9f5a77"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_006.m4s",
+          "sha256": "4e30beb4e4c31a9683f24c123a8fbc898998b9a778e5bda56fa7f3846d17752d"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_007.m4s",
+          "sha256": "c74e62a8048a955d80f05344fe70bf524eab2136bb34987cc5c79381ca83b482"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_008.m4s",
+          "sha256": "622a6f23a794a4f5c52fdf76c493312f491879bd01baa4cac84bb702478e8e2a"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_009.m4s",
+          "sha256": "524fd593cb3ba9b1254826c43913541baaba0f914e4950fee814e7c2d29c61ab"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_010.m4s",
+          "sha256": "bbb367399abc1553e8bbe0572458381b83975ae1b49eff7cc3a25fe5a45f29ea"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_011.m4s",
+          "sha256": "ae4757fc3ef62c364bbfbd31e6c8c46437ec96a31e0493784b59254354925a13"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_012.m4s",
+          "sha256": "ac9f5213689ec2748b8053e809e737436c49481fff14ea721a9466ba0d3ec666"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_013.m4s",
+          "sha256": "1d8ff62e742206a569aad4f32c554cb28069e8887d322f4e2c8902d494e7cabb"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_014.m4s",
+          "sha256": "770e2af837863a98993946ad5944e149006b593d6e50a2065402a2f5612df436"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_015.m4s",
+          "sha256": "3f498a2cdeb450c914c91b1dfd8db880fa461743dce6b8b8b96e6e26e82e686c"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_016.m4s",
+          "sha256": "be229707d4fff75342f8c264adfabe795d19f3bb5e2002f0aab5a7a748545ef2"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_017.m4s",
+          "sha256": "9dbb65680395339b356b3645fb85df2dff117199919be9aa2324a9f5d16acce6"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_018.m4s",
+          "sha256": "895e7342a52c2d2fda8fc899c7d5120a97c0a6802f496d60d530dbf0bab2e648"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_019.m4s",
+          "sha256": "e103fd7303f76ffe1799d88b03efb3b7312c67f3e1626b64ab4b3f1c08ac8929"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_020.m4s",
+          "sha256": "95dbed0de4b1e89e7e6782304e01274d3a876ee17f5508cd28f8f2065624aca9"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_021.m4s",
+          "sha256": "a61813cb073559b75252d6623ba6e4cb83ae59a9334ca85aae497121e7e0810f"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_022.m4s",
+          "sha256": "e0d1257987dc433477240290923be019653a3cb73c75e0bc196b7a4733e6b0f6"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_023.m4s",
+          "sha256": "29f672679d51903a9d24ba3263c0b688773f61224a9bee718396a0e80b104e48"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_024.m4s",
+          "sha256": "1e151dd788a1d87deb8182d7cddfb2ae591f17ffd6da0c2e9dd2b6d7e527d5e9"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_025.m4s",
+          "sha256": "af33c8fdc4ff24c3f6811e735ee032723dbb3a3d10757c47e815e15f3d137506"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_026.m4s",
+          "sha256": "e4f659e1905b9832ab9d12b79c8134a40d97fd6bc810717cb429cfacccb7f2c2"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_027.m4s",
+          "sha256": "80eeda10f3cc0a0567a4613bf2b1840821394f447b175c9f8cf851d7229cb3bc"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_028.m4s",
+          "sha256": "5380d729e16e3fb775ff7c97696cacebaa3e175d047e41c884f4dbf09cb5ebb6"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_029.m4s",
+          "sha256": "a52633a0e68c814b6c6b6ec9979569f41ace764df8d4250698451205d91b7ef4"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_030.m4s",
+          "sha256": "81dccd0da072f1f561c72dd4caccab9065cbf4b550e98b35fdd8a6ed5655d9f3"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_031.m4s",
+          "sha256": "5486d78e64b87193f102424cb1c0f4ae84cf0a6dfd0c79f2e2c69f2dfd42912c"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_032.m4s",
+          "sha256": "2fa48617e3b636079d52e12890ce19ebbdee90c91b1f83042db60fd01742f741"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_033.m4s",
+          "sha256": "08ad0d89c5eb9227f2167697a58a562dddfa27290e0e6663f3237fd32578465b"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_034.m4s",
+          "sha256": "2a9512a02ab161bb7cfc69d5aa3ddc2a089934f70a4972f04b904476a42a8d3a"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_035.m4s",
+          "sha256": "868400d464918922c730bfe7a6390ab676a34a8fd46062a61322061b2099ad00"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_036.m4s",
+          "sha256": "0858ac4102060e4b8f5c24c69a77a627110bf0018a43bbf6d99bce7f378009c9"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_037.m4s",
+          "sha256": "4627a5fdc2fe01cd9a3fb9a3e28e16e7bc0e58b576a34035f12ebd6dfde5968e"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_038.m4s",
+          "sha256": "85b925bbdc3310327851edee048d9f46b598ce8ddf219c54d136dfa7417a2ae4"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_039.m4s",
+          "sha256": "676a32331a4d8173d25ac219d1d1d773cd8aa8afe78601685adbc2984d1e3626"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_040.m4s",
+          "sha256": "5dee47520cf85a5af51cd0c7b63cb70b9fba6e6665742df11d20913f6f88ebbb"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_041.m4s",
+          "sha256": "d04048098b9347c44acafcb456af5053ce299a412d566cb42e463b69608383cd"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_042.m4s",
+          "sha256": "1a3730f21af2a9fb28de8f13d13f168d0afa07da67a21b74e942e7c3c796f030"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_043.m4s",
+          "sha256": "996dd5d743c42d97bad0a6da148d24c2d96abad48889fb5c3e74956196f16029"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_044.m4s",
+          "sha256": "5a5818d0ecbbf6cd43d1e699514dd03911cc3c856e4a3c15e5bc23bd7030dda3"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_045.m4s",
+          "sha256": "21554a6f43f70f2c379efc28cb67f3c0ed5531d801d4c40e4c591428804b474c"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_046.m4s",
+          "sha256": "4f87140a64de70669ef4c0933282d7a1f257b8d04a9d2d2417ca3b35304f6794"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_047.m4s",
+          "sha256": "4eee0c563873a49912a41a6c2bd1631c4f1fe6cec0abc03a75476bb197b127f4"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_048.m4s",
+          "sha256": "46992a9551f0d8ba2f6bdc9f64ce98672bc0f6bfa0779e561c649a83968d9d58"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_049.m4s",
+          "sha256": "4f995a86e88c862705ccb5e0dd2e6525103c3300d20b464bcf7839cb37b37ca5"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_050.m4s",
+          "sha256": "3c68dcc39a589e7bc39f5e9576aaca400c0f8e94f9e821a5b92ffb87a54e65ca"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_051.m4s",
+          "sha256": "1c57bce7ebdc0ab396883ca6b9672068a5163913bac6901ce56a8d060b6429fb"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_052.m4s",
+          "sha256": "21e97b4dbb5aeb55973edc260f52d0fcea9ea911206eb64441266d3f8479f14d"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_053.m4s",
+          "sha256": "11ca060503283cc5721fc36131c3be798bcf0a3424e84d4e6b99e98f861d9288"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_054.m4s",
+          "sha256": "d24870c81a259a84a755fe9faaf99c0babc52c6fcd8419f1553330322eade450"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_055.m4s",
+          "sha256": "30a2a5b95d19ac0b51178f23e1f580be67eb4678610a509a667816cc51519ede"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_056.m4s",
+          "sha256": "485309043da44cf6965eb8819d708ebe6565ec04b49bd3036f2f065c835b87fe"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_057.m4s",
+          "sha256": "d6d97d4ce7b7d2cf064593c4aa22ab71147c544fd54df3333ed51c4ad1baf699"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_058.m4s",
+          "sha256": "ed1c2496eb273eea14bd42e1edc460511630356b64842207d4c65ce9ccef5501"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_059.m4s",
+          "sha256": "a2296a2917246f419f29929883d25575e3c88a158022701ac1745ecb37037ec1"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_060.m4s",
+          "sha256": "073b46ad63555c1db98ea1fbc8c192dfe1fdab1d3bd40551b6dd6b34204dc0c1"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_061.m4s",
+          "sha256": "3f215403a878fbedcb32203c4c61b375f737fb1c920f004269ca28df55d53630"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_062.m4s",
+          "sha256": "b8a9b1815a5280fa784268d059f2f35fc3f7880a30cb138a9ed46b922edd55a4"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_063.m4s",
+          "sha256": "b727d6f19387f52ce25b0f0f6a0390dca92e19b47c3a06abb267483f75ff58f6"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_064.m4s",
+          "sha256": "52f2e40abe609e749fecdd32b91158fbefd6338c11d14457306b83b4a63d8086"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_065.m4s",
+          "sha256": "82b7b5ba70fd94c943455b683846083c206731e0a011b6d1176d9e10e181d1ee"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_066.m4s",
+          "sha256": "6f43e36a92036819aa5038a905d239355f2108a7c42d12c66bbd006811706724"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_067.m4s",
+          "sha256": "e10df13da960bd95d7472ffbdeda9630cf99d3a28bfaccbdabe53ba280927a75"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_068.m4s",
+          "sha256": "767b830ab125e88b834094d60824a1feff3a1378f7dab97124d8a371509baa3a"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_069.m4s",
+          "sha256": "e3811546c6afdbf88ea8032ce7291c4f71b9c494a0f0a07096bb28fec57ada4d"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_070.m4s",
+          "sha256": "2794b511deff01dab317f302e3e5d790f5ae2055e41b8d9695798ab04ec05ece"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_071.m4s",
+          "sha256": "8e19e770c2c3df7f9360880dd89e39c4ef5ebdc849b34bdc7f107980c6fbcead"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_072.m4s",
+          "sha256": "fab2463d8e854c12f42c6b21c55e1074ea343c496a2d1fce46918c4895c5e334"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_073.m4s",
+          "sha256": "c5df8e75d16b183a8857fd2c0a7dae5bf24e59c9ac434f1bcd56f1e2f1b4a6fc"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/english/segment_074.m4s",
+          "sha256": "86dd7f9f2be5c267ae0a7e53431242799dd4adc8228313e3473520918e197f4d"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/master.m3u8",
+          "sha256": "a263b765c6a448efea791efe80b73e3a938036db332739d7b40620745975eca8"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/index.m3u8",
+          "sha256": "59ced1cb4ad05acf1b927afe678ad7cd25df6cff94ee83789a0c9597e2f06944"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/init_2.mp4",
+          "sha256": "6aad61c85144edd41d9441413d214e60c91d04e1ffb25f01cbdade2b0c9e893b"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_000.m4s",
+          "sha256": "900de385a2e1dcf706a05de0ce6aae36f54c96d83229d129955981a1b0873414"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_001.m4s",
+          "sha256": "e86f156c8935bb6870d95d52ec3849e0043652fd60daf465ad21717ba7ff0d99"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_002.m4s",
+          "sha256": "7626a15e7f68420c6d920543c538b68090772b9dc91906a58b339d6d31a3a831"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_003.m4s",
+          "sha256": "1bbd7fd266a5a1b81ccf3b8eab46325978256684d98c2babe89821f4f33783c5"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_004.m4s",
+          "sha256": "98598284fd32833d5ad5baadd9c6ce27378e8bfe399e2451f530173ef2f32cd8"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_005.m4s",
+          "sha256": "0c2fb5146f45b2955c965b896c3d74e35deaf5dd253c41217665cda17b6cbe5e"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_006.m4s",
+          "sha256": "922fece6f5a7c4e923f0dcc100e25c4f3b270b828fab9740c97579f55de70c81"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_007.m4s",
+          "sha256": "df6eb7eaa23899579875505ca8f075e56e34b35e9b9a266d42413a447ef6edd7"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_008.m4s",
+          "sha256": "a2128086b2cad144cf574302c85fc23851149156bace667832f684df96fd5ead"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_009.m4s",
+          "sha256": "d480f0e078ee763f0e52d30e11be927bc3cfefdab8c98e4a0bb4f596b6c13e2b"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_010.m4s",
+          "sha256": "69bb1084c2f49f6b44c5c4fa7979c0407276294bc0c30715892ab4bc4c120d75"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_011.m4s",
+          "sha256": "8b5b522298882d58a93a7224fd028367ed3e03bbc90a492ca237ce39eb6e54d0"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_012.m4s",
+          "sha256": "c176c784abe3d44690458d937f16078dcac0e71fd08a5b1647da5a1ee0dc5ea3"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_013.m4s",
+          "sha256": "555134b79c71a735af604855207b3c87c1bc6b3a172be5baa79806639c8be84c"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_014.m4s",
+          "sha256": "708d214548ca2accb8477bc8f12ab694cb770d201bbb00242a54f0e5170c6b9e"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_015.m4s",
+          "sha256": "7df1475fefd339dcfa4413fc7a2f0a58267df6efabd719a624671f9e5169a257"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_016.m4s",
+          "sha256": "f858c3b961c48b9218d60416d03c7dcaf61225664318e2c396adb3ed79ab1e76"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_017.m4s",
+          "sha256": "d63113c09d56b579841b759a4dc1e42f0536e9381cf2e0340c54e65aa346ac6e"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_018.m4s",
+          "sha256": "5bc6fe0f0fc3373ce2aedf5ab1859c3a6f65439740745f50dcc4d656023e0771"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_019.m4s",
+          "sha256": "9ac3c74c0675c849548ec74649468fdcb043c9b79153e0d26e4f3cf1b99f070c"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_020.m4s",
+          "sha256": "c2ab0cf48932ef7536deabb2e4536562664a3b39182d04ff0c965297033b1038"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_021.m4s",
+          "sha256": "d5801121a20a5c387678f7c46b5e3c7bf682cdaa3b60414ff489c1033fcb5879"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_022.m4s",
+          "sha256": "bb956b378e7021df1d99316950ba0171898ef6e85badcdee915db8134b4500fb"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_023.m4s",
+          "sha256": "0fb48241d98c6f4943701dd4198d1b1bcba43fc0d0b75f78f2caa3381213ac41"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_024.m4s",
+          "sha256": "bbb7e549490b880be84ced4730d16e9cc350133e56e9e69f3d16b8415f0c0149"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_025.m4s",
+          "sha256": "c1ab5acf96d0b7370c6f16b09f0fafe315b99a17164c2ec8a572049ecec33e89"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_026.m4s",
+          "sha256": "7a41c4756bc7dbd547fb75cb61bdec4bcc5fba91c025a6929479b957ffb7a900"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_027.m4s",
+          "sha256": "66972dcfa002df70e8e430e9e48c544dcd74a7df2a20899b486441aa24908580"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_028.m4s",
+          "sha256": "856b148e7b0e543cb77532664aa02e1cbe6b7e6459ae67477342bfb8f54ae686"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_029.m4s",
+          "sha256": "297fafc0da43cf89471f0e1e10a2d629af4acd40b588a94a9efe4c256707db57"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_030.m4s",
+          "sha256": "3f00fe5a0c5c617edbd192daa3de1530bfcf602e3bac204c3fdb5edbbcecc82c"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_031.m4s",
+          "sha256": "a31649ecaeee0e79c0d86a967c661a485542a87ef69b694549ad588bd26e4909"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_032.m4s",
+          "sha256": "e5fd135dce6e7e5ba08e5d40b64fae3961d2c07b7b4e3066a98c5dce6f8c4d17"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_033.m4s",
+          "sha256": "d046df9952f659f2a9a2aa88d26a110597badf5b39c629b9a85ddf23ff6908c4"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_034.m4s",
+          "sha256": "0277b92e2c3abeaae84c51d81afe00c0bf4200c39932381158ee8cb5a860dbec"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_035.m4s",
+          "sha256": "7b21949e4c946a3d6aea7ab1d7f57b139e16b3d86469f4d392a64210f5b6a6ab"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_036.m4s",
+          "sha256": "d6d970eb2ad10726a3ade9ee270281ce3228728cb6e07e3f896ff458342ca819"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_037.m4s",
+          "sha256": "f83774b65e3eb77d02f6073b15849e4bf777d23d87b4bf65dae9335eccb778fa"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_038.m4s",
+          "sha256": "c916da7b1dfb278d95c3aeb8b7843faf3a5ce7467d1db10887b8ea4bb79119f0"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_039.m4s",
+          "sha256": "03358ff0a455ada1361e8f61029abb1e28323c67112c3dc3e01afcb5aa4ca52a"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_040.m4s",
+          "sha256": "8df76783dc71c3fcb56a4172848255c11101482c51d8ba31aee3c32fbc731905"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_041.m4s",
+          "sha256": "5ee46e71bb420fe5cd150edf85627292c89cf65a9824b9c041604849ec84af80"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_042.m4s",
+          "sha256": "9fabcc8fc667d523068330e107fa03ce8afd341ad9d988791b02cd3ed1c11ad1"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_043.m4s",
+          "sha256": "1d0aaa18e7be1fe115fb94887bcbcca03da393abc5a811370feaadbd2c5c4c39"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_044.m4s",
+          "sha256": "267b3a054df3264d6fbab176cd5a7f7f70443ad30334bc00b51ea0823d01d5df"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_045.m4s",
+          "sha256": "4f3b6b12cc8ed927b085f5605a1b3a215193e0ec46f2484a0d67b01e8c3cbd44"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_046.m4s",
+          "sha256": "f5f9b691744608c5490476b4b352cceaa2a4917dc52386654cdd577bbde8a483"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_047.m4s",
+          "sha256": "7f31b592b7979cce72a7110e28debe154a6cddc4823ffca6dd9455cec1365e90"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_048.m4s",
+          "sha256": "c970024ee88850a1cf340db2c6783d8c799ee9a80e3b2ab86b72fa0d101bb548"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_049.m4s",
+          "sha256": "83b1cf6483f4f63e5347fb01f30719a98f2a0781650a9099318fd7cccea2b3cc"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_050.m4s",
+          "sha256": "f93b08af72e5069adb8d66bc37ea1448bf4b7694cdb68e071bdb8287cf480960"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_051.m4s",
+          "sha256": "6bf387209bf861f02ea5c2198fb43313921f080ae5bd0c75db44e774f65c6609"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_052.m4s",
+          "sha256": "4d0351353370528b8a732db2e8614bbe294c030fe97803626664bae726b498b8"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_053.m4s",
+          "sha256": "2a918e0779770109767e1dcefe183fa3166d791af3bc6205843414f584ee889e"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_054.m4s",
+          "sha256": "f61d5057e74cb89ff5984d9af57a4daba1418ce99486c6a15c7ef2f413b8f680"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_055.m4s",
+          "sha256": "54690413c66e29e392e4d1c8102e229556e7e6534c5a1ea4b392eda87809e8f0"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_056.m4s",
+          "sha256": "3fe4d92472544347f5ff498b8c47af2a8bdfd2cd096e0f5f694c17475fd6fa27"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_057.m4s",
+          "sha256": "3293058a7a64c92889b42bc4bd405d9bfc63a43906488851d51209d7ca9e25e9"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_058.m4s",
+          "sha256": "592b5a72e26ba2efdc3e8ea124ecd9580ee8a5af0560b309a5ffc0c9f3d55041"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_059.m4s",
+          "sha256": "cc7dc539cbfd6423971446057328e8b54aac73e6327f4d88164e6de3bc7ac987"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_060.m4s",
+          "sha256": "1ba6daa74c1bc51efb252db752ef48b252eb8b82c7b6084268b82dd114b22911"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_061.m4s",
+          "sha256": "5ea009ce6eacd7ce5dbc6350f00b5aec0a60bab86c476104e7a54b56c004e6ea"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_062.m4s",
+          "sha256": "3bc2dafa10ce54d2bc5875d3eea405641f9f951b8397a27ed60d44fbf8c1eeb1"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_063.m4s",
+          "sha256": "ee1323e442fb6dc2681d31d918fead36e2712a45be61c270a096f4b1a550d809"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_064.m4s",
+          "sha256": "4fd6ce8b136f4f54f8049d93e04e48f3a648e8531151ebaff9a235a850d1882a"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_065.m4s",
+          "sha256": "c1a19ebbba2166ebb2335613dd7abfbf7d9949cdcd4d2d6697a58bf070ed15e4"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_066.m4s",
+          "sha256": "33b844ba38effbf6d504b9a3e0ae0db93f68d01258ba3aed0c7a0ae9680fedf9"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_067.m4s",
+          "sha256": "886cb2b7561adcb93f4e537a5a83ce4008c5a6afd9f46ba08f67f84d6f92ebe8"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_068.m4s",
+          "sha256": "b5389ed151bde9c4b490de64a9553cfb8a12594121c797d20cac310b9f5a8b7e"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_069.m4s",
+          "sha256": "d1629e1f95b0872a4276ad70d81ff857c6318af855cbac1bd89ae8c71c036cd9"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_070.m4s",
+          "sha256": "e37c462c737ce42b883d90ef31cc7a14d8141cbd61bcc06a674562448a26b9f1"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_071.m4s",
+          "sha256": "bec2393384eaa5463ccb6eae465eb83321a76ec36dad8c2a53d4fbcdcc4eb1ea"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_072.m4s",
+          "sha256": "dbe8a3ef00bc343447ba421097d166b2329ea45bdbdbabef1277dc0c732979de"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_073.m4s",
+          "sha256": "2014fda1f96106fc983329247e170579024c66800d5fb7d36504dae285e01d09"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/spanish/segment_074.m4s",
+          "sha256": "5802ac5163fef881115420621ea96389069cc92d12e628facd1957b9185dadba"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/index.m3u8",
+          "sha256": "466ca35ab06332a10e278f677cc213d2acea835058c9607a34be7a640f299cef"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_000.vtt",
+          "sha256": "457bd75ad8d955ce88e42ab28bc5aad0275377c7521a88eea884852a32cb3fce"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_001.vtt",
+          "sha256": "329ed52bb839a05d6aabc7fadff176f1f5c7c40169f397f39702f7b3cd0d7fcd"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_002.vtt",
+          "sha256": "6af4ad2d70cd1b33715f52173252c8d3315cf001be5b9c46dae519d686e76136"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_003.vtt",
+          "sha256": "68df765d1b5bce561d71121ba44993a9d198787664acc653c7557a2efbb50024"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_004.vtt",
+          "sha256": "b65752f765a94ac90af3bcfb1b2968846d6b8891b8df2be9c8f8017accaf72d6"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_005.vtt",
+          "sha256": "91e48e131c00339c1287ad4e4a8b5ed4cace2db572f165ad2cd0a80729799485"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_006.vtt",
+          "sha256": "7799473c2b0442f0c18a57bec3224db70f4679e5b87c41b1b10b3259e014881e"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_007.vtt",
+          "sha256": "7ef963fdc7335344cea098ce0644eccd2e75fbe8004bf3d3451db0201040bd45"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_008.vtt",
+          "sha256": "147a644ccc4cb3d44ef5f4a9d7a10530c72e5bcff91b357d7371b6824966cf4f"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_009.vtt",
+          "sha256": "2cafc32b833e56f0f5243eb0847e2e8d39e099dc94d0ffa1395ee06b6af15c32"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_010.vtt",
+          "sha256": "5799109ea0362a481b735ba04ab0b07097440cb0607111bbe1a1c47071173ec8"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_011.vtt",
+          "sha256": "2dfbc2f6eb1c821bb175bf500174756e60567efc5a0a373ec0a3d9037e5f1037"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_012.vtt",
+          "sha256": "0929bde82942c8c181fd2e3a420a57cfe29f9c1c8a0f02b94f0c7c0ee9e8a2ce"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_013.vtt",
+          "sha256": "476549c815b8c784d185b89166b9f99d57bea7726ba3be20209acf0dc998e218"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_014.vtt",
+          "sha256": "27ed7f862ba4582e37f93429c5f3107baced436724bd70c34fbb878acb21d88a"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_015.vtt",
+          "sha256": "300542e25370d14212d16238a960515a66677b3b1e71f130ec39dfbbaa4e39e3"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_016.vtt",
+          "sha256": "f1c859df2dd61bb48fb2aceb1cfbf8bb7856d3bcae1a7319b0d7e13b6a5b20a7"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_017.vtt",
+          "sha256": "4085563d59a81703b5d4220207719ef208e8ec917015b1a36d411c958ab816ec"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_018.vtt",
+          "sha256": "b866b5ca45e7a1f1b51b37e2ff9a04bdda090f2ee8ea152d6cfff591fe67bc4f"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_019.vtt",
+          "sha256": "2af684fc9dceebb0c36639acad06b8dcc0f44c98a5c767de2f1deefaa821cd80"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_020.vtt",
+          "sha256": "594fea858917ee7b97af572ef7273957e48ece338bd0aeab45a2a67abaf670b5"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_021.vtt",
+          "sha256": "b3c1bda43f5a1d52992c09cd91591f40ce90124f8da0ea3cf899bda83071bf46"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_022.vtt",
+          "sha256": "76ddf74bc335ea166bb33a1cfd45f7d950a75793924a96c9348b6d1cb6176430"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_023.vtt",
+          "sha256": "60dc898d365c8fe541353bdf384f372fe64a406af33d354e723d110dba8de45b"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_024.vtt",
+          "sha256": "f12ac21268761a35498deca8523aaebce5fc02f08caa452947ce136ff3b92b4e"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_025.vtt",
+          "sha256": "69bca8b4038d9af1be8bdd7feb04f7b979198c07b1fe621588df14d2510ae893"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_026.vtt",
+          "sha256": "042ada77694cff1e6678beb2013e47426961556dde306205d8101f7ccf7fcb96"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_027.vtt",
+          "sha256": "3164cf0a8c739c7c6e0878bc64d15589186762b67be65224c0ba7a554e77b86f"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_028.vtt",
+          "sha256": "d2adba0b772bcb3a0ff28affa0c1daae203259a127d0566b1fa1892410b38214"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_029.vtt",
+          "sha256": "884c17aa51ae096f14f65934afe97da84d9664bb38f3cc4c3fb143b2e19c57b4"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_030.vtt",
+          "sha256": "965084b3d19b342cc15be715e979027e9d89ed07ecb3f6aaa4a61ae2e3aafd57"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_031.vtt",
+          "sha256": "8eb6dc5eb97dad48cbf85f6f8b5f686c5ab965b9a3686b5dd32a99537b0f0050"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_032.vtt",
+          "sha256": "e41d9b9e442d29eda914a50a804a2454913b84b3717f79a45fed5ad7da51958e"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_033.vtt",
+          "sha256": "5b105f92726b57eded132211ae75019fc224ea6dc54a3651c3836448be07f452"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_034.vtt",
+          "sha256": "2b808818241b257c6e5679880c5965976f43fc2c7ba3a56e162a032cce1fd9a7"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_035.vtt",
+          "sha256": "a646976ca6b2b68a23690e0e272b27552c989edb68f0cda65c49d2664fd4448a"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_036.vtt",
+          "sha256": "8ad4e62d79a63e1047597b20a405c7c65cf0c140c5eec94dffc95e33b12fa9da"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_037.vtt",
+          "sha256": "99b02b429578ec62a36f8d2ec526ed3b39ffd5b5d5e39b99f877e135de5a89af"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_038.vtt",
+          "sha256": "c9e875dac77b7cd386de71f1943509598a10e0388937ff21fa14ea49c778a0a8"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_039.vtt",
+          "sha256": "a82c3896152eb2f4cc7d292601fee75cd2377cf5b8084099544fba13ed4e224f"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_040.vtt",
+          "sha256": "f2d111beac0da4ed433a0c40ae8358b6d77fbf8ed27932562eda1dbcc5df1cd5"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_041.vtt",
+          "sha256": "8231eec9722d6dcb965ee130ccd303de290907dd1bed1fd4ac2d53c18ae8a789"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_042.vtt",
+          "sha256": "e2137884895f65a829a89048bd70f24a7490c4986f018b1c28098349989b3976"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_043.vtt",
+          "sha256": "d8e2820ca8a33abcde9ce5a588fa54d40d3d5b74b6c82eb3e93ce7aab2664e3b"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_044.vtt",
+          "sha256": "b87fff97f4116b074c39848723f11737fa62d5e8a84a19c0c60f8db487d266cd"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_045.vtt",
+          "sha256": "69505aa885bef4077fd4716b2056b9f4a3ca92b7e9e93dc4cbe22b07bafd7551"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_046.vtt",
+          "sha256": "37f8690929c45ba394ef0fbb16dad3f7d9d5e71b7443ffd1367b65e715f3cd83"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_047.vtt",
+          "sha256": "558a7c7e6b54f2e8e21bf5523b90b2c3fd29d82222be5bae7abc7964088058a4"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_048.vtt",
+          "sha256": "e6aebc059a63ee886de155ba0e739f9f5e12b9058a2b0e1b8b7c05e8d683d099"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_049.vtt",
+          "sha256": "70436916e9c32fc4dfecac7a4fd97dbe568ad12cd96ef492c77a27fa9cdb18c4"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_050.vtt",
+          "sha256": "9a0b9b63e6f46ef1e9593acfa576271037d151b867710db4d935de7f73c882d7"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_051.vtt",
+          "sha256": "48297eccbb285482a7f2b54a7f72f5c15e7a45c505f07f9422ff842a3b243756"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_052.vtt",
+          "sha256": "68bcd2f72d4051e7d5f2e381a3dc45a05b77eac2a4092218085f1b5885a90139"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_053.vtt",
+          "sha256": "40672647784524b6c39b81a9735f7312847e5fbd8bbbcb3d4f48e824e3d2061c"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_054.vtt",
+          "sha256": "9c1cfc8ec8ea8b50725c3c676189c46687bd59f61c6632d4be7421939604222c"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_055.vtt",
+          "sha256": "0411794175792b1c3cba50597d671634381844942d561a1e73088b0939d5877f"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_056.vtt",
+          "sha256": "2c03987fa773d2948a03031a01069352f8ffaad3f8ec2776cb3beecb13e82d71"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_057.vtt",
+          "sha256": "5b4709e02cc64ab41fa4398bc2f8dd9cedfa98ca7fa1d06893455f6ebc680310"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_058.vtt",
+          "sha256": "d05fe470237ad2004a2de302b6f00653ea27800ab7f52262f222ff2566daedd7"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_059.vtt",
+          "sha256": "b47665d4c11292d3c2b108568262bb2d72259d2ee2829c080871f322e1b891dc"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_060.vtt",
+          "sha256": "e84356a7327ecfbbd05914478c6ec4d444d16eedd024203403060eefc9c1226b"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_061.vtt",
+          "sha256": "c84d25f9e02fbee1a9cd63ee97530ee973dd8b3e8c9f149f1ecb8e74badd92d9"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_062.vtt",
+          "sha256": "a56627098b9f5157c3c5538dba1f18e8ef81f2c1b0e71cb665aee025b825fa6d"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_063.vtt",
+          "sha256": "8fbe1b5e70755f18a7e937f2a741ac220132bb164119d8902e85041b8dd0ac46"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_064.vtt",
+          "sha256": "9303ba6e7ffd636830dd7c97baf25fca3053da8e7ee62f24357b5b36c20732be"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_065.vtt",
+          "sha256": "92caaf42148136ec6aca29055292301691730be8661235afafc5ce4ba698a139"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_066.vtt",
+          "sha256": "de7afcf9ce39743176bade6103fca4ced01f1ade494a012b41440f5591d13c6e"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_067.vtt",
+          "sha256": "fc03d07b37a310d279329680cb54f50588bcddf4cb58622fe47882f9b468aae3"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_068.vtt",
+          "sha256": "20453b61fb60095dd730ba4e3de9a5694f58d30d21b8fa8382e56c9e02b1311b"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_069.vtt",
+          "sha256": "297aaf31fbb19f5a69d21d903d703618c580b9548d09d86a567b0c049ef2c600"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_070.vtt",
+          "sha256": "f7e3be55a06e5dceb88630478fb211fbdeb7f979a137e115985a0a4430817ce1"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_071.vtt",
+          "sha256": "46e8618517eb0c7f2144c22861ed746cdf2534a8d8ea9c627fd82f52d74e40c1"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_072.vtt",
+          "sha256": "3c34a30fe1b0433a971c9ca0e4e0bd436aa362d0dacbf68f106e3e5e56d280e3"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_073.vtt",
+          "sha256": "59ff70f66c95328ec3eaac396ad37c02c1fbc5be5443018ff2688423d41ac253"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/subtitles/segment_074.vtt",
+          "sha256": "53a05f7460006ac7dd98ba80ec868d0be344f085a313a3d1931552aa055e3f38"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/index.m3u8",
+          "sha256": "f86fd699b0378541fc2cdf162f0ed9a3c85c8263b1d9a97078c5ab0556edc59c"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/init_0.mp4",
+          "sha256": "1a1ef7b52b2205ba744934faa251d99c45a97b49fb1d83e64e1f4a6defd7cdbb"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_000.m4s",
+          "sha256": "107dbdf4933945a403524009e6ca1d9245dbc4ea58df34135e85696bd117e4c0"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_001.m4s",
+          "sha256": "784542218012027a310e922c911622ddd33941862f62d08b32bef60d0225613f"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_002.m4s",
+          "sha256": "a55a8aa18336de52a5ce44c9c98f07b6df5b10174753d3cdb48b1e1986a2f286"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_003.m4s",
+          "sha256": "151d0f6cd8063be5ff707711f68c31e17bc290eb735363aaa7d61ecaa91078c8"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_004.m4s",
+          "sha256": "4016086311f5f31f116a2e0f4e2bbad82ced6794c29dae333619e8b220015a0b"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_005.m4s",
+          "sha256": "7b1c2cb6d880be77ffc0093f12aa5044e6bfdd1a53f4d351a4b8dc21ee9ce234"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_006.m4s",
+          "sha256": "b3eaac5e71e3c329e25dac87270552b6e6aed06431e759269cdedbc92916b827"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_007.m4s",
+          "sha256": "a952db12383b840f2c2c4d0c36631f082d560b10c30c9fdec373a9f34e22288f"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_008.m4s",
+          "sha256": "845bf538f18d842a1b780b5e47795eea70c5a498b300b926ddb96075d6f6abc8"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_009.m4s",
+          "sha256": "595667d8e211b89083b85c1bd32ab49e47580a47e6b03dac3e8deb4e361a9931"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_010.m4s",
+          "sha256": "1bad55aeee8ad3a0bd1533ba9864fa30610df187483f8973233c09a466044f0e"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_011.m4s",
+          "sha256": "00cea2c0e36b84588107249d758406d0b217c789fef440686e2125fa6b375cbe"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_012.m4s",
+          "sha256": "f81af94c848f70c5580a850e17706466ef804206d2df5016c8e95e189aa9a5df"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_013.m4s",
+          "sha256": "576300ed2577855f04e1edd0977eeadfc95f27017923c08d84932559d618929f"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_014.m4s",
+          "sha256": "147338da36be78802e180650ef0aabbebecc0e4c837cc21b1c90c4f62c6f59a4"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_015.m4s",
+          "sha256": "8208d524d2bef23a0d82c43736d7df2b8e677f5c2443219abce7ea637c2b3285"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_016.m4s",
+          "sha256": "89c1db9086aa5c947b3f3dcb7eafd56e1f4ad1efa2e90e40c781f4d6d0eb3dcc"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_017.m4s",
+          "sha256": "369d9a4113fd3192f9bdefe40f3b25c31a89ae62b6d7302d85e3a127aa4e4ebc"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_018.m4s",
+          "sha256": "00a91ea99197bb31332c891dca7b8a121954e4eebfba36a8ee2040536cf8f4e0"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_019.m4s",
+          "sha256": "5b0213325db20f812f523800296c8c4e8b8eb5a2b729b357d9828fa8049472fd"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_020.m4s",
+          "sha256": "e93a62b155af8cdcac01e5a8041e92e1c74c691bfefa82d0a401a9fe16e87717"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_021.m4s",
+          "sha256": "2f85bab10a2429286cb5e496a574d958ae6b121d587fe86652585ef6648a0406"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_022.m4s",
+          "sha256": "a7f2f259a1e6cd21b7e7c225c6651b1a4f3c41f52ae1bc598225f782f60aa628"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_023.m4s",
+          "sha256": "1eeaed944dbaba0d8f2140b8b6e85c7166bedbcf2d2abca9d7e2c55834651613"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_024.m4s",
+          "sha256": "d824742d08345a600898e959e70668aff5fbf255f41d245d9d032a03a03563fc"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_025.m4s",
+          "sha256": "c9dfbc7df38c4d6019265b0b55c52713d9a12b71c8907cf4bbf466ebad9bd30f"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_026.m4s",
+          "sha256": "ec222a745e0994fc0099d000133877a56341eab7c5036c816aed5603fd737793"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_027.m4s",
+          "sha256": "8356e2d16ddd821e3a0a02a1a4faceda3be733cd073cff52308a2b69f354d7b0"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_028.m4s",
+          "sha256": "97d41d5d848d2148c7b9a7d8cad97eb06269633c4a943ebe4a37419912a6e607"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_029.m4s",
+          "sha256": "b50d0a07ea816a84023a0d07ce6e44a8b8f5a8804dc22f6f35f6f4b46ac39038"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_030.m4s",
+          "sha256": "9c66c648efa8a2627bb2b9c1a74d6de1e45c8c6cbe4f13a079938e6b23456b7f"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_031.m4s",
+          "sha256": "3f44a03596925a5eae7f2d2d6ee8b385bb7a7783c0fe3060d2f3706523b8047e"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_032.m4s",
+          "sha256": "e00e6f3e01932ce56443f2c6e601e8a79dbb949c0a0232ce2554c6685bc2e0d0"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_033.m4s",
+          "sha256": "a2d38e563189da9de52801cc1e88ca9efa16edc798043e17ba1723b720e98954"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_034.m4s",
+          "sha256": "06b2db968c31f23724caaf92464dd6697d8e4ab9e0a7af41fd02427464fd111a"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_035.m4s",
+          "sha256": "00a542fa6265286dbd8f647d5c9192b75d4fc2b14814ed79820f9ed77798a60d"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_036.m4s",
+          "sha256": "98212798ce590bf61e6db8d509d098a6319f2ca174a7bd417800555b522ff0f5"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_037.m4s",
+          "sha256": "6548f7a7ea3d4e027dbb1f83265bc31b2f470d6027f5b2ebb7eede102fceda19"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_038.m4s",
+          "sha256": "9dabff7139daee194c8330748d68cc953f0c257a82f0b4af43e387b314b85527"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_039.m4s",
+          "sha256": "04cbffb6196921648c6721561e2bfcf3c8a60b7340580d4ddce185794b6fcbc0"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_040.m4s",
+          "sha256": "c82d690f0892f6e717889e27cb0ba21520e9572736eddb68c352f740a2f48315"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_041.m4s",
+          "sha256": "275d3db8e534b99de5b86d3731910cf64bea0d6a0daa57e58c948436bf46d99b"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_042.m4s",
+          "sha256": "faec47151d76f13d5fa15abce55baffbfba6d21b4b9c73e3e6d7e6d75df3d2a7"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_043.m4s",
+          "sha256": "aeb2398c4cd7d40610fa14404030f6ba83445f2c3416f78f881c9b4bf67edfcf"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_044.m4s",
+          "sha256": "56657527c09f7551939373ca8fcac4a223caae03ab5b3d9f37da94a707591f63"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_045.m4s",
+          "sha256": "4a2bd2a4a47f87717525b1c415d083aaf7dfb98322e087105c484a8fe1d6284a"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_046.m4s",
+          "sha256": "4e0ee365e43aaa468d59d7ee1c522b4729fe92e4cfbbd1cee67393efe137f536"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_047.m4s",
+          "sha256": "2069211b53c23a0cf6da2f5871d983a67268bf85cd9e132472efa89a6e27b61c"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_048.m4s",
+          "sha256": "e7fa52814e6e65707c7f92d444c2717a60dcc1be0f7f81853da160a9bf6919bf"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_049.m4s",
+          "sha256": "595f00b88fe0c72823538712c1640edb5e8b972366a92dfda26d6ae9e83e9a89"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_050.m4s",
+          "sha256": "e2e34951987d5eb926157ea1daa222dd9e6c85fc96f1f488f33f9d31494f01d2"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_051.m4s",
+          "sha256": "d63a76ab88fdf9072e00b8a1be8c4d128ceba800f99fcc61aa4193bb2eaf3c51"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_052.m4s",
+          "sha256": "921cd914ebdaf12c09b7c9539ca127d50cffb558760ebce2d6acc7aec48f9b8b"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_053.m4s",
+          "sha256": "41026a7eadda20942678383ef774e91d7545bb1f0d180cb27ea7d1739691905b"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_054.m4s",
+          "sha256": "1dc0bf2b287c4738727d8f2f16513ad91ec2bfea52484f64e48227a3efb5bffd"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_055.m4s",
+          "sha256": "abb5f211436ba4e4e4b0254a33926d80f4a66e5d0237968ddb80845247051e0a"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_056.m4s",
+          "sha256": "f1bdd99e12019af52949673db1ef5f32137f55ff3dd66795f6ba805a50b2864e"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_057.m4s",
+          "sha256": "0dc77e869d53163b4a16f2bd048b08759367d26dea470f2ff431a8795f8918da"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_058.m4s",
+          "sha256": "cac249d8ece09e124aa0980dfd2647983693c74cb19e8baaebdbd45b0ab28cb6"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_059.m4s",
+          "sha256": "c65794c0c73c3fa9e81526cd8c9332a82613963ae71d9cf886a9ad430b229f1d"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_060.m4s",
+          "sha256": "da9ea7794e5d26973ab8e250afd948c739b9c4f7b08de0a9a2fe01ce4690ba90"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_061.m4s",
+          "sha256": "07e2a5f2bcb2efc87a02b91a0339e4febbac43521ed263bc567729f82ea6050d"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_062.m4s",
+          "sha256": "21ef4e1a352f2412057c7372b61eef3f8ced3328aa36ca5278ab6bef739df943"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_063.m4s",
+          "sha256": "770010241f3a8ef19f8e4405fb2f5faf930d60710574069a8f6936f03e80f59a"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_064.m4s",
+          "sha256": "972ce721d18db596b705452b227b5d85fc7c621a7e4b5989dce835c610d44d23"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_065.m4s",
+          "sha256": "8484999b2f67874a608ae87db48dbbdc3ee0b6a120c7a8122d1840c483509a79"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_066.m4s",
+          "sha256": "84be7de557ee2153c3bfc2aaf8a60a392f89da3a2e419b8cc9fcae4b54a46e6f"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_067.m4s",
+          "sha256": "fadd014da9e0b1bf1504926a2f50a0ae8a3b0aee6622249983a1a8ef3890f4aa"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_068.m4s",
+          "sha256": "13db0eba3932a13b7939f37637e7176f56d00fe6601eb5b704852a759c21b5f6"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_069.m4s",
+          "sha256": "988b9a60fbe11ed78ae1edccac3ccda35d714b49f59973e6dfdf55b1f151319b"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_070.m4s",
+          "sha256": "d8f5652defc00fd606c425af8ba1659f472247ed752ec219ddacbf19f6d346cb"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_071.m4s",
+          "sha256": "bb29f72cf6288c3177f89629c644ff43eb870e3be254595a2bd4e51540b32b87"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_072.m4s",
+          "sha256": "3fca07a3e20073684afc07c57ba072ff5c48e893e95b3575cc1b2598aeefb38f"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_073.m4s",
+          "sha256": "22c4643f987d677b7797baf890b5d854d2f6763e9f5675f127d084879ae11fb8"
+        },
+        {
+          "path": "06-seek-5min/aether-hdr10-sar43-hev1-alt-audio-hls-5min/video/segment_074.m4s",
+          "sha256": "e733da0f0a367512290f300f4be78084326c75afc3d3936b932b7c872cfefa70"
+        }
+      ],
+      "expected_media": {
+        "container": "hls",
+        "duration_seconds": 300.0,
+        "video_codecs": [
+          "hevc"
+        ],
+        "audio_codecs": [
+          "aac",
+          "aac"
+        ],
+        "subtitle_codecs": [
+          "webvtt"
+        ],
+        "track_count": 4
+      },
+      "seek": {
+        "forward_seek_seconds": 150.0,
+        "backward_seek_seconds": 60.0,
+        "minimum_post_seek_progress_seconds": 2.0
+      },
+      "expected_route": "hybridCarrier",
+      "hardware_requirements": [
+        "hdr10_display",
+        "physical_tvos"
+      ],
+      "allowed_capability_deltas": [],
+      "expected_outcome": "playable",
+      "completion_mode": "play_to_end",
+      "expected_failure": null
+    }
+  ]
+}

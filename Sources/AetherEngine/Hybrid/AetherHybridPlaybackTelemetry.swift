@@ -11,6 +11,7 @@ public enum AetherHybridPlaybackTelemetryFailure:
     Equatable
 {
     case videoPipelineMissing
+    case audioPipelineMissing
     case renderSurfaceMissing
     case invalidSeekableVODOptions
     case sourceIndependentReaderUnavailable
@@ -22,6 +23,7 @@ public enum AetherHybridPlaybackTelemetryFailure:
     case preflightContractChanged
     case sourceVideoFormatDiverged
     case sourceDolbyVisionConfigurationDiverged
+    case progressiveSourceFactsDiverged
     case invalidReadinessTimeout
     case invalidSeekTarget
     case invalidRate
@@ -52,6 +54,8 @@ public enum AetherHybridPlaybackTelemetryFailure:
         self = switch error {
         case .videoPipelineMissing:
             .videoPipelineMissing
+        case .audioPipelineMissing:
+            .audioPipelineMissing
         case .renderSurfaceMissing:
             .renderSurfaceMissing
         case .invalidSeekableVODOptions:
@@ -74,6 +78,8 @@ public enum AetherHybridPlaybackTelemetryFailure:
             .sourceVideoFormatDiverged
         case .sourceDolbyVisionConfigurationDiverged:
             .sourceDolbyVisionConfigurationDiverged
+        case .progressiveSourceFactsDiverged:
+            .progressiveSourceFactsDiverged
         case .invalidReadinessTimeout:
             .invalidReadinessTimeout
         case .invalidSeekTarget:
@@ -139,6 +145,7 @@ public enum AetherHybridPlaybackTelemetryState:
         generation: UInt64,
         targetSeconds: Double?
     )
+    case ended(generation: UInt64)
     case failed(AetherHybridPlaybackTelemetryFailure)
     case stopped
 
@@ -158,6 +165,8 @@ public enum AetherHybridPlaybackTelemetryState:
                 generation: generation,
                 targetSeconds: Self.validSeconds(target)
             )
+        case .ended(let generation):
+            .ended(generation: generation)
         case .failed(let error):
             .failed(
                 AetherHybridPlaybackTelemetryFailure(error)

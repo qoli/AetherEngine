@@ -41,15 +41,39 @@ enum DisplayCriteriaApplicationResult: Equatable {
     }
 }
 
+/// Process-local ownership for the single window-level display-criteria
+/// writer. A late route may release only the generation it actually wrote;
+/// once a successor applies newer criteria, stale teardown becomes a no-op.
+struct DisplayCriteriaOwnershipCoordinator: Sendable, Equatable {
+    private(set) var latestSequence: UInt64 = 0
+    private(set) var activeSequence: UInt64?
+
+    mutating func acquire() -> UInt64 {
+        latestSequence &+= 1
+        activeSequence = latestSequence
+        return latestSequence
+    }
+
+    mutating func releaseIfOwned(_ sequence: UInt64) -> Bool {
+        guard activeSequence == sequence else { return false }
+        activeSequence = nil
+        return true
+    }
+}
+
 /// HDMI HDR-mode handshake via AVDisplayManager (tvOS 11.2+). Programs AVDisplayCriteria before playback so the panel finishes its mode negotiation before the first frame. No-op stub on iOS/macOS. Lifted from Sodalite's PlayerViewModel so the engine owns the handshake; hosts no longer touch UIWindow.avDisplayManager.
 @MainActor
 final class DisplayCriteriaController {
+
+    private static var ownership =
+        DisplayCriteriaOwnershipCoordinator()
 
     /// Override window discovery. Default walks connectedScenes and picks the first window; multi-window or custom-presentation hosts can supply their own resolver here.
     nonisolated(unsafe) static var windowProvider: (@MainActor () -> Any?)?
 
     /// Whether apply() wrote preferredDisplayCriteria this session. reset() is gated on this so AVKit-sole-writer hosts (LoadOptions.suppressDisplayCriteria=true) get zero engine writes; a nil write on a suppressed session races AVKit's in-flight criteria and collapsed EDR headroom to 1.0 (DrHurt#4 Build 176).
     private var didApply: Bool = false
+    private var ownershipSequence: UInt64?
 
     /// True when the last apply() set HDR color extensions. waitForSwitch uses this to distinguish a legitimate SDR rate-only settle (headroom 1.0 expected) from an HDR handshake failure (headroom 1.0 is wrong).
     private var lastCriteriaWasHDR: Bool = false
@@ -127,6 +151,7 @@ final class DisplayCriteriaController {
         let effectiveRate = Float(sourceFrameRate)
         let criteria = AVDisplayCriteria(refreshRate: effectiveRate, formatDescription: desc)
         displayManager.preferredDisplayCriteria = criteria
+        ownershipSequence = Self.ownership.acquire()
         didApply = true
         lastCriteriaWasHDR = isHDR
 
@@ -267,6 +292,17 @@ final class DisplayCriteriaController {
     func reset() {
         #if os(tvOS)
         guard didApply else { return }
+        guard let ownershipSequence,
+              Self.ownership.releaseIfOwned(ownershipSequence) else {
+            didApply = false
+            self.ownershipSequence = nil
+            EngineLog.emit(
+                "[DisplayCriteria] stale RESET skipped",
+                category: .engine
+            )
+            return
+        }
+        self.ownershipSequence = nil
         guard let window = resolveWindow() else {
             didApply = false
             return

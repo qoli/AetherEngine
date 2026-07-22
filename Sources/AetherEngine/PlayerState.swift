@@ -23,7 +23,8 @@ public enum PlaybackBackend: String, Sendable, Equatable {
     case none
     /// Removed in 1.0.0; reserved for hosts that still switch on it.
     case aether
-    /// HLS-fMP4 over loopback to AVPlayer + AVPlayerLayer. Default for HEVC / H.264 / VP9.
+    /// Legacy low-level loopback AVPlayer backend. It can carry HEVC/H.264/VP9,
+    /// but the unified AetherPlaybackSession never admits positive HEVC here.
     case native
     /// FFmpeg / dav1d + AVSampleBufferDisplayLayer. Used for AV1 on tvOS (no HW decoder).
     case software
@@ -266,17 +267,39 @@ public enum AetherSourceContainer: String, Sendable, Equatable, Hashable {
     case matroska
     case isoBaseMedia
     case mpegTransport
+    case flashVideo
     case unknown
     case other
 
     public var supportsNativeHLSFMP4Remux: Bool {
         switch self {
-        case .matroska, .isoBaseMedia, .mpegTransport:
+        case .matroska, .isoBaseMedia, .mpegTransport, .flashVideo:
             true
         case .unknown, .other:
             false
         }
     }
+}
+
+/// Positive scan-type evidence read from the exact FFmpeg video stream.
+/// Unknown is kept distinct from progressive so routing never invents a
+/// deinterlacing requirement from missing metadata.
+public enum AetherVideoScanType: String, Sendable, Equatable, Hashable {
+    case unknown
+    case progressive
+    case interlaced
+}
+
+/// Exact demux evidence for whether a source contains a video stream.
+///
+/// `unknown` is deliberately distinct from `provenAbsent`: only a completed
+/// stream inventory may prove audio-only media. Missing codec parameters,
+/// dimensions, or a best-stream selection are not evidence that video is
+/// absent.
+public enum AetherVideoStreamPresence: String, Sendable, Equatable {
+    case unknown
+    case provenAbsent
+    case provenPresent
 }
 
 /// One-shot container + stream metadata from `AetherEngine.probe(url:options:)`. No HLS server, no decoders.
@@ -286,18 +309,22 @@ public struct SourceProbe: Sendable {
     public let durationSeconds: Double
     /// `.sdr` when no HDR signaling or no video track.
     public let videoFormat: VideoFormat
-    /// FFmpeg AVCodecID raw value; 0 (AV_CODEC_ID_NONE) when no video track.
+    /// FFmpeg AVCodecID raw value; 0 (AV_CODEC_ID_NONE) when no video codec
+    /// was identified. Consult `videoStreamPresence` for stream existence.
     public let videoCodecID: Int32
     /// Codec name from libavcodec (e.g. "hevc", "h264", "av1"). nil when unavailable.
     public let videoCodecName: String?
     /// Input container positively identified by FFmpeg. Never inferred from the URL suffix.
     public let sourceContainer: AetherSourceContainer
-    /// 0 when no video track.
+    /// 0 when video geometry is absent or unresolved.
     public let videoWidth: Int32
-    /// 0 when no video track.
+    /// 0 when video geometry is absent or unresolved.
     public let videoHeight: Int32
     /// Snapped to a standard rate (23.976, 24, 25, ...). nil when not advertised.
     public let videoFrameRate: Double?
+    /// Exact FFmpeg field-order evidence. Positive interlaced H.264 cannot use
+    /// the Native AVPlayer remux route because tvOS does not deinterlace it.
+    public let videoScanType: AetherVideoScanType
     public let isDolbyVision: Bool
     /// Dolby Vision profile number (5, 7, 8, 10) read from the dvcC/dvvC configuration record; nil when not DV.
     public let dvProfile: Int?
@@ -309,8 +336,34 @@ public struct SourceProbe: Sendable {
     /// Includes both text and bitmap (PGS / DVB) variants.
     public let subtitleTracks: [TrackInfo]
     public let metadata: MediaMetadata
+    /// Positive byte/timeline seekability reported by the exact opened
+    /// demuxer. Unknown or forward-only inputs are false; callers must not
+    /// infer this capability from a finite duration or URL metadata.
+    public let isSourceSeekable: Bool
     /// Heuristic: no duration + network scheme (http / https / udp / rtp / rtsp). False positives possible (VOD MKVs with broken duration). Hosts decide the final `LoadOptions.isLive`.
     public let isLive: Bool
+
+    /// Exact stream-inventory evidence. Codec/geometry metadata may promote
+    /// an otherwise inconclusive observation to `provenPresent`, but only an
+    /// explicit completed inventory may produce `provenAbsent`.
+    public let videoStreamPresence: AetherVideoStreamPresence
+
+    /// Compatibility view for callers interested only in positive presence.
+    /// `false` covers both unknown and proven-absent; route admission must use
+    /// `videoStreamPresence` so those states are never conflated.
+    public var hasVideoStream: Bool {
+        videoStreamPresence == .provenPresent
+    }
+
+    /// Unified Hybrid admission requires all three positive facts. Keeping
+    /// the derivation with the probe prevents finite forward-only sources
+    /// from being mistaken for seekable VOD.
+    public var isFiniteSeekableVOD: Bool {
+        durationSeconds.isFinite
+            && durationSeconds > 0
+            && !isLive
+            && isSourceSeekable
+    }
 
     public init(
         url: URL,
@@ -322,6 +375,7 @@ public struct SourceProbe: Sendable {
         videoWidth: Int32,
         videoHeight: Int32,
         videoFrameRate: Double?,
+        videoScanType: AetherVideoScanType = .unknown,
         isDolbyVision: Bool,
         dvProfile: Int? = nil,
         dolbyVisionConfiguration: AetherDolbyVisionConfiguration? = nil,
@@ -329,7 +383,10 @@ public struct SourceProbe: Sendable {
         audioTracks: [TrackInfo],
         subtitleTracks: [TrackInfo],
         metadata: MediaMetadata = MediaMetadata(title: nil, artist: nil, album: nil, artworkData: nil),
-        isLive: Bool = false
+        isSourceSeekable: Bool = false,
+        isLive: Bool = false,
+        hasVideoStream: Bool? = nil,
+        videoStreamPresence: AetherVideoStreamPresence? = nil
     ) {
         self.url = url
         self.durationSeconds = durationSeconds
@@ -340,6 +397,7 @@ public struct SourceProbe: Sendable {
         self.videoWidth = videoWidth
         self.videoHeight = videoHeight
         self.videoFrameRate = videoFrameRate
+        self.videoScanType = videoScanType
         self.isDolbyVision = isDolbyVision
         self.dvProfile = dvProfile
         self.dolbyVisionConfiguration = dolbyVisionConfiguration
@@ -348,7 +406,20 @@ public struct SourceProbe: Sendable {
         self.audioTracks = audioTracks
         self.subtitleTracks = subtitleTracks
         self.metadata = metadata
+        self.isSourceSeekable = isSourceSeekable
         self.isLive = isLive
+        let hasPositiveVideoMetadata = videoCodecID != 0
+            || videoCodecName != nil
+            || videoWidth > 0
+            || videoHeight > 0
+        let declaredPresence = videoStreamPresence
+            ?? hasVideoStream.map {
+                $0 ? .provenPresent : .provenAbsent
+            }
+            ?? .unknown
+        self.videoStreamPresence = hasPositiveVideoMetadata
+            ? .provenPresent
+            : declaredPresence
     }
 }
 

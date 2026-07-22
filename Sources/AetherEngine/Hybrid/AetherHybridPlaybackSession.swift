@@ -206,12 +206,13 @@ final class AetherHybridPlaybackSession: ObservableObject {
     ///
     /// Clear, finite, seekable HLS VOD is admitted only through an opaque
     /// `AetherHLSPlaybackPreflight` resource binding. The verified renderer admits
-    /// SDR, HDR10, and HLG; every other color format is rejected by preflight
-    /// rather than tone-mapped.
+    /// SDR, HDR10, HLG, and verified Dolby Vision Profile 8.4; every other
+    /// color format is rejected by preflight rather than tone-mapped.
     public nonisolated static var capabilities: HybridPlaybackCapabilities {
         HybridPlaybackCapabilities(
             hasDirectVideoDecoder: true,
             hasSampleBufferRenderer: true,
+            hasAudioBridgeCarrier: true,
             supportedVideoFormats: AetherHybridPresentationView
                 .verifiedVideoFormats,
             supportedDolbyVisionProfiles: [.profile84],
@@ -234,6 +235,8 @@ final class AetherHybridPlaybackSession: ObservableObject {
 
     @Published public private(set) var state:
         HybridPlaybackSessionState
+    @Published private(set) var videoOutputSnapshot:
+        AetherVideoOutputSnapshot
     @Published public private(set) var overlaySubtitleTracks:
         [AetherHybridOverlaySubtitleTrack]
     @Published public private(set) var activeOverlaySubtitleTrackID:
@@ -263,6 +266,7 @@ final class AetherHybridPlaybackSession: ObservableObject {
     private let core: HybridPlaybackSession
     private let telemetryHub:
         AetherHybridPlaybackTelemetryHub
+    private var videoOutputSequence: UInt64 = 0
     #if os(tvOS)
     private weak var configuredCarrierPlayerViewController:
         AVPlayerViewController?
@@ -284,6 +288,21 @@ final class AetherHybridPlaybackSession: ObservableObject {
         self.timeline = timeline
         self.presentationView = presentationView
         self.telemetryHub = telemetryHub
+        let videoExpected = preflightResult.sourceProfile
+            .videoStreamPresence == .provenPresent
+        videoOutputSnapshot = AetherVideoOutputSnapshot(
+            videoExpected: videoExpected,
+            outputStatus: videoExpected ? .missing : .notExpected,
+            frameSequence: 0,
+            frameGeneration: core.generation,
+            lastPresentedFrameMediaTimeSeconds: nil,
+            observedAtUptimeSeconds: nil,
+            activeRoute: .hybridCarrier,
+            canonicalCodec: videoExpected
+                ? preflightResult.sourceProfile
+                    .videoCodec.canonicalVideoOutputCodec
+                : .none
+        )
         telemetrySessionID = telemetryHub.sessionID
         avPlayer = core.avPlayer
         state = core.state
@@ -295,6 +314,7 @@ final class AetherHybridPlaybackSession: ObservableObject {
         core.stateDidChange = { [weak self] state in
             guard let self else { return }
             self.state = state
+            self.resetVideoOutputIfGenerationChanged(state)
             #if os(tvOS)
             switch state {
             case .failed, .stopped:
@@ -307,6 +327,9 @@ final class AetherHybridPlaybackSession: ObservableObject {
         }
         core.telemetryDidChange = { [weak self] trigger in
             self?.publishTelemetry(for: trigger)
+        }
+        core.presentedFrameDidChange = { [weak self] evidence in
+            self?.publishPresentedFrame(evidence)
         }
         core.subtitleTracksDidChange = {
             [weak self] tracks, selectedTrackID in
@@ -386,13 +409,27 @@ final class AetherHybridPlaybackSession: ObservableObject {
 
         let core: HybridPlaybackSession
         do {
-            core = try await HybridPlaybackSession.makeSeekableVOD(
-                source: source,
-                options: options,
-                timeline: timeline,
-                initialGeneration: initialGeneration,
-                selectTitleID: selectTitleID
-            )
+            if preflightResult.reason == .hybridAudioBridge,
+               preflightResult.sourceProfile.videoStreamPresence
+                    == .provenAbsent,
+               preflightResult.sourceProfile.audioCodecs == [.vorbis] {
+                core = try await HybridPlaybackSession
+                    .makeAudioOnlySeekableVOD(
+                        source: source,
+                        options: options,
+                        timeline: timeline,
+                        initialGeneration: initialGeneration,
+                        selectTitleID: selectTitleID
+                    )
+            } else {
+                core = try await HybridPlaybackSession.makeSeekableVOD(
+                    source: source,
+                    options: options,
+                    timeline: timeline,
+                    initialGeneration: initialGeneration,
+                    selectTitleID: selectTitleID
+                )
+            }
         } catch let error as HybridPlaybackSessionError {
             throw error
         } catch BlackCarrierDemuxSourceFactoryError
@@ -410,8 +447,20 @@ final class AetherHybridPlaybackSession: ObservableObject {
                 )
             )
         }
-        guard core.sourceVideoFormat
-                == preflightResult.sourceProfile.videoFormat else {
+        guard let sourceFacts = core.progressiveSourceFacts,
+              sourceFacts.matches(
+                preflightProfile: preflightResult.sourceProfile,
+                timelineDurationSeconds:
+                    CMTimeGetSeconds(timeline.duration)
+              ) else {
+            core.stop()
+            throw HybridPlaybackSessionError
+                .progressiveSourceFactsDiverged
+        }
+        guard preflightResult.sourceProfile.videoStreamPresence
+                != .provenPresent
+                || core.sourceVideoFormat
+                    == preflightResult.sourceProfile.videoFormat else {
             let decoded = core.sourceVideoFormat
             core.stop()
             throw HybridPlaybackSessionError
@@ -441,6 +490,7 @@ final class AetherHybridPlaybackSession: ObservableObject {
 
     static func makeSeekableVOD(
         source: MediaSource,
+        preparedURLSource: AetherPreparedURLSource? = nil,
         options: LoadOptions,
         timeline: BlackCarrierTimeline,
         preflightResult: PlaybackPreflightResult,
@@ -451,6 +501,7 @@ final class AetherHybridPlaybackSession: ObservableObject {
     ) async throws -> AetherHybridPlaybackSession {
         try await makeInjectedSeekableVOD(
             source: source,
+            preparedURLSource: preparedURLSource,
             options: options,
             timeline: timeline,
             preflightResult: preflightResult,
@@ -463,6 +514,7 @@ final class AetherHybridPlaybackSession: ObservableObject {
 
     private static func makeInjectedSeekableVOD(
         source: MediaSource,
+        preparedURLSource: AetherPreparedURLSource?,
         options: LoadOptions,
         timeline: BlackCarrierTimeline,
         preflightResult: PlaybackPreflightResult,
@@ -503,16 +555,47 @@ final class AetherHybridPlaybackSession: ObservableObject {
             timeline: timeline,
             sourceKind: preflightResult.sourceProfile.sourceKind
         )
-        let core = try await HybridPlaybackSession.makeSeekableVOD(
-            source: source,
-            options: options,
-            timeline: timeline,
-            avPlayer: avPlayer,
-            decoderPreference: decoderPreference,
-            initialGeneration: initialGeneration,
-            selectTitleID: selectTitleID
-        )
-        guard core.sourceVideoFormat == preflightResult.sourceProfile.videoFormat else {
+        let core: HybridPlaybackSession
+        if preflightResult.reason == .hybridAudioBridge,
+           preflightResult.sourceProfile.videoStreamPresence
+                == .provenAbsent,
+           preflightResult.sourceProfile.audioCodecs == [.vorbis] {
+            core = try await HybridPlaybackSession
+                .makeAudioOnlySeekableVOD(
+                    source: source,
+                    preparedURLSource: preparedURLSource,
+                    options: options,
+                    timeline: timeline,
+                    avPlayer: avPlayer,
+                    initialGeneration: initialGeneration,
+                    selectTitleID: selectTitleID
+                )
+        } else {
+            core = try await HybridPlaybackSession.makeSeekableVOD(
+                source: source,
+                preparedURLSource: preparedURLSource,
+                options: options,
+                timeline: timeline,
+                avPlayer: avPlayer,
+                decoderPreference: decoderPreference,
+                initialGeneration: initialGeneration,
+                selectTitleID: selectTitleID
+            )
+        }
+        guard let sourceFacts = core.progressiveSourceFacts,
+              sourceFacts.matches(
+                preflightProfile: preflightResult.sourceProfile,
+                timelineDurationSeconds:
+                    CMTimeGetSeconds(timeline.duration)
+              ) else {
+            core.stop()
+            throw HybridPlaybackSessionError
+                .progressiveSourceFactsDiverged
+        }
+        guard preflightResult.sourceProfile.videoStreamPresence
+                != .provenPresent
+                || core.sourceVideoFormat
+                    == preflightResult.sourceProfile.videoFormat else {
             let decoded = core.sourceVideoFormat
             core.stop()
             throw HybridPlaybackSessionError.sourceVideoFormatDiverged(
@@ -875,6 +958,10 @@ final class AetherHybridPlaybackSession: ObservableObject {
         try await core.seek(to: target, timeout: timeout)
     }
 
+    func pollVideoOutput() {
+        core.pollPresentedVideoOutput()
+    }
+
     public func audioAnalysisStream(
         request: AudioAnalysisRequest
     ) throws -> AudioAnalysisStream {
@@ -906,6 +993,73 @@ final class AetherHybridPlaybackSession: ObservableObject {
     public func stop() {
         core.stop()
         telemetryHub.finish()
+    }
+
+    private func resetVideoOutputIfGenerationChanged(
+        _ state: HybridPlaybackSessionState
+    ) {
+        let generation: UInt64? = switch state {
+        case .preparing(let generation, _),
+             .ready(let generation),
+             .seeking(let generation, _),
+             .ended(let generation):
+            generation
+        case .idle, .failed, .stopped:
+            nil
+        }
+        guard let generation,
+              generation != videoOutputSnapshot.frameGeneration else {
+            return
+        }
+        let videoExpected = preflightResult.sourceProfile
+            .videoStreamPresence == .provenPresent
+        videoOutputSnapshot = AetherVideoOutputSnapshot(
+            videoExpected: videoExpected,
+            outputStatus: videoExpected ? .missing : .notExpected,
+            frameSequence: videoOutputSequence,
+            frameGeneration: generation,
+            lastPresentedFrameMediaTimeSeconds: nil,
+            observedAtUptimeSeconds: nil,
+            activeRoute: .hybridCarrier,
+            canonicalCodec: videoExpected
+                ? preflightResult.sourceProfile
+                    .videoCodec.canonicalVideoOutputCodec
+                : .none
+        )
+    }
+
+    private func publishPresentedFrame(
+        _ evidence: AetherHybridPresentedFrameEvidence
+    ) {
+        guard preflightResult.sourceProfile.videoStreamPresence
+                == .provenPresent,
+              evidence.generation == core.generation,
+              evidence.mediaTimeSeconds.isFinite,
+              evidence.observedAtUptimeSeconds.isFinite else {
+            return
+        }
+        if evidence.generation
+                != videoOutputSnapshot.frameGeneration {
+            resetVideoOutputIfGenerationChanged(core.state)
+        }
+        guard evidence.generation
+                == videoOutputSnapshot.frameGeneration else {
+            return
+        }
+        videoOutputSequence &+= 1
+        videoOutputSnapshot = AetherVideoOutputSnapshot(
+            videoExpected: true,
+            outputStatus: .presented,
+            frameSequence: videoOutputSequence,
+            frameGeneration: evidence.generation,
+            lastPresentedFrameMediaTimeSeconds:
+                evidence.mediaTimeSeconds,
+            observedAtUptimeSeconds:
+                evidence.observedAtUptimeSeconds,
+            activeRoute: .hybridCarrier,
+            canonicalCodec: preflightResult.sourceProfile
+                .videoCodec.canonicalVideoOutputCodec
+        )
     }
 
     #if os(tvOS)
@@ -1043,7 +1197,7 @@ final class AetherHybridPlaybackSession: ObservableObject {
                 .sessionEnded,
                 payload: .sessionEnded(.stoppedByHost)
             )
-        case .idle, .preparing, .ready, .seeking:
+        case .idle, .preparing, .ready, .seeking, .ended:
             publishTelemetry(.stateChanged)
         }
     }

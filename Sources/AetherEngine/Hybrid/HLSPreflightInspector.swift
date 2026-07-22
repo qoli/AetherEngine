@@ -119,6 +119,7 @@ struct HLSPreflightFetchResponse: Sendable {
 
 private struct HLSPreflightResolvedMedia: Sendable {
     let variant: HLSVariant?
+    let masterContainsUninspectedHEVCVariant: Bool
     let separateAudioGroupID: String?
     let audioRenditions: [HLSAudioRendition]
     let separateSubtitleGroupID: String?
@@ -131,6 +132,7 @@ private struct HLSPreflightResolvedMedia: Sendable {
 
 private struct HLSInspectedVideo: Sendable {
     let codec: AetherVideoCodec
+    let scanType: AetherVideoScanType
     let format: VideoFormat
     let dolbyVisionConfiguration:
         AetherDolbyVisionConfiguration?
@@ -210,7 +212,9 @@ struct HLSPreflightInspector {
                     isSeekableVOD: sourceIsSeekableVOD,
                     manifestCodecs: manifestCodecs,
                     contentProtection: .none,
-                    hybridCapabilities: hybridCapabilities
+                    hybridCapabilities: hybridCapabilities,
+                    masterContainsUninspectedHEVCVariant:
+                        resolved.masterContainsUninspectedHEVCVariant
                 ),
                 resourceGraph: nil,
                 httpHeaders: httpHeaders
@@ -285,7 +289,9 @@ struct HLSPreflightInspector {
                     manifestCodecs: manifestCodecs,
                     contentProtection: .none,
                     hybridCapabilities: hybridCapabilities,
-                    container: container
+                    container: container,
+                    masterContainsUninspectedHEVCVariant:
+                        resolved.masterContainsUninspectedHEVCVariant
                 ),
                 resourceGraph: nil,
                 httpHeaders: httpHeaders
@@ -302,7 +308,9 @@ struct HLSPreflightInspector {
                 actualCodec: inspected.codec,
                 sampleEntry: inspected.sampleEntry
             ),
-            contentProtection: .none
+            contentProtection: .none,
+            masterContainsUninspectedHEVCVariant:
+                resolved.masterContainsUninspectedHEVCVariant
         )
         let hdr10PlusAdmission = Self.resolveHDR10PlusAdmission(
             baseFormat: inspected.format,
@@ -312,6 +320,7 @@ struct HLSPreflightInspector {
             sourceKind: .hls,
             isSeekableVOD: sourceIsSeekableVOD,
             videoCodec: inspected.codec,
+            videoScanType: inspected.scanType,
             videoFormat: hdr10PlusAdmission.videoFormat,
             dolbyVisionConfiguration:
                 inspected.dolbyVisionConfiguration,
@@ -448,6 +457,7 @@ struct HLSPreflightInspector {
         case .media(let media):
             return HLSPreflightResolvedMedia(
                 variant: nil,
+                masterContainsUninspectedHEVCVariant: false,
                 separateAudioGroupID: nil,
                 audioRenditions: [],
                 separateSubtitleGroupID: nil,
@@ -502,6 +512,11 @@ struct HLSPreflightInspector {
             }
             return HLSPreflightResolvedMedia(
                 variant: variant,
+                masterContainsUninspectedHEVCVariant:
+                    Self.masterContainsHEVCVariant(
+                        master,
+                        excludingURI: variant.uri
+                    ),
                 separateAudioGroupID: variant.audioGroupID.flatMap {
                     master.demuxedAudioGroupIDs.contains($0)
                         ? $0
@@ -1085,7 +1100,8 @@ struct HLSPreflightInspector {
         manifestCodecs: [String],
         contentProtection: HLSContentProtection,
         hybridCapabilities: HybridPlaybackCapabilities,
-        container: HLSVideoContainer = .unknown
+        container: HLSVideoContainer = .unknown,
+        masterContainsUninspectedHEVCVariant: Bool = false
     ) -> PlaybackPreflightResult {
         let source = AetherSourceProfile(
             sourceKind: .hls,
@@ -1099,7 +1115,9 @@ struct HLSPreflightInspector {
             manifestCodecs: manifestCodecs,
             actualVideoCodec: .unknown,
             codecVerification: .segmentNotInspected,
-            contentProtection: contentProtection
+            contentProtection: contentProtection,
+            masterContainsUninspectedHEVCVariant:
+                masterContainsUninspectedHEVCVariant
         )
         return PlaybackPreflight.resolve(
             sourceProfile: source,
@@ -1124,7 +1142,9 @@ struct HLSPreflightInspector {
                 manifestCodecs: manifestCodecs,
                 contentProtection:
                     resolved.media.contentProtection,
-                hybridCapabilities: hybridCapabilities
+                hybridCapabilities: hybridCapabilities,
+                masterContainsUninspectedHEVCVariant:
+                    resolved.masterContainsUninspectedHEVCVariant
             )
         }
         let source = AetherSourceProfile(
@@ -1140,7 +1160,9 @@ struct HLSPreflightInspector {
             actualVideoCodec: inspected.codec,
             codecVerification: .protectedManifestVerified,
             contentProtection:
-                resolved.media.contentProtection
+                resolved.media.contentProtection,
+            masterContainsUninspectedHEVCVariant:
+                resolved.masterContainsUninspectedHEVCVariant
         )
         return PlaybackPreflight.resolve(
             sourceProfile: source,
@@ -1168,7 +1190,9 @@ struct HLSPreflightInspector {
             manifestCodecs: packaging.manifestCodecs,
             actualVideoCodec: packaging.actualVideoCodec,
             codecVerification: packaging.codecVerification,
-            contentProtection: protection
+            contentProtection: protection,
+            masterContainsUninspectedHEVCVariant:
+                packaging.masterContainsUninspectedHEVCVariant
         )
         return PlaybackPreflight.resolve(
             sourceProfile: result.sourceProfile,
@@ -1249,6 +1273,19 @@ struct HLSPreflightInspector {
         return nil
     }
 
+    private static func masterContainsHEVCVariant(
+        _ master: HLSMasterPlaylist,
+        excludingURI: String
+    ) -> Bool {
+        master.variants.contains { variant in
+            guard variant.uri != excludingURI else { return false }
+            return (variant.codecs + variant.supplementalCodecs)
+                .contains { token in
+                    codec(forManifestToken: token) == .hevc
+                }
+        }
+    }
+
     private static func manifestVideoFormat(
         tokens: [String],
         videoRange: String?
@@ -1307,6 +1344,7 @@ struct HLSPreflightInspector {
             )
             return HLSInspectedVideo(
                 codec: codec,
+                scanType: probe.videoScanType,
                 format: probe.videoFormat,
                 dolbyVisionConfiguration:
                     probe.dolbyVisionConfiguration,

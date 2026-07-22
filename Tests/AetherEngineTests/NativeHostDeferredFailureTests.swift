@@ -1,3 +1,5 @@
+import AVFoundation
+import Foundation
 import Testing
 @testable import AetherEngine
 
@@ -15,6 +17,24 @@ import Testing
 /// the wiring depends on, so the change cannot start false-positiving on streams that recover.
 @Suite("NativeAVPlayerHost deferred-failure resolution")
 struct NativeHostDeferredFailureTests {
+
+    @MainActor
+    @Test("A late host teardown preserves a successor player item")
+    func teardownPreservesSuccessorItem() {
+        let player = AVPlayer()
+        let host = NativeAVPlayerHost(avPlayer: player)
+        host.load(
+            url: URL(fileURLWithPath: "/not-opened.mp4"),
+            startPosition: nil
+        )
+        let successor = AVPlayerItem(asset: AVMutableComposition())
+        player.replaceCurrentItem(with: successor)
+
+        host.tearDown()
+
+        #expect(player.currentItem === successor)
+        player.replaceCurrentItem(with: nil)
+    }
 
     @Test("Surfaces when the player stopped and the clock stayed frozen (reported live-IPTV death)")
     func surfacesWhenStoppedAndFrozen() {

@@ -16,8 +16,9 @@ import SwiftUI
 /// hands it to `engine.bind(view:)`. The engine then attaches whichever
 /// `CALayer` is active for the current source:
 ///
-/// - `AVPlayerLayer` for the native AVPlayer path (HEVC, H.264, plus AV1
-///   on devices with hardware AV1 decode).
+/// - `AVPlayerLayer` for the lower-level native path (HEVC, H.264, plus AV1
+///   on devices with hardware AV1 decode). This describes layer capability,
+///   not unified `AetherPlaybackSession` admission; positive HEVC is Hybrid.
 /// - `AVSampleBufferDisplayLayer` for the software path driven by
 ///   `SoftwarePlaybackHost` (AV1 without hardware decode, VP9, MPEG-4
 ///   Part 2, MPEG-2, VC-1).

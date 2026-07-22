@@ -27,9 +27,86 @@
 
 A player engine that gets the hard parts right (HDR, Dolby Vision, Dolby Atmos, container coverage, codec coverage) and exposes a single `AetherPlayerView` (UIKit / AppKit) or `AetherPlayerSurface` (SwiftUI) plus a handful of `async` methods. No `AVPlayerViewController`. No opinionated controls. No analytics. Bind the view, call `play()`, read the published properties for state.
 
-The view is polymorphic: under the hood the engine swaps the hosted CALayer (`AVPlayerLayer` for the native AVPlayer path, `AVSampleBufferDisplayLayer` for the SW dav1d fallback path) per session without the host having to know.
+The view is polymorphic: under the hood the engine swaps the hosted CALayer (`AVPlayerLayer` for the native AVPlayer path, `AVSampleBufferDisplayLayer` for the software dav1d path) per session without the host having to know.
 
 You provide the transport bar. You provide the dropdowns. You provide the pretty.
+
+### Playback resilience contract
+
+The route chosen at load is the initial evidence-backed capability route, not an irrevocable lifetime choice. AetherEngine may perform bounded, observable retry, reopen, item/producer rebuild, decoder/backend change, or route recovery inside the same playback session when runtime evidence shows that the active path cannot keep making progress. Recovery must preserve the canonical media request, source and content identity, authorization/credentials, DRM meaning, selected track, and provenance; the original failure, recovery history, and any capability delta remain observable. Terminal failure is emitted only when admissible recovery is inapplicable or exhausted.
+
+The production unified-session budget gives initial canonical resolution and
+route preparation at most 15 seconds, then gives each recovery episode at most
+30 seconds. An Aether-owned asynchronous operation that cannot settle within
+the remaining budget terminates through the privacy-safe failure domain
+`AetherPlaybackOperationDeadline` and case code
+`operation.deadlineExceeded`; its stage still determines whether the failure
+is classified as transport or route runtime. A timed-out, cancellation-resistant
+operation is retired from route ownership and cannot later install over its
+successor. These bounds govern recovery of the same request only; they never
+authorize a different source, server URL, credential scope, or media identity.
+
+Changing to another provider, media item, origin, credentials, or server-mediated URL is a different request, not engine recovery. A host must never perform that substitution silently after an Aether error; it may offer it only as an explicit new load chosen under the host's own product contract.
+
+For the formal unified `AetherPlaybackSession`, positive HEVC is always a
+`hybridCarrier` route, even though lower-level AVPlayer and VideoToolbox
+components can decode HEVC. ISO-BMFF is only a container signature and therefore
+must be probed before route admission; it is never permission for an early
+Native trial. Clear, finite, seekable, segment-verified HEVC enters Hybrid when
+all declared Hybrid capabilities are present. Protected/DRM HEVC, manifest and
+segment mismatch, uninspected segments, unverified Dolby Vision Profile 8.4, or
+missing Hybrid capability returns a typed unsupported result. Recovery cannot
+transition HEVC to Native.
+
+Positive interlaced H.264 is likewise Hybrid-only. Exact progressive probe
+evidence or a clear inspected HLS selected segment with positive interlaced
+field order enters `hybridCarrier`, where Aether owns software decode and
+deinterlacing; protected interlaced HLS is typed unsupported. Provisional Native
+is allowed only while codec, scan type, container, and stream presence are all
+genuinely inconclusive. Fresh same-request classification may make one bounded
+transition to Hybrid when it positively identifies interlaced H.264, but a
+forged or drifted positive profile fails closed.
+
+For a mixed HLS master, inspecting one H.264 variant does not authorize handing
+the root master to Native when another uninspected variant advertises HEVC;
+AVPlayer could select it independently. Aether binds the inspected same-source
+variant graph to Hybrid instead. If a Native replacement item or deferred track
+load later positively exposes HEVC, the Native item is detached immediately and
+the unified session may only fresh-resolve the same request into Hybrid or emit
+one typed terminal failure; a same-Native rebuild is forbidden.
+
+For progressive Hybrid media, `finite` and `non-live` are not proxies for
+seekability. Admission also requires the exact probe demuxer to report a
+seekable source. That prepared demuxer becomes the first Hybrid generation, and
+codec, container, duration, seekability, video format, and Dolby Vision facts
+remain pinned across subsequent generations; drift is a typed terminal failure.
+
+A progressive item enters an audio-only route only when the exact demux probe
+positively found no video stream. Ordinary AVPlayer-supported audio remains
+Native; exact finite, seekable Vorbis audio instead enters `hybridCarrier`,
+where `AudioBridge` emits the same source audio into Aether's black carrier
+without inventing source-video output. An unknown or unidentified video stream
+remains video, while an inconclusive stream inventory is typed unsupported
+rather than treated as audio-only. Any video track observed later on an admitted
+audio-only item is a typed source-divergence failure. Positive codec evidence
+always implies video, so contradictory `no video + HEVC` facts still require
+Hybrid and can never authorize Native. The Vorbis Hybrid snapshot remains
+`videoExpected=false`, `notExpected`, codec `none`; the generated black carrier
+is transport, never presented-frame evidence.
+
+For integration acceptance, `AetherPlaybackSession.videoOutputSnapshot` reports
+privacy-safe real-frame evidence independently of playback state. For a video
+item, snapshot `frameSequence` advances only after Native produces a newly
+decoded output appropriate for display, or Hybrid records actual renderer
+display evidence; the Native signal is not a physical AVKit compositor callback.
+`readyToPlay`, `.playing`, a moving media clock, and an enqueued Hybrid sample are
+insufficient. Capture a baseline and call
+`await session.waitForVideoFrame(after: baseline, timeout: budget)` at
+startup, after seeks, and at bounded soak checkpoints. A deadline returns the
+latest snapshot (`missing` when no frame was proved); a positively inspected
+audio-only item reports `notExpected` with codec `none`. Native pixel polling is
+active only for that bounded wait and adds no continuous sampling to ordinary
+playback.
 
 ## What it handles
 
@@ -72,7 +149,7 @@ On Apple platforms the real choice is between AVPlayer, with deep OS integration
 | **Rendering & UI** | OS-native, you ship SwiftUI | Own Metal renderer, bundled controls | OS-native, you ship UI | Own renderer, bundled controls | Own renderer, bundled OSC |
 | **Apple TV / App Store** | Yes, LGPL plus store exception | Free tier GPL, DV / Atmos / MKV need paid LGPL | Yes | Yes, LGPL | Not practical, GPL, no tvOS |
 
-The engine leans on the platform where the platform is best (hardware decode, Dolby Vision display, Atmos passthrough) and only falls back to its own software path (dav1d, libavcodec) for the formats VideoToolbox cannot handle.
+The engine leans on the platform where the platform is best (hardware decode, Dolby Vision display, Atmos passthrough) and capability-routes to its own software path (dav1d, libavcodec) for formats the native pipeline cannot handle.
 
 ## Quick start
 
@@ -237,7 +314,7 @@ try await player.load(
 )
 ```
 
-Direct ingest covers MPEG-TS with demuxed-audio and packed-audio renditions, in-line AES-128 clear-key decryption, and SSAI ad-pod direct play (versioned init segments, audio re-anchoring, no-cut watchdog). Unsupported encryption / fMP4 playlists surface a typed `HLSIngestError` so the host can fall back. Details in [docs/formats.md › Live ingest](docs/formats.md#live-ingest-aes-128-ssai).
+Direct ingest covers MPEG-TS with demuxed-audio and packed-audio renditions, in-line AES-128 clear-key decryption, and SSAI ad-pod direct play (versioned init segments, audio re-anchoring, no-cut watchdog). Unsupported encryption / fMP4 playlists terminate this request with a typed `HLSIngestError`; they do not authorize the host to substitute another URL or source. Details in [docs/formats.md › Live ingest](docs/formats.md#live-ingest-aes-128-ssai).
 
 For an upstream AVPlayer can play natively (a standard remote `master.m3u8`, e.g. a Jellyfin live channel), `LoadOptions.nativeRemoteHLS` skips the demuxer probe and the loopback server entirely and hands the URL straight to AVPlayer, which manages the live edge and reconnect itself. Pair it with `isLive: true`. `LoadOptions.httpHeaders` rides into the `AVURLAsset` on this path, so origins that enforce per-stream `Referer` / `User-Agent` / `Authorization` headers (common for IPTV channels) work too.
 

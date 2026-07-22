@@ -3,6 +3,84 @@ import Foundation
 import Testing
 @testable import AetherEngine
 
+private func launchNativePreflight(
+    sourceKind: AetherMediaSourceKind,
+    videoStreamPresence: AetherVideoStreamPresence,
+    videoCodec: AetherVideoCodec,
+    sourceContainer: AetherSourceContainer = .unknown,
+    hlsPackaging: HLSVideoPackaging? = nil,
+    reason: PlaybackRouteReason
+) -> PlaybackPreflightResult {
+    PlaybackPreflightResult(
+        sourceProfile: AetherSourceProfile(
+            sourceKind: sourceKind,
+            isSeekableVOD: sourceKind != .unclassifiedURL,
+            videoStreamPresence: videoStreamPresence,
+            videoCodec: videoCodec,
+            sourceContainer: sourceContainer,
+            videoFormat: .sdr
+        ),
+        hlsPackaging: hlsPackaging,
+        route: .nativeAVPlayer,
+        reason: reason
+    )
+}
+
+private let launchDirectProgressive = launchNativePreflight(
+    sourceKind: .progressive,
+    videoStreamPresence: .provenPresent,
+    videoCodec: .h264,
+    sourceContainer: .isoBaseMedia,
+    reason: .nativeProvisionalURL
+)
+
+private let launchNativeRemux = launchNativePreflight(
+    sourceKind: .progressive,
+    videoStreamPresence: .provenPresent,
+    videoCodec: .h264,
+    sourceContainer: .matroska,
+    reason: .nativeHLSFMP4Remux
+)
+
+private let launchVerifiedNativeHLS = launchNativePreflight(
+    sourceKind: .hls,
+    videoStreamPresence: .provenPresent,
+    videoCodec: .h264,
+    hlsPackaging: HLSVideoPackaging(
+        container: .fragmentedMP4,
+        sampleEntry: .avc1,
+        manifestCodecs: ["avc1.640028"],
+        actualVideoCodec: .h264,
+        codecVerification: .verified,
+        contentProtection: .none
+    ),
+    reason: .nativeHLSContractVerified
+)
+
+private func launchH264HLS(
+    container: HLSVideoContainer,
+    verification: HLSManifestCodecVerification,
+    protection: HLSContentProtection = .none,
+    reason: PlaybackRouteReason = .nativeHLSContractVerified
+) -> PlaybackPreflightResult {
+    launchNativePreflight(
+        sourceKind: .hls,
+        videoStreamPresence: .provenPresent,
+        videoCodec: .h264,
+        hlsPackaging: HLSVideoPackaging(
+            container: container,
+            sampleEntry: container == .fragmentedMP4
+                ? .avc1
+                : .notApplicable,
+            manifestCodecs: ["avc1.640028"],
+            actualVideoCodec: .h264,
+            codecVerification: verification,
+            contentProtection: protection
+        ),
+        reason: reason
+    )
+}
+
 @Suite("Aether playback launch boundary")
 struct AetherPlaybackLaunchBoundaryTests {
     @Test("Native readiness keeps a slow item inside its bounded startup window")
@@ -34,6 +112,244 @@ struct AetherPlaybackLaunchBoundaryTests {
         #expect(
             gate.decide(status: .failed, elapsed: 0)
                 == .failed
+        )
+    }
+
+    @Test("Direct Native keeps isPlayable as a hard gate")
+    func directNativePlayabilityGate() {
+        #expect(
+            AetherNativeAssetPlayabilityPolicy.decide(
+                ownership: .directAsset,
+                preflightResult: launchDirectProgressive,
+                observation: .reportedPlayable
+            ) == .proceed
+        )
+        #expect(
+            AetherNativeAssetPlayabilityPolicy.decide(
+                ownership: .directAsset,
+                preflightResult: launchDirectProgressive,
+                observation: .reportedNotPlayable
+            ) == .fail
+        )
+        #expect(
+            AetherNativeAssetPlayabilityPolicy.decide(
+                ownership: .directAsset,
+                preflightResult: launchDirectProgressive,
+                observation: .loadFailed
+            ) == .fail
+        )
+    }
+
+    @Test("Aether-owned Native remux treats isPlayable as advisory")
+    func nativeRemuxPlayabilityAdvisory() {
+        #expect(
+            AetherNativeAssetPlayabilityPolicy.decide(
+                ownership: .aetherOwnedHLSFMP4Remux,
+                preflightResult: launchNativeRemux,
+                observation: .reportedPlayable
+            ) == .proceed
+        )
+        #expect(
+            AetherNativeAssetPlayabilityPolicy.decide(
+                ownership: .aetherOwnedHLSFMP4Remux,
+                preflightResult: launchNativeRemux,
+                observation: .reportedNotPlayable
+            ) == .proceedWithAdvisory
+        )
+        #expect(
+            AetherNativeAssetPlayabilityPolicy.decide(
+                ownership: .aetherOwnedHLSFMP4Remux,
+                preflightResult: launchNativeRemux,
+                observation: .loadFailed
+            ) == .proceedWithAdvisory
+        )
+    }
+
+    @Test("Verified clear H.264 Native HLS treats early AVAsset metadata as advisory")
+    func verifiedNativeHLSAssetMetadataAdvisory() {
+        #expect(
+            AetherNativeEarlyAssetAdvisoryContract.directOwnership(
+                for: launchVerifiedNativeHLS
+            ) == .verifiedNativeHLS
+        )
+        #expect(
+            AetherNativeAssetPlayabilityPolicy.decide(
+                ownership: .verifiedNativeHLS,
+                preflightResult: launchVerifiedNativeHLS,
+                observation: .reportedNotPlayable
+            ) == .proceedWithAdvisory
+        )
+        #expect(
+            AetherNativeAssetPlayabilityPolicy.decide(
+                ownership: .verifiedNativeHLS,
+                preflightResult: launchVerifiedNativeHLS,
+                observation: .loadFailed
+            ) == .proceedWithAdvisory
+        )
+        #expect(
+            AetherNativeVideoTrackPreparationPolicy.decide(
+                ownership: .verifiedNativeHLS,
+                preflightResult: launchVerifiedNativeHLS,
+                inspection: .expectedVideoMissing(.h264)
+            ) == .proceedWithAdvisory
+        )
+    }
+
+    @Test("Verified Native HLS ownership requires clear positive segment packaging")
+    func verifiedNativeHLSOwnershipEvidenceBoundary() {
+        for result in [
+            launchH264HLS(
+                container: .fragmentedMP4,
+                verification: .verified
+            ),
+            launchH264HLS(
+                container: .mpegTransport,
+                verification: .manifestMissingButSegmentVerified
+            ),
+            launchH264HLS(
+                container: .fragmentedMP4,
+                verification: .mismatch
+            ),
+        ] {
+            #expect(
+                AetherNativeEarlyAssetAdvisoryContract.directOwnership(
+                    for: result
+                ) == .verifiedNativeHLS
+            )
+        }
+
+        let protectedManifestOnly = launchH264HLS(
+            container: .fragmentedMP4,
+            verification: .protectedManifestVerified,
+            protection: .fairPlay,
+            reason: .nativeProtectedHLSContractVerified
+        )
+        let uninspected = launchH264HLS(
+            container: .fragmentedMP4,
+            verification: .segmentNotInspected
+        )
+        let unknownPackaging = launchH264HLS(
+            container: .unknown,
+            verification: .verified
+        )
+
+        for result in [
+            protectedManifestOnly,
+            uninspected,
+            unknownPackaging,
+            launchDirectProgressive,
+        ] {
+            #expect(
+                AetherNativeEarlyAssetAdvisoryContract.directOwnership(
+                    for: result
+                ) == .directAsset
+            )
+        }
+    }
+
+    @Test("Verified-HLS ownership token is fail-closed for unknown and HEVC facts")
+    func verifiedNativeHLSTokenCannotBroadenRoute() {
+        let provisional = launchNativePreflight(
+            sourceKind: .unclassifiedURL,
+            videoStreamPresence: .unknown,
+            videoCodec: .unknown,
+            reason: .nativeProvisionalURL
+        )
+        let invalidHEVC = launchNativePreflight(
+            sourceKind: .hls,
+            videoStreamPresence: .provenPresent,
+            videoCodec: .hevc,
+            hlsPackaging: HLSVideoPackaging(
+                container: .fragmentedMP4,
+                sampleEntry: .hvc1,
+                manifestCodecs: ["hvc1.2.4.L153.B0"],
+                actualVideoCodec: .hevc,
+                codecVerification: .verified,
+                contentProtection: .none
+            ),
+            reason: .nativeHLSContractVerified
+        )
+
+        for result in [provisional, invalidHEVC] {
+            #expect(
+                !AetherNativeEarlyAssetAdvisoryContract.permits(
+                    ownership: .verifiedNativeHLS,
+                    preflightResult: result
+                )
+            )
+            #expect(
+                AetherNativeAssetPlayabilityPolicy.decide(
+                    ownership: .verifiedNativeHLS,
+                    preflightResult: result,
+                    observation: .reportedNotPlayable
+                ) == .fail
+            )
+        }
+        #expect(
+            AetherNativeVideoTrackPreparationPolicy.decide(
+                ownership: .verifiedNativeHLS,
+                preflightResult: invalidHEVC,
+                inspection: .expectedVideoMissing(.hevc)
+            ) == .fail(.observedHEVCRequiresHybrid)
+        )
+    }
+
+    @Test("Native false playable result remains an Aether route failure")
+    func nativeReportedNotPlayableEvidence() {
+        let evidence = AetherNativePlaybackSession
+            .assetReportedNotPlayableEvidence
+        let failure = AetherPlaybackSession.nativeFailure(
+            stage: .preparation,
+            evidence: evidence
+        )
+
+        #expect(evidence.category == .routeRuntime)
+        #expect(evidence.domain == "AVFoundation")
+        #expect(evidence.code == 0)
+        #expect(failure.stage == .preparation)
+        #expect(failure.kind == .routeRuntimeFailure)
+        #expect(
+            failure.caseCode
+                == "native.assetReportedNotPlayable"
+        )
+    }
+
+    @Test("Native playable load failure preserves underlying transport evidence")
+    func nativePlayableLoadFailureEvidence() {
+        let underlying = URLError(.timedOut)
+        let evidence = AetherNativePlaybackSession.failureEvidence(
+            error: underlying,
+            caseCode: "assetPlayableLoadFailed"
+        )
+        let failure = AetherPlaybackSession.nativeFailure(
+            stage: .preparation,
+            evidence: evidence
+        )
+
+        #expect(evidence.category == .transientTransport)
+        #expect(evidence.domain == NSURLErrorDomain)
+        #expect(evidence.code == URLError.timedOut.rawValue)
+        #expect(failure.stage == .preparation)
+        #expect(failure.kind == .transientTransport)
+        #expect(failure.domain == NSURLErrorDomain)
+        #expect(failure.code == URLError.timedOut.rawValue)
+        #expect(
+            failure.caseCode
+                == "native.assetPlayableLoadFailed"
+        )
+    }
+
+    @Test("Installed route preparation cannot be reported as preflight")
+    func installedRoutePreparationStage() {
+        #expect(
+            AetherPlaybackSession.initialPreparationFailureStage(
+                hasInstalledRoute: false
+            ) == .preflight
+        )
+        #expect(
+            AetherPlaybackSession.initialPreparationFailureStage(
+                hasInstalledRoute: true
+            ) == .preparation
         )
     }
 
@@ -93,6 +409,7 @@ struct AetherPlaybackLaunchBoundaryTests {
             sourceProfile: AetherSourceProfile(
                 sourceKind: .unclassifiedURL,
                 isSeekableVOD: true,
+                videoStreamPresence: .unknown,
                 videoCodec: .unknown,
                 videoFormat: .sdr
             ),
@@ -153,22 +470,38 @@ struct AetherPlaybackLaunchBoundaryTests {
         )
     }
 
-    @Test("ISO-BMFF signature positively admits the initial direct Native asset")
-    func isoBaseMediaSignatureIsDistinctFromGenericProgressive() throws {
+    @Test("ISO-BMFF HEVC requires a progressive probe before Hybrid admission")
+    func isoBaseMediaHEVCDoesNotTakeProvisionalNativeShortcut() throws {
         let prefix = Data([
             0x00, 0x00, 0x00, 0x18,
             0x66, 0x74, 0x79, 0x70,
             0x69, 0x73, 0x6F, 0x6D,
         ])
 
+        let signature = try AetherURLPlaybackSourceClassifier
+            .inspect(prefix: prefix)
+        #expect(signature == .isoBaseMedia)
         #expect(
-            try AetherURLPlaybackSourceClassifier.inspect(prefix: prefix)
-                == .isoBaseMedia
+            signature.canonicalResolutionStep == .probeProgressive
         )
         #expect(
             try AetherURLPlaybackSourceClassifier.classify(prefix: prefix)
                 == .progressive
         )
+        let preflight = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .progressive,
+                isSeekableVOD: true,
+                videoCodec: .hevc,
+                sourceContainer: .isoBaseMedia,
+                videoFormat: .sdr
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+        #expect(preflight.route == .hybridCarrier)
+        #expect(preflight.reason == .hybridHEVC)
     }
 
     @Test("Empty classification evidence fails instead of choosing a route")
@@ -180,6 +513,71 @@ struct AetherPlaybackLaunchBoundaryTests {
             try AetherURLPlaybackSourceClassifier
                 .classify(prefix: Data())
         }
+    }
+
+    @Test("HTML and complete JSON resolver payloads fail before progressive demux")
+    func nonMediaPayloadClassification() throws {
+        #expect(throws:
+            AetherURLPlaybackSourceClassificationError
+                .nonMediaPayload(.html)
+        ) {
+            try AetherURLPlaybackSourceClassifier.classify(
+                prefix: Data(
+                    " \n<!DOCTYPE html><html><script>var media = 'x'</script></html>"
+                        .utf8
+                )
+            )
+        }
+        #expect(throws:
+            AetherURLPlaybackSourceClassificationError
+                .nonMediaPayload(.json)
+        ) {
+            try AetherURLPlaybackSourceClassifier.classify(
+                prefix: Data("{\"url\":\"redacted\"}".utf8)
+            )
+        }
+
+        // An incomplete text-like prefix remains probeable; classification
+        // does not guess from a leading bracket alone.
+        #expect(
+            try AetherURLPlaybackSourceClassifier.classify(
+                prefix: Data("[Script Info]".utf8)
+            ) == .progressive
+        )
+    }
+
+    @Test("Demux failure preserves FFmpeg code and only typed evidence changes ownership")
+    func demuxFailureClassification() {
+        let malformed = DemuxerError.openFailed(
+            code: FFmpegErr.invalidData
+        )
+        #expect(malformed.ffmpegCode == FFmpegErr.invalidData)
+        #expect(
+            AetherPlaybackSession.classify(malformed)
+                == .malformedMedia
+        )
+        #expect(
+            AetherPlaybackSession.failureCaseCode(malformed)
+                == "demux.openFailed"
+        )
+
+        let transport = DemuxerError.openFailed(code: -5)
+        #expect(transport.ffmpegCode == -5)
+        #expect(
+            AetherPlaybackSession.classify(transport)
+                == .transientTransport
+        )
+
+        let ambiguous = DemuxerError.streamInfoFailed(code: -1)
+        #expect(ambiguous.ffmpegCode == -1)
+        #expect(
+            AetherPlaybackSession.classify(ambiguous)
+                == .routeRuntimeFailure
+        )
+        #expect(
+            AetherPlaybackSession.failureCaseCode(ambiguous)
+                == "demux.streamInfoFailed"
+        )
     }
 
     @Test("Local file classification reads only source bytes")
@@ -236,7 +634,7 @@ struct AetherPlaybackLaunchBoundaryTests {
             sourceProfile: AetherSourceProfile(
                 sourceKind: .progressive,
                 isSeekableVOD: true,
-                videoCodec: .hevc,
+                videoCodec: .h264,
                 sourceContainer: .matroska,
                 videoFormat: .sdr
             ),
@@ -274,6 +672,62 @@ struct AetherPlaybackLaunchBoundaryTests {
                 options: .init()
             )
         }
+    }
+
+    @Test("Hybrid source factory consumes the exact progressive preflight demuxer once")
+    func hybridFactoryConsumesPreparedSource() throws {
+        let url = blackCarrierSourceURL()
+        let prepared = try AetherEngine.prepareURLSource(url: url)
+        #expect(
+            prepared.probe.videoStreamPresence
+                == .provenPresent
+        )
+        let expectedContainer = prepared.probe.sourceContainer
+        let factory = try BlackCarrierDemuxSourceFactory.adopting(
+            preparedURLSource: prepared,
+            url: url,
+            options: .init()
+        )
+        defer { factory.close() }
+        let demuxer = try factory.openDemuxer()
+        defer { demuxer.close() }
+
+        #expect(demuxer.hasAnyVideoStreamByType)
+        #expect(demuxer.sourceContainer == expectedContainer)
+        #expect(throws: AetherPreparedURLSourceError.alreadyConsumed) {
+            _ = try prepared.consume(url: url, options: .init())
+        }
+    }
+
+    @Test("A consumed Hybrid owner is replaced by a fresh recovery owner")
+    func freshRecoveryOwnerCanBuildAfterInitialConsumption() throws {
+        let url = blackCarrierSourceURL()
+        let initial = try AetherEngine.prepareURLSource(url: url)
+        let initialFactory = try BlackCarrierDemuxSourceFactory.adopting(
+            preparedURLSource: initial,
+            url: url,
+            options: .init()
+        )
+        let initialDemuxer = try initialFactory.openDemuxer()
+        initialDemuxer.close()
+        initialFactory.close()
+        #expect(throws: AetherPreparedURLSourceError.alreadyConsumed) {
+            _ = try initial.consume(url: url, options: .init())
+        }
+
+        let recovery = try AetherEngine.prepareURLSource(url: url)
+        let recoveryFactory = try BlackCarrierDemuxSourceFactory.adopting(
+            preparedURLSource: recovery,
+            url: url,
+            options: .init()
+        )
+        defer { recoveryFactory.close() }
+        let recoveryDemuxer = try recoveryFactory.openDemuxer()
+        defer { recoveryDemuxer.close() }
+        #expect(
+            recoveryDemuxer.sourceContainer
+                == initial.probe.sourceContainer
+        )
     }
 
     @MainActor
@@ -318,55 +772,259 @@ struct AetherPlaybackLaunchBoundaryTests {
     }
 
     @MainActor
-    @Test("Progressive Native admission preserves container-appropriate execution on the stable player")
-    func progressiveNativeUsesContainerAppropriateExecution() async throws {
-        let originURL = ProcessInfo.processInfo.environment[
-            "AETHER_NATIVE_REMUX_TEST_SOURCE"
-        ].map(URL.init(fileURLWithPath:)) ?? blackCarrierSourceURL()
-        let session = try AetherPlaybackSessionFactory
-            .makeSeekableURLVOD(url: originURL)
-        let stablePlayer = session.avPlayer
-        let stablePresentation = session.presentationView
-
-        try await session.prepare()
-
-        #expect(session.avPlayer === stablePlayer)
-        #expect(session.presentationView === stablePresentation)
-        #expect(session.activeRoute == .nativeAVPlayer)
-        let expectsRemux = originURL.pathExtension.lowercased()
-            == "mkv"
-        #expect(
-            session.preflightResult?.reason
-                == (expectsRemux
-                    ? .nativeHLSFMP4Remux
-                    : .nativeProvisionalURL)
+    @Test("A late native session stop preserves a successor player item")
+    func nativeRouteStopPreservesSuccessorItem() throws {
+        let stablePlayer = AVPlayer()
+        let session = try AetherNativePlaybackSession.make(
+            url: URL(fileURLWithPath: "/not-opened.mp4"),
+            preflightResult: nativePreflight(),
+            audioAnalysisBinding: .unavailable(
+                sourceURL: URL(
+                    fileURLWithPath: "/not-opened.mp4"
+                ),
+                httpHeaders: [:],
+                error: .analysisFailed("not prepared")
+            ),
+            avPlayer: stablePlayer
         )
-        let expectedContainer: AetherSourceContainer =
-            originURL.pathExtension.lowercased() == "mkv"
-                ? .matroska
-                : .isoBaseMedia
-        #expect(
-            session.preflightResult?.sourceProfile
-                .sourceContainer == expectedContainer
-        )
-        guard let asset = session.currentItem?.asset
-                as? AVURLAsset else {
-            Issue.record("Native remux did not publish an AVURLAsset")
-            session.stop()
-            return
-        }
-        if expectsRemux {
-            #expect(asset.url != originURL)
-            #expect(
-                asset.url.host == "127.0.0.1"
-                    || asset.url.host == "localhost"
-            )
-        } else {
-            #expect(asset.url == originURL)
-        }
+        let successor = AVPlayerItem(asset: AVMutableComposition())
+        stablePlayer.replaceCurrentItem(with: successor)
 
         session.stop()
-        #expect(stablePlayer.currentItem == nil)
+
+        #expect(stablePlayer.currentItem === successor)
+        stablePlayer.replaceCurrentItem(with: nil)
+    }
+
+    @Test("ISO-BMFF H264 is probed before Native remux admission")
+    func progressiveNativeUsesContainerAppropriateExecution() async throws {
+        let originURL = blackCarrierSourceURL()
+        let signature = try await AetherURLPlaybackSourceClassifier
+            .inspect(url: originURL)
+        #expect(signature == .isoBaseMedia)
+        #expect(
+            signature.canonicalResolutionStep == .probeProgressive
+        )
+        let prepared = try AetherEngine.prepareURLSource(
+            url: originURL
+        )
+        defer { prepared.discard() }
+        let probe = prepared.probe
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                probe: probe,
+                sourceKind: .progressive,
+                isSeekableVOD: probe.isFiniteSeekableVOD
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+
+        #expect(result.route == .nativeAVPlayer)
+        #expect(
+            result.reason == .nativeHLSFMP4Remux
+        )
+        #expect(
+            result.sourceProfile
+                .sourceContainer == .isoBaseMedia
+        )
+    }
+
+    @Test("Finite forward-only HEVC is not admitted as seekable Hybrid VOD")
+    func forwardOnlyHEVCFailsSeekableVODAdmission() {
+        let probe = SourceProbe(
+            url: URL(string: "https://example.com/video.mp4")!,
+            durationSeconds: 1_800,
+            videoFormat: .sdr,
+            videoCodecID: 0,
+            videoCodecName: "hevc",
+            sourceContainer: .isoBaseMedia,
+            videoWidth: 1_920,
+            videoHeight: 1_080,
+            videoFrameRate: 24,
+            isDolbyVision: false,
+            audioTracks: [],
+            subtitleTracks: [],
+            isSourceSeekable: false,
+            isLive: false
+        )
+        #expect(!probe.isFiniteSeekableVOD)
+
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                probe: probe,
+                sourceKind: .progressive,
+                isSeekableVOD: probe.isFiniteSeekableVOD
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+        #expect(result.route == .unsupported)
+        #expect(
+            result.reason
+                == .unsupportedHybridRequiresSeekableVOD
+        )
+    }
+
+    @Test("Hybrid commit rejects HEVC to H264 progressive source-fact drift")
+    func progressiveHEVCCodecDriftFailsContract() {
+        func probe(codec: String) -> SourceProbe {
+            SourceProbe(
+                url: URL(
+                    string: "https://example.com/video.mp4"
+                )!,
+                durationSeconds: 1_800,
+                videoFormat: .sdr,
+                videoCodecID: 0,
+                videoCodecName: codec,
+                sourceContainer: .isoBaseMedia,
+                videoWidth: 1_920,
+                videoHeight: 1_080,
+                videoFrameRate: 24,
+                isDolbyVision: false,
+                audioTracks: [],
+                subtitleTracks: [],
+                isSourceSeekable: true,
+                isLive: false
+            )
+        }
+
+        let admittedProbe = probe(codec: "hevc")
+        let admittedProfile = AetherSourceProfile(
+            probe: admittedProbe,
+            sourceKind: .progressive,
+            isSeekableVOD: admittedProbe.isFiniteSeekableVOD
+        )
+        #expect(
+            AetherProgressiveSourceFacts(probe: admittedProbe)
+                .matches(
+                    preflightProfile: admittedProfile,
+                    timelineDurationSeconds: 1_800
+                )
+        )
+        #expect(
+            !AetherProgressiveSourceFacts(probe: probe(codec: "h264"))
+                .matches(
+                    preflightProfile: admittedProfile,
+                    timelineDurationSeconds: 1_800
+                )
+        )
+    }
+
+    @Test("Hybrid commit rejects progressive scan-type drift")
+    func progressiveScanTypeDriftFailsContract() {
+        func probe(scanType: AetherVideoScanType) -> SourceProbe {
+            SourceProbe(
+                url: URL(
+                    string: "https://example.com/interlaced.mkv"
+                )!,
+                durationSeconds: 1_800,
+                videoFormat: .sdr,
+                videoCodecID: 0,
+                videoCodecName: "h264",
+                sourceContainer: .matroska,
+                videoWidth: 1_920,
+                videoHeight: 1_080,
+                videoFrameRate: 25,
+                videoScanType: scanType,
+                isDolbyVision: false,
+                audioTracks: [],
+                subtitleTracks: [],
+                isSourceSeekable: true,
+                isLive: false
+            )
+        }
+
+        let admittedProbe = probe(scanType: .interlaced)
+        let admittedProfile = AetherSourceProfile(
+            probe: admittedProbe,
+            sourceKind: .progressive,
+            isSeekableVOD: true
+        )
+        #expect(
+            AetherProgressiveSourceFacts(probe: admittedProbe)
+                .matches(
+                    preflightProfile: admittedProfile,
+                    timelineDurationSeconds: 1_800
+                )
+        )
+        #expect(
+            !AetherProgressiveSourceFacts(
+                probe: probe(scanType: .progressive)
+            ).matches(
+                preflightProfile: admittedProfile,
+                timelineDurationSeconds: 1_800
+            )
+        )
+    }
+
+    @MainActor
+    @Test("Exact Hybrid generation rejects a forged HEVC preflight over H264 bytes")
+    func exactHybridGenerationRejectsCodecDrift() async throws {
+        let url = blackCarrierSourceURL()
+        let prepared = try AetherEngine.prepareURLSource(url: url)
+        defer { prepared.discard() }
+        let probe = prepared.probe
+        let forgedHEVC = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .progressive,
+                isSeekableVOD: probe.isFiniteSeekableVOD,
+                videoCodec: .hevc,
+                sourceContainer: probe.sourceContainer,
+                videoFormat: probe.videoFormat,
+                dolbyVisionConfiguration:
+                    probe.dolbyVisionConfiguration,
+                hasVerifiedDolbyVisionProfile84BaseLayer:
+                    probe
+                        .hasVerifiedDolbyVisionProfile84BaseLayer
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(
+                seconds: probe.durationSeconds,
+                preferredTimescale: 90_000
+            )
+        )
+
+        await #expect(
+            throws: HybridPlaybackSessionError
+                .progressiveSourceFactsDiverged
+        ) {
+            _ = try await AetherHybridPlaybackSession
+                .makeSeekableVOD(
+                    source: .url(url),
+                    preparedURLSource: prepared,
+                    options: .init(),
+                    timeline: timeline,
+                    preflightResult: forgedHEVC,
+                    avPlayer: AVPlayer()
+                )
+        }
+    }
+
+    @Test("Outer ended seek restores rate or remains truthfully paused")
+    func outerEndedSeekTransportIntent() {
+        #expect(
+            AetherPlaybackSession.stateAfterAppliedSeek(
+                desiredPlaying: true,
+                desiredRate: 1.5,
+                carrierRate: 1.5,
+                carrierTimeControlStatus: .playing
+            ) == .playing
+        )
+        #expect(
+            AetherPlaybackSession.stateAfterAppliedSeek(
+                desiredPlaying: false,
+                desiredRate: 1.5,
+                carrierRate: 0,
+                carrierTimeControlStatus: .paused
+            ) == .paused
+        )
     }
 
     @MainActor
@@ -444,9 +1102,24 @@ struct AetherPlaybackLaunchBoundaryTests {
                 at: url.deletingLastPathComponent()
             )
         }
+        let probe = try AetherEngine.probe(url: url)
+        #expect(
+            probe.videoStreamPresence == .provenAbsent
+        )
+        let audioOnlyPreflight = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                probe: probe,
+                sourceKind: .progressive,
+                isSeekableVOD: probe.isFiniteSeekableVOD
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+        #expect(audioOnlyPreflight.reason == .nativeAudioOnly)
         let session = try AetherNativePlaybackSession.make(
             url: url,
-            preflightResult: nativePreflight()
+            preflightResult: audioOnlyPreflight
         )
         try await session.prepare()
         try session.play()

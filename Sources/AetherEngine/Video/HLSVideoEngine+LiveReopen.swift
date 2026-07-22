@@ -57,29 +57,38 @@ extension HLSVideoEngine {
         case .stopRequested, .muxerFailed, .backpressureWedge:
             return
         case .sourceReplay:
-            // Server restarted stream from beginning (Jellyfin transcode respawn); URL reopen would replay stale content. Delegate to host for fresh negotiation.
+            // The canonical server restarted this stream from its beginning, so
+            // reopening the same URL would replay stale content. End this
+            // lower-level Aether attempt and publish reset evidence. Any new
+            // host load is an explicit request; this callback does not authorize
+            // silently choosing another server-mediated URL.
             EngineLog.emit(
                 "[HLSVideoEngine] live source replayed from start after reconnect; "
-                + "requesting host retune (fresh playback session)",
+                + "publishing liveSourceReset without source substitution",
                 category: .session
             )
             onLiveSourceReset?()
             return
         case .segmentStall:
-            // SSAI ad pod the cutter can't cut through; URL reopen would re-enter it. Delegate to host for server-muxed fallback.
+            // Reopening the same URL would re-enter the SSAI ad pod. Publish
+            // reset evidence after this bounded Aether attempt; do not silently
+            // replace it with a server-muxed source.
             EngineLog.emit(
                 "[HLSVideoEngine] live segment cutter stalled (likely SSAI ad pod); "
-                + "requesting host retune to the server route",
+                + "publishing liveSourceReset without route substitution",
                 category: .session
             )
             onLiveSourceReset?()
             return
         case .eof, .readError, .keyframeStarvation:
-            // Custom-reader sources (e.g. live HLS ingest) own their own reconnection; URL reopen burns the backoff budget on guaranteed failures.
+            // Custom readers (for example live HLS ingest) own same-request
+            // reconnection. A URL reopen is unavailable here, so publish reset
+            // evidence rather than spending the Aether budget on a known-impossible
+            // operation or suggesting an alternate source.
             if !sourceReopenableByURL {
                 EngineLog.emit(
                     "[HLSVideoEngine] live custom-source pump exited (reason=\(reason)); "
-                    + "URL reopen not possible, requesting host retune",
+                    + "URL reopen unavailable, publishing liveSourceReset",
                     category: .session
                 )
                 onLiveSourceReset?()

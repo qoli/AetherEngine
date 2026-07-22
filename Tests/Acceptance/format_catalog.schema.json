@@ -1,0 +1,407 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aetherengine.invalid/schemas/player-test-videos-catalog-v1.json",
+  "title": "AetherEngine PlayerTestVideos Acceptance Catalog v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "catalog_id",
+    "fixtures"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "catalog_id": {
+      "$ref": "#/$defs/id"
+    },
+    "fixtures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/fixture"
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*\\\\).+$"
+    },
+    "capabilityDelta": {
+      "enum": [
+        "air_play",
+        "atmos",
+        "audio_analysis",
+        "audio_tracks",
+        "dolby_vision",
+        "external_display",
+        "picture_in_picture",
+        "selected_audio_track",
+        "selected_subtitle_track",
+        "subtitle_tracks",
+        "video_format"
+      ]
+    },
+    "resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "expectedMedia": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "container",
+        "duration_seconds",
+        "video_codecs",
+        "audio_codecs",
+        "subtitle_codecs",
+        "track_count"
+      ],
+      "properties": {
+        "container": {
+          "type": "string",
+          "minLength": 1
+        },
+        "duration_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "video_codecs": {
+          "$ref": "#/$defs/codecList"
+        },
+        "audio_codecs": {
+          "$ref": "#/$defs/codecList"
+        },
+        "subtitle_codecs": {
+          "$ref": "#/$defs/codecList"
+        },
+        "track_count": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "codecList": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "seek": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "forward_seek_seconds",
+        "backward_seek_seconds",
+        "minimum_post_seek_progress_seconds"
+      ],
+      "properties": {
+        "forward_seek_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "backward_seek_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "minimum_post_seek_progress_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "exclusiveMaximum": 30
+        }
+      }
+    },
+    "expectedFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "error_code",
+        "failure_stage",
+        "recovery_failure_kind"
+      ],
+      "properties": {
+        "error_code": {
+          "enum": [
+            "acceptance_timeout",
+            "identity_changed",
+            "media_too_short",
+            "not_seekable",
+            "playback_ended_early",
+            "player_terminal_failure",
+            "seek_failed",
+            "seek_landing_mismatch",
+            "stall_exhausted",
+            "unexpected_capability_delta"
+          ]
+        },
+        "failure_stage": {
+          "enum": [
+            "accepted",
+            "readiness",
+            "source",
+            "search",
+            "episodes",
+            "resolve",
+            "playback_start",
+            "playback_health",
+            "seek_request",
+            "seek_landed",
+            "post_seek_progress",
+            "recovery",
+            "capability_delta"
+          ]
+        },
+        "recovery_failure_kind": {
+          "enum": [
+            "authenticationRejected",
+            "cancelled",
+            "decoderRuntimeFailure",
+            "hostContractViolation",
+            "inconclusiveEvidence",
+            "invariantViolation",
+            "malformedMedia",
+            "routeRuntimeFailure",
+            "securityBoundary",
+            "transientTransport",
+            "unsupportedCapability",
+            null
+          ]
+        }
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "fixture_id",
+        "entry_path",
+        "resources",
+        "expected_media",
+        "seek",
+        "expected_route",
+        "hardware_requirements",
+        "allowed_capability_deltas",
+        "expected_outcome",
+        "completion_mode",
+        "expected_failure"
+      ],
+      "properties": {
+        "case_id": {
+          "$ref": "#/$defs/id"
+        },
+        "fixture_id": {
+          "$ref": "#/$defs/id"
+        },
+        "entry_path": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/relativePath"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/resource"
+          }
+        },
+        "expected_media": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/expectedMedia"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "seek": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/seek"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expected_route": {
+          "enum": [
+            "nativeAVPlayer",
+            "hybridCarrier",
+            null
+          ]
+        },
+        "hardware_requirements": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "contains": {
+            "const": "physical_tvos"
+          },
+          "items": {
+            "enum": [
+              "physical_tvos",
+              "hdr10_display",
+              "hlg_display",
+              "dolby_vision_display",
+              "atmos_output"
+            ]
+          }
+        },
+        "allowed_capability_deltas": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/capabilityDelta"
+          }
+        },
+        "expected_outcome": {
+          "enum": [
+            "playable",
+            "typed_failure",
+            "blocked"
+          ]
+        },
+        "completion_mode": {
+          "enum": [
+            "play_to_end",
+            "terminal_failure",
+            "not_run"
+          ]
+        },
+        "expected_failure": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/expectedFailure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "blocked_reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "expected_outcome": {
+                "const": "blocked"
+              }
+            },
+            "required": [
+              "expected_outcome"
+            ]
+          },
+          "then": {
+            "required": [
+              "blocked_reason"
+            ],
+            "properties": {
+              "completion_mode": {
+                "const": "not_run"
+              },
+              "expected_failure": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "blocked_reason"
+              ]
+            },
+            "properties": {
+              "entry_path": {
+                "$ref": "#/$defs/relativePath"
+              },
+              "resources": {
+                "minItems": 1
+              },
+              "expected_media": {
+                "$ref": "#/$defs/expectedMedia"
+              },
+              "seek": {
+                "$ref": "#/$defs/seek"
+              },
+              "expected_route": {
+                "enum": [
+                  "nativeAVPlayer",
+                  "hybridCarrier"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "expected_outcome": {
+                "const": "playable"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "completion_mode": {
+                "const": "play_to_end"
+              },
+              "expected_failure": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "expected_outcome": {
+                "const": "typed_failure"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "completion_mode": {
+                "const": "terminal_failure"
+              },
+              "expected_failure": {
+                "$ref": "#/$defs/expectedFailure"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

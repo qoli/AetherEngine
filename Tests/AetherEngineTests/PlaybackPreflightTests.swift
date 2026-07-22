@@ -5,6 +5,7 @@ final class PlaybackPreflightTests: XCTestCase {
     private let fullHybridCapabilities = HybridPlaybackCapabilities(
         hasDirectVideoDecoder: true,
         hasSampleBufferRenderer: true,
+        hasAudioBridgeCarrier: true,
         supportedVideoFormats: [.sdr, .hdr10, .hdr10Plus, .hlg, .dolbyVision],
         supportedDolbyVisionProfiles: [.profile84]
     )
@@ -24,15 +25,21 @@ final class PlaybackPreflightTests: XCTestCase {
     private func source(
         kind: AetherMediaSourceKind = .hls,
         seekableVOD: Bool = true,
+        hasVideo: Bool = true,
         codec: AetherVideoCodec = .hevc,
+        audioCodecs: Set<AetherAudioCodec> = [],
         container: AetherSourceContainer = .unknown,
+        scanType: AetherVideoScanType = .unknown,
         format: VideoFormat = .sdr
     ) -> AetherSourceProfile {
         AetherSourceProfile(
             sourceKind: kind,
             isSeekableVOD: seekableVOD,
+            hasVideoStream: hasVideo,
             videoCodec: codec,
+            audioCodecs: audioCodecs,
             sourceContainer: container,
+            videoScanType: scanType,
             videoFormat: format
         )
     }
@@ -54,59 +61,62 @@ final class PlaybackPreflightTests: XCTestCase {
         )
     }
 
-    func testVerifiedHVC1FMP4UsesNativeAVPlayer() {
+    func testVerifiedHVC1FMP4UsesHybrid() {
         let result = PlaybackPreflight.resolve(
             sourceProfile: source(),
             hlsPackaging: hls(),
             hybridCapabilities: fullHybridCapabilities
         )
 
-        XCTAssertEqual(result.route, .nativeAVPlayer)
-        XCTAssertEqual(result.reason, .nativeHLSContractVerified)
+        XCTAssertEqual(result.route, .hybridCarrier)
+        XCTAssertEqual(result.reason, .hybridHEVC)
     }
 
-    func testVerifiedDVH1FMP4UsesNativeAVPlayer() {
+    func testDVH1WithoutVerifiedDolbyVisionFactsIsUnsupported() {
         let result = PlaybackPreflight.resolve(
             sourceProfile: source(format: .dolbyVision),
             hlsPackaging: hls(sampleEntry: .dvh1),
             hybridCapabilities: fullHybridCapabilities
         )
 
-        XCTAssertEqual(result.route, .nativeAVPlayer)
-        XCTAssertEqual(result.reason, .nativeHLSContractVerified)
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(
+            result.reason,
+            .unsupportedDolbyVisionConfigurationMissing
+        )
     }
 
-    func testHEV1VODDoesNotEnterCodecHybrid() {
+    func testHEV1VODUsesHybrid() {
         let result = PlaybackPreflight.resolve(
             sourceProfile: source(),
             hlsPackaging: hls(sampleEntry: .hev1),
             hybridCapabilities: fullHybridCapabilities
         )
 
-        XCTAssertEqual(result.route, .unsupported)
-        XCTAssertEqual(result.reason, .unsupportedHLSVideoPackaging)
+        XCTAssertEqual(result.route, .hybridCarrier)
+        XCTAssertEqual(result.reason, .hybridHEV1SampleEntry)
     }
 
-    func testPlainHLGHEV1DoesNotEnterCodecHybrid() {
+    func testPlainHLGHEV1UsesHybrid() {
         let result = PlaybackPreflight.resolve(
             sourceProfile: source(format: .hlg),
             hlsPackaging: hls(sampleEntry: .hev1),
             hybridCapabilities: fullHybridCapabilities
         )
 
-        XCTAssertEqual(result.route, .unsupported)
-        XCTAssertEqual(result.reason, .unsupportedHLSVideoPackaging)
+        XCTAssertEqual(result.route, .hybridCarrier)
+        XCTAssertEqual(result.reason, .hybridHEV1SampleEntry)
     }
 
-    func testHEVCInMPEGTransportDoesNotEnterCodecHybrid() {
+    func testHEVCInMPEGTransportUsesHybrid() {
         let result = PlaybackPreflight.resolve(
             sourceProfile: source(),
             hlsPackaging: hls(container: .mpegTransport, sampleEntry: .notApplicable),
             hybridCapabilities: fullHybridCapabilities
         )
 
-        XCTAssertEqual(result.route, .unsupported)
-        XCTAssertEqual(result.reason, .unsupportedHLSVideoPackaging)
+        XCTAssertEqual(result.route, .hybridCarrier)
+        XCTAssertEqual(result.reason, .hybridHEVCInMPEGTransport)
     }
 
     func testHEVCInMPEGTransportLiveFailsInsteadOfUsingAnotherRoute() {
@@ -117,29 +127,35 @@ final class PlaybackPreflightTests: XCTestCase {
         )
 
         XCTAssertEqual(result.route, .unsupported)
-        XCTAssertEqual(result.reason, .unsupportedHLSVideoPackaging)
+        XCTAssertEqual(
+            result.reason,
+            .unsupportedHybridRequiresSeekableVOD
+        )
     }
 
-    func testMissingManifestCodecsWithVerifiedHEVCSegmentUsesDirectNative() {
+    func testMissingManifestCodecsWithVerifiedHEVCSegmentUsesHybrid() {
         let result = PlaybackPreflight.resolve(
             sourceProfile: source(),
             hlsPackaging: hls(verification: .manifestMissingButSegmentVerified),
             hybridCapabilities: fullHybridCapabilities
         )
 
-        XCTAssertEqual(result.route, .nativeAVPlayer)
-        XCTAssertEqual(result.reason, .nativeHLSContractVerified)
+        XCTAssertEqual(result.route, .hybridCarrier)
+        XCTAssertEqual(
+            result.reason,
+            .hybridHLSManifestMissingCodecs
+        )
     }
 
-    func testManifestSegmentMismatchUsesVerifiedHEVCSegmentForDirectNative() {
+    func testManifestSegmentMismatchIsTypedUnsupportedForHEVC() {
         let result = PlaybackPreflight.resolve(
             sourceProfile: source(),
             hlsPackaging: hls(verification: .mismatch),
             hybridCapabilities: fullHybridCapabilities
         )
 
-        XCTAssertEqual(result.route, .nativeAVPlayer)
-        XCTAssertEqual(result.reason, .nativeHLSContractVerified)
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(result.reason, .unsupportedHLSVideoPackaging)
     }
 
     func testMissingManifestCodecsWithVerifiedH264TSSegmentUsesDirectNative() {
@@ -156,6 +172,25 @@ final class PlaybackPreflightTests: XCTestCase {
 
         XCTAssertEqual(result.route, .nativeAVPlayer)
         XCTAssertEqual(result.reason, .nativeHLSContractVerified)
+    }
+
+    func testInterlacedH264HLSSegmentUsesHybridDeinterlacingPath() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(
+                codec: .h264,
+                scanType: .interlaced
+            ),
+            hlsPackaging: hls(
+                container: .mpegTransport,
+                sampleEntry: .avc1,
+                codec: .h264,
+                verification: .verified
+            ),
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .hybridCarrier)
+        XCTAssertEqual(result.reason, .hybridInterlacedH264)
     }
 
     func testManifestMismatchUsesVerifiedH264FMP4SegmentForDirectNative() {
@@ -185,7 +220,7 @@ final class PlaybackPreflightTests: XCTestCase {
         XCTAssertEqual(result.reason, .unsupportedHLSSegmentNotInspected)
     }
 
-    func testProtectedHVC1FMP4StaysOnNativeAVPlayer() {
+    func testProtectedHVC1FMP4IsTypedUnsupported() {
         let result = PlaybackPreflight.resolve(
             sourceProfile: source(),
             hlsPackaging: hls(
@@ -195,10 +230,10 @@ final class PlaybackPreflightTests: XCTestCase {
             hybridCapabilities: fullHybridCapabilities
         )
 
-        XCTAssertEqual(result.route, .nativeAVPlayer)
+        XCTAssertEqual(result.route, .unsupported)
         XCTAssertEqual(
             result.reason,
-            .nativeProtectedHLSContractVerified
+            .unsupportedHLSContentProtection
         )
     }
 
@@ -220,6 +255,26 @@ final class PlaybackPreflightTests: XCTestCase {
             result.reason,
             .nativeProtectedHLSContractVerified
         )
+    }
+
+    func testPositiveInterlacedH264ProtectedHLSIsUnsupported() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(
+                codec: .h264,
+                scanType: .interlaced
+            ),
+            hlsPackaging: hls(
+                container: .mpegTransport,
+                sampleEntry: .avc1,
+                codec: .h264,
+                verification: .protectedManifestVerified,
+                protection: .sampleAES
+            ),
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(result.reason, .unsupportedHLSContentProtection)
     }
 
     func testAES128H264StaysOnNativeAVPlayer() {
@@ -302,7 +357,7 @@ final class PlaybackPreflightTests: XCTestCase {
         )
 
         XCTAssertEqual(result.route, .unsupported)
-        XCTAssertEqual(result.reason, .unsupportedHLSVideoPackaging)
+        XCTAssertEqual(result.reason, .unsupportedHybridVideoFormat)
     }
 
     func testHybridDolbyVisionRequiresExactConfiguration() {
@@ -379,7 +434,7 @@ final class PlaybackPreflightTests: XCTestCase {
         )
     }
 
-    func testValidDolbyVisionHEV1StillDoesNotEnterCodecHybrid() {
+    func testValidDolbyVisionHEV1UsesHybrid() {
         let result = PlaybackPreflight.resolve(
             sourceProfile: AetherSourceProfile(
                 sourceKind: .hls,
@@ -393,8 +448,8 @@ final class PlaybackPreflightTests: XCTestCase {
             hybridCapabilities: fullHybridCapabilities
         )
 
-        XCTAssertEqual(result.route, .unsupported)
-        XCTAssertEqual(result.reason, .unsupportedHLSVideoPackaging)
+        XCTAssertEqual(result.route, .hybridCarrier)
+        XCTAssertEqual(result.reason, .hybridHEV1SampleEntry)
     }
 
     func testHybridDolbyVisionRejectsContradictoryBaseLayerBeforeSession() {
@@ -429,7 +484,7 @@ final class PlaybackPreflightTests: XCTestCase {
         XCTAssertEqual(result.reason, .hybridNonAVPlayerCodec)
     }
 
-    func testMatroskaHEVCUsesNativeHLSFMP4Remux() {
+    func testMatroskaHEVCUsesHybrid() {
         let result = PlaybackPreflight.resolve(
             sourceProfile: source(
                 kind: .progressive,
@@ -440,8 +495,33 @@ final class PlaybackPreflightTests: XCTestCase {
             hybridCapabilities: fullHybridCapabilities
         )
 
-        XCTAssertEqual(result.route, .nativeAVPlayer)
-        XCTAssertEqual(result.reason, .nativeHLSFMP4Remux)
+        XCTAssertEqual(result.route, .hybridCarrier)
+        XCTAssertEqual(result.reason, .hybridHEVC)
+    }
+
+    func testHEVCHybridNeverRecoversBackToNative() {
+        let profile = source(
+            kind: .progressive,
+            codec: .hevc,
+            container: .matroska
+        )
+
+        XCTAssertNil(
+            PlaybackPreflight.resolveRecoveryAlternate(
+                sourceProfile: profile,
+                hlsPackaging: nil,
+                excluding: .hybridCarrier,
+                hybridCapabilities: fullHybridCapabilities
+            )
+        )
+        XCTAssertNil(
+            PlaybackPreflight.resolveRecoveryAlternate(
+                sourceProfile: profile,
+                hlsPackaging: nil,
+                excluding: .nativeAVPlayer,
+                hybridCapabilities: fullHybridCapabilities
+            )
+        )
     }
 
     func testMatroskaH264UsesNativeHLSFMP4Remux() {
@@ -459,7 +539,55 @@ final class PlaybackPreflightTests: XCTestCase {
         XCTAssertEqual(result.reason, .nativeHLSFMP4Remux)
     }
 
-    func testUnknownProgressiveContainerFailsInsteadOfPassingRawURLToAVPlayer() {
+    func testFlashVideoH264UsesNativeHLSFMP4Remux() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(
+                kind: .progressive,
+                codec: .h264,
+                container: .flashVideo,
+                scanType: .progressive
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .nativeAVPlayer)
+        XCTAssertEqual(result.reason, .nativeHLSFMP4Remux)
+    }
+
+    func testFlashVideoHEVCStillUsesHybrid() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(
+                kind: .progressive,
+                codec: .hevc,
+                container: .flashVideo,
+                scanType: .progressive
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .hybridCarrier)
+        XCTAssertEqual(result.reason, .hybridHEVC)
+    }
+
+    func testInterlacedProgressiveH264UsesHybridDeinterlacingPath() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(
+                kind: .progressive,
+                codec: .h264,
+                container: .matroska,
+                scanType: .interlaced
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .hybridCarrier)
+        XCTAssertEqual(result.reason, .hybridInterlacedH264)
+    }
+
+    func testUnknownProgressiveHEVCContainerStillUsesHybridDecoder() {
         let result = PlaybackPreflight.resolve(
             sourceProfile: source(
                 kind: .progressive,
@@ -470,14 +598,11 @@ final class PlaybackPreflightTests: XCTestCase {
             hybridCapabilities: fullHybridCapabilities
         )
 
-        XCTAssertEqual(result.route, .unsupported)
-        XCTAssertEqual(
-            result.reason,
-            .unsupportedProgressiveContainerUnverified
-        )
+        XCTAssertEqual(result.route, .hybridCarrier)
+        XCTAssertEqual(result.reason, .hybridHEVC)
     }
 
-    func testNativeCodecPackagingDoesNotUseHybridSourceAdmission() {
+    func testHEVCHybridRequiresHLSInSourceAdmission() {
         let progressiveOnly = HybridPlaybackCapabilities(
             hasDirectVideoDecoder: true,
             hasSampleBufferRenderer: true,
@@ -491,7 +616,7 @@ final class PlaybackPreflightTests: XCTestCase {
         )
 
         XCTAssertEqual(result.route, .unsupported)
-        XCTAssertEqual(result.reason, .unsupportedHLSVideoPackaging)
+        XCTAssertEqual(result.reason, .unsupportedHybridSourceKind)
     }
 
     func testUnknownCodecFailsInsteadOfAssumingNative() {
@@ -503,5 +628,271 @@ final class PlaybackPreflightTests: XCTestCase {
 
         XCTAssertEqual(result.route, .unsupported)
         XCTAssertEqual(result.reason, .unsupportedVideoCodec)
+    }
+
+    func testUnclassifiedURLOnlyAdmitsInconclusiveFacts() {
+        let inconclusive = AetherSourceProfile(
+            sourceKind: .unclassifiedURL,
+            isSeekableVOD: true,
+            videoStreamPresence: .unknown,
+            videoCodec: .unknown,
+            videoFormat: .sdr
+        )
+        let positiveHEVC = source(
+            kind: .unclassifiedURL,
+            codec: .hevc
+        )
+        let positiveInterlacedH264 = source(
+            kind: .unclassifiedURL,
+            codec: .h264,
+            scanType: .interlaced
+        )
+        let positiveHDRFormat = AetherSourceProfile(
+            sourceKind: .unclassifiedURL,
+            isSeekableVOD: true,
+            videoStreamPresence: .unknown,
+            videoCodec: .unknown,
+            videoFormat: .hdr10
+        )
+
+        XCTAssertEqual(
+            PlaybackPreflight.resolve(
+                sourceProfile: inconclusive,
+                hlsPackaging: nil,
+                hybridCapabilities: fullHybridCapabilities
+            ).route,
+            .nativeAVPlayer
+        )
+        for forged in [
+            positiveHEVC,
+            positiveInterlacedH264,
+            positiveHDRFormat,
+        ] {
+            let result = PlaybackPreflight.resolve(
+                sourceProfile: forged,
+                hlsPackaging: nil,
+                hybridCapabilities: fullHybridCapabilities
+            )
+            XCTAssertEqual(result.route, .unsupported)
+            XCTAssertEqual(
+                result.reason,
+                .unsupportedProvisionalURLFactsResolved
+            )
+        }
+        let packaged = PlaybackPreflight.resolve(
+            sourceProfile: inconclusive,
+            hlsPackaging: hls(
+                container: .mpegTransport,
+                sampleEntry: .avc1,
+                codec: .h264
+            ),
+            hybridCapabilities: fullHybridCapabilities
+        )
+        XCTAssertEqual(packaged.route, .unsupported)
+        XCTAssertEqual(
+            packaged.reason,
+            .unsupportedProvisionalURLFactsResolved
+        )
+        XCTAssertNotNil(packaged.hlsPackaging)
+    }
+
+    func testProbeConfirmedProgressiveAudioOnlyUsesNative() {
+        let probe = SourceProbe(
+            url: URL(string: "https://example.invalid/audio.aac")!,
+            durationSeconds: 7.75,
+            videoFormat: .sdr,
+            videoCodecID: 0,
+            videoCodecName: nil,
+            sourceContainer: .other,
+            videoWidth: 0,
+            videoHeight: 0,
+            videoFrameRate: nil,
+            isDolbyVision: false,
+            audioTracks: [],
+            subtitleTracks: [],
+            isSourceSeekable: true,
+            isLive: false,
+            videoStreamPresence: .provenAbsent
+        )
+        let profile = AetherSourceProfile(
+            probe: probe,
+            sourceKind: .progressive,
+            isSeekableVOD: probe.isFiniteSeekableVOD
+        )
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: profile,
+            hlsPackaging: nil,
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(
+            probe.videoStreamPresence,
+            .provenAbsent
+        )
+        XCTAssertEqual(
+            profile.videoStreamPresence,
+            .provenAbsent
+        )
+        XCTAssertFalse(profile.hasVideoStream)
+        XCTAssertEqual(result.route, .nativeAVPlayer)
+        XCTAssertEqual(result.reason, .nativeAudioOnly)
+    }
+
+    func testProbeConfirmedVorbisAudioOnlyUsesHybridAudioBridge() {
+        let probe = SourceProbe(
+            url: URL(string: "https://example.invalid/audio.ogg")!,
+            durationSeconds: 6,
+            videoFormat: .sdr,
+            videoCodecID: 0,
+            videoCodecName: nil,
+            sourceContainer: .other,
+            videoWidth: 0,
+            videoHeight: 0,
+            videoFrameRate: nil,
+            isDolbyVision: false,
+            audioTracks: [
+                TrackInfo(
+                    id: 0,
+                    name: "Vorbis",
+                    codec: "vorbis",
+                    language: nil,
+                    isDefault: true
+                ),
+            ],
+            subtitleTracks: [],
+            isSourceSeekable: true,
+            isLive: false,
+            videoStreamPresence: .provenAbsent
+        )
+        let profile = AetherSourceProfile(
+            probe: probe,
+            sourceKind: .progressive,
+            isSeekableVOD: probe.isFiniteSeekableVOD
+        )
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: profile,
+            hlsPackaging: nil,
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(profile.audioCodecs, [.vorbis])
+        XCTAssertEqual(result.route, .hybridCarrier)
+        XCTAssertEqual(result.reason, .hybridAudioBridge)
+    }
+
+    func testVorbisAudioOnlyWithoutCarrierCapabilityIsTypedUnsupported() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(
+                kind: .progressive,
+                hasVideo: false,
+                codec: .unknown,
+                audioCodecs: [.vorbis],
+                container: .other
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities: HybridPlaybackCapabilities(
+                hasDirectVideoDecoder: true,
+                hasSampleBufferRenderer: true,
+                hasAudioBridgeCarrier: false,
+                supportedVideoFormats: [.sdr]
+            )
+        )
+
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(
+            result.reason,
+            .unsupportedHybridAudioBridgeUnavailable
+        )
+    }
+
+    func testMissingStreamInventoryDoesNotBecomeAudioOnly() {
+        let probe = SourceProbe(
+            url: URL(string: "https://example.invalid/unknown.bin")!,
+            durationSeconds: 1_200,
+            videoFormat: .sdr,
+            videoCodecID: 0,
+            videoCodecName: nil,
+            sourceContainer: .other,
+            videoWidth: 0,
+            videoHeight: 0,
+            videoFrameRate: nil,
+            isDolbyVision: false,
+            audioTracks: [],
+            subtitleTracks: [],
+            isSourceSeekable: true,
+            isLive: false
+        )
+        let profile = AetherSourceProfile(
+            probe: probe,
+            sourceKind: .progressive,
+            isSeekableVOD: probe.isFiniteSeekableVOD
+        )
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: profile,
+            hlsPackaging: nil,
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(probe.videoStreamPresence, .unknown)
+        XCTAssertEqual(profile.videoStreamPresence, .unknown)
+        XCTAssertFalse(profile.hasVideoStream)
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(
+            result.reason,
+            .unsupportedVideoStreamPresenceInconclusive
+        )
+    }
+
+    func testDemuxConfirmedUnknownVideoCannotBecomeAudioOnly() {
+        let probe = SourceProbe(
+            url: URL(string: "https://example.invalid/unknown-video.bin")!,
+            durationSeconds: 1_200,
+            videoFormat: .sdr,
+            videoCodecID: 0,
+            videoCodecName: nil,
+            sourceContainer: .other,
+            videoWidth: 0,
+            videoHeight: 0,
+            videoFrameRate: nil,
+            isDolbyVision: false,
+            audioTracks: [],
+            subtitleTracks: [],
+            isSourceSeekable: true,
+            isLive: false,
+            videoStreamPresence: .provenPresent
+        )
+        let profile = AetherSourceProfile(
+            probe: probe,
+            sourceKind: .progressive,
+            isSeekableVOD: probe.isFiniteSeekableVOD
+        )
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: profile,
+            hlsPackaging: nil,
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertTrue(probe.hasVideoStream)
+        XCTAssertTrue(profile.hasVideoStream)
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(result.reason, .unsupportedVideoCodec)
+    }
+
+    func testPositiveHEVCCannotBeMaskedByFalseVideoFlag() {
+        let profile = source(
+            kind: .progressive,
+            hasVideo: false,
+            codec: .hevc,
+            container: .isoBaseMedia
+        )
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: profile,
+            hlsPackaging: nil,
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertTrue(profile.hasVideoStream)
+        XCTAssertEqual(result.route, .hybridCarrier)
+        XCTAssertEqual(result.reason, .hybridHEVC)
     }
 }

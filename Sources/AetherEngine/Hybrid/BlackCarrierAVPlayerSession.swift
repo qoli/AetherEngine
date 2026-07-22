@@ -83,6 +83,12 @@ final class BlackCarrierAVPlayerSession {
     private var statusObservation: NSKeyValueObservation?
     private var readinessContinuation: CheckedContinuation<Void, Error>?
     private var preparationTimedOut = false
+    private var installedItem: AVPlayerItem?
+    private var previousAllowsExternalPlayback: Bool?
+    #if os(iOS) || os(tvOS)
+    private var previousUsesExternalPlaybackWhileExternalScreenIsActive:
+        Bool?
+    #endif
 
     init(
         provider: any BlackCarrierTransportProvider,
@@ -90,11 +96,6 @@ final class BlackCarrierAVPlayerSession {
     ) {
         self.provider = provider
         server = HLSLocalServer(provider: provider)
-
-        avPlayer.allowsExternalPlayback = false
-        #if os(iOS) || os(tvOS)
-        avPlayer.usesExternalPlaybackWhileExternalScreenIsActive = false
-        #endif
         self.avPlayer = avPlayer
     }
 
@@ -115,6 +116,7 @@ final class BlackCarrierAVPlayerSession {
         case .stopped:
             throw BlackCarrierAVPlayerSessionError.alreadyStopped
         }
+        configurePlayerForCarrier()
 
         if prepareProvider {
             do {
@@ -147,6 +149,7 @@ final class BlackCarrierAVPlayerSession {
         ) / Double(BlackCarrierProfile.approved.timescale)
         item.appliesPerFrameHDRDisplayMetadata = false
         item.canUseNetworkResourcesForLiveStreamingWhilePaused = false
+        installedItem = item
         avPlayer.replaceCurrentItem(with: item)
 
         self.playlistURL = playlistURL
@@ -288,8 +291,17 @@ final class BlackCarrierAVPlayerSession {
     func stop() {
         guard lifecycle != .stopped else { return }
         cancelPendingReadiness(with: .preparationCancelled)
-        avPlayer.pause()
-        avPlayer.replaceCurrentItem(with: nil)
+        let mayRestorePlayerConfiguration = avPlayer.currentItem == nil
+            || avPlayer.currentItem === installedItem
+        if let installedItem,
+           avPlayer.currentItem === installedItem {
+            avPlayer.pause()
+            avPlayer.replaceCurrentItem(with: nil)
+        }
+        restorePlayerConfiguration(
+            ifOwned: mayRestorePlayerConfiguration
+        )
+        installedItem = nil
         server.stop()
         provider.close()
         playlistURL = nil
@@ -299,11 +311,39 @@ final class BlackCarrierAVPlayerSession {
 
     private func failAndClose() {
         cancelPendingReadiness(with: .preparationCancelled)
+        restorePlayerConfiguration(ifOwned: true)
         server.stop()
         provider.close()
+        installedItem = nil
         playlistURL = nil
         lifecycle = .stopped
         transportState = .stopped
+    }
+
+    private func configurePlayerForCarrier() {
+        guard previousAllowsExternalPlayback == nil else { return }
+        previousAllowsExternalPlayback = avPlayer.allowsExternalPlayback
+        avPlayer.allowsExternalPlayback = false
+        #if os(iOS) || os(tvOS)
+        previousUsesExternalPlaybackWhileExternalScreenIsActive =
+            avPlayer.usesExternalPlaybackWhileExternalScreenIsActive
+        avPlayer.usesExternalPlaybackWhileExternalScreenIsActive = false
+        #endif
+    }
+
+    private func restorePlayerConfiguration(ifOwned: Bool) {
+        guard ifOwned,
+              let previousAllowsExternalPlayback else { return }
+        avPlayer.allowsExternalPlayback = previousAllowsExternalPlayback
+        self.previousAllowsExternalPlayback = nil
+        #if os(iOS) || os(tvOS)
+        if let previous =
+                previousUsesExternalPlaybackWhileExternalScreenIsActive {
+            avPlayer.usesExternalPlaybackWhileExternalScreenIsActive =
+                previous
+        }
+        previousUsesExternalPlaybackWhileExternalScreenIsActive = nil
+        #endif
     }
 
     private func loadAndAwaitReady(item: AVPlayerItem) async throws {

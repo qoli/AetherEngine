@@ -223,6 +223,62 @@ struct BlackCarrierFreshDemuxRestartTests {
         }
     }
 
+    @Test("Explicit provider close does not record its interrupted demux read as terminal")
+    func closeDoesNotRecordInterruptedRead() throws {
+        let sourceData = makeWAV(seconds: 12.25)
+        let initialReader = BlockingIOReader(data: sourceData)
+        let initialDemuxer = Demuxer()
+        try initialDemuxer.open(reader: initialReader)
+        defer { initialDemuxer.close() }
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(seconds: 12.25, preferredTimescale: 90_000)
+        )
+        let videoProvider = try BlackCarrierVideoProvider(
+            timeline: timeline
+        )
+        let pump = try BlackCarrierMediaFanoutPump(
+            demuxer: initialDemuxer,
+            timeline: timeline,
+            freshDemuxerFactory: {
+                let fresh = Demuxer()
+                try fresh.open(reader: DataIOReader(data: sourceData))
+                return fresh
+            }
+        )
+        let provider = try BlackCarrierLazyCompositeProvider(
+            videoProvider: videoProvider,
+            pump: pump
+        )
+        defer { provider.close() }
+
+        try provider.prepareForTransportStart()
+        initialReader.armBlockingReads()
+
+        let produceResult = ProduceResultBox()
+        let produceFinished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            produceResult.store(Result {
+                try provider.prepareHybridGeneration(segmentIndex: 2)
+            })
+            produceFinished.signal()
+        }
+        #expect(initialReader.waitUntilBlocked(timeout: 2))
+
+        let closeFinished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            provider.close()
+            closeFinished.signal()
+        }
+
+        #expect(produceFinished.wait(timeout: .now() + 1) == .success)
+        #expect(closeFinished.wait(timeout: .now() + 1) == .success)
+        let result = try #require(produceResult.load())
+        if case .success = result {
+            Issue.record("Interrupted fanout unexpectedly completed")
+        }
+        #expect(provider.terminalError == nil)
+    }
+
     private func makeWAV(seconds: Double) -> Data {
         let sampleRate = 48_000
         let channels = 2

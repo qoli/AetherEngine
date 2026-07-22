@@ -208,6 +208,7 @@ extension AetherEngine {
         preopenedDemuxer: Demuxer? = nil,
         generation: UInt64
     ) async throws {
+        try checkLoadCurrent(generation)
         // Both values are set by the reader's resolver before any main-stream byte flows, so they are final by the time loadNative runs.
         // HLSVideoEngine uses liveSourceCadenceHint for playlist shaping (TARGETDURATION floor, blocking-reload eligibility).
         // companionAudioReader: side demuxer for demuxed-audio ingest; nil means muxed audio.
@@ -504,7 +505,7 @@ extension AetherEngine {
         }
         #endif
         // Superseded while starting: stop and unwind before touching shared state.
-        if loadGeneration != generation {
+        if Task.isCancelled || loadGeneration != generation {
             session.stop()
             try checkLoadCurrent(generation)
         }
@@ -877,7 +878,7 @@ extension AetherEngine {
             )
         }.value
         // Superseded: stop idempotently to tear down the demuxer the detached closure opened, then unwind.
-        if loadGeneration != generation {
+        if Task.isCancelled || loadGeneration != generation {
             host.stop()
             try checkLoadCurrent(generation)
         }
@@ -942,7 +943,7 @@ extension AetherEngine {
             )
         }.value
         // Superseded: re-stop detached host, then throw.
-        if loadGeneration != generation {
+        if Task.isCancelled || loadGeneration != generation {
             host.stop()
             try checkLoadCurrent(generation)
         }
@@ -1105,7 +1106,7 @@ extension AetherEngine {
                 state = .error("Reload failed: \(error.localizedDescription)")
                 return
             }
-            if loadGeneration != gen {
+            if Task.isCancelled || loadGeneration != gen {
                 customPreopened?.markClosed()
                 if let d = customPreopened {
                     Task.detached { d.close() }
@@ -1130,7 +1131,7 @@ extension AetherEngine {
                 state = .error("Reload failed: \(error.localizedDescription)")
                 return
             }
-            if loadGeneration != gen {
+            if Task.isCancelled || loadGeneration != gen {
                 customPreopened?.markClosed()
                 if let d = customPreopened {
                     Task.detached { d.close() }

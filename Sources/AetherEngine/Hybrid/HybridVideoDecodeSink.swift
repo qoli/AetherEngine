@@ -14,6 +14,8 @@ enum HybridVideoStreamContractMatch: Sendable, Equatable {
 }
 
 struct HybridVideoStreamContract: Sendable, Equatable {
+    static let maximumPresentationReorderDepth = 16
+
     let codecID: UInt32
     let codedWidth: Int
     let codedHeight: Int
@@ -26,6 +28,10 @@ struct HybridVideoStreamContract: Sendable, Equatable {
     let rotationDegrees: Int
     let nominalFrameDuration: CMTime
     let displayFrameRate: Double?
+    /// Source-declared decoded-frame delay (`AVCodecParameters.video_delay`).
+    /// Hybrid retains exactly this many callback frames before emitting the
+    /// lowest real PTS; it does not invent a fixed sorting window.
+    let presentationReorderDepth: Int
     let packetTimeBaseNumerator: Int32
     let packetTimeBaseDenominator: Int32
     let sourceStartPTS: Int64
@@ -53,6 +59,15 @@ struct HybridVideoStreamContract: Sendable, Equatable {
         videoFormat = AetherEngine.detectVideoFormat(stream: stream)
         dolbyVisionConfiguration =
             AetherEngine.dolbyVisionConfiguration(stream: stream)
+        presentationReorderDepth = Int(codecParameters.video_delay)
+        guard presentationReorderDepth >= 0,
+              presentationReorderDepth
+                <= Self.maximumPresentationReorderDepth else {
+            throw HybridVideoDecodeSinkError
+                .invalidPresentationReorderDepth(
+                    presentationReorderDepth
+                )
+        }
 
         let parameterSAR = codecParameters.sample_aspect_ratio
         let streamSAR = stream.pointee.sample_aspect_ratio
@@ -203,6 +218,7 @@ struct HybridVideoStreamContract: Sendable, Equatable {
             "rotation=\(rotationDegrees)",
             "frameDuration=\(nominalFrameDuration.value)/\(nominalFrameDuration.timescale)",
             "fps=\(framesPerSecond)",
+            "reorderDepth=\(presentationReorderDepth)",
             "timeBase=\(packetTimeBaseNumerator)/\(packetTimeBaseDenominator)",
         ].joined(separator: " ")
     }
@@ -235,6 +251,7 @@ enum HybridVideoDecodeSinkError:
     case packetCloneFailed
     case packetTimestampMissing
     case invalidPacketTimeBase
+    case invalidPresentationReorderDepth(Int)
     case restartTimestampRebaseAmbiguous(
         generation: UInt64,
         timestamp: Int64
@@ -281,6 +298,8 @@ enum HybridVideoDecodeSinkError:
             return "Hybrid compressed-video packet has no decode or presentation timestamp"
         case .invalidPacketTimeBase:
             return "Hybrid video stream has an invalid packet time base"
+        case .invalidPresentationReorderDepth(let depth):
+            return "Hybrid video stream declares unsupported presentation reorder depth \(depth)"
         case .restartTimestampRebaseAmbiguous(
             let generation,
             let timestamp
@@ -334,6 +353,7 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
     private let callbackBox = CallbackBox()
     private let lock = NSLock()
     private let operationLock = NSLock()
+    private let presentationOrderLock = NSLock()
     private let maximumQueuedBytes: Int
     private let maximumQueuedPackets: Int
 
@@ -355,6 +375,10 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
     private var restartBeyondSourceOrigin = false
     private var realVideoBitrateAccumulator =
         HybridRealVideoBitrateAccumulator()
+    private var presentationOrder:
+        HybridFramePresentationOrder<DecodedVideoFrame>
+    private var presentationReadyFrames: [DecodedVideoFrame] = []
+    private var presentationDrainIsActive = false
 
     init(
         demuxer: Demuxer,
@@ -387,6 +411,10 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
             stream: stream,
             sourceStartPTSOverride:
                 sourceStartPTSOverride
+        )
+        presentationOrder = HybridFramePresentationOrder(
+            reorderDepth:
+                streamContract.presentationReorderDepth
         )
         generation = initialGeneration
         targetTime = initialTargetTime
@@ -591,6 +619,7 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         clearQueuedPacketsLocked()
         decoder.flush()
         try throwIfUnavailable()
+        discardPendingPresentationFrames()
         // The hybrid scheduler and presentation gate own seek pre-roll. A frame
         // whose PTS precedes the target may still cover the target by duration;
         // decoder-level PTS skipping would incorrectly discard that frame.
@@ -689,6 +718,7 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         lock.unlock()
         clearQueuedPacketsLocked()
         decoder.close()
+        discardPendingPresentationFrames()
         operationLock.unlock()
     }
 
@@ -706,7 +736,6 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
             return
         }
         let frameGeneration = generation
-        let target = targetTime
         lock.unlock()
 
         let geometry: DecodedVideoFrameGeometry
@@ -765,25 +794,7 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
             ))
             return
         }
-        if HybridPresentationReadinessGate.frameIntersectsTargetWindow(
-            frame: frame,
-            targetTime: target,
-            toleranceBefore: CMTime(
-                seconds: 0.1,
-                preferredTimescale: 600
-            ),
-            toleranceAfter: CMTime(
-                seconds: 0.25,
-                preferredTimescale: 600
-            )
-        ) {
-            lock.lock()
-            if generation == frameGeneration {
-                targetFrameReady = true
-            }
-            lock.unlock()
-        }
-        frameHandler(frame)
+        emitInPresentationOrder(frame)
     }
 
     /// Accept exactly the two decoder contracts observed on Apple platforms: a coded-size pixel buffer with
@@ -1094,6 +1105,96 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         didFinishDecoder = true
         decoder.finish()
         try throwIfUnavailable()
+        drainPendingPresentationFrames()
+    }
+
+    private func emitInPresentationOrder(_ frame: DecodedVideoFrame) {
+        presentationOrderLock.lock()
+        presentationReadyFrames.append(contentsOf:
+            presentationOrder.insert(
+                frame,
+                presentationTime: frame.presentationTime
+            )
+        )
+        let shouldDrain = claimPresentationDrainLocked()
+        presentationOrderLock.unlock()
+        if shouldDrain {
+            drainPresentationReadyFrames()
+        }
+    }
+
+    private func drainPendingPresentationFrames() {
+        presentationOrderLock.lock()
+        presentationReadyFrames.append(contentsOf:
+            presentationOrder.drain()
+        )
+        let shouldDrain = claimPresentationDrainLocked()
+        presentationOrderLock.unlock()
+        if shouldDrain {
+            drainPresentationReadyFrames()
+        }
+    }
+
+    private func discardPendingPresentationFrames() {
+        presentationOrderLock.lock()
+        presentationOrder.discard()
+        presentationReadyFrames.removeAll(keepingCapacity: true)
+        presentationOrderLock.unlock()
+    }
+
+    private func claimPresentationDrainLocked() -> Bool {
+        guard !presentationDrainIsActive,
+              !presentationReadyFrames.isEmpty else {
+            return false
+        }
+        presentationDrainIsActive = true
+        return true
+    }
+
+    /// VideoToolbox callbacks may arrive concurrently. Only the caller that
+    /// claims this drain may invoke the downstream handler; later callbacks
+    /// append to the same queue. This preserves the ordering decision through
+    /// the relay boundary without holding a lock while backpressure waits.
+    private func drainPresentationReadyFrames() {
+        while true {
+            presentationOrderLock.lock()
+            guard !presentationReadyFrames.isEmpty else {
+                presentationDrainIsActive = false
+                presentationOrderLock.unlock()
+                return
+            }
+            let frame = presentationReadyFrames.removeFirst()
+            presentationOrderLock.unlock()
+            deliverPresentationFrame(frame)
+        }
+    }
+
+    private func deliverPresentationFrame(_ frame: DecodedVideoFrame) {
+        lock.lock()
+        let activeFrameGeneration = generation
+        let activeTarget = targetTime
+        lock.unlock()
+        if frame.generation == activeFrameGeneration,
+           HybridPresentationReadinessGate.frameIntersectsTargetWindow(
+               frame: frame,
+               targetTime: activeTarget,
+               toleranceBefore: CMTime(
+                   seconds: 0.1,
+                   preferredTimescale: 600
+               ),
+               toleranceAfter: CMTime(
+                   seconds: 0.25,
+                   preferredTimescale: 600
+               )
+           ) {
+            lock.lock()
+            if generation == activeFrameGeneration,
+               targetTime == activeTarget {
+                targetFrameReady = true
+            }
+            lock.unlock()
+        }
+        frameHandler(frame)
     }
 
     private func clearQueuedPacketsLocked() {

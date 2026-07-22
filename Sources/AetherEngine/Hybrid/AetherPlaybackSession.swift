@@ -374,6 +374,27 @@ private enum AetherActiveRouteSession {
         }
     }
 
+    var videoOutputSnapshot: AetherVideoOutputSnapshot {
+        switch self {
+        case .native(let session): session.videoOutputSnapshot
+        case .hybrid(let session): session.videoOutputSnapshot
+        }
+    }
+
+    var nativeFailureEvidence:
+        AetherNativePlaybackFailureEvidence?
+    {
+        guard case .native(let session) = self else { return nil }
+        return session.lastFailureEvidence
+    }
+
+    func pollVideoOutput() {
+        switch self {
+        case .native(let session): session.pollVideoOutput()
+        case .hybrid(let session): session.pollVideoOutput()
+        }
+    }
+
     func prepare() async throws {
         switch self {
         case .native(let session): try await session.prepare()
@@ -543,6 +564,18 @@ private enum AetherResolvedPlaybackSource {
             : .directAsset
     }
 
+    var progressiveSourceFacts: AetherProgressiveSourceFacts? {
+        guard case .progressive(let probe, _, _) = self else {
+            return nil
+        }
+        return AetherProgressiveSourceFacts(probe: probe)
+    }
+
+    var hlsResourceIdentity: String? {
+        guard case .hls(let preflight) = self else { return nil }
+        return preflight.resourceIdentity
+    }
+
     func admitting(
         route: PlaybackRenderRoute
     ) -> AetherResolvedPlaybackSource? {
@@ -628,11 +661,110 @@ private final class AetherPlaybackAudioAnalysisProxy {
     }
 }
 
+/// Single-resume broker for Aether-owned asynchronously suspended work that
+/// may ignore task cancellation while blocked in a framework or native
+/// dependency. Unlike a structured task-group race, the caller never waits
+/// for the losing operation after the deadline. This cannot preempt
+/// synchronous MainActor work; lower layers must still place cancellation or
+/// generation checks immediately after their own suspension points. The
+/// owning route transaction remains the authority that rejects any late
+/// install or commit.
+@MainActor
+final class AetherPlaybackOperationDeadlineRace<Value: Sendable> {
+    private var continuation: CheckedContinuation<Value, Error>?
+    private var operationTask: Task<Void, Never>?
+    private var timeoutTask: Task<Void, Never>?
+    private var onAbandon: (() -> Void)?
+
+    func run(
+        timeout: TimeInterval,
+        timeoutFailure: AetherPlaybackFailure,
+        onAbandon: @escaping () -> Void = {},
+        operation: @escaping @MainActor @Sendable () async throws -> Value
+    ) async throws -> Value {
+        guard timeout.isFinite, timeout > 0 else {
+            onAbandon()
+            throw timeoutFailure
+        }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                start(
+                    continuation: continuation,
+                    timeout: timeout,
+                    timeoutFailure: timeoutFailure,
+                    onAbandon: onAbandon,
+                    operation: operation
+                )
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.cancel()
+            }
+        }
+    }
+
+    private func start(
+        continuation: CheckedContinuation<Value, Error>,
+        timeout: TimeInterval,
+        timeoutFailure: AetherPlaybackFailure,
+        onAbandon: @escaping () -> Void,
+        operation: @escaping @MainActor @Sendable () async throws -> Value
+    ) {
+        self.continuation = continuation
+        self.onAbandon = onAbandon
+        operationTask = Task { @MainActor [self] in
+            do {
+                resolve(.success(try await operation()))
+            } catch {
+                resolve(.failure(error))
+            }
+        }
+        timeoutTask = Task { @MainActor [self] in
+            do {
+                try await Task.sleep(
+                    nanoseconds: UInt64(timeout * 1_000_000_000)
+                )
+            } catch {
+                return
+            }
+            guard continuationIsPending else { return }
+            self.onAbandon?()
+            resolve(.failure(timeoutFailure))
+        }
+    }
+
+    private var continuationIsPending: Bool {
+        continuation != nil
+    }
+
+    func cancel() {
+        guard continuationIsPending else { return }
+        onAbandon?()
+        resolve(.failure(CancellationError()))
+    }
+
+    private func resolve(_ result: Result<Value, Error>) {
+        guard let continuation else { return }
+        self.continuation = nil
+        onAbandon = nil
+        operationTask?.cancel()
+        timeoutTask?.cancel()
+        operationTask = nil
+        timeoutTask = nil
+        continuation.resume(with: result)
+    }
+}
+
 /// Aether-owned playback lifecycle. The host mounts one player and one
 /// presentation container; route reconstruction and evidence-backed route
 /// transitions remain entirely inside this object.
 @MainActor
 public final class AetherPlaybackSession: ObservableObject {
+    /// Leaves the MainActor enough time to publish the typed Aether terminal
+    /// before Syncnext's outer 45-second integration guard observes the same
+    /// session. This is not an additional retry budget.
+    nonisolated static let recoveryTerminalPublicationHeadroomSeconds = 0.25
+
     /// Public admission catalog for the internally owned Hybrid route.
     /// Hosts may display capability information, but cannot construct or
     /// select the route implementation directly.
@@ -659,6 +791,8 @@ public final class AetherPlaybackSession: ObservableObject {
     @Published public private(set) var currentItem: AVPlayerItem?
     @Published public private(set) var activeRoute:
         PlaybackRenderRoute?
+    @Published public private(set) var videoOutputSnapshot:
+        AetherVideoOutputSnapshot = .unresolved
     @Published public private(set) var preflightResult:
         PlaybackPreflightResult?
     @Published public private(set) var capabilities:
@@ -701,11 +835,18 @@ public final class AetherPlaybackSession: ObservableObject {
     private let options: LoadOptions
     private let variantSelection: HLSPreflightVariantSelection
     private let recoveryBudget: AetherPlaybackRecoveryBudget
+    private let routeNeutralAllowsExternalPlayback: Bool
+    #if os(iOS) || os(tvOS)
+    private let routeNeutralUsesExternalPlaybackWhileExternalScreenIsActive:
+        Bool
+    #endif
     private var resolvedSource: AetherResolvedPlaybackSource?
     private var activeSession: AetherActiveRouteSession?
     private var activeNativeExecutionMode:
         AetherNativePlaybackExecutionMode?
     private var routeCancellables = Set<AnyCancellable>()
+    private var videoOutputReducer =
+        AetherSessionVideoOutputReducer()
     private var currentItemObservation: NSKeyValueObservation?
     private var healthyProgressObserver: Any?
     private var playbackProgressEpoch = PlaybackProgressEpoch()
@@ -735,6 +876,7 @@ public final class AetherPlaybackSession: ObservableObject {
         AetherPlaybackCapabilities?
     private var mergedRuntimeFailureKeys = Set<String>()
     private var lastRecoveryFailure: AetherPlaybackFailure?
+    private var initialPreparationDeadline: PlaybackRecoveryDeadline?
     private let transportRetryBudget:
         PlaybackTransportRetryBudget
     private var lowerVariantRecoveryWasAttempted = false
@@ -760,7 +902,14 @@ public final class AetherPlaybackSession: ObservableObject {
             maximumFailureAttempts:
                 recoveryBudget.maximumTransportAttempts
         )
-        avPlayer = AVPlayer()
+        let stablePlayer = AVPlayer()
+        avPlayer = stablePlayer
+        routeNeutralAllowsExternalPlayback =
+            stablePlayer.allowsExternalPlayback
+        #if os(iOS) || os(tvOS)
+        routeNeutralUsesExternalPlaybackWhileExternalScreenIsActive =
+            stablePlayer.usesExternalPlaybackWhileExternalScreenIsActive
+        #endif
         presentationView = AetherPlaybackPresentationView()
         sessionID = UUID()
         var components = URLComponents(
@@ -804,18 +953,25 @@ public final class AetherPlaybackSession: ObservableObject {
         }
         state = .preparing
         isPreparingOrRecovering = true
+        initialPreparationDeadline = PlaybackRecoveryDeadline(
+            startedAt: ProcessInfo.processInfo.systemUptime,
+            durationSeconds:
+                recoveryBudget.initialPreparationSettleSeconds
+        )
+        defer { initialPreparationDeadline = nil }
         do {
             let source = try await resolveCanonicalSource(
                 allowProvisionalNative: true
             )
             try await installAndPrepare(source)
-            await applyCanonicalDefaultTrackIntent()
+            try await applyCanonicalDefaultTrackIntent()
             didCompleteInitialPrepare = true
             isPreparingOrRecovering = false
             state = .ready
             resetRecoveryEpisode()
         } catch is CancellationError {
             isPreparingOrRecovering = false
+            teardownActiveRoute()
             let failure = failure(
                 stage: .preparation,
                 error: CancellationError()
@@ -824,26 +980,20 @@ public final class AetherPlaybackSession: ObservableObject {
             throw CancellationError()
         } catch {
             let initialFailure = failure(
-                stage: activeRoute == nil ? .preflight : .preparation,
+                stage: Self.initialPreparationFailureStage(
+                    hasInstalledRoute: activeSession != nil
+                ),
                 error: error
             )
-            if try await recover(
+            try await recoverOrTerminate(
                 from: initialFailure,
-                duringInitialPrepare: true
-            ) {
-                didCompleteInitialPrepare = true
-                isPreparingOrRecovering = false
-                return
-            }
-            isPreparingOrRecovering = false
-            let terminal = recoveryCoordinator.episodeFirstFailure
-                ?? initialFailure
-            publishTerminal(
-                terminal,
-                finalFailure: lastRecoveryFailure ?? initialFailure,
+                duringInitialPrepare: true,
+                failureStage: .preparation,
                 exhaustionReason: "initial recovery exhausted"
             )
-            throw AetherPlaybackSessionError.terminal(terminal)
+            didCompleteInitialPrepare = true
+            isPreparingOrRecovering = false
+            return
         }
     }
 
@@ -958,10 +1108,31 @@ public final class AetherPlaybackSession: ObservableObject {
             guard result == .applied else {
                 return .superseded
             }
+            guard let current = self.activeSession,
+                  current.isIdentical(to: activeSession) else {
+                throw CancellationError()
+            }
+            // The route owns its seek mechanics, while the stable outer
+            // session owns the user's latest transport intent. Reassert that
+            // intent after an ended-generation seek so the public state never
+            // claims `.playing` while the real AVPlayer is still parked at
+            // rate zero. This does not select another route or source.
+            if desiredPlaying {
+                try activeSession.play()
+                try activeSession.setRate(desiredRate)
+            } else {
+                try activeSession.pause()
+            }
             lastConfirmedMediaTime = target
             lastAppliedSeekOperationSequence = operationSequence
             desiredSeekTarget = nil
-            state = desiredPlaying ? .playing : .paused
+            state = Self.stateAfterAppliedSeek(
+                desiredPlaying: desiredPlaying,
+                desiredRate: desiredRate,
+                carrierRate: avPlayer.rate,
+                carrierTimeControlStatus:
+                    avPlayer.timeControlStatus
+            )
             return .applied
         } catch is CancellationError {
             if activeSeekOperationSequence == operationSequence {
@@ -979,24 +1150,55 @@ public final class AetherPlaybackSession: ObservableObject {
                 return .superseded
             }
             let seekFailure = failure(stage: .playback, error: error)
-            if try await recover(
+            try await recoverOrTerminate(
                 from: seekFailure,
-                duringInitialPrepare: false
-            ) {
-                guard operationCoordinator.isCurrentSeek(operationSequence) else {
-                    return .superseded
-                }
-                lastAppliedSeekOperationSequence = operationSequence
-                desiredSeekTarget = nil
-                return .applied
-            }
-            publishTerminal(
-                recoveryCoordinator.episodeFirstFailure ?? seekFailure,
-                finalFailure: seekFailure,
+                duringInitialPrepare: false,
+                failureStage: .playback,
                 exhaustionReason: "seek recovery exhausted"
             )
-            throw AetherPlaybackSessionError.terminal(seekFailure)
+            guard operationCoordinator.isCurrentSeek(operationSequence) else {
+                return .superseded
+            }
+            lastAppliedSeekOperationSequence = operationSequence
+            desiredSeekTarget = nil
+            return .applied
         }
+    }
+
+    /// Actively polls the current Aether-owned output surface until a newer
+    /// real frame is observed. The call returns immediately for a positively
+    /// observed audio-only item and returns the latest fail-closed snapshot at
+    /// the bounded deadline.
+    ///
+    /// This method never treats media-clock movement, `readyToPlay`, route
+    /// state, or a renderer enqueue as frame evidence.
+    public func waitForVideoFrame(
+        after sequence: UInt64,
+        timeout: TimeInterval
+    ) async -> AetherVideoOutputSnapshot {
+        guard timeout.isFinite, timeout >= 0,
+              !isStopped else { return videoOutputSnapshot }
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        while !Task.isCancelled, !isStopped {
+            activeSession?.pollVideoOutput()
+            let snapshot = videoOutputSnapshot
+            if snapshot.outputStatus == .notExpected {
+                return snapshot
+            }
+            if snapshot.outputStatus == .presented,
+               snapshot.frameSequence > sequence {
+                return snapshot
+            }
+            guard ProcessInfo.processInfo.systemUptime < deadline else {
+                return videoOutputSnapshot
+            }
+            do {
+                try await Task.sleep(nanoseconds: 50_000_000)
+            } catch {
+                return videoOutputSnapshot
+            }
+        }
+        return videoOutputSnapshot
     }
 
     public func setExternalMetadata(
@@ -1006,6 +1208,197 @@ public final class AetherPlaybackSession: ObservableObject {
         #if os(tvOS) || os(iOS)
         currentItem?.externalMetadata = metadata
         #endif
+    }
+
+    /// Truthful public state after the route has applied a seek and the outer
+    /// session has reasserted its transport intent. A positive desired rate is
+    /// not enough by itself: AVPlayer must expose an active/waiting transport
+    /// or a positive real rate before `.playing` is published.
+    nonisolated static func stateAfterAppliedSeek(
+        desiredPlaying: Bool,
+        desiredRate: Float,
+        carrierRate: Float,
+        carrierTimeControlStatus:
+            AVPlayer.TimeControlStatus
+    ) -> AetherPlaybackSessionState {
+        guard desiredPlaying,
+              desiredRate.isFinite,
+              desiredRate > 0 else {
+            return .paused
+        }
+        let carrierHasPlaybackIntent =
+            (carrierRate.isFinite && carrierRate > 0)
+                || carrierTimeControlStatus != .paused
+        return carrierHasPlaybackIntent ? .playing : .paused
+    }
+
+    /// Recovery capability differences are meaningful only after the outer
+    /// session has published a committed route. Initial preparation can have
+    /// an installed, partially prepared route while the public capability
+    /// value is still the route-neutral default; that value is not a baseline.
+    nonisolated static func committedRecoveryCapabilityBaseline(
+        didCompleteInitialPrepare: Bool,
+        activeRoute: PlaybackRenderRoute?,
+        fromRoute: PlaybackRenderRoute?,
+        capabilities: AetherPlaybackCapabilities
+    ) -> AetherPlaybackCapabilities? {
+        guard didCompleteInitialPrepare,
+              let activeRoute,
+              activeRoute == fromRoute,
+              capabilities.route == activeRoute else {
+            return nil
+        }
+        return capabilities
+    }
+
+    /// Fresh-fact route reclassification is admitted only when it completes an
+    /// earlier inconclusive URL classification: unknown provisional Native may
+    /// become positively verified HEVC Hybrid, interlaced-H.264 Hybrid, or
+    /// positively verified audio-only Vorbis Hybrid. A committed codec/route
+    /// identity is otherwise immutable; drift is a typed terminal invariant
+    /// failure, never an invitation to reinterpret the media.
+    nonisolated static func freshRouteReclassificationFailure(
+        previousResult: PlaybackPreflightResult?,
+        from failedRoute: PlaybackRenderRoute,
+        freshResult: PlaybackPreflightResult
+    ) -> AetherPlaybackFailure? {
+        let freshRoute = freshResult.route
+        guard freshRoute != .unsupported,
+              freshRoute != failedRoute else { return nil }
+
+        let freshReasonIsPositiveHEVC = switch freshResult.reason {
+        case .hybridHEVC, .hybridHEV1SampleEntry,
+             .hybridHEVCInMPEGTransport,
+             .hybridHLSManifestMissingCodecs,
+             .hybridHLSMasterContainsHEVCVariant:
+            true
+        default:
+            false
+        }
+        let completedProvisionalClassification =
+            previousResult?.route == .nativeAVPlayer
+            && previousResult?.reason == .nativeProvisionalURL
+            && previousResult?.sourceProfile.sourceKind
+                == .unclassifiedURL
+            && previousResult?.sourceProfile.videoCodec == .unknown
+            && failedRoute == .nativeAVPlayer
+            && freshRoute == .hybridCarrier
+            && freshResult.sourceProfile.sourceKind != .unclassifiedURL
+        let isCompletedProvisionalHEVCClassification =
+            completedProvisionalClassification
+            && (freshResult.sourceProfile.videoCodec == .hevc
+                || freshResult.reason
+                    == .hybridHLSMasterContainsHEVCVariant)
+            && freshReasonIsPositiveHEVC
+        let isCompletedProvisionalVorbisClassification =
+            completedProvisionalClassification
+            && freshResult.reason == .hybridAudioBridge
+            && freshResult.sourceProfile.videoStreamPresence
+                == .provenAbsent
+            && freshResult.sourceProfile.videoCodec == .unknown
+            && freshResult.sourceProfile.audioCodecs == [.vorbis]
+        let isCompletedProvisionalInterlacedH264Classification =
+            completedProvisionalClassification
+            && freshResult.reason == .hybridInterlacedH264
+            && freshResult.sourceProfile.videoCodec == .h264
+            && freshResult.sourceProfile.videoScanType == .interlaced
+        let isCompletedProvisionalHybridClassification =
+            isCompletedProvisionalHEVCClassification
+                || isCompletedProvisionalVorbisClassification
+                || isCompletedProvisionalInterlacedH264Classification
+
+        return AetherPlaybackFailure(
+            stage: .preflight,
+            kind: isCompletedProvisionalHybridClassification
+                ? .routeRuntimeFailure
+                : .invariantViolation,
+            domain: "AetherPlaybackRoutePolicy",
+            code: 0,
+            reason: isCompletedProvisionalHybridClassification
+                ? "provisional Native source was positively classified for Hybrid"
+                : "fresh source facts diverged from committed codec or route identity"
+        )
+    }
+
+    /// Once a progressive probe has established media identity, every fresh
+    /// recovery probe must describe that same media. This check runs before
+    /// route admission so a same-route codec/container/duration drift cannot
+    /// be hidden by rebuilding a new implementation.
+    nonisolated static func freshProgressiveSourceIdentityFailure(
+        previousFacts: AetherProgressiveSourceFacts?,
+        freshFacts: AetherProgressiveSourceFacts?
+    ) -> AetherPlaybackFailure? {
+        guard let previousFacts else { return nil }
+        guard let freshFacts,
+              previousFacts.hasSameMediaIdentity(as: freshFacts) else {
+            return AetherPlaybackFailure(
+                stage: .preflight,
+                kind: .invariantViolation,
+                domain: "AetherPlaybackSourceIdentity",
+                code: 0,
+                reason: "fresh progressive facts diverged from committed source identity"
+            )
+        }
+        return nil
+    }
+
+    /// A software decoder transition is a new Hybrid implementation build,
+    /// so it must come from a freshly resolved, unconsumed source owner while
+    /// remaining byte/graph-identical to the committed HEVC request.
+    nonisolated static func freshSoftwareRecoverySourceIdentityFailure(
+        previousResult: PlaybackPreflightResult?,
+        previousProgressiveFacts: AetherProgressiveSourceFacts?,
+        previousHLSResourceIdentity: String?,
+        freshResult: PlaybackPreflightResult,
+        freshProgressiveFacts: AetherProgressiveSourceFacts?,
+        freshHLSResourceIdentity: String?
+    ) -> AetherPlaybackFailure? {
+        let sameProgressiveIdentity: Bool
+        if let previousProgressiveFacts {
+            sameProgressiveIdentity = freshProgressiveFacts.map {
+                previousProgressiveFacts.hasSameMediaIdentity(as: $0)
+            } ?? false
+        } else {
+            sameProgressiveIdentity = freshProgressiveFacts == nil
+        }
+        let sameHLSIdentity: Bool
+        if let previousHLSResourceIdentity {
+            sameHLSIdentity =
+                freshHLSResourceIdentity == previousHLSResourceIdentity
+        } else {
+            sameHLSIdentity = freshHLSResourceIdentity == nil
+        }
+        let identityShapeMatches = switch previousResult?
+            .sourceProfile.sourceKind {
+        case .progressive:
+            previousProgressiveFacts != nil
+                && freshProgressiveFacts != nil
+                && previousHLSResourceIdentity == nil
+                && freshHLSResourceIdentity == nil
+        case .hls:
+            previousProgressiveFacts == nil
+                && freshProgressiveFacts == nil
+                && previousHLSResourceIdentity != nil
+                && freshHLSResourceIdentity != nil
+        case .custom, .unclassifiedURL, nil:
+            false
+        }
+        guard let previousResult,
+              previousResult.route == .hybridCarrier,
+              previousResult.sourceProfile.videoCodec == .hevc,
+              freshResult == previousResult,
+              identityShapeMatches,
+              sameProgressiveIdentity,
+              sameHLSIdentity else {
+            return AetherPlaybackFailure(
+                stage: .preflight,
+                kind: .invariantViolation,
+                domain: "AetherPlaybackSourceIdentity",
+                code: 0,
+                reason: "fresh software recovery source diverged from committed HEVC identity"
+            )
+        }
+        return nil
     }
 
     public func setSystemPlaybackActivity(
@@ -1095,28 +1488,27 @@ public final class AetherPlaybackSession: ObservableObject {
         }
         do {
             try await activeSession.selectAudioTrack(id)
+            guard let current = self.activeSession,
+                  current.isIdentical(to: activeSession) else {
+                throw CancellationError()
+            }
             publishTrackState(from: activeSession)
             publishCapabilities()
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             let selectionFailure = failure(
                 stage: .playback,
                 error: error
             )
-            if try await recover(
+            try await recoverOrTerminate(
                 from: selectionFailure,
-                duringInitialPrepare: false
-            ) {
-                return
-            }
-            publishTerminal(
-                selectionFailure,
-                finalFailure: selectionFailure,
+                duringInitialPrepare: false,
+                failureStage: .playback,
                 exhaustionReason:
                     "selected audio track could not be restored"
             )
-            throw AetherPlaybackSessionError.terminal(
-                selectionFailure
-            )
+            return
         }
     }
 
@@ -1149,11 +1541,15 @@ public final class AetherPlaybackSession: ObservableObject {
             throw AetherPlaybackSessionError.noActiveRoute
         }
         try await activeSession.selectSubtitleTrack(id)
+        guard let current = self.activeSession,
+              current.isIdentical(to: activeSession) else {
+            throw CancellationError()
+        }
         publishTrackState(from: activeSession)
         publishCapabilities()
     }
 
-    private func applyCanonicalDefaultTrackIntent() async {
+    private func applyCanonicalDefaultTrackIntent() async throws {
         guard desiredSubtitleTrackID == nil,
               !options.externalSubtitles.isEmpty,
               let activeSession else {
@@ -1171,12 +1567,30 @@ public final class AetherPlaybackSession: ObservableObject {
             )
             return
         }
+        guard let routeTransaction = routeTransactions.activeSequence else {
+            return
+        }
         do {
-            try await activeSession.selectSubtitleTrack(externalTrack.id)
+            let deadline = try operationDeadline(stage: .preparation)
+            try await AetherPlaybackOperationDeadlineRace<Void>().run(
+                timeout: deadline.timeout,
+                timeoutFailure: deadline.failure
+            ) {
+                try await activeSession.selectSubtitleTrack(
+                    externalTrack.id
+                )
+            }
+            try requireCurrentRouteTransaction(routeTransaction)
+            guard let current = self.activeSession,
+                  current.isIdentical(to: activeSession) else {
+                throw CancellationError()
+            }
             desiredSubtitleTrackID = externalTrack.id
             desiredOverlaySubtitleTrackID = externalTrack.sourceTrackID
             publishTrackState(from: activeSession)
             publishCapabilities()
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             // External subtitles are a declared degradable capability. Keep
             // playback alive and publish their unselected state.
@@ -1324,6 +1738,8 @@ public final class AetherPlaybackSession: ObservableObject {
         routeCancellables.removeAll()
         activeSession?.stop()
         activeSession = nil
+        restoreRouteNeutralPlayerCapabilities()
+        invalidateVideoOutputRoute()
         activeNativeExecutionMode = nil
         presentationView.install(nil)
         avPlayer.pause()
@@ -1376,15 +1792,8 @@ public final class AetherPlaybackSession: ObservableObject {
             throw failure
         }
 
-        if allowProvisionalNative,
-           sourceSignature == .isoBaseMedia {
-            return provisionalNativeSource(
-                sourceContainer: .isoBaseMedia
-            )
-        }
-
-        switch sourceSignature.sourceKind {
-        case .hls:
+        switch sourceSignature.canonicalResolutionStep {
+        case .inspectHLS:
             do {
                 let preflight = try await retryTransport(
                     stage: .preflight
@@ -1401,23 +1810,12 @@ public final class AetherPlaybackSession: ObservableObject {
                         options: self.options
                     )
                 }
-                if allowProvisionalNative,
-                   preflight.result.route == .unsupported,
-                   Self.isInconclusiveHLSPreflight(preflight) {
-                    return provisionalNativeSource()
-                }
                 return .hls(preflight)
             } catch {
-                let failure = failure(stage: .preflight, error: error)
-                if allowProvisionalNative,
-                   failure.kind == .transientTransport
-                        || failure.kind == .inconclusiveEvidence {
-                    return provisionalNativeSource()
-                }
-                throw failure
+                throw failure(stage: .preflight, error: error)
             }
 
-        case .progressive:
+        case .probeProgressive:
             do {
                 let preparedSource = try await retryTransport(
                     stage: .preflight
@@ -1430,14 +1828,10 @@ public final class AetherPlaybackSession: ObservableObject {
                     }.value
                 }
                 let probe = preparedSource.probe
-                let isSeekableVOD =
-                    probe.durationSeconds.isFinite
-                    && probe.durationSeconds > 0
-                    && !probe.isLive
                 let profile = AetherSourceProfile(
                     probe: probe,
                     sourceKind: .progressive,
-                    isSeekableVOD: isSeekableVOD
+                    isSeekableVOD: probe.isFiniteSeekableVOD
                 )
                 let result = PlaybackPreflight.resolve(
                     sourceProfile: profile,
@@ -1447,8 +1841,9 @@ public final class AetherPlaybackSession: ObservableObject {
                 )
                 let retainedPreparedSource:
                     AetherPreparedURLSource?
-                if result.route == .nativeAVPlayer,
-                   result.reason == .nativeHLSFMP4Remux {
+                if result.route == .hybridCarrier
+                    || (result.route == .nativeAVPlayer
+                        && result.reason == .nativeHLSFMP4Remux) {
                     retainedPreparedSource = preparedSource
                 } else {
                     preparedSource.discard()
@@ -1460,17 +1855,8 @@ public final class AetherPlaybackSession: ObservableObject {
                     preparedSource: retainedPreparedSource
                 )
             } catch {
-                let failure = failure(stage: .preflight, error: error)
-                if allowProvisionalNative,
-                   failure.kind == .transientTransport
-                        || failure.kind == .inconclusiveEvidence {
-                    return provisionalNativeSource()
-                }
-                throw failure
+                throw failure(stage: .preflight, error: error)
             }
-
-        case .custom, .unclassifiedURL:
-            throw AetherPlaybackSessionError.invalidFactorySource
         }
     }
 
@@ -1482,6 +1868,7 @@ public final class AetherPlaybackSession: ObservableObject {
         let profile = AetherSourceProfile(
             sourceKind: .unclassifiedURL,
             isSeekableVOD: true,
+            videoStreamPresence: .unknown,
             videoCodec: .unknown,
             sourceContainer: sourceContainer,
             // Ignored by the provisional Native-only contract.
@@ -1497,38 +1884,52 @@ public final class AetherPlaybackSession: ObservableObject {
         )
     }
 
-    private static func isInconclusiveHLSPreflight(
-        _ preflight: AetherHLSPlaybackPreflight
-    ) -> Bool {
-        switch preflight.result.reason {
-        case .unsupportedHLSPreflightMissing,
-             .unsupportedHLSSegmentNotInspected:
-            return true
-        case .unsupportedHLSContentProtection:
-            return preflight.result.hlsPackaging?
-                .contentProtection == .unknown
-        default:
-            return false
-        }
-    }
-
     private func installAndPrepare(
         _ source: AetherResolvedPlaybackSource,
         decoderPreference: HybridVideoDecoderPreference = .automatic
+    ) async throws {
+        let deadline = try operationDeadline(
+            stage: .preparation
+        )
+        let race = AetherPlaybackOperationDeadlineRace<Void>()
+        try await race.run(
+            timeout: deadline.timeout,
+            timeoutFailure: deadline.failure,
+            onAbandon: { [weak self] in
+                self?.teardownActiveRoute()
+            }
+        ) { [self] in
+            try await installAndPrepareWithoutDeadline(
+                source,
+                decoderPreference: decoderPreference
+            )
+        }
+    }
+
+    private func installAndPrepareWithoutDeadline(
+        _ source: AetherResolvedPlaybackSource,
+        decoderPreference: HybridVideoDecoderPreference
     ) async throws {
         guard source.result.route != .unsupported else {
             throw AetherPlaybackSessionError.unsupported(
                 source.result.reason
             )
         }
+        // Retain the positively resolved same-source contract before route
+        // construction so a bounded construction timeout can still rebuild
+        // that exact admitted route without inventing another source.
+        resolvedSource = source
         let transaction = routeTransactions.begin()
         let route = try await makeRouteSession(
             source,
-            decoderPreference: decoderPreference
+            decoderPreference: decoderPreference,
+            transaction: transaction
         )
-        guard routeTransactions.isActive(transaction) else {
+        do {
+            try requireCurrentRouteTransaction(transaction)
+        } catch {
             route.stop()
-            throw CancellationError()
+            throw error
         }
         try install(
             route,
@@ -1536,6 +1937,7 @@ public final class AetherPlaybackSession: ObservableObject {
             transaction: transaction
         )
         try await route.prepare()
+        try requireCurrentRouteTransaction(transaction)
         try commit(
             route,
             source: source,
@@ -1546,7 +1948,8 @@ public final class AetherPlaybackSession: ObservableObject {
 
     private func makeRouteSession(
         _ source: AetherResolvedPlaybackSource,
-        decoderPreference: HybridVideoDecoderPreference = .automatic
+        decoderPreference: HybridVideoDecoderPreference = .automatic,
+        transaction: UInt64
     ) async throws -> AetherActiveRouteSession {
         switch source.result.route {
         case .nativeAVPlayer:
@@ -1559,6 +1962,7 @@ public final class AetherPlaybackSession: ObservableObject {
                         options: options,
                         preflight: preflight
                     )
+                try requireCurrentRouteTransaction(transaction)
             case .progressive(let probe, _, _):
                 binding = .progressive(
                     sourceURL: url,
@@ -1582,54 +1986,74 @@ public final class AetherPlaybackSession: ObservableObject {
                     throw AetherNativePlaybackSessionError
                         .nativeRemuxRequiresPreparedSource
                 }
-                return .native(
-                    try await AetherNativePlaybackSession.makeRemuxed(
+                let session = try await AetherNativePlaybackSession
+                    .makeRemuxed(
                         preparedSource: preparedSource,
                         options: options,
                         preflightResult: source.result,
                         audioAnalysisBinding: binding,
                         avPlayer: avPlayer
                     )
+                return try admitConstructedRoute(
+                    .native(session),
+                    transaction: transaction
                 )
             } else {
-                return .native(
-                    try AetherNativePlaybackSession.make(
+                try requireCurrentRouteTransaction(transaction)
+                let session = try AetherNativePlaybackSession.make(
                         url: url,
                         options: options,
                         preflightResult: source.result,
                         audioAnalysisBinding: binding,
                         avPlayer: avPlayer
                     )
+                return try admitConstructedRoute(
+                    .native(session),
+                    transaction: transaction
                 )
             }
 
         case .hybridCarrier:
             switch source {
             case .hls(let preflight):
-                return .hybrid(
-                    try await AetherHybridPlaybackSession.makeHLSVOD(
+                let session = try await AetherHybridPlaybackSession
+                    .makeHLSVOD(
                         preflight: preflight,
                         avPlayer: avPlayer,
                         decoderPreference: decoderPreference,
                         transportRetryBudget: transportRetryBudget
                     )
+                return try admitConstructedRoute(
+                    .hybrid(session),
+                    transaction: transaction
                 )
-            case .progressive(let probe, let result, _):
+            case .progressive(
+                let probe,
+                let result,
+                let preparedSource
+            ):
+                guard let preparedSource else {
+                    throw AetherPlaybackSessionError.invalidFactorySource
+                }
                 let timeline = try BlackCarrierTimeline.fileVOD(
                     duration: CMTime(
                         seconds: probe.durationSeconds,
                         preferredTimescale: 90_000
                     )
                 )
-                return .hybrid(
-                    try await AetherHybridPlaybackSession.makeSeekableVOD(
+                let session = try await AetherHybridPlaybackSession
+                    .makeSeekableVOD(
                         source: .url(url),
+                        preparedURLSource: preparedSource,
                         options: options,
                         timeline: timeline,
                         preflightResult: result,
                         avPlayer: avPlayer,
                         decoderPreference: decoderPreference
                     )
+                return try admitConstructedRoute(
+                    .hybrid(session),
+                    transaction: transaction
                 )
             case .provisionalNative:
                 throw AetherPlaybackSessionError.invalidFactorySource
@@ -1639,6 +2063,28 @@ public final class AetherPlaybackSession: ObservableObject {
             throw AetherPlaybackSessionError.unsupported(
                 source.result.reason
             )
+        }
+    }
+
+    private func requireCurrentRouteTransaction(
+        _ transaction: UInt64
+    ) throws {
+        try Task.checkCancellation()
+        guard routeTransactions.isActive(transaction) else {
+            throw CancellationError()
+        }
+    }
+
+    private func admitConstructedRoute(
+        _ route: AetherActiveRouteSession,
+        transaction: UInt64
+    ) throws -> AetherActiveRouteSession {
+        do {
+            try requireCurrentRouteTransaction(transaction)
+            return route
+        } catch {
+            route.stop()
+            throw error
         }
     }
 
@@ -1655,6 +2101,7 @@ public final class AetherPlaybackSession: ObservableObject {
         resolvedSource = source
         switch session {
         case .native(let native):
+            restoreRouteNeutralPlayerCapabilities()
             presentationView.install(nil)
             bind(native)
         case .hybrid(let hybrid):
@@ -1711,6 +2158,10 @@ public final class AetherPlaybackSession: ObservableObject {
     private func bind(
         _ session: AetherNativePlaybackSession
     ) {
+        bindVideoOutput(
+            session.$videoOutputSnapshot,
+            initial: session.videoOutputSnapshot
+        )
         session.$state.sink { [weak self, weak session] state in
             guard let self,
                   let session,
@@ -1736,6 +2187,10 @@ public final class AetherPlaybackSession: ObservableObject {
     private func bind(
         _ session: AetherHybridPlaybackSession
     ) {
+        bindVideoOutput(
+            session.$videoOutputSnapshot,
+            initial: session.videoOutputSnapshot
+        )
         session.$state.sink { [weak self, weak session] state in
             guard let self,
                   let session,
@@ -1766,6 +2221,28 @@ public final class AetherPlaybackSession: ObservableObject {
             .store(in: &routeCancellables)
     }
 
+    private func bindVideoOutput(
+        _ publisher: Published<
+            AetherVideoOutputSnapshot
+        >.Publisher,
+        initial: AetherVideoOutputSnapshot
+    ) {
+        let bindingToken = videoOutputReducer.beginBinding(initial)
+        videoOutputSnapshot = videoOutputReducer.snapshot
+        publisher.sink { [weak self] snapshot in
+            guard let self,
+                  let outerSnapshot = self.videoOutputReducer.apply(
+                    snapshot,
+                    bindingToken: bindingToken
+                  ) else { return }
+            self.videoOutputSnapshot = outerSnapshot
+        }.store(in: &routeCancellables)
+    }
+
+    private func invalidateVideoOutputRoute() {
+        videoOutputSnapshot = videoOutputReducer.invalidate()
+    }
+
     private func handleNativeState(
         _ nativeState: AetherNativePlaybackSessionState,
         evidence: AetherNativePlaybackFailureEvidence?
@@ -1782,26 +2259,9 @@ public final class AetherPlaybackSession: ObservableObject {
             guard didCompleteInitialPrepare,
                   !isPreparingOrRecovering,
                   activeSeekOperationSequence == nil else { return }
-            let kind: AetherPlaybackFailureKind =
-                switch evidence?.category {
-                case .transientTransport: .transientTransport
-                case .authentication: .authenticationRejected
-                case .security: .securityBoundary
-                case .decoder: .decoderRuntimeFailure
-                case .malformed: .malformedMedia
-                case .cancelled: .cancelled
-                case .invariant: .invariantViolation
-                case .routeRuntime, nil: .routeRuntimeFailure
-                }
-            scheduleRuntimeRecovery(AetherPlaybackFailure(
-                stage: .playback,
-                kind: kind,
-                domain: evidence?.domain
-                    ?? "AetherNativePlaybackSessionFailure",
-                code: evidence?.code ?? 0,
-                reason: evidence.map {
-                    "native.\($0.caseCode)"
-                } ?? failure.rawValue
+            scheduleRuntimeRecovery(Self.nativeRuntimeFailure(
+                fallback: failure,
+                evidence: evidence
             ))
         case .stopped: break
         }
@@ -1820,6 +2280,8 @@ public final class AetherPlaybackSession: ObservableObject {
             }
         case .seeking:
             if !isPreparingOrRecovering { state = .seeking }
+        case .ended:
+            state = .ended
         case .failed(let error):
             guard didCompleteInitialPrepare,
                   !isPreparingOrRecovering,
@@ -1876,10 +2338,8 @@ public final class AetherPlaybackSession: ObservableObject {
                     duringInitialPrepare: false
                 )
                 if !recovered {
-                    let original = self.recoveryCoordinator
-                        .episodeFirstFailure ?? failure
-                    self.publishTerminal(
-                        original,
+                    _ = self.finishRecoveryAsTerminal(
+                        initialFailure: failure,
                         finalFailure:
                             self.lastRecoveryFailure ?? failure,
                         exhaustionReason:
@@ -1888,17 +2348,27 @@ public final class AetherPlaybackSession: ObservableObject {
                 }
             } catch is CancellationError {
                 if !self.isStopped {
-                    self.publishTerminal(
-                        self.failure(
-                            stage: .playback,
-                            error: CancellationError()
-                        )
+                    let cancelled = self.failure(
+                        stage: .playback,
+                        error: CancellationError()
+                    )
+                    _ = self.finishRecoveryAsTerminal(
+                        initialFailure: failure,
+                        finalFailure: cancelled,
+                        exhaustionReason:
+                            "runtime recovery cancelled"
                     )
                 }
             } catch {
-                self.publishTerminal(
-                    self.recoveryCoordinator.episodeFirstFailure
-                        ?? self.failure(stage: .playback, error: error)
+                let finalFailure = self.failure(
+                    stage: .playback,
+                    error: error
+                )
+                _ = self.finishRecoveryAsTerminal(
+                    initialFailure: failure,
+                    finalFailure: finalFailure,
+                    exhaustionReason:
+                        "runtime recovery operation failed"
                 )
             }
             self.recoveryTask = nil
@@ -1915,10 +2385,22 @@ public final class AetherPlaybackSession: ObservableObject {
         beginRecoveryEpisodeIfNeeded(initialFailure)
         let recoveryDeadline = currentRecoveryDeadline
         try ensureRecoveryDeadline(recoveryDeadline)
-        let failedRoute = activeSession?.route ?? activeRoute
+        let failedRoute = activeSession?.route
+            ?? activeRoute
+            ?? resolvedSource?.result.route
+        let failedSourceResult = resolvedSource?.result
+        let failedProgressiveSourceFacts =
+            resolvedSource?.progressiveSourceFacts
+        let failedHLSResourceIdentity =
+            resolvedSource?.hlsResourceIdentity
         let playbackContext = snapshotPlaybackContext()
         var latestFailure = initialFailure
         var freshSource = resolvedSource
+        let requiresImmediateNativeExit = PlaybackRecoveryDecision
+            .requiresImmediateNativeExit(
+                failure: initialFailure,
+                activeRoute: failedRoute
+            )
 
         switch initialFailure.kind {
         case .unsupportedCapability, .authenticationRejected,
@@ -1955,7 +2437,17 @@ public final class AetherPlaybackSession: ObservableObject {
             return false
         }
 
-        if recoveryCoordinator.sameRouteRebuildCount
+        if requiresImmediateNativeExit {
+            // Positive HEVC disproves the Native implementation. Tear it down
+            // before re-resolution so no same-route rebuild can continue
+            // presenting the violating item. Only a freshly admitted source
+            // for this same canonical request may supply Hybrid.
+            teardownActiveRoute()
+            freshSource = nil
+        }
+
+        if !requiresImmediateNativeExit,
+           recoveryCoordinator.sameRouteRebuildCount
                 < recoveryBudget.maximumSameRouteRebuilds,
            let failedRoute {
             let action = AetherPlaybackRecoveryAction.rebuildSameRoute
@@ -1977,12 +2469,33 @@ public final class AetherPlaybackSession: ObservableObject {
                             initialFailure
                         )
                 )
-                guard let admitted = freshSource?.admitting(
+                guard let freshSource else {
+                    throw AetherPlaybackSessionError.unsupported(
+                        .unsupportedVideoCodec
+                    )
+                }
+                if let sourceDivergence = Self
+                    .freshProgressiveSourceIdentityFailure(
+                        previousFacts:
+                            failedProgressiveSourceFacts,
+                        freshFacts:
+                            freshSource.progressiveSourceFacts
+                    ) {
+                    throw sourceDivergence
+                }
+                guard let admitted = freshSource.admitting(
                     route: failedRoute
                 ) else {
+                    if let reclassified = Self
+                        .freshRouteReclassificationFailure(
+                            previousResult: failedSourceResult,
+                            from: failedRoute,
+                            freshResult: freshSource.result
+                        ) {
+                        throw reclassified
+                    }
                     throw AetherPlaybackSessionError.unsupported(
-                        freshSource?.result.reason
-                            ?? .unsupportedVideoCodec
+                        freshSource.result.reason
                     )
                 }
                 try await installAndPrepare(admitted)
@@ -2021,17 +2534,52 @@ public final class AetherPlaybackSession: ObservableObject {
             do {
                 try ensureRecoveryDeadline(recoveryDeadline)
                 freshSource = try await resolveCanonicalSource(
-                    allowProvisionalNative: true
+                    allowProvisionalNative: false
                 )
             } catch {
                 latestFailure = failure(stage: .preflight, error: error)
             }
         }
+        var softwareRecoverySource: AetherResolvedPlaybackSource?
         if failedRoute == .hybridCarrier,
            initialFailure.kind == .decoderRuntimeFailure,
-           let softwareSource = freshSource?.admitting(
-                route: .hybridCarrier
-           ),
+           !Self.isPermanentFailure(latestFailure.kind) {
+            do {
+                try ensureRecoveryDeadline(recoveryDeadline)
+                let candidate = try await resolveCanonicalSource(
+                    allowProvisionalNative: false
+                )
+                if let sourceDivergence = Self
+                    .freshSoftwareRecoverySourceIdentityFailure(
+                        previousResult: failedSourceResult,
+                        previousProgressiveFacts:
+                            failedProgressiveSourceFacts,
+                        previousHLSResourceIdentity:
+                            failedHLSResourceIdentity,
+                        freshResult: candidate.result,
+                        freshProgressiveFacts:
+                            candidate.progressiveSourceFacts,
+                        freshHLSResourceIdentity:
+                            candidate.hlsResourceIdentity
+                    ) {
+                    throw sourceDivergence
+                }
+                freshSource = candidate
+                softwareRecoverySource = candidate.admitting(
+                    route: .hybridCarrier
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                latestFailure = failure(
+                    stage: .preflight,
+                    error: error
+                )
+            }
+        }
+        if failedRoute == .hybridCarrier,
+           initialFailure.kind == .decoderRuntimeFailure,
+           let softwareSource = softwareRecoverySource,
            isSoftwareHEVCRecoveryEligible(softwareSource) {
             let softwareAction = PlaybackRecoveryDecision.resolve(
                 context: AetherPlaybackRecoveryContext(
@@ -2189,12 +2737,132 @@ public final class AetherPlaybackSession: ObservableObject {
         }
     }
 
+    private func recoverOrTerminate(
+        from initialFailure: AetherPlaybackFailure,
+        duringInitialPrepare: Bool,
+        failureStage: AetherPlaybackRecoveryStage,
+        exhaustionReason: String
+    ) async throws {
+        do {
+            if try await recover(
+                from: initialFailure,
+                duringInitialPrepare: duringInitialPrepare
+            ) {
+                return
+            }
+            let terminal = finishRecoveryAsTerminal(
+                initialFailure: initialFailure,
+                finalFailure: lastRecoveryFailure ?? initialFailure,
+                exhaustionReason: exhaustionReason
+            )
+            throw AetherPlaybackSessionError.terminal(terminal)
+        } catch is CancellationError {
+            let cancelled = failure(
+                stage: failureStage,
+                error: CancellationError()
+            )
+            _ = finishRecoveryAsTerminal(
+                initialFailure: initialFailure,
+                finalFailure: cancelled,
+                exhaustionReason:
+                    "recovery cancelled without successor"
+            )
+            throw CancellationError()
+        } catch let terminal as AetherPlaybackSessionError {
+            if case .terminal = terminal {
+                throw terminal
+            }
+            let finalFailure = failure(
+                stage: failureStage,
+                error: terminal
+            )
+            let original = finishRecoveryAsTerminal(
+                initialFailure: initialFailure,
+                finalFailure: finalFailure,
+                exhaustionReason: exhaustionReason
+            )
+            throw AetherPlaybackSessionError.terminal(original)
+        } catch {
+            let finalFailure = failure(
+                stage: failureStage,
+                error: error
+            )
+            let terminal = finishRecoveryAsTerminal(
+                initialFailure: initialFailure,
+                finalFailure: finalFailure,
+                exhaustionReason: exhaustionReason
+            )
+            throw AetherPlaybackSessionError.terminal(terminal)
+        }
+    }
+
+    @discardableResult
+    private func finishRecoveryAsTerminal(
+        initialFailure: AetherPlaybackFailure,
+        finalFailure: AetherPlaybackFailure,
+        exhaustionReason: String
+    ) -> AetherPlaybackFailure {
+        let original = recoveryCoordinator.episodeFirstFailure
+            ?? initialFailure
+        if recoveryHistory.last?.outcome != .exhausted {
+            publishRecovery(
+                failure: finalFailure,
+                action: .terminate,
+                from: activeSession?.route
+                    ?? activeRoute
+                    ?? resolvedSource?.result.route,
+                to: nil,
+                outcome: .exhausted
+            )
+        }
+        teardownActiveRoute()
+        isPreparingOrRecovering = false
+        publishTerminal(
+            original,
+            finalFailure: finalFailure,
+            exhaustionReason: exhaustionReason
+        )
+        return original
+    }
+
     private func restorePlaybackContext(
+        _ context: AetherPlaybackContextSnapshot,
+        duringInitialPrepare: Bool
+    ) async throws {
+        let stage: AetherPlaybackRecoveryStage =
+            duringInitialPrepare ? .preparation : .playback
+        let deadline = try operationDeadline(stage: stage)
+        let race = AetherPlaybackOperationDeadlineRace<Void>()
+        try await race.run(
+            timeout: deadline.timeout,
+            timeoutFailure: deadline.failure,
+            onAbandon: { [weak self] in
+                self?.teardownActiveRoute()
+            }
+        ) { [self] in
+            try await restorePlaybackContextWithoutDeadline(
+                context,
+                duringInitialPrepare: duringInitialPrepare
+            )
+        }
+    }
+
+    private func restorePlaybackContextWithoutDeadline(
         _ context: AetherPlaybackContextSnapshot,
         duringInitialPrepare: Bool
     ) async throws {
         guard let activeSession else {
             throw AetherPlaybackSessionError.noActiveRoute
+        }
+        guard let routeTransaction = routeTransactions.activeSequence else {
+            throw CancellationError()
+        }
+        func requireCurrentRoute() throws {
+            guard routeTransactions.isActive(routeTransaction),
+                  let current = self.activeSession,
+                  current.isIdentical(to: activeSession) else {
+                throw CancellationError()
+            }
         }
         let resumeTime = desiredSeekTarget ?? context.position
         if !duringInitialPrepare,
@@ -2209,12 +2877,14 @@ public final class AetherPlaybackSession: ObservableObject {
             guard seekResult == .applied else {
                 throw CancellationError()
             }
+            try requireCurrentRoute()
             lastConfirmedMediaTime = resumeTime
             if desiredSeekTarget != nil {
                 lastAppliedSeekOperationSequence =
                     operationCoordinator.latestSeekSequence
             }
         }
+        try requireCurrentRoute()
         // The stable player and session-owned intent remain live while a route
         // is being rebuilt. Apply their latest values instead of replaying an
         // episode-start snapshot over changes made during recovery.
@@ -2234,6 +2904,7 @@ public final class AetherPlaybackSession: ObservableObject {
             try await activeSession.selectAudioTrack(
                 desiredAudioTrackID
             )
+            try requireCurrentRoute()
         }
         if let desiredSubtitleTrackID {
             if activeSession.subtitleTracks.contains(where: {
@@ -2243,7 +2914,12 @@ public final class AetherPlaybackSession: ObservableObject {
                     try await activeSession.selectSubtitleTrack(
                         desiredSubtitleTrackID
                     )
+                    try requireCurrentRoute()
+                } catch is CancellationError {
+                    throw CancellationError()
                 } catch {
+                    try Task.checkCancellation()
+                    try requireCurrentRoute()
                     selectedSubtitleTrackID = nil
                     EngineLog.emit(
                         "[AetherPlaybackSession] optional subtitle unavailable "
@@ -2262,6 +2938,7 @@ public final class AetherPlaybackSession: ObservableObject {
                 )
             }
         }
+        try requireCurrentRoute()
         publishTrackState(from: activeSession)
         publishCapabilities()
         if desiredPlaying {
@@ -2374,9 +3051,9 @@ public final class AetherPlaybackSession: ObservableObject {
         !failure.reason.hasPrefix("hybrid.presentation.mediaDivergence")
     }
 
-    private func retryTransport<T>(
+    private func retryTransport<T: Sendable>(
         stage: AetherPlaybackRecoveryStage,
-        operation: () async throws -> T
+        operation: @escaping @MainActor @Sendable () async throws -> T
     ) async throws -> T {
         var pendingRetry:
             (AetherPlaybackFailure, AetherPlaybackRecoveryAction)?
@@ -2396,7 +3073,13 @@ public final class AetherPlaybackSession: ObservableObject {
                         )
                     }
                 }
-                let value = try await operation()
+                let deadline = try operationDeadline(stage: stage)
+                let value = try await AetherPlaybackOperationDeadlineRace<T>()
+                    .run(
+                        timeout: deadline.timeout,
+                        timeoutFailure: deadline.failure,
+                        operation: operation
+                    )
                 if recoveryCoordinator.episodeFirstFailure != nil {
                     try ensureRecoveryDeadline(currentRecoveryDeadline)
                 }
@@ -2515,6 +3198,59 @@ public final class AetherPlaybackSession: ObservableObject {
         return remaining
     }
 
+    private func operationDeadline(
+        stage: AetherPlaybackRecoveryStage
+    ) throws -> (timeout: TimeInterval, failure: AetherPlaybackFailure) {
+        let perOperationLimit =
+            recoveryBudget.initialPreparationSettleSeconds
+        let totalBudget: TimeInterval
+        let remaining: TimeInterval
+        if recoveryCoordinator.episodeFirstFailure != nil {
+            totalBudget = recoveryBudget.maximumEpisodeDurationSeconds
+            remaining = max(
+                0,
+                currentRecoveryDeadline.remainingSeconds(
+                    now: ProcessInfo.processInfo.systemUptime
+                ) - Self.recoveryTerminalPublicationHeadroomSeconds
+            )
+        } else if let initialPreparationDeadline {
+            totalBudget = recoveryBudget.initialPreparationSettleSeconds
+            remaining = initialPreparationDeadline.remainingSeconds(
+                now: ProcessInfo.processInfo.systemUptime
+            )
+        } else {
+            totalBudget = perOperationLimit
+            remaining = perOperationLimit
+        }
+        let failure = Self.operationDeadlineFailure(
+            stage: stage,
+            seconds: totalBudget
+        )
+        guard remaining > 0 else { throw failure }
+        return (min(perOperationLimit, remaining), failure)
+    }
+
+    nonisolated static func operationDeadlineFailure(
+        stage: AetherPlaybackRecoveryStage,
+        seconds: TimeInterval
+    ) -> AetherPlaybackFailure {
+        let kind: AetherPlaybackFailureKind = switch stage {
+        case .classification, .preflight, .origin:
+            .transientTransport
+        case .routeCreation, .preparation, .playback,
+             .decoder, .presentation:
+            .routeRuntimeFailure
+        }
+        return AetherPlaybackFailure(
+            stage: stage,
+            kind: kind,
+            domain: "AetherPlaybackOperationDeadline",
+            code: Int(seconds.rounded(.up)),
+            caseCode: "operation.deadlineExceeded",
+            reason: "aether.operation.deadlineExceeded"
+        )
+    }
+
     private func failure(
         stage: AetherPlaybackRecoveryStage,
         error: Error
@@ -2529,6 +3265,13 @@ public final class AetherPlaybackSession: ObservableObject {
                 domain: "CancellationError",
                 code: 0,
                 reason: "Playback operation was cancelled"
+            )
+        }
+        if error is AetherNativePlaybackSessionError,
+           let evidence = activeSession?.nativeFailureEvidence {
+            return Self.nativeFailure(
+                stage: stage,
+                evidence: evidence
             )
         }
         if let hybrid = error as? HybridPlaybackSessionError,
@@ -2568,19 +3311,7 @@ public final class AetherPlaybackSession: ObservableObject {
                 evidence = nil
             }
             if let evidence {
-                let evidenceStage:
-                    AetherPlaybackRecoveryStage = switch evidence.stage {
-                case .routeCreation: .routeCreation
-                case .preparation: .preparation
-                case .seek, .runtime, .provider, .carrier: .playback
-                }
-                return AetherPlaybackFailure(
-                    stage: evidenceStage,
-                    kind: .routeRuntimeFailure,
-                    domain: evidence.underlyingDomain,
-                    code: evidence.underlyingCode,
-                    reason: "hybrid.\(evidence.stage.rawValue).\(evidence.caseCode)"
-                )
+                return Self.hybridFailure(evidence: evidence)
             }
         }
 
@@ -2591,6 +3322,8 @@ public final class AetherPlaybackSession: ObservableObject {
         case let error as HLSPreflightError:
             kind = Self.classify(error)
         case let error as HybridPlaybackSessionError:
+            kind = Self.classify(error)
+        case let error as DemuxerError:
             kind = Self.classify(error)
         case is AetherNativePlaybackSessionError:
             kind = .routeRuntimeFailure
@@ -2610,11 +3343,23 @@ public final class AetherPlaybackSession: ObservableObject {
                 : .transientTransport
         }
         let nsError = error as NSError
+        let code = (error as? DemuxerError)
+            .map { Int($0.ffmpegCode) }
+            ?? nsError.code
+        let caseCode: String? = switch error {
+        case let error as AetherURLPlaybackSourceClassificationError:
+            Self.failureCaseCode(error)
+        case let error as DemuxerError:
+            Self.failureCaseCode(error)
+        default:
+            nil
+        }
         return AetherPlaybackFailure(
             stage: stage,
             kind: kind,
             domain: String(reflecting: type(of: error)),
-            code: nsError.code,
+            code: code,
+            caseCode: caseCode,
             reason: Self.redactedReason(
                 kind: kind,
                 stage: stage,
@@ -2623,7 +3368,88 @@ public final class AetherPlaybackSession: ObservableObject {
         )
     }
 
-    private static func classify(
+    nonisolated static func initialPreparationFailureStage(
+        hasInstalledRoute: Bool
+    ) -> AetherPlaybackRecoveryStage {
+        hasInstalledRoute ? .preparation : .preflight
+    }
+
+    nonisolated static func nativeFailure(
+        stage: AetherPlaybackRecoveryStage,
+        evidence: AetherNativePlaybackFailureEvidence
+    ) -> AetherPlaybackFailure {
+        let kind: AetherPlaybackFailureKind = switch evidence.category {
+        case .transientTransport: .transientTransport
+        case .authentication: .authenticationRejected
+        case .security: .securityBoundary
+        case .decoder: .decoderRuntimeFailure
+        case .malformed: .malformedMedia
+        case .routeRuntime: .routeRuntimeFailure
+        case .cancelled: .cancelled
+        case .invariant: .invariantViolation
+        }
+        let caseCode = "native.\(evidence.caseCode)"
+        return AetherPlaybackFailure(
+            stage: stage,
+            kind: kind,
+            domain: evidence.domain,
+            code: evidence.code,
+            caseCode: caseCode,
+            reason: caseCode
+        )
+    }
+
+    /// Converts the actual Native state callback into recovery evidence. Keep
+    /// this path closed over the same machine code used by preparation so a
+    /// positively observed HEVC item cannot fall through to a Native rebuild.
+    nonisolated static func nativeRuntimeFailure(
+        fallback: AetherNativePlaybackSessionFailure,
+        evidence: AetherNativePlaybackFailureEvidence?
+    ) -> AetherPlaybackFailure {
+        guard let evidence else {
+            return AetherPlaybackFailure(
+                stage: .playback,
+                kind: .routeRuntimeFailure,
+                domain: "AetherNativePlaybackSessionFailure",
+                code: 0,
+                reason: fallback.rawValue
+            )
+        }
+        return nativeFailure(stage: .playback, evidence: evidence)
+    }
+
+    /// Preserves provider/carrier closed case codes through the unified
+    /// Aether terminal and recovery history boundary.
+    nonisolated static func hybridFailure(
+        evidence: HybridPlaybackFailureEvidence
+    ) -> AetherPlaybackFailure {
+        let stage: AetherPlaybackRecoveryStage = switch evidence.stage {
+        case .routeCreation: .routeCreation
+        case .preparation: .preparation
+        case .seek, .runtime, .provider, .carrier: .playback
+        }
+        return AetherPlaybackFailure(
+            stage: stage,
+            kind: .routeRuntimeFailure,
+            domain: evidence.underlyingDomain,
+            code: evidence.underlyingCode,
+            caseCode: publicHybridCaseCode(evidence.caseCode),
+            reason: "hybrid.\(evidence.stage.rawValue).\(evidence.caseCode)"
+        )
+    }
+
+    /// Only closed, documented Hybrid cases cross the public Aether/host
+    /// boundary. Internal provider labels remain redacted diagnostics.
+    nonisolated static func publicHybridCaseCode(
+        _ caseCode: String
+    ) -> String? {
+        switch caseCode {
+        case "progressive.audioMuxer.emptySegment": caseCode
+        default: nil
+        }
+    }
+
+    nonisolated static func classify(
         _ error: AetherURLPlaybackSourceClassificationError
     ) -> AetherPlaybackFailureKind {
         switch error {
@@ -2640,9 +3466,59 @@ public final class AetherPlaybackSession: ObservableObject {
             }
         case .redirectCredentialScopeViolation:
             .securityBoundary
+        case .dependencyCapabilityUnavailable:
+            .unsupportedCapability
+        case .nonMediaPayload:
+            .malformedMedia
         case .unsupportedURLScheme, .unreadableFile,
              .nonHTTPResponse, .unsupportedContentEncoding:
             .invariantViolation
+        }
+    }
+
+    nonisolated static func classify(
+        _ error: DemuxerError
+    ) -> AetherPlaybackFailureKind {
+        switch error.ffmpegCode {
+        case FFmpegErr.invalidData, FFmpegErr.eof:
+            .malformedMedia
+        case -5, FFmpegErr.eagain:
+            // Aether's AVIO boundary reports exhausted I/O as EIO. EAGAIN is
+            // likewise transport availability, not evidence that the media
+            // bytes themselves are malformed.
+            .transientTransport
+        default:
+            // Preserve ambiguous FFmpeg failures as Aether-owned runtime
+            // evidence instead of guessing that the upstream bytes are bad.
+            .routeRuntimeFailure
+        }
+    }
+
+    nonisolated static func failureCaseCode(
+        _ error: AetherURLPlaybackSourceClassificationError
+    ) -> String? {
+        switch error {
+        case .nonMediaPayload(let family):
+            "classification.nonMediaPayload.\(family.rawValue)"
+        case .dependencyCapabilityUnavailable(
+            .libavformatASFDemuxer
+        ):
+            "dependency.libavformat.asfDemuxerUnavailable"
+        default:
+            nil
+        }
+    }
+
+    nonisolated static func failureCaseCode(
+        _ error: DemuxerError
+    ) -> String {
+        switch error {
+        case .openFailed:
+            "demux.openFailed"
+        case .streamInfoFailed:
+            "demux.streamInfoFailed"
+        case .readFailed:
+            "demux.readFailed"
         }
     }
 
@@ -2719,7 +3595,7 @@ public final class AetherPlaybackSession: ObservableObject {
             .hostContractViolation
         case .cancelled:
             .cancelled
-        case .videoPipelineMissing:
+        case .videoPipelineMissing, .audioPipelineMissing:
             .unsupportedCapability
         case .carrierItemMissing, .carrierClockUnavailable,
              .resumeIntentMissing, .generationDiverged,
@@ -2729,6 +3605,7 @@ public final class AetherPlaybackSession: ObservableObject {
         case .renderSurfaceMissing,
              .invalidSeekableVODOptions,
              .sourceIndependentReaderUnavailable,
+             .progressiveSourceFactsDiverged,
              .hlsPreflightRequired,
              .hlsPreflightResourceGraphMissing,
              .sourceKindMismatch, .timelineSourceMismatch,
@@ -2757,6 +3634,8 @@ public final class AetherPlaybackSession: ObservableObject {
             return "HLS preflight failed (\(kind.rawValue))"
         case let error as AetherURLPlaybackSourceClassificationError:
             return error.localizedDescription
+        case is DemuxerError:
+            return "Media demux \(stage.rawValue) failed (\(kind.rawValue))"
         default:
             return "Playback \(stage.rawValue) failed (\(kind.rawValue))"
         }
@@ -2782,6 +3661,8 @@ public final class AetherPlaybackSession: ObservableObject {
             return "hybrid.carrier.seekDidNotLand"
         case .generationDiverged:
             return "hybrid.operation.generationDiverged"
+        case .progressiveSourceFactsDiverged:
+            return "hybrid.source.factsDiverged"
         case .cancelled:
             return "hybrid.operation.cancelled"
         case .hlsPreflightGenerationInvalidated(let reason):
@@ -2889,7 +3770,14 @@ public final class AetherPlaybackSession: ObservableObject {
         let capabilityDelta:
             AetherPlaybackCapabilityDelta?
         if outcome == .scheduled {
-            capabilitiesBeforeRecoveryAttempt = capabilities
+            capabilitiesBeforeRecoveryAttempt = Self
+                .committedRecoveryCapabilityBaseline(
+                    didCompleteInitialPrepare:
+                        didCompleteInitialPrepare,
+                    activeRoute: activeRoute,
+                    fromRoute: from,
+                    capabilities: capabilities
+                )
             capabilityDelta = nil
         } else if outcome != .merged,
                   let before = capabilitiesBeforeRecoveryAttempt {
@@ -2959,6 +3847,7 @@ public final class AetherPlaybackSession: ObservableObject {
             finalFailure: finalFailure,
             exhaustionReason: exhaustionReason
         )
+        teardownActiveRoute()
         EngineLog.emit(
             "[AetherPlaybackSession] terminal "
                 + "session=\(sessionID.uuidString.prefix(8)) "
@@ -3002,7 +3891,18 @@ public final class AetherPlaybackSession: ObservableObject {
         activeSession?.cancelAudioAnalysisStreams()
         activeSession?.stop()
         activeSession = nil
+        restoreRouteNeutralPlayerCapabilities()
+        invalidateVideoOutputRoute()
         presentationView.install(nil)
+    }
+
+    private func restoreRouteNeutralPlayerCapabilities() {
+        avPlayer.allowsExternalPlayback =
+            routeNeutralAllowsExternalPlayback
+        #if os(iOS) || os(tvOS)
+        avPlayer.usesExternalPlaybackWhileExternalScreenIsActive =
+            routeNeutralUsesExternalPlaybackWhileExternalScreenIsActive
+        #endif
     }
 
     private func publishCurrentItem(
@@ -3128,14 +4028,12 @@ public final class AetherPlaybackSession: ObservableObject {
         case .native(let native):
             try native.configurePlayerViewController(controller)
             controller.allowsPictureInPicturePlayback = true
-            avPlayer.allowsExternalPlayback = true
         case .hybrid(let hybrid):
             try hybrid.configureCarrierPlayerViewController(
                 controller,
                 realVideoGravity: realVideoGravity
             )
             controller.allowsPictureInPicturePlayback = false
-            avPlayer.allowsExternalPlayback = false
         }
     }
     #endif

@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import Testing
 @testable import AetherEngine
@@ -108,6 +109,433 @@ struct AetherPlaybackRecoveryTests {
         #expect(rebuild == .rebuildSameRoute)
         #expect(transition == .transition(to: .hybridCarrier))
         #expect(exhausted == .terminate)
+    }
+
+    @Test("Positive runtime HEVC never rebuilds Native")
+    func runtimeHEVCExitsNativeImmediately() {
+        let observedHEVC = AetherPlaybackFailure(
+            stage: .playback,
+            kind: .routeRuntimeFailure,
+            domain: "AetherPlaybackRoutePolicy",
+            code: 0,
+            caseCode: "native.observedHEVCRequiresHybrid",
+            reason: "native.observedHEVCRequiresHybrid"
+        )
+
+        let transition = PlaybackRecoveryDecision.resolve(
+            context: context(
+                failure: observedHEVC,
+                activeRoute: .nativeAVPlayer,
+                alternate: .hybridCarrier,
+                sameRouteRebuildCount: 0
+            )
+        )
+        let noAdmittedHybrid = PlaybackRecoveryDecision.resolve(
+            context: context(
+                failure: observedHEVC,
+                activeRoute: .nativeAVPlayer,
+                alternate: nil,
+                sameRouteRebuildCount: 0
+            )
+        )
+
+        #expect(
+            PlaybackRecoveryDecision.requiresImmediateNativeExit(
+                failure: observedHEVC,
+                activeRoute: .nativeAVPlayer
+            )
+        )
+        #expect(transition == .transition(to: .hybridCarrier))
+        #expect(noAdmittedHybrid == .terminate)
+    }
+
+    @Test("Fresh HEVC facts reclassify provisional Native into an admitted Hybrid transition")
+    func provisionalNativeReclassificationTransition() throws {
+        let provisional = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .unclassifiedURL,
+                isSeekableVOD: true,
+                videoStreamPresence: .unknown,
+                videoCodec: .unknown,
+                videoFormat: .sdr
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+        let verifiedHEVC = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .progressive,
+                isSeekableVOD: true,
+                videoCodec: .hevc,
+                sourceContainer: .isoBaseMedia,
+                videoFormat: .sdr
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+        let candidate = AetherPlaybackSession
+            .freshRouteReclassificationFailure(
+                previousResult: provisional,
+                from: .nativeAVPlayer,
+                freshResult: verifiedHEVC
+            )
+        let reclassified = try #require(candidate)
+        #expect(reclassified.kind == .routeRuntimeFailure)
+        #expect(reclassified.stage == .preflight)
+        #expect(
+            PlaybackRecoveryDecision.resolve(
+                context: context(
+                    failure: reclassified,
+                    activeRoute: .nativeAVPlayer,
+                    alternate: .hybridCarrier,
+                    sameRouteRebuildCount: 1
+                )
+            ) == .transition(to: .hybridCarrier)
+        )
+        #expect(
+            AetherPlaybackSession
+                .freshRouteReclassificationFailure(
+                    previousResult: verifiedHEVC,
+                    from: .hybridCarrier,
+                    freshResult: verifiedHEVC
+                ) == nil
+        )
+    }
+
+    @Test("Fresh interlaced H264 facts reclassify provisional Native into Hybrid")
+    func provisionalNativeInterlacedH264Transition() throws {
+        let provisional = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .unclassifiedURL,
+                isSeekableVOD: true,
+                videoStreamPresence: .unknown,
+                videoCodec: .unknown,
+                videoFormat: .sdr
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+        let verifiedInterlacedH264 = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .progressive,
+                isSeekableVOD: true,
+                videoCodec: .h264,
+                sourceContainer: .matroska,
+                videoScanType: .interlaced,
+                videoFormat: .sdr
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+        let candidate = AetherPlaybackSession
+            .freshRouteReclassificationFailure(
+                previousResult: provisional,
+                from: .nativeAVPlayer,
+                freshResult: verifiedInterlacedH264
+            )
+        let reclassified = try #require(candidate)
+        #expect(reclassified.kind == .routeRuntimeFailure)
+        #expect(
+            PlaybackRecoveryDecision.resolve(
+                context: context(
+                    failure: reclassified,
+                    activeRoute: .nativeAVPlayer,
+                    alternate: .hybridCarrier,
+                    sameRouteRebuildCount: 1
+                )
+            ) == .transition(to: .hybridCarrier)
+        )
+    }
+
+    @Test("Committed HEVC Hybrid never reclassifies to Native after fresh codec drift")
+    func committedHEVCNeverReturnsToNative() throws {
+        let committedHEVC = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .progressive,
+                isSeekableVOD: true,
+                videoCodec: .hevc,
+                sourceContainer: .isoBaseMedia,
+                videoFormat: .sdr
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+        let driftedH264 = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .progressive,
+                isSeekableVOD: true,
+                videoCodec: .h264,
+                sourceContainer: .isoBaseMedia,
+                videoFormat: .sdr
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+        let candidate = AetherPlaybackSession
+            .freshRouteReclassificationFailure(
+                previousResult: committedHEVC,
+                from: .hybridCarrier,
+                freshResult: driftedH264
+            )
+        let divergence = try #require(candidate)
+        #expect(divergence.kind == .invariantViolation)
+        #expect(divergence.stage == .preflight)
+        #expect(
+            PlaybackRecoveryDecision.resolve(
+                context: context(
+                    failure: divergence,
+                    activeRoute: .hybridCarrier,
+                    alternate: .nativeAVPlayer,
+                    sameRouteRebuildCount: 1
+                )
+            ) == .terminate
+        )
+    }
+
+    @Test("Session recovery pins progressive facts before same-route rebuild")
+    func progressiveRecoveryPinsSourceIdentity() throws {
+        func facts(codec: String) -> AetherProgressiveSourceFacts {
+            AetherProgressiveSourceFacts(
+                probe: SourceProbe(
+                    url: URL(
+                        string: "https://example.com/video.mp4"
+                    )!,
+                    durationSeconds: 1_800,
+                    videoFormat: .sdr,
+                    videoCodecID: 0,
+                    videoCodecName: codec,
+                    sourceContainer: .isoBaseMedia,
+                    videoWidth: 1_920,
+                    videoHeight: 1_080,
+                    videoFrameRate: 24,
+                    isDolbyVision: false,
+                    audioTracks: [],
+                    subtitleTracks: [],
+                    isSourceSeekable: true,
+                    isLive: false
+                )
+            )
+        }
+        let committed = facts(codec: "hevc")
+        func result(codec: AetherVideoCodec) -> PlaybackPreflightResult {
+            PlaybackPreflight.resolve(
+                sourceProfile: AetherSourceProfile(
+                    sourceKind: .progressive,
+                    isSeekableVOD: true,
+                    videoCodec: codec,
+                    sourceContainer: .isoBaseMedia,
+                    videoFormat: .sdr
+                ),
+                hlsPackaging: nil,
+                hybridCapabilities:
+                    AetherHybridPlaybackSession.capabilities
+            )
+        }
+        let committedResult = result(codec: .hevc)
+        #expect(
+            AetherPlaybackSession
+                .freshProgressiveSourceIdentityFailure(
+                    previousFacts: committed,
+                    freshFacts: committed
+                ) == nil
+        )
+        let candidate = AetherPlaybackSession
+            .freshProgressiveSourceIdentityFailure(
+                previousFacts: committed,
+                freshFacts: facts(codec: "h264")
+            )
+        let divergence = try #require(candidate)
+        #expect(divergence.kind == .invariantViolation)
+        #expect(
+            PlaybackRecoveryDecision.resolve(
+                context: context(
+                    failure: divergence,
+                    activeRoute: .hybridCarrier,
+                    alternate: .hybridCarrier,
+                    sameRouteRebuildCount: 0
+                )
+            ) == .terminate
+        )
+        #expect(
+            AetherPlaybackSession
+                .freshSoftwareRecoverySourceIdentityFailure(
+                    previousResult: committedResult,
+                    previousProgressiveFacts: committed,
+                    previousHLSResourceIdentity: nil,
+                    freshResult: committedResult,
+                    freshProgressiveFacts: committed,
+                    freshHLSResourceIdentity: nil
+                ) == nil
+        )
+        let softwareDrift = AetherPlaybackSession
+            .freshSoftwareRecoverySourceIdentityFailure(
+                previousResult: committedResult,
+                previousProgressiveFacts: committed,
+                previousHLSResourceIdentity: nil,
+                freshResult: result(codec: .h264),
+                freshProgressiveFacts: facts(codec: "h264"),
+                freshHLSResourceIdentity: nil
+            )
+        #expect(try #require(softwareDrift).kind == .invariantViolation)
+    }
+
+    @Test("Software HEVC recovery pins the HLS resource graph identity")
+    func softwareRecoveryPinsHLSGraph() throws {
+        let profile = AetherSourceProfile(
+            sourceKind: .hls,
+            isSeekableVOD: true,
+            videoCodec: .hevc,
+            videoFormat: .sdr
+        )
+        let packaging = HLSVideoPackaging(
+            container: .fragmentedMP4,
+            sampleEntry: .hvc1,
+            manifestCodecs: ["hvc1.1.6.L93.B0"],
+            actualVideoCodec: .hevc,
+            codecVerification: .verified,
+            contentProtection: .none
+        )
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: profile,
+            hlsPackaging: packaging,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+        #expect(
+            AetherPlaybackSession
+                .freshSoftwareRecoverySourceIdentityFailure(
+                    previousResult: result,
+                    previousProgressiveFacts: nil,
+                    previousHLSResourceIdentity: "graph-a",
+                    freshResult: result,
+                    freshProgressiveFacts: nil,
+                    freshHLSResourceIdentity: "graph-a"
+                ) == nil
+        )
+        let drift = AetherPlaybackSession
+            .freshSoftwareRecoverySourceIdentityFailure(
+                previousResult: result,
+                previousProgressiveFacts: nil,
+                previousHLSResourceIdentity: "graph-a",
+                freshResult: result,
+                freshProgressiveFacts: nil,
+                freshHLSResourceIdentity: "graph-b"
+            )
+        #expect(try #require(drift).kind == .invariantViolation)
+    }
+
+    @Test("Provisional Native only admits verified HEVC, not another Hybrid codec")
+    func provisionalNativeRejectsGenericCodecDrift() throws {
+        let provisional = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .unclassifiedURL,
+                isSeekableVOD: true,
+                videoStreamPresence: .unknown,
+                videoCodec: .unknown,
+                videoFormat: .sdr
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+        let driftedAV1 = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .progressive,
+                isSeekableVOD: true,
+                videoCodec: .av1,
+                sourceContainer: .matroska,
+                videoFormat: .sdr
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+        let candidate = AetherPlaybackSession
+            .freshRouteReclassificationFailure(
+                previousResult: provisional,
+                from: .nativeAVPlayer,
+                freshResult: driftedAV1
+            )
+        #expect(try #require(candidate).kind == .invariantViolation)
+    }
+
+    @Test("Provisional Native admits positively verified audio-only Vorbis Hybrid")
+    func provisionalNativeAdmitsVorbisHybrid() throws {
+        let provisional = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .unclassifiedURL,
+                isSeekableVOD: true,
+                videoStreamPresence: .unknown,
+                videoCodec: .unknown,
+                videoFormat: .sdr
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+        let verifiedVorbis = PlaybackPreflight.resolve(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .progressive,
+                isSeekableVOD: true,
+                videoStreamPresence: .provenAbsent,
+                videoCodec: .unknown,
+                audioCodecs: [.vorbis],
+                sourceContainer: .other,
+                videoFormat: .sdr
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities:
+                AetherHybridPlaybackSession.capabilities
+        )
+        let candidate = AetherPlaybackSession
+            .freshRouteReclassificationFailure(
+                previousResult: provisional,
+                from: .nativeAVPlayer,
+                freshResult: verifiedVorbis
+            )
+
+        #expect(verifiedVorbis.route == .hybridCarrier)
+        #expect(verifiedVorbis.reason == .hybridAudioBridge)
+        #expect(try #require(candidate).kind == .routeRuntimeFailure)
+    }
+
+    @Test("Initial recovery has no capability baseline; committed runtime recovery does")
+    func committedCapabilityBaseline() {
+        let native = playbackCapabilities(route: .nativeAVPlayer)
+
+        #expect(
+            AetherPlaybackSession
+                .committedRecoveryCapabilityBaseline(
+                    didCompleteInitialPrepare: false,
+                    activeRoute: nil,
+                    fromRoute: .nativeAVPlayer,
+                    capabilities: playbackCapabilities(route: nil)
+                ) == nil
+        )
+        #expect(
+            AetherPlaybackSession
+                .committedRecoveryCapabilityBaseline(
+                    didCompleteInitialPrepare: false,
+                    activeRoute: .nativeAVPlayer,
+                    fromRoute: .nativeAVPlayer,
+                    capabilities: native
+                ) == nil
+        )
+        #expect(
+            AetherPlaybackSession
+                .committedRecoveryCapabilityBaseline(
+                    didCompleteInitialPrepare: true,
+                    activeRoute: .nativeAVPlayer,
+                    fromRoute: .nativeAVPlayer,
+                    capabilities: native
+                ) == native
+        )
     }
 
     @Test("Active system presentation prevents a Hybrid transition")
@@ -368,6 +796,42 @@ struct AetherPlaybackRecoveryTests {
         #expect(recoveredMonotonicProgress)
     }
 
+    @Test("Outer post-seek state requires real carrier intent and honors rate")
+    func outerPostSeekStateUsesRealTransport() {
+        #expect(
+            AetherPlaybackSession.stateAfterAppliedSeek(
+                desiredPlaying: true,
+                desiredRate: 1.75,
+                carrierRate: 0,
+                carrierTimeControlStatus: .paused
+            ) == .paused
+        )
+        #expect(
+            AetherPlaybackSession.stateAfterAppliedSeek(
+                desiredPlaying: true,
+                desiredRate: 1.75,
+                carrierRate: 1.75,
+                carrierTimeControlStatus: .waitingToPlayAtSpecifiedRate
+            ) == .playing
+        )
+        #expect(
+            AetherPlaybackSession.stateAfterAppliedSeek(
+                desiredPlaying: true,
+                desiredRate: 1.75,
+                carrierRate: 0,
+                carrierTimeControlStatus: .playing
+            ) == .playing
+        )
+        #expect(
+            AetherPlaybackSession.stateAfterAppliedSeek(
+                desiredPlaying: false,
+                desiredRate: 1.75,
+                carrierRate: 1.75,
+                carrierTimeControlStatus: .playing
+            ) == .paused
+        )
+    }
+
     @Test("Terminal report preserves distinct first and final evidence")
     func terminalFailureEvidence() {
         let terminal = AetherPlaybackTerminalFailure(
@@ -410,6 +874,79 @@ struct AetherPlaybackRecoveryTests {
         #expect(deadline.remainingSeconds(now: 129.9) > 0)
         #expect(deadline.isExpired(now: 130.1))
         #expect(deadline.remainingSeconds(now: 130.1) == 0)
+    }
+
+    @MainActor
+    @Test("Operation deadline returns without awaiting a cancellation-resistant loser")
+    func operationDeadlineDoesNotAwaitLoser() async {
+        var transactions = PlaybackRouteTransactionCoordinator()
+        let transaction = transactions.begin()
+        var deadlineCallbackCount = 0
+        let failure = AetherPlaybackSession.operationDeadlineFailure(
+            stage: .preparation,
+            seconds: 0.02
+        )
+        let race = AetherPlaybackOperationDeadlineRace<Int>()
+        let operationGate = CancellationResistantTestGate()
+        let lateReturnGate = CancellationResistantTestGate()
+        var lateOperationDidReturn = false
+
+        do {
+            _ = try await race.run(
+                timeout: 0.02,
+                timeoutFailure: failure,
+                onAbandon: {
+                    deadlineCallbackCount += 1
+                    transactions.invalidate()
+                }
+            ) {
+                await operationGate.wait()
+                lateOperationDidReturn = true
+                await lateReturnGate.open()
+                return 42
+            }
+            Issue.record("Deadline race unexpectedly returned the late value")
+        } catch let typed as AetherPlaybackFailure {
+            #expect(typed == failure)
+        } catch {
+            Issue.record("Unexpected deadline error: \(error)")
+        }
+
+        #expect(!lateOperationDidReturn)
+        #expect(deadlineCallbackCount == 1)
+        #expect(!transactions.isActive(transaction))
+
+        await operationGate.open()
+        await lateReturnGate.wait()
+        #expect(lateOperationDidReturn)
+        #expect(deadlineCallbackCount == 1)
+        #expect(!transactions.isActive(transaction))
+    }
+
+    @Test("Preparation settle and operation timeout preserve typed ownership")
+    func operationDeadlineContract() {
+        let budget = AetherPlaybackRecoveryBudget.production
+        #expect(budget.initialPreparationSettleSeconds == 15)
+        #expect(budget.maximumEpisodeDurationSeconds == 30)
+        #expect(
+            AetherPlaybackSession
+                .recoveryTerminalPublicationHeadroomSeconds == 0.25
+        )
+
+        let preflight = AetherPlaybackSession.operationDeadlineFailure(
+            stage: .preflight,
+            seconds: budget.initialPreparationSettleSeconds
+        )
+        #expect(preflight.kind == .transientTransport)
+        #expect(preflight.domain == "AetherPlaybackOperationDeadline")
+        #expect(preflight.caseCode == "operation.deadlineExceeded")
+
+        let preparation = AetherPlaybackSession.operationDeadlineFailure(
+            stage: .preparation,
+            seconds: budget.maximumEpisodeDurationSeconds
+        )
+        #expect(preparation.kind == .routeRuntimeFailure)
+        #expect(preparation.code == 30)
     }
 
     @Test("Security and authentication failures are always terminal")
@@ -494,6 +1031,7 @@ struct AetherPlaybackRecoveryTests {
         let unknown = AetherSourceProfile(
             sourceKind: .unclassifiedURL,
             isSeekableVOD: true,
+            videoStreamPresence: .unknown,
             videoCodec: .unknown,
             videoFormat: .sdr
         )
@@ -552,5 +1090,43 @@ struct AetherPlaybackRecoveryTests {
             elapsedSeconds: 0,
             systemActivity: activity
         )
+    }
+
+    private func playbackCapabilities(
+        route: PlaybackRenderRoute?
+    ) -> AetherPlaybackCapabilities {
+        AetherPlaybackCapabilities(
+            route: route,
+            systemFeaturePolicy: .firstRelease,
+            audioAnalysisTrackIDs: [],
+            selectedAudioAnalysisTrackID: nil,
+            videoFormat: route == nil ? nil : .sdr,
+            dolbyVisionProfile: nil,
+            variantBitrate: nil,
+            audioTracks: [],
+            subtitleTracks: [],
+            selectedAudioTrackID: nil,
+            selectedSubtitleTrackID: nil
+        )
+    }
+}
+
+private actor CancellationResistantTestGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        guard !isOpen else { return }
+        isOpen = true
+        let pendingWaiters = waiters
+        waiters.removeAll()
+        pendingWaiters.forEach { $0.resume() }
     }
 }

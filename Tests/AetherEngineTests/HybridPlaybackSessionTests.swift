@@ -158,7 +158,7 @@ struct HybridPlaybackSessionTests {
         }
     }
 
-    private final class Provider:
+    private class Provider:
         HybridCarrierTransportProvider,
         HybridAudioAnalysisSource,
         HybridAudioAnalysisPlaybackPressureSink,
@@ -169,7 +169,7 @@ struct HybridPlaybackSessionTests {
         private let timeline: BlackCarrierTimeline
         private let analysisData: Data?
         private let analysisTrackIDs: [Int]
-        private let videoFormat: VideoFormat
+        private let videoFormat: VideoFormat?
         private let lock = NSLock()
 
         private(set) var didPrepareInitial = false
@@ -187,6 +187,8 @@ struct HybridPlaybackSessionTests {
             HybridPlaybackSessionError?
         private var preparedGenerationFrameTimes: [Double]?
         private var restartGate: RestartGate?
+        private var decodeDemandGate: RestartGate?
+        private var terminalDecodeDemandFrameTime: Double?
         private var terminalErrorHandler:
             (@Sendable (
                 HybridPlaybackSessionError
@@ -197,7 +199,7 @@ struct HybridPlaybackSessionTests {
             timeline: BlackCarrierTimeline,
             analysisData: Data? = nil,
             analysisTrackIDs: [Int]? = nil,
-            videoFormat: VideoFormat = .sdr
+            videoFormat: VideoFormat? = .sdr
         ) {
             self.relay = relay
             self.timeline = timeline
@@ -293,6 +295,7 @@ struct HybridPlaybackSessionTests {
             didPrepareInitial = true
             prepareMainThreadSamples.append(Thread.isMainThread)
             lock.unlock()
+            guard let videoFormat else { return }
             relay.emit(try makeHybridPlaybackSessionFrame(
                 time: 0,
                 generation: 0,
@@ -335,6 +338,7 @@ struct HybridPlaybackSessionTests {
             let generation = currentGeneration
             let configuredFrameTimes = preparedGenerationFrameTimes
             lock.unlock()
+            guard let videoFormat else { return }
             if let configuredFrameTimes {
                 for time in configuredFrameTimes {
                     relay.emit(try makeHybridPlaybackSessionFrame(
@@ -358,7 +362,25 @@ struct HybridPlaybackSessionTests {
         func advanceVideoDecodeDemand(to time: CMTime) throws {
             lock.lock()
             decodeDemands.append(time)
+            let gate = decodeDemandGate
+            decodeDemandGate = nil
+            let terminalFrameTime =
+                CMTimeCompare(time, timeline.duration) >= 0
+                    ? terminalDecodeDemandFrameTime
+                    : nil
+            let generation = currentGeneration
             lock.unlock()
+            gate?.wait()
+            if let terminalFrameTime, let videoFormat {
+                relay.emit(
+                    try makeHybridPlaybackSessionFrame(
+                        time: terminalFrameTime,
+                        duration: 0.25,
+                        generation: generation,
+                        videoFormat: videoFormat
+                    )
+                )
+            }
         }
 
         func close() {
@@ -386,6 +408,20 @@ struct HybridPlaybackSessionTests {
         func configureRestartGate(_ gate: RestartGate) {
             lock.lock()
             restartGate = gate
+            lock.unlock()
+        }
+
+        func configureDecodeDemandGate(_ gate: RestartGate) {
+            lock.lock()
+            decodeDemandGate = gate
+            lock.unlock()
+        }
+
+        func configureTerminalDecodeDemandFrameTime(
+            _ time: Double
+        ) {
+            lock.lock()
+            terminalDecodeDemandFrameTime = time
             lock.unlock()
         }
 
@@ -435,7 +471,16 @@ struct HybridPlaybackSessionTests {
 
     @MainActor
     private final class Transport: HybridCarrierPlayerTransport {
-        let avPlayer = AVPlayer()
+        private final class ClockPlayer: AVPlayer {
+            nonisolated(unsafe) var controlledTime = CMTime.zero
+
+            override func currentTime() -> CMTime {
+                controlledTime
+            }
+        }
+
+        private let clockPlayer = ClockPlayer()
+        var avPlayer: AVPlayer { clockPlayer }
         private(set) var didStart = false
         private(set) var didStop = false
         private(set) var seekTargets: [CMTime] = []
@@ -455,14 +500,125 @@ struct HybridPlaybackSessionTests {
 
         func seek(to time: CMTime, timeout: TimeInterval) async -> Bool {
             seekTargets.append(time)
+            clockPlayer.controlledTime = time
             onSeek?(time)
             return true
+        }
+
+        func setCurrentTime(_ time: CMTime) {
+            clockPlayer.controlledTime = time
         }
 
         func stop() {
             didStop = true
             avPlayer.pause()
             avPlayer.replaceCurrentItem(with: nil)
+        }
+    }
+
+    private final class BlockingProviderTelemetryProbe:
+        @unchecked Sendable
+    {
+        let carrier = AetherHybridCarrierBandwidthTelemetry(
+            observedPeakBandwidth: 640_000,
+            observedAverageBandwidth: 512_000,
+            observedSegmentCount: 2,
+            audioRenditionCount: 1,
+            state: .partial
+        )
+        let realVideo = AetherHybridRealVideoBitrateTelemetry(
+            observedAverageBitrate: 1_200_000,
+            observedCompressedByteCount: 300_000,
+            observedSourceDurationSeconds: 2,
+            observedPacketCount: 48,
+            state: .partial
+        )
+
+        private let condition = NSCondition()
+        private var isReleased = false
+        private var readCount = 0
+        private var mainThreadReadCount = 0
+
+        func readCarrier()
+            -> AetherHybridCarrierBandwidthTelemetry
+        {
+            waitForReleaseIfOffMainThread()
+            return carrier
+        }
+
+        func readRealVideo()
+            -> AetherHybridRealVideoBitrateTelemetry
+        {
+            waitForReleaseIfOffMainThread()
+            return realVideo
+        }
+
+        var hasReadStarted: Bool {
+            condition.lock()
+            defer { condition.unlock() }
+            return readCount > 0
+        }
+
+        var observedMainThreadReadCount: Int {
+            condition.lock()
+            defer { condition.unlock() }
+            return mainThreadReadCount
+        }
+
+        func release() {
+            condition.lock()
+            isReleased = true
+            condition.broadcast()
+            condition.unlock()
+        }
+
+        private func waitForReleaseIfOffMainThread() {
+            condition.lock()
+            readCount += 1
+            if Thread.isMainThread {
+                mainThreadReadCount += 1
+                condition.unlock()
+                return
+            }
+            condition.broadcast()
+            while !isReleased {
+                condition.wait()
+            }
+            condition.unlock()
+        }
+    }
+
+    private final class TelemetryProvider:
+        Provider,
+        HybridCarrierBandwidthTelemetrySource,
+        HybridRealVideoBitrateTelemetrySource,
+        @unchecked Sendable
+    {
+        private let telemetryProbe:
+            BlockingProviderTelemetryProbe
+
+        init(
+            relay: HybridPlaybackFrameRelay,
+            timeline: BlackCarrierTimeline,
+            telemetryProbe: BlockingProviderTelemetryProbe
+        ) {
+            self.telemetryProbe = telemetryProbe
+            super.init(
+                relay: relay,
+                timeline: timeline
+            )
+        }
+
+        var carrierBandwidthTelemetry:
+            AetherHybridCarrierBandwidthTelemetry
+        {
+            telemetryProbe.readCarrier()
+        }
+
+        var realVideoBitrateTelemetry:
+            AetherHybridRealVideoBitrateTelemetry
+        {
+            telemetryProbe.readRealVideo()
         }
     }
 
@@ -1172,6 +1328,68 @@ struct HybridPlaybackSessionTests {
         )
     }
 
+    @Test("Audio-only Hybrid carrier is ready and seekable without source-video evidence")
+    @MainActor
+    func audioOnlyCarrierReadinessAndSeek() async throws {
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(
+                seconds: 5.25,
+                preferredTimescale: 90_000
+            )
+        )
+        let relay = HybridPlaybackFrameRelay()
+        let provider = Provider(
+            relay: relay,
+            timeline: timeline,
+            analysisData: Data([0]),
+            videoFormat: nil
+        )
+        let transport = Transport()
+        let renderSurface = RenderSurface()
+        let session = try HybridPlaybackSession(
+            provider: provider,
+            transport: transport,
+            renderSurface: renderSurface,
+            timeline: timeline,
+            relay: relay,
+            allowsAudioOnlyCarrier: true
+        )
+        defer { session.stop() }
+
+        try await session.prepare(timeout: 1)
+        let carrierItem = try #require(transport.avPlayer.currentItem)
+        #expect(session.state == .ready(generation: 0))
+        #expect(session.avPlayer === transport.avPlayer)
+        #expect(provider.snapshot().prepared)
+        #expect(provider.snapshot().demands.isEmpty)
+        #expect(renderSurface.frames.isEmpty)
+        #expect(renderSurface.videoFormat == nil)
+
+        session.handleClockTick(
+            CMTime(seconds: 1, preferredTimescale: 600)
+        )
+        try await Task.sleep(nanoseconds: 20_000_000)
+        #expect(provider.snapshot().demands.isEmpty)
+
+        let target = CMTime(
+            seconds: 4.5,
+            preferredTimescale: 600
+        )
+        let result = try await session.seek(
+            to: target,
+            timeout: 1
+        )
+
+        #expect(result == .applied(generation: 1, target: target))
+        #expect(session.state == .ready(generation: 1))
+        #expect(transport.avPlayer.currentItem === carrierItem)
+        #expect(transport.seekTargets == [target])
+        #expect(provider.snapshot().segments == [1])
+        #expect(provider.snapshot().demands.isEmpty)
+        #expect(renderSurface.frames.isEmpty)
+        #expect(renderSurface.generation == 0)
+    }
+
     @Test("Late HDR10 Plus metadata upgrades format without changing generation")
     @MainActor
     func lateHDR10PlusUpgradeKeepsGeneration() async throws {
@@ -1341,6 +1559,352 @@ struct HybridPlaybackSessionTests {
         try fixture.session.play()
         #expect(
             telemetry.values.contains(.transportChanged)
+        )
+    }
+
+    @Test("Carrier completion is exact, stale post-seek EOS is ignored, and true EOS resets")
+    @MainActor
+    func carrierCompletionStateAndStaleSeekReset() async throws {
+        let fixture = try makeSession()
+        defer { fixture.session.stop() }
+        let telemetry = HybridTelemetryTriggerRecorder()
+        fixture.session.telemetryDidChange = {
+            telemetry.record($0)
+        }
+        try await fixture.session.prepare(timeout: 1)
+        telemetry.removeAll()
+        let item = try #require(
+            fixture.session.avPlayer.currentItem
+        )
+        let unrelatedItem = AVPlayerItem(
+            asset: AVURLAsset(
+                url: URL(
+                    string: "https://example.invalid/unrelated.m3u8"
+                )!
+            )
+        )
+
+        fixture.transport.setCurrentTime(
+            CMTime(
+                seconds: 5.1,
+                preferredTimescale: 600
+            )
+        )
+        NotificationCenter.default.post(
+            name: AVPlayerItem.didPlayToEndTimeNotification,
+            object: unrelatedItem
+        )
+        #expect(fixture.session.state == .ready(generation: 0))
+        #expect(telemetry.values.isEmpty)
+
+        try fixture.session.setRate(1.5)
+
+        NotificationCenter.default.post(
+            name: AVPlayerItem.didPlayToEndTimeNotification,
+            object: item
+        )
+
+        try await waitUntil {
+            fixture.session.state == .ended(generation: 0)
+        }
+
+        #expect(fixture.session.state == .ended(generation: 0))
+        #expect(fixture.session.avPlayer.rate == 0)
+        #expect(
+            fixture.session.avPlayer.timeControlStatus == .paused
+        )
+        #expect(
+            telemetry.values.filter { trigger in
+                if case .sessionEnded(.playbackCompleted) = trigger {
+                    return true
+                }
+                return false
+            }.count == 1
+        )
+
+        let target = CMTime(
+            seconds: 1.25,
+            preferredTimescale: 600
+        )
+        let result = try await fixture.session.seek(
+            to: target,
+            timeout: 1
+        )
+        #expect(
+            result == .applied(
+                generation: 1,
+                target: target
+            )
+        )
+        #expect(fixture.session.state == .ready(generation: 1))
+        #expect(fixture.session.avPlayer.rate == 1.5)
+        #expect(
+            fixture.session.avPlayer.timeControlStatus != .paused
+        )
+
+        // This is the exact carrier item's delayed generation-zero EOS, now
+        // delivered after the explicit seek established generation one. The
+        // actual carrier clock is at the new target, so it must not terminate
+        // the new generation.
+        NotificationCenter.default.post(
+            name: AVPlayerItem.didPlayToEndTimeNotification,
+            object: item
+        )
+        #expect(fixture.session.state == .ready(generation: 1))
+        #expect(
+            telemetry.values.filter { trigger in
+                if case .sessionEnded(.playbackCompleted) = trigger {
+                    return true
+                }
+                return false
+            }.count == 1
+        )
+
+        fixture.transport.setCurrentTime(
+            CMTime(
+                seconds: 5.2,
+                preferredTimescale: 600
+            )
+        )
+        NotificationCenter.default.post(
+            name: AVPlayerItem.didPlayToEndTimeNotification,
+            object: item
+        )
+        NotificationCenter.default.post(
+            name: AVPlayerItem.didPlayToEndTimeNotification,
+            object: item
+        )
+        try await waitUntil {
+            fixture.session.state == .ended(generation: 1)
+        }
+        #expect(fixture.session.state == .ended(generation: 1))
+        #expect(fixture.session.avPlayer.rate == 0)
+        #expect(
+            telemetry.values.filter { trigger in
+                if case .sessionEnded(.playbackCompleted) = trigger {
+                    return true
+                }
+                return false
+            }.count == 2
+        )
+    }
+
+    @Test("Carrier completion drains the coalesced exact-end video demand before ended")
+    @MainActor
+    func carrierCompletionDrainsPendingDecodeDemand() async throws {
+        let fixture = try makeSession()
+        defer { fixture.session.stop() }
+        let telemetry = HybridTelemetryTriggerRecorder()
+        fixture.session.telemetryDidChange = {
+            telemetry.record($0)
+        }
+        try await fixture.session.prepare(timeout: 1)
+        try await waitUntil {
+            !fixture.provider.snapshot().demands.isEmpty
+        }
+        telemetry.removeAll()
+
+        let gate = RestartGate()
+        fixture.provider.configureDecodeDemandGate(gate)
+        fixture.provider.configureTerminalDecodeDemandFrameTime(5.0)
+
+        fixture.session.handleClockTick(
+            CMTime(
+                seconds: 1,
+                preferredTimescale: 600
+            )
+        )
+        try await waitUntil { gate.isWaiting }
+
+        // This later ordinary clock request must be coalesced into the exact
+        // finite-end request while the first provider call remains in flight.
+        fixture.session.handleClockTick(
+            CMTime(
+                seconds: 3,
+                preferredTimescale: 600
+            )
+        )
+        fixture.transport.setCurrentTime(
+            CMTime(
+                seconds: 5.25,
+                preferredTimescale: 600
+            )
+        )
+        let item = try #require(
+            fixture.session.avPlayer.currentItem
+        )
+        NotificationCenter.default.post(
+            name: AVPlayerItem.didPlayToEndTimeNotification,
+            object: item
+        )
+
+        #expect(fixture.session.state == .ready(generation: 0))
+        #expect(
+            !telemetry.values.contains { trigger in
+                if case .sessionEnded(.playbackCompleted) = trigger {
+                    return true
+                }
+                return false
+            }
+        )
+
+        gate.release()
+        try await waitUntil {
+            fixture.session.state == .ended(generation: 0)
+        }
+
+        let demandSeconds = fixture.provider.snapshot().demands.map(
+            \.seconds
+        )
+        #expect(
+            abs(try #require(demandSeconds.last) - 5.25)
+                < 0.000_001
+        )
+        #expect(
+            !demandSeconds.contains {
+                abs($0 - 3.25) < 0.000_001
+            }
+        )
+        #expect(
+            abs(
+                try #require(
+                    fixture.renderSurface.frames.last?
+                        .presentationTime.seconds
+                ) - 5.0
+            ) < 0.000_001
+        )
+        #expect(
+            telemetry.values.filter { trigger in
+                if case .sessionEnded(.playbackCompleted) = trigger {
+                    return true
+                }
+                return false
+            }.count == 1
+        )
+    }
+
+    @Test("Seek supersedes a provisional carrier-completion video drain")
+    @MainActor
+    func seekSupersedesCarrierCompletionDrain() async throws {
+        let fixture = try makeSession()
+        defer { fixture.session.stop() }
+        let telemetry = HybridTelemetryTriggerRecorder()
+        fixture.session.telemetryDidChange = {
+            telemetry.record($0)
+        }
+        try await fixture.session.prepare(timeout: 1)
+        try await waitUntil {
+            !fixture.provider.snapshot().demands.isEmpty
+        }
+        telemetry.removeAll()
+
+        let gate = RestartGate()
+        defer { gate.release() }
+        fixture.provider.configureDecodeDemandGate(gate)
+        fixture.session.handleClockTick(
+            CMTime(
+                seconds: 1,
+                preferredTimescale: 600
+            )
+        )
+        try await waitUntil { gate.isWaiting }
+
+        fixture.transport.setCurrentTime(
+            CMTime(
+                seconds: 5.25,
+                preferredTimescale: 600
+            )
+        )
+        let item = try #require(
+            fixture.session.avPlayer.currentItem
+        )
+        NotificationCenter.default.post(
+            name: AVPlayerItem.didPlayToEndTimeNotification,
+            object: item
+        )
+        #expect(fixture.session.state == .ready(generation: 0))
+
+        let target = CMTime(
+            seconds: 1.25,
+            preferredTimescale: 600
+        )
+        let seekTask = Task { @MainActor in
+            try await fixture.session.seek(
+                to: target,
+                timeout: 1
+            )
+        }
+        try await waitUntil {
+            if case .seeking(
+                let generation,
+                let observedTarget
+            ) = fixture.session.state {
+                return generation == 1
+                    && observedTarget == target
+            }
+            return false
+        }
+        gate.release()
+
+        #expect(
+            try await seekTask.value
+                == .applied(generation: 1, target: target)
+        )
+        #expect(fixture.session.state == .ready(generation: 1))
+        #expect(
+            !telemetry.values.contains { trigger in
+                if case .sessionEnded(.playbackCompleted) = trigger {
+                    return true
+                }
+                return false
+            }
+        )
+    }
+
+    @Test("Carrier completion clock admission is finite and tightly bounded")
+    func carrierCompletionClockAdmission() {
+        let duration = CMTime(
+            seconds: 5.25,
+            preferredTimescale: 600
+        )
+        #expect(
+            HybridPlaybackSession.isCarrierClockAtFiniteEnd(
+                currentTime: CMTime(
+                    seconds: 5.1,
+                    preferredTimescale: 600
+                ),
+                duration: duration
+            )
+        )
+        #expect(
+            !HybridPlaybackSession.isCarrierClockAtFiniteEnd(
+                currentTime: CMTime(
+                    seconds: 4.99,
+                    preferredTimescale: 600
+                ),
+                duration: duration
+            )
+        )
+        #expect(
+            !HybridPlaybackSession.isCarrierClockAtFiniteEnd(
+                currentTime: CMTime(
+                    seconds: 5.51,
+                    preferredTimescale: 600
+                ),
+                duration: duration
+            )
+        )
+        #expect(
+            !HybridPlaybackSession.isCarrierClockAtFiniteEnd(
+                currentTime: .indefinite,
+                duration: duration
+            )
+        )
+        #expect(
+            !HybridPlaybackSession.isCarrierClockAtFiniteEnd(
+                currentTime: duration,
+                duration: .indefinite
+            )
         )
     }
 
@@ -1800,6 +2364,88 @@ struct HybridPlaybackSessionTests {
             try fixture.session.setRate(-1)
         }
         #expect(fixture.session.state == .ready(generation: 0))
+    }
+
+    @Test("Repeated unit rate never synchronously samples provider telemetry")
+    @MainActor
+    func repeatedUnitRateDoesNotSynchronouslySampleProviderTelemetry()
+        async throws
+    {
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(
+                seconds: 5.25,
+                preferredTimescale: 90_000
+            )
+        )
+        let relay = HybridPlaybackFrameRelay()
+        let telemetryProbe = BlockingProviderTelemetryProbe()
+        let provider = TelemetryProvider(
+            relay: relay,
+            timeline: timeline,
+            telemetryProbe: telemetryProbe
+        )
+        let transport = Transport()
+        let renderSurface = RenderSurface()
+        let session = try HybridPlaybackSession(
+            provider: provider,
+            transport: transport,
+            renderSurface: renderSurface,
+            timeline: timeline,
+            relay: relay
+        )
+        defer {
+            telemetryProbe.release()
+            session.telemetryDidChange = nil
+            session.stop()
+        }
+
+        var transportChangeCount = 0
+        session.telemetryDidChange = { trigger in
+            // Production AetherHybridPlaybackSession builds a diagnostics
+            // snapshot synchronously for every trigger. Reading these cached
+            // properties here recreates that boundary without a public route.
+            _ = session.carrierBandwidthTelemetry
+            _ = session.realVideoBitrateTelemetry
+            if trigger == .transportChanged {
+                transportChangeCount += 1
+            }
+        }
+
+        try await session.prepare(timeout: 1)
+        try await waitUntil {
+            telemetryProbe.hasReadStarted
+        }
+        #expect(
+            session.carrierBandwidthTelemetry.state
+                == .awaitingCarrierSegments
+        )
+        #expect(
+            session.realVideoBitrateTelemetry.state
+                == .awaitingCompressedPackets
+        )
+
+        try session.play()
+        let validationCountBeforeRates =
+            renderSurface.carrierClockValidationCount
+        try session.setRate(1)
+        try session.setRate(1)
+
+        #expect(
+            renderSurface.carrierClockValidationCount
+                == validationCountBeforeRates + 2
+        )
+        #expect(transportChangeCount == 3)
+        #expect(telemetryProbe.observedMainThreadReadCount == 0)
+        #expect(session.state == .ready(generation: 0))
+
+        telemetryProbe.release()
+        try await waitUntil {
+            session.carrierBandwidthTelemetry
+                == telemetryProbe.carrier
+                && session.realVideoBitrateTelemetry
+                    == telemetryProbe.realVideo
+        }
+        #expect(telemetryProbe.observedMainThreadReadCount == 0)
     }
 
     @Test("Provider generation divergence is a terminal typed failure")

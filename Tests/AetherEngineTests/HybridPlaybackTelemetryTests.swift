@@ -60,6 +60,33 @@ struct HybridPlaybackTelemetryTests {
         )
     }
 
+    @Test("Carrier completion remains a generation-bound telemetry state")
+    func endedStateRemainsGenerationBound() {
+        #expect(
+            AetherHybridPlaybackTelemetryState(
+                .ended(generation: 7)
+            ) == .ended(generation: 7)
+        )
+    }
+
+    @MainActor
+    @Test("Renderer metrics diagnostics remain visible at the public telemetry boundary")
+    func rendererMetricsDiagnosticsRemainVisible() {
+        let renderer = makeSnapshot(state: .ready(generation: 0))
+            .renderer
+
+        #expect(renderer.metricsSampleInFlight)
+        #expect(renderer.lastMetricsRequestCarrierTimeSeconds == 3.875)
+        #expect(renderer.lastMetricsCompletionCarrierTimeSeconds == 6.007)
+        #expect(renderer.metricsCompletionCount == 2)
+        #expect(renderer.lastMetricsCompletionHadCounters == true)
+        #expect(renderer.lastRendererTotalFrameCount == 19)
+        #expect(renderer.lastRendererDroppedFrameCount == 0)
+        #expect(renderer.lastRendererDisplayedFrameCount == 19)
+        #expect(renderer.lastRendererDisplayedFrameDelta == 9)
+        #expect(renderer.lastPublishedEvidenceTimeSeconds == 5.958)
+    }
+
     @Test("Arbitrary provider reasons collapse to a privacy-safe failure code")
     func providerFailureSanitization() {
         let sourceError = HybridPlaybackSessionError
@@ -138,6 +165,15 @@ struct HybridPlaybackTelemetryTests {
             ) == .failed(
                 .sourceDolbyVisionConfigurationDiverged
             )
+        )
+    }
+
+    @Test("Progressive immutable-fact drift remains a stable failure code")
+    func progressiveSourceFactDriftFailureCode() {
+        #expect(
+            AetherHybridPlaybackTelemetryFailure(
+                .progressiveSourceFactsDiverged
+            ) == .progressiveSourceFactsDiverged
         )
     }
 
@@ -224,6 +260,16 @@ struct HybridPlaybackTelemetryTests {
                 hdr10PlusAttachedSampleBuffers: 0,
                 firstHDR10PlusAttachmentTimeSeconds: nil,
                 lastEnqueuedTimeSeconds: nil,
+                metricsSampleInFlight: true,
+                lastMetricsRequestCarrierTimeSeconds: 3.875,
+                lastMetricsCompletionCarrierTimeSeconds: 6.007,
+                metricsCompletionCount: 2,
+                lastMetricsCompletionHadCounters: true,
+                lastRendererTotalFrameCount: 19,
+                lastRendererDroppedFrameCount: 0,
+                lastRendererDisplayedFrameCount: 19,
+                lastRendererDisplayedFrameDelta: 9,
+                lastPublishedEvidenceTimeSeconds: 5.958,
                 lastAcceptedFrameDurationSeconds: nil,
                 lastAcceptedGeometry: nil,
                 carrierTimebaseBound: true,

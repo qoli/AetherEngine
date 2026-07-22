@@ -22,6 +22,67 @@ enum BlackCarrierAudioRenditionMuxerError: Error, LocalizedError, Sendable, Equa
     case segmentFinalizeFailed(index: Int)
     case initSegmentMissing
     case alreadyFinished
+    case terminalPacketAllocationFailed
+    case terminalPacketReferenceFailed(code: Int32)
+
+    /// Stable, closed failure identity for telemetry and recovery evidence.
+    ///
+    /// `NSError.code` synthesized from a Swift enum is an implementation detail
+    /// and loses the associated nested case when this error is wrapped by the
+    /// media fanout pump. Keep this mapping exhaustive so acceptance artifacts
+    /// can distinguish an EOF coverage failure from a packet/muxer failure.
+    var failureCaseCode: String {
+        switch self {
+        case .emptyTimeline: "emptyTimeline"
+        case .audioStreamMissing: "audioStreamMissing"
+        case .unsupportedCodec: "unsupportedCodec"
+        case .codecParametersCopyFailed: "codecParametersCopyFailed"
+        case .atmosStreamCopyUnavailable: "atmosStreamCopyUnavailable"
+        case .bridgeCreationFailed: "bridgeCreationFailed"
+        case .bridgeHeaderRejected: "bridgeHeaderRejected"
+        case .muxerSetupFailed: "muxerSetupFailed"
+        case .bridgeFeedFailed: "bridgeFeedFailed"
+        case .invalidStartingSegment: "invalidStartingSegment"
+        case .restartTimestampOffsetOverflow:
+            "restartTimestampOffsetOverflow"
+        case .nonMonotonicSegment: "nonMonotonicSegment"
+        case .emptySegment: "emptySegment"
+        case .packetWriteFailed: "packetWriteFailed"
+        case .segmentFinalizeFailed: "segmentFinalizeFailed"
+        case .initSegmentMissing: "initSegmentMissing"
+        case .alreadyFinished: "alreadyFinished"
+        case .terminalPacketAllocationFailed:
+            "terminalPacketAllocationFailed"
+        case .terminalPacketReferenceFailed:
+            "terminalPacketReferenceFailed"
+        }
+    }
+
+    /// Stable numeric companion to `failureCaseCode`; unlike bridged enum
+    /// ordinals, these values are part of Aether's evidence contract.
+    var failureCode: Int {
+        switch self {
+        case .emptyTimeline: 1
+        case .audioStreamMissing: 2
+        case .unsupportedCodec: 3
+        case .codecParametersCopyFailed: 4
+        case .atmosStreamCopyUnavailable: 5
+        case .bridgeCreationFailed: 6
+        case .bridgeHeaderRejected: 7
+        case .muxerSetupFailed: 8
+        case .bridgeFeedFailed: 9
+        case .invalidStartingSegment: 10
+        case .restartTimestampOffsetOverflow: 11
+        case .nonMonotonicSegment: 12
+        case .emptySegment: 13
+        case .packetWriteFailed: 14
+        case .segmentFinalizeFailed: 15
+        case .initSegmentMissing: 16
+        case .alreadyFinished: 17
+        case .terminalPacketAllocationFailed: 18
+        case .terminalPacketReferenceFailed: 19
+        }
+    }
 
     var errorDescription: String? {
         switch self {
@@ -59,6 +120,10 @@ enum BlackCarrierAudioRenditionMuxerError: Error, LocalizedError, Sendable, Equa
             return "Black carrier audio muxer did not produce an init segment"
         case .alreadyFinished:
             return "Black carrier audio rendition writer is already finished"
+        case .terminalPacketAllocationFailed:
+            return "Black carrier terminal audio packet could not be allocated"
+        case .terminalPacketReferenceFailed(let code):
+            return "Black carrier terminal audio packet could not be retained (\(code))"
         }
     }
 }
@@ -140,6 +205,13 @@ enum BlackCarrierAudioRenditionMuxer {
         private var isFinished = false
         private var didPublishInit = false
         private(set) var highestFinalizedSegmentIndex: Int
+        private var lastAcceptedTimelinePTS: Int64?
+        private var lastAcceptedTimelineEndPTS: Int64?
+        private var pendingTerminalTailPacket:
+            UnsafeMutablePointer<AVPacket>?
+        private var pendingTerminalTailTimelinePTS: Int64 = 0
+        private var pendingTerminalTailEndPTS: Int64 = 0
+        private var pendingTerminalTailDurationPTS: Int64 = 0
 
         fileprivate init(
             sourceStreamIndex: Int32,
@@ -206,6 +278,7 @@ enum BlackCarrierAudioRenditionMuxer {
         }
 
         deinit {
+            trackedPacketFree(&pendingTerminalTailPacket)
             route.bridge?.close()
         }
 
@@ -307,12 +380,30 @@ enum BlackCarrierAudioRenditionMuxer {
                     try writeOutputPacket(output)
                 }
             }
+            try flushPendingTerminalTailPacket(assignToExactTail: true)
 
             guard currentOffset == timeline.segments.count - 1,
                   wroteCurrentSegment else {
                 let missingOffset = min(
                     currentOffset + (wroteCurrentSegment ? 1 : 0),
                     timeline.segments.count - 1
+                )
+                let lastPTSDescription = lastAcceptedTimelinePTS.map {
+                    String($0)
+                } ?? "none"
+                let lastEndPTSDescription =
+                    lastAcceptedTimelineEndPTS.map {
+                        String($0)
+                    } ?? "none"
+                EngineLog.emit(
+                    "[BlackCarrierAudioRenditionMuxer] EOF segment coverage failed "
+                        + "missing=\(timeline.segments[missingOffset].index) "
+                        + "current=\(timeline.segments[currentOffset].index) "
+                        + "wroteCurrent=\(wroteCurrentSegment) "
+                        + "lastPTS=\(lastPTSDescription) "
+                        + "lastEndPTS=\(lastEndPTSDescription) "
+                        + "timelineEndPTS=\(timeline.duration.value)",
+                    category: .session
                 )
                 throw BlackCarrierAudioRenditionMuxerError.emptySegment(
                     index: timeline.segments[missingOffset].index
@@ -378,6 +469,10 @@ enum BlackCarrierAudioRenditionMuxer {
         private func writeOutputPacket(
             _ packet: UnsafeMutablePointer<AVPacket>
         ) throws {
+            // A prior near-tail candidate was not terminal after all. Commit it
+            // to its nominal segment before considering the newer packet.
+            try flushPendingTerminalTailPacket(assignToExactTail: false)
+
             if packet.pointee.pts == Int64.min {
                 packet.pointee.pts = packet.pointee.dts
             }
@@ -418,10 +513,54 @@ enum BlackCarrierAudioRenditionMuxer {
             guard timelinePTS < timeline.duration.value else {
                 return
             }
-            let nextOffset = segmentOffset(
+            let packetDurationPTS = max(
+                1,
+                av_rescale_q(
+                    packet.pointee.duration,
+                    route.packetTimeBase,
+                    approvedTimelineTimeBase
+                )
+            )
+            let packetEndResult = timelinePTS.addingReportingOverflow(
+                packetDurationPTS
+            )
+            let packetEndPTS = packetEndResult.overflow
+                ? Int64.max
+                : packetEndResult.partialValue
+            let nominalOffset = segmentOffset(
                 forTimelinePTS: timelinePTS,
                 timeline: timeline
             )
+            if shouldDeferTerminalBridgePacketForExactTail(
+                packetTimelinePTS: timelinePTS,
+                packetEndTimelinePTS: packetEndPTS,
+                packetDurationPTS: packetDurationPTS,
+                nominalOffset: nominalOffset
+            ) {
+                try retainPendingTerminalTailPacket(
+                    packet,
+                    timelinePTS: timelinePTS,
+                    packetEndPTS: packetEndPTS,
+                    packetDurationPTS: packetDurationPTS
+                )
+                return
+            }
+            try writePreparedOutputPacket(
+                packet,
+                timelinePTS: timelinePTS,
+                packetEndPTS: packetEndPTS,
+                nextOffset: nominalOffset
+            )
+        }
+
+        private func writePreparedOutputPacket(
+            _ packet: UnsafeMutablePointer<AVPacket>,
+            timelinePTS: Int64,
+            packetEndPTS: Int64,
+            nextOffset: Int
+        ) throws {
+            lastAcceptedTimelinePTS = timelinePTS
+            lastAcceptedTimelineEndPTS = packetEndPTS
             if nextOffset < startingOffset {
                 return
             }
@@ -477,6 +616,108 @@ enum BlackCarrierAudioRenditionMuxer {
             }
             wroteCurrentSegment = true
             publishInitIfAvailable()
+        }
+
+        /// A fixed-file timeline may have a final sub-frame tail when the
+        /// container duration is a few milliseconds longer than its playable
+        /// A/V samples (for example an ASS cue ending at 300.008 s). A bridged
+        /// codec emits indivisible access units, so its last packet can end
+        /// within one encoded frame of that tail without any packet starting
+        /// inside it. Hold a near-tail candidate until bridge EOF proves it is
+        /// the final real packet; bridge drain may otherwise emit a later
+        /// packet that still belongs to the penultimate segment.
+        private func shouldDeferTerminalBridgePacketForExactTail(
+            packetTimelinePTS: Int64,
+            packetEndTimelinePTS: Int64,
+            packetDurationPTS: Int64,
+            nominalOffset: Int
+        ) -> Bool {
+            guard route.bridge != nil,
+                  timeline.segments.count >= 2 else {
+                return false
+            }
+            let lastOffset = timeline.segments.count - 1
+            let penultimateOffset = lastOffset - 1
+            let tail = timeline.segments[lastOffset]
+            guard currentOffset == penultimateOffset,
+                  nominalOffset == penultimateOffset,
+                  tail.duration.value > 0,
+                  tail.duration.value < packetDurationPTS,
+                  packetTimelinePTS < tail.startTime.value else {
+                return false
+            }
+            let remaining = packetEndTimelinePTS >= timeline.duration.value
+                ? (partialValue: Int64(0), overflow: false)
+                : timeline.duration.value
+                    .subtractingReportingOverflow(packetEndTimelinePTS)
+            return !remaining.overflow
+                && remaining.partialValue >= 0
+                && remaining.partialValue <= packetDurationPTS
+        }
+
+        private func retainPendingTerminalTailPacket(
+            _ packet: UnsafeMutablePointer<AVPacket>,
+            timelinePTS: Int64,
+            packetEndPTS: Int64,
+            packetDurationPTS: Int64
+        ) throws {
+            guard pendingTerminalTailPacket == nil else {
+                throw BlackCarrierAudioRenditionMuxerError
+                    .terminalPacketAllocationFailed
+            }
+            guard let retained = trackedPacketAlloc() else {
+                throw BlackCarrierAudioRenditionMuxerError
+                    .terminalPacketAllocationFailed
+            }
+            let referenceResult = av_packet_ref(retained, packet)
+            guard referenceResult >= 0 else {
+                var retainedToFree: UnsafeMutablePointer<AVPacket>? = retained
+                trackedPacketFree(&retainedToFree)
+                throw BlackCarrierAudioRenditionMuxerError
+                    .terminalPacketReferenceFailed(code: referenceResult)
+            }
+            pendingTerminalTailPacket = retained
+            pendingTerminalTailTimelinePTS = timelinePTS
+            pendingTerminalTailEndPTS = packetEndPTS
+            pendingTerminalTailDurationPTS = packetDurationPTS
+        }
+
+        private func flushPendingTerminalTailPacket(
+            assignToExactTail: Bool
+        ) throws {
+            guard let retained = pendingTerminalTailPacket else {
+                return
+            }
+            let timelinePTS = pendingTerminalTailTimelinePTS
+            let packetEndPTS = pendingTerminalTailEndPTS
+            let packetDurationPTS = pendingTerminalTailDurationPTS
+            pendingTerminalTailPacket = nil
+            var retainedToFree: UnsafeMutablePointer<AVPacket>? = retained
+            defer { trackedPacketFree(&retainedToFree) }
+
+            let nominalOffset = segmentOffset(
+                forTimelinePTS: timelinePTS,
+                timeline: timeline
+            )
+            let nextOffset = assignToExactTail
+                ? timeline.segments.count - 1
+                : nominalOffset
+            if assignToExactTail {
+                EngineLog.emit(
+                    "[BlackCarrierAudioRenditionMuxer] assigned EOF-confirmed bridge packet "
+                        + "to exact carrier tail packetPTS=\(timelinePTS) "
+                        + "packetEndPTS=\(packetEndPTS) "
+                        + "packetDurationPTS=\(packetDurationPTS) "
+                        + "tail=\(timeline.segments[nextOffset].index)",
+                    category: .session
+                )
+            }
+            try writePreparedOutputPacket(
+                retained,
+                timelinePTS: timelinePTS,
+                packetEndPTS: packetEndPTS,
+                nextOffset: nextOffset
+            )
         }
 
         private func publishInitIfAvailable() {

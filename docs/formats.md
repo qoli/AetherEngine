@@ -6,7 +6,23 @@ Depth behind the README's "What it handles" matrix: codec routing, HDR signaling
 
 **Containers (demux side):** MKV, MP4, WebM, MPEG-TS, AVI, OGG, FLV.
 
-**Hardware decode** (native AVPlayer path, VideoToolbox): H.264 (progressive), HEVC, HEVC Main10. AV1 on devices with HW AV1 (M3+ Mac, iPhone 15 Pro+, future Apple TV chips) also routes natively.
+ASF/WMV is dependency-gated separately from VC-1 decoding. The current exact
+FFmpegBuild revision includes the VC-1 decoder and parser but does not register
+libavformat's ASF input demuxer. When source bytes positively match the ASF
+Header Object GUID and `av_find_input_format("asf")` is unavailable, unified
+playback emits `unsupportedCapability` with the privacy-safe case code
+`dependency.libavformat.asfDemuxerUnavailable`. It does not relabel the source
+as malformed media, change the source or route, or claim the fixture passed.
+Once the exact dependency provides the ASF demuxer, the same signed source
+continues through the ordinary progressive probe without a compatibility path.
+
+**Hardware decode capability:** VideoToolbox supports H.264, HEVC, HEVC Main10,
+and AV1 on devices with HW AV1 (M3+ Mac, iPhone 15 Pro+, future Apple TV chips).
+That decoder capability is not the unified route policy: formal
+`AetherPlaybackSession` playback sends every positive HEVC source to
+`hybridCarrier`, where the same VideoToolbox HEVC capability can sit behind the
+sample-buffer renderer. Lower-level `AetherEngine.load` paths may still host HEVC
+through AVPlayer; integration code must not infer `nativeAVPlayer` from that.
 
 **Software decode** (`SoftwareVideoDecoder` + `AVSampleBufferDisplayLayer`):
 
@@ -15,7 +31,51 @@ Depth behind the README's "What it handles" matrix: codec routing, HDR signaling
 - MPEG-4 Part 2 (XVID / DIVX / SP / ASP), MPEG-2 video, and VC-1, none of which AVPlayer's HLS-fMP4 pipeline accepts; libavcodec ships native decoders for all three.
 - Interlaced H.264 (declared field order TT / BB / TB / BT), so the deinterlacer below can run; tvOS AVPlayer does not deinterlace, so 1080i / 576i broadcast combs on the native path (#107).
 
-Interlaced sources (DVD-rip MPEG-2, SD / HD broadcast H.264) are deinterlaced through a persistent bwdif graph (yadif fallback) that engages on the first interlaced frame and costs nothing on progressive content. The dispatch decision lives in `AetherEngine.load` (`VideoRoutingPolicy`), gated per source on `VTCapabilityProbe`, codec id, and declared field order.
+Interlaced sources (DVD-rip MPEG-2, SD / HD broadcast H.264) are deinterlaced through a persistent bwdif graph (yadif fallback) that engages on the first interlaced frame and costs nothing on progressive content. The lower-level dispatch decision lives in `AetherEngine.load` (`VideoRoutingPolicy`), gated per source on `VTCapabilityProbe`, codec id, and declared field order. Unified `AetherPlaybackSession` retains the same positive field-order fact in progressive source profiles and clear HLS selected-segment profiles, then sends interlaced H.264 directly to Hybrid, whose software decode sink uses that deinterlacer; it does not first claim Native and then switch backend invisibly. Protected interlaced HLS is explicit unsupported because Aether cannot feed protected packets to that decoder.
+
+Format dispatch establishes the initial capability route. It does not forbid a bounded, observable Aether-owned route/backend recovery after runtime evidence invalidates that route. Such recovery must keep the same canonical media, source identity, authorization/credentials, DRM meaning, selected content, and provenance, and must expose any capability delta. A different origin, server-mediated URL, provider, or media item is a new playback request and cannot be silently substituted to make a format case appear playable.
+
+The unified HEVC boundary is fail-closed: only clear, finite, seekable HEVC with
+verified segment evidence (or missing manifest `CODECS` backed by verified
+segment evidence) and complete Hybrid source-kind, decoder, renderer, and video-
+format capability is playable. HLS manifest/segment mismatch, uninspected
+segments, protection/DRM, unverified Dolby Vision Profile 8.4, and capability
+gaps are typed unsupported. No recovery alternate may move HEVC to Native.
+An HLS root master with an uninspected alternate variant that advertises HEVC
+uses the inspected selection's graph-bound Hybrid route, even when that selected
+segment is H.264, because Native AVPlayer could otherwise choose the uninspected
+variant. Positive HEVC found later on a Native replacement item immediately
+detaches that item and permits only fresh same-source Hybrid admission or typed
+terminal failure; it never consumes a same-Native rebuild.
+For progressive input, seekability is a positive fact from the exact opened
+demuxer, not an inference from duration or HTTP metadata. The first Hybrid
+generation adopts that prepared demuxer, and codec, container, duration,
+seekability, video format, and Dolby Vision configuration are immutable for the
+session; drift is typed terminal source divergence.
+
+Progressive audio-only admission is equally fail-closed. It requires the exact
+demuxer to positively find no video stream; a present but unidentified video
+stream is not audio-only, and an inconclusive stream inventory is typed
+unsupported. AVPlayer-supported audio remains Native, but exact finite,
+seekable Vorbis is admitted directly to `hybridCarrier` so the existing
+`AudioBridge` can emit the same source audio as a carrier rendition. That Hybrid
+execution has no source-video decoder or presented-frame gate: its black video
+is transport only, while public output is `videoExpected=false`, `notExpected`,
+codec `none`. Missing carrier capability is typed unsupported. Any positive
+video codec implies video, and an item that exposes a video track after
+audio-only admission terminates as source divergence. Therefore positive HEVC
+always remains on the Hybrid boundary even if another observation incorrectly
+claims that no video exists.
+
+Early AVFoundation asset metadata is not equivalent to those source facts. A
+clear direct H.264 HLS item with positively inspected selected-segment packaging,
+or an Aether-owned H.264 HLS-fMP4 remux bound to its exact prepared progressive
+source, may temporarily report `isPlayable == false` or no asset video tracks
+before AVPlayer parses the playlist/init segment. Only those two ownership- and
+evidence-bound cases treat the observation as advisory and wait for typed item
+failure or real presented-frame/media progress. Direct progressive assets,
+unknown/provisional video, protected or uninspected HLS, and every HEVC fact stay
+fail-closed; no advisory changes source, player, or route.
 
 ## HDR routing
 
@@ -68,6 +128,8 @@ Non-streamable codecs route through `AudioBridge` in one of two modes (`LoadOpti
 `.surroundCompat` is the default because the soundbar / basic-AVR install base is the majority. Object metadata (Atmos / TrueHD-MA) is lost in either mode: FFmpeg's EAC3 encoder doesn't produce JOC, and FLAC has no object-channel concept. If a JOC source ever falls through to the bridge the engine logs a loud `WARNING: Atmos downgrade, ...`.
 
 Two bridge lifecycle invariants (issue #99): the encoder PTS counter re-bases onto the first fed packet's (gate-shifted) source PTS on every session start and producer restart, so bridged audio always shares the video's output timeline, including a `load(startPosition:)` resume that anchors mid-file (a 0-based bridge timeline puts the audio track a full resume-offset away from video inside the same fragments, which AVPlayer silently discards). And the EOF tail flush leaves the encoder in FFmpeg's terminal draining state, so the bridge latches that and rebuilds the encoder on the next restart; a VOD pump that still dies with `muxerFailed` gets a bounded producer rebuild instead of stranding the session.
+
+A fixed progressive carrier may end with a segment shorter than one encoded audio access unit when container duration is extended by sparse metadata or subtitles. For bridged audio only, a real packet that ends within one encoder frame of that final sub-frame tail is retained until bridge EOF confirms that no later packet exists, then assigned to the final audio fragment. The packet bytes and timestamps remain source-derived; Aether does not synthesize silence or duplicate a packet. A missing full segment, an earlier gap, or a terminal gap larger than one encoded frame still fails as progressive.audioMuxer.emptySegment (stable evidence domain AetherEngine.BlackCarrierAudioRenditionMuxer, code 13).
 
 ### Dolby Atmos
 
@@ -223,7 +285,7 @@ Read-only. NTLMv2 and guest auth (no Kerberos, which tvOS lacks). No writing, lo
 
 ## Live ingest, AES-128, SSAI
 
-A live HLS upstream can be ingested directly via `HLSLiveIngestReader` (a public forward-only `IOReader`), no media server in the data path. Contract: MPEG-TS segments, including demuxed-audio variants (`EXT-X-MEDIA` audio groups, fetched by a companion reader and merged by DTS) and packed-audio renditions (raw ADTS framed by ID3 timestamps). AES-128 clear-key segments (`EXT-X-KEY:METHOD=AES-128`, the standard FAST-channel scheme) are decrypted in-line by `HLSSegmentDecryptor`: the key is fetched once per clip and memoised, each segment decrypted (AES-128-CBC / PKCS7) before demux. SAMPLE-AES / keyless AES-128 (no `URI`), fMP4 playlists (`EXT-X-MAP`), and a key-fetch / decrypt failure terminate with a typed `HLSIngestError` so the host can fall back to a server-mediated URL. This is standard HLS clear-key, not FairPlay / Widevine.
+A live HLS upstream can be ingested directly via `HLSLiveIngestReader` (a public forward-only `IOReader`), no media server in the data path. Contract: MPEG-TS segments, including demuxed-audio variants (`EXT-X-MEDIA` audio groups, fetched by a companion reader and merged by DTS) and packed-audio renditions (raw ADTS framed by ID3 timestamps). AES-128 clear-key segments (`EXT-X-KEY:METHOD=AES-128`, the standard FAST-channel scheme) are decrypted in-line by `HLSSegmentDecryptor`: the key is fetched once per clip and memoised, each segment decrypted (AES-128-CBC / PKCS7) before demux. SAMPLE-AES / keyless AES-128 (no `URI`), fMP4 playlists (`EXT-X-MAP`), and a key-fetch / decrypt failure terminate the request with a typed `HLSIngestError`. They do not authorize the host to substitute a server-mediated URL; that URL would be a separate, explicit playback request. This is standard HLS clear-key, not FairPlay / Widevine.
 
 Server-side ad insertion (SSAI) plays through the direct path instead of bouncing to a server transcode at the ad break. FAST channels (Pluto and similar) splice ad creatives that restart the source clock and often carry a different video PID, resolution, and SPS than the program. The producer detects the program switch, parses the ad's SPS/PPS by hand (`H264SPS`) to build a fresh codec config, rotates the fMP4 muxer, and emits a versioned `#EXT-X-MAP` per discontinuity so AVPlayer resyncs cleanly across the init and resolution change; audio is re-anchored to the video timeline at every creative boundary (including amux creatives that mux audio on a separate source clock) and an `OutputTimestampSanitizer` keeps the stream monotonic across the splice. A no-cut stall watchdog sits underneath as a safety net: it tells a genuinely wedged pod (reading at full rate but unable to cut) from a slow source (a trickle) by read rate, escalating only the former to a host retune.
 

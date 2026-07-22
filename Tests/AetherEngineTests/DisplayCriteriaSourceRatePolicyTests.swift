@@ -48,3 +48,20 @@ struct DisplayCriteriaSourceRatePolicyTests {
         )
     }
 }
+
+@Suite("Display criteria generation ownership")
+struct DisplayCriteriaOwnershipCoordinatorTests {
+    @Test("A stale route cannot release successor display criteria")
+    func staleReleaseCannotClearSuccessor() {
+        var ownership = DisplayCriteriaOwnershipCoordinator()
+        let first = ownership.acquire()
+        let successor = ownership.acquire()
+
+        let staleRelease = ownership.releaseIfOwned(first)
+        #expect(!staleRelease)
+        #expect(ownership.activeSequence == successor)
+        let successorRelease = ownership.releaseIfOwned(successor)
+        #expect(successorRelease)
+        #expect(ownership.activeSequence == nil)
+    }
+}

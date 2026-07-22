@@ -70,6 +70,10 @@ enum AetherNativePlaybackSessionError:
     case incompatibleRemuxOptions
     case sourceFactsDiverged
     case engineRouteContractDiverged
+    case expectedVideoTrackMissing(codec: AetherVideoCodec)
+    case videoTrackInspectionInconclusive
+    case unexpectedVideoTrack(codec: AetherCanonicalVideoCodec)
+    case observedHEVCRequiresHybrid
     case stopped
     case invalidRate
     case invalidSeekTarget
@@ -93,6 +97,14 @@ enum AetherNativePlaybackSessionError:
             "The prepared source facts changed before native remux"
         case .engineRouteContractDiverged:
             "The native remux pipeline did not produce the stable AVPlayer route"
+        case .expectedVideoTrackMissing(let codec):
+            "The native playback item omitted the source-proven \(codec.rawValue) video track"
+        case .videoTrackInspectionInconclusive:
+            "The native playback item's video-track inspection was inconclusive"
+        case .unexpectedVideoTrack(let codec):
+            "The native playback item exposed an unexpected \(codec.rawValue) video track after audio-only preflight"
+        case .observedHEVCRequiresHybrid:
+            "The native playback item exposed HEVC, which requires the unified Hybrid route"
         case .stopped:
             "The native playback session has stopped"
         case .invalidRate:
@@ -114,6 +126,209 @@ enum AetherNativeItemReadinessDecision: Sendable, Equatable {
     case ready
     case failed
     case timedOut
+}
+
+enum AetherNativeAssetPlayabilityOwnership: Sendable, Equatable {
+    case directAsset
+    /// A direct AVPlayer item admitted only after clear selected-segment
+    /// inspection positively verified H.264 Native HLS packaging.
+    case verifiedNativeHLS
+    /// Issued only by `makeRemuxed` after the exact prepared source has been
+    /// consumed and its loaded profile equals the admitted preflight profile.
+    case aetherOwnedHLSFMP4Remux
+
+    var diagnosticLabel: String {
+        switch self {
+        case .directAsset:
+            "direct Native asset"
+        case .verifiedNativeHLS:
+            "verified H.264 Native HLS"
+        case .aetherOwnedHLSFMP4Remux:
+            "Aether-owned H.264 HLS-fMP4 remux"
+        }
+    }
+}
+
+enum AetherNativeAssetPlayabilityObservation: Sendable, Equatable {
+    case reportedPlayable
+    case reportedNotPlayable
+    case loadFailed
+}
+
+enum AetherNativeAssetPlayabilityDecision: Sendable, Equatable {
+    case proceed
+    case proceedWithAdvisory
+    case fail
+}
+
+/// Pure proof check for the only Native assets whose early AVAsset metadata is
+/// advisory. The ownership value is a capability token; these profile and
+/// package checks keep a forged or stale token fail-closed.
+enum AetherNativeEarlyAssetAdvisoryContract {
+    static func permits(
+        ownership: AetherNativeAssetPlayabilityOwnership,
+        preflightResult: PlaybackPreflightResult
+    ) -> Bool {
+        switch ownership {
+        case .directAsset:
+            return false
+        case .verifiedNativeHLS:
+            return isVerifiedClearH264HLS(preflightResult)
+        case .aetherOwnedHLSFMP4Remux:
+            return isExactPreparedH264Remux(preflightResult)
+        }
+    }
+
+    static func directOwnership(
+        for preflightResult: PlaybackPreflightResult
+    ) -> AetherNativeAssetPlayabilityOwnership {
+        isVerifiedClearH264HLS(preflightResult)
+            ? .verifiedNativeHLS
+            : .directAsset
+    }
+
+    private static func isVerifiedClearH264HLS(
+        _ result: PlaybackPreflightResult
+    ) -> Bool {
+        let source = result.sourceProfile
+        guard result.route == .nativeAVPlayer,
+              result.reason == .nativeHLSContractVerified,
+              source.sourceKind == .hls,
+              source.videoStreamPresence == .provenPresent,
+              source.videoCodec == .h264,
+              let packaging = result.hlsPackaging,
+              packaging.contentProtection == .none,
+              packaging.actualVideoCodec == .h264,
+              packaging.container != .unknown else {
+            return false
+        }
+        switch packaging.codecVerification {
+        case .verified, .manifestMissingButSegmentVerified, .mismatch:
+            return true
+        case .protectedManifestVerified, .segmentNotInspected:
+            return false
+        }
+    }
+
+    private static func isExactPreparedH264Remux(
+        _ result: PlaybackPreflightResult
+    ) -> Bool {
+        let source = result.sourceProfile
+        return result.route == .nativeAVPlayer
+            && result.reason == .nativeHLSFMP4Remux
+            && (source.sourceKind == .progressive
+                || source.sourceKind == .custom)
+            && source.videoStreamPresence == .provenPresent
+            && source.videoCodec == .h264
+            && source.sourceContainer.supportsNativeHLSFMP4Remux
+            && result.hlsPackaging == nil
+    }
+}
+
+/// AVFoundation's `isPlayable` result is authoritative for ordinary direct
+/// assets, but only an early observation for verified Native HLS and an
+/// Aether-owned loopback playlist. Both can report false while the playlist or
+/// init segment is still settling. Runtime item failure and real media/output
+/// progress stay authoritative after this advisory observation.
+enum AetherNativeAssetPlayabilityPolicy {
+    static func decide(
+        ownership: AetherNativeAssetPlayabilityOwnership,
+        preflightResult: PlaybackPreflightResult,
+        observation: AetherNativeAssetPlayabilityObservation
+    ) -> AetherNativeAssetPlayabilityDecision {
+        if observation == .reportedPlayable {
+            return .proceed
+        }
+        return AetherNativeEarlyAssetAdvisoryContract.permits(
+            ownership: ownership,
+            preflightResult: preflightResult
+        ) ? .proceedWithAdvisory : .fail
+    }
+}
+
+enum AetherNativeVideoTrackPreparationDecision:
+    Sendable,
+    Equatable
+{
+    case proceed
+    case proceedWithAdvisory
+    case fail(AetherNativePlaybackSessionError)
+}
+
+/// `AVAsset` track absence is authoritative for ordinary direct Native items,
+/// but verified Native HLS and Aether-owned generated HLS can expose no asset
+/// tracks until AVPlayer parses the playlist and init segment. Only those
+/// positive H.264 contracts may defer that empty observation to item failure
+/// and real presented-frame/media progress. Unknown/provisional video and
+/// every HEVC observation remain fail-closed.
+enum AetherNativeVideoTrackPreparationPolicy {
+    static func decide(
+        ownership: AetherNativeAssetPlayabilityOwnership,
+        preflightResult: PlaybackPreflightResult,
+        inspection: AetherNativeVideoTrackInspectionResult
+    ) -> AetherNativeVideoTrackPreparationDecision {
+        let sourceProfile = preflightResult.sourceProfile
+        if sourceProfile.videoCodec == .hevc
+            || inspection.exposesHEVC {
+            return .fail(.observedHEVCRequiresHybrid)
+        }
+
+        switch inspection {
+        case .expectedVideoMissing(let missingCodec):
+            if AetherNativeEarlyAssetAdvisoryContract.permits(
+                ownership: ownership,
+                preflightResult: preflightResult
+            ),
+               missingCodec == .h264 {
+                return .proceedWithAdvisory
+            }
+            guard sourceProfile.videoCodec != .unknown else {
+                return .fail(.videoTrackInspectionInconclusive)
+            }
+            return .fail(
+                .expectedVideoTrackMissing(
+                    codec: sourceProfile.videoCodec
+                )
+            )
+        case .observedVideo(let codec):
+            guard codec != .unknown else {
+                return .fail(.videoTrackInspectionInconclusive)
+            }
+            let expectedCodec = sourceProfile.videoCodec
+                .canonicalVideoOutputCodec
+            if expectedCodec != .unknown,
+               expectedCodec != codec {
+                return .fail(.unexpectedVideoTrack(codec: codec))
+            }
+            return .proceed
+        case .observedNoVideo:
+            guard sourceProfile.videoStreamPresence == .provenAbsent,
+                  sourceProfile.videoCodec == .unknown else {
+                return .fail(.videoTrackInspectionInconclusive)
+            }
+            return .proceed
+        case .unexpectedVideo(let codec):
+            return .fail(.unexpectedVideoTrack(codec: codec))
+        case .nativeRouteRejectedHEVC:
+            return .fail(.observedHEVCRequiresHybrid)
+        case .inconclusive:
+            return .fail(.videoTrackInspectionInconclusive)
+        }
+    }
+}
+
+private extension AetherNativeVideoTrackInspectionResult {
+    var exposesHEVC: Bool {
+        switch self {
+        case .observedVideo(.hevc), .unexpectedVideo(.hevc),
+             .expectedVideoMissing(.hevc),
+             .nativeRouteRejectedHEVC:
+            true
+        case .observedVideo, .observedNoVideo,
+             .expectedVideoMissing, .unexpectedVideo, .inconclusive:
+            false
+        }
+    }
 }
 
 struct AetherNativeItemReadinessGate: Sendable, Equatable {
@@ -229,6 +444,17 @@ final class AetherNativePlaybackSession: ObservableObject {
 
     @Published public private(set) var state:
         AetherNativePlaybackSessionState = .idle
+    @Published private(set) var videoOutputSnapshot =
+        AetherVideoOutputSnapshot(
+            videoExpected: false,
+            outputStatus: .missing,
+            frameSequence: 0,
+            frameGeneration: 0,
+            lastPresentedFrameMediaTimeSeconds: nil,
+            observedAtUptimeSeconds: nil,
+            activeRoute: .nativeAVPlayer,
+            canonicalCodec: .unknown
+        )
     /// Stable Aether track identity corresponding to AVKit's current audible
     /// selection. `nil` means the option-to-source mapping is not proven.
     @Published public private(set) var selectedAudioAnalysisTrackID:
@@ -303,6 +529,7 @@ final class AetherNativePlaybackSession: ObservableObject {
     private var mediaSelectionObserver: NSObjectProtocol?
     private var playbackStalledObserver: NSObjectProtocol?
     private var progressObserver: Any?
+    private var videoTrackObservationTask: Task<Void, Never>?
     private var directStallRecoveryTask: Task<Void, Never>?
     private var directStartupProgressTask: Task<Void, Never>?
     private var directItemDeathConfirmationTask: Task<Void, Never>?
@@ -329,6 +556,10 @@ final class AetherNativePlaybackSession: ObservableObject {
     private let audioAnalysisTelemetryHub =
         AetherAudioAnalysisTelemetryHub()
     private let engine: AetherEngine?
+    private let assetPlayabilityOwnership:
+        AetherNativeAssetPlayabilityOwnership
+    private let videoOutputMonitor =
+        AetherNativeVideoOutputMonitor()
     private var engineCancellables = Set<AnyCancellable>()
     private var isStopped = false
     private let itemReadinessGate = AetherNativeItemReadinessGate()
@@ -339,19 +570,24 @@ final class AetherNativePlaybackSession: ObservableObject {
         avPlayer: AVPlayer,
         audioAnalysisBinding:
             AetherNativeAudioAnalysisBinding,
-        engine: AetherEngine? = nil
+        engine: AetherEngine? = nil,
+        assetPlayabilityOwnership:
+            AetherNativeAssetPlayabilityOwnership
     ) {
         self.preflightResult = preflightResult
         self.audioAnalysisBinding = audioAnalysisBinding
         self.avPlayerItem = avPlayerItem
         self.avPlayer = avPlayer
         self.engine = engine
+        self.assetPlayabilityOwnership =
+            assetPlayabilityOwnership
         if avPlayer.currentItem !== avPlayerItem {
             avPlayer.replaceCurrentItem(with: avPlayerItem)
         }
         avPlayer.actionAtItemEnd = .pause
         avPlayer.preventsDisplaySleepDuringVideoPlayback = true
         avPlayer.automaticallyWaitsToMinimizeStalling = true
+        bindVideoOutput(to: avPlayerItem)
         if let engine {
             installEngineObservers(engine)
         } else {
@@ -414,7 +650,10 @@ final class AetherNativePlaybackSession: ObservableObject {
                 asset: AVURLAsset(url: url, options: assetOptions)
             ),
             avPlayer: avPlayer,
-            audioAnalysisBinding: audioAnalysisBinding
+            audioAnalysisBinding: audioAnalysisBinding,
+            assetPlayabilityOwnership:
+                AetherNativeEarlyAssetAdvisoryContract
+                    .directOwnership(for: preflightResult)
         )
     }
 
@@ -459,13 +698,11 @@ final class AetherNativePlaybackSession: ObservableObject {
                 throw AetherNativePlaybackSessionError
                     .sourceFactsDiverged
             }
+            try Task.checkCancellation()
             let loadedProfile = AetherSourceProfile(
                 probe: loadedProbe,
                 sourceKind: .progressive,
-                isSeekableVOD:
-                    loadedProbe.durationSeconds.isFinite
-                    && loadedProbe.durationSeconds > 0
-                    && !loadedProbe.isLive
+                isSeekableVOD: loadedProbe.isFiniteSeekableVOD
             )
             guard loadedProfile == preflightResult.sourceProfile else {
                 engine.stop()
@@ -483,7 +720,9 @@ final class AetherNativePlaybackSession: ObservableObject {
                 avPlayerItem: item,
                 avPlayer: avPlayer,
                 audioAnalysisBinding: audioAnalysisBinding,
-                engine: engine
+                engine: engine,
+                assetPlayabilityOwnership:
+                    .aetherOwnedHLSFMP4Remux
             )
         } catch {
             engine.stop()
@@ -495,12 +734,83 @@ final class AetherNativePlaybackSession: ObservableObject {
     /// through `state` and is not treated as permission to change route.
     public func prepare() async throws {
         try requireActive()
+        lastFailureEvidence = nil
         state = .preparing
         do {
-            let playable = try await avPlayerItem.asset.load(.isPlayable)
-            guard playable else {
+            let playabilityObservation:
+                AetherNativeAssetPlayabilityObservation
+            let playabilityLoadError: Error?
+            do {
+                let playable = try await avPlayerItem.asset
+                    .load(.isPlayable)
+                playabilityObservation = playable
+                    ? .reportedPlayable
+                    : .reportedNotPlayable
+                playabilityLoadError = nil
+            } catch {
+                playabilityObservation = .loadFailed
+                playabilityLoadError = error
+            }
+            switch AetherNativeAssetPlayabilityPolicy.decide(
+                ownership: assetPlayabilityOwnership,
+                preflightResult: preflightResult,
+                observation: playabilityObservation
+            ) {
+            case .proceed:
+                break
+            case .proceedWithAdvisory:
+                let detail: String
+                if let playabilityLoadError {
+                    let nsError = playabilityLoadError as NSError
+                    detail = "load failed \(nsError.domain)/\(nsError.code)"
+                } else {
+                    detail = "AVFoundation reported false"
+                }
+                EngineLog.emit(
+                    "[AetherNativePlaybackSession] "
+                        + "\(assetPlayabilityOwnership.diagnosticLabel) "
+                        + "isPlayable is advisory (\(detail)); deferring to "
+                        + "item failure and real media/output progress",
+                    category: .session
+                )
+            case .fail:
+                if let playabilityLoadError {
+                    lastFailureEvidence = Self.failureEvidence(
+                        error: playabilityLoadError,
+                        caseCode: "assetPlayableLoadFailed"
+                    )
+                } else {
+                    lastFailureEvidence =
+                        Self.assetReportedNotPlayableEvidence
+                }
                 state = .failed(.assetNotPlayable)
                 throw AetherNativePlaybackSessionError.assetNotPlayable
+            }
+            let videoTrackInspection = await observeVideoTracks(
+                for: avPlayerItem
+            )
+            switch AetherNativeVideoTrackPreparationPolicy.decide(
+                ownership: assetPlayabilityOwnership,
+                preflightResult: preflightResult,
+                inspection: videoTrackInspection
+            ) {
+            case .proceed:
+                break
+            case .proceedWithAdvisory:
+                EngineLog.emit(
+                    "[AetherNativePlaybackSession] "
+                        + "\(assetPlayabilityOwnership.diagnosticLabel) "
+                        + "asset video tracks are temporarily empty; "
+                        + "deferring to item failure and real "
+                        + "media/output progress",
+                    category: .session
+                )
+            case .fail(let trackFailure):
+                lastFailureEvidence = Self.failureEvidence(
+                    for: trackFailure
+                )
+                state = .failed(.playerItemFailed)
+                throw trackFailure
             }
             if let engine {
                 if case .error = engine.state {
@@ -537,6 +847,10 @@ final class AetherNativePlaybackSession: ObservableObject {
         } catch let error as AetherNativePlaybackSessionError {
             throw error
         } catch {
+            lastFailureEvidence = Self.failureEvidence(
+                error: error,
+                caseCode: "assetPlayableLoadFailed"
+            )
             state = .failed(.assetNotPlayable)
             throw AetherNativePlaybackSessionError.assetNotPlayable
         }
@@ -610,6 +924,8 @@ final class AetherNativePlaybackSession: ObservableObject {
         }
         seekRequestSequence &+= 1
         let requestSequence = seekRequestSequence
+        videoOutputMonitor.beginSeekGeneration()
+        publishVideoOutputSnapshot()
         activeEngineSeekDeadlineRace?.cancel()
         activeEngineSeekDeadlineRace = nil
         let engineShouldResume = engine != nil && state == .playing
@@ -761,15 +1077,26 @@ final class AetherNativePlaybackSession: ObservableObject {
             throw AetherNativePlaybackSessionError
                 .engineRouteContractDiverged
         }
+        let item = avPlayerItem
         guard let optionIndex = audioAnalysisBinding.optionTrackIDs
-                .firstIndex(of: trackID),
-              let group = try await avPlayerItem.asset
-                .loadMediaSelectionGroup(for: .audible),
+                .firstIndex(of: trackID) else {
+            throw AetherNativePlaybackSessionError
+                .sourceFactsDiverged
+        }
+        let group = try await item.asset
+            .loadMediaSelectionGroup(for: .audible)
+        try Task.checkCancellation()
+        try requireActive()
+        guard avPlayerItem === item,
+              avPlayer.currentItem === item else {
+            throw AetherNativePlaybackSessionError.stopped
+        }
+        guard let group,
               group.options.indices.contains(optionIndex) else {
             throw AetherNativePlaybackSessionError
                 .sourceFactsDiverged
         }
-        avPlayerItem.select(
+        item.select(
             group.options[optionIndex],
             in: group
         )
@@ -801,8 +1128,16 @@ final class AetherNativePlaybackSession: ObservableObject {
             engine.selectSubtitleTrack(index: trackID)
             return
         }
-        guard let group = try await avPlayerItem.asset
-                .loadMediaSelectionGroup(for: .legible) else {
+        let item = avPlayerItem
+        let group = try await item.asset
+            .loadMediaSelectionGroup(for: .legible)
+        try Task.checkCancellation()
+        try requireActive()
+        guard avPlayerItem === item,
+              avPlayer.currentItem === item else {
+            throw AetherNativePlaybackSessionError.stopped
+        }
+        guard let group else {
             if trackID == nil { return }
             throw AetherNativePlaybackSessionError
                 .sourceFactsDiverged
@@ -812,11 +1147,17 @@ final class AetherNativePlaybackSession: ObservableObject {
                 throw AetherNativePlaybackSessionError
                     .sourceFactsDiverged
             }
-            avPlayerItem.select(group.options[trackID], in: group)
+            item.select(group.options[trackID], in: group)
         } else {
-            avPlayerItem.select(nil, in: group)
+            item.select(nil, in: group)
         }
         await refreshDirectSubtitleSelectionFromPlayer()
+        try Task.checkCancellation()
+        try requireActive()
+        guard avPlayerItem === item,
+              avPlayer.currentItem === item else {
+            throw AetherNativePlaybackSessionError.stopped
+        }
     }
 
     #if os(tvOS)
@@ -941,6 +1282,9 @@ final class AetherNativePlaybackSession: ObservableObject {
             avPlayer.removeTimeObserver(progressObserver)
             self.progressObserver = nil
         }
+        videoTrackObservationTask?.cancel()
+        videoTrackObservationTask = nil
+        videoOutputMonitor.unbind()
         directStallRecoveryTask?.cancel()
         directStallRecoveryTask = nil
         directStartupProgressTask?.cancel()
@@ -952,11 +1296,204 @@ final class AetherNativePlaybackSession: ObservableObject {
         engineCancellables.removeAll()
         if let engine {
             engine.stop()
-        } else {
+        } else if avPlayer.currentItem === avPlayerItem {
             avPlayer.pause()
             avPlayer.replaceCurrentItem(with: nil)
         }
         state = .stopped
+    }
+
+    /// Polls the exact output attached to the current AVPlayerItem. Production
+    /// calls this only from the outer session's caller-bounded evidence wait;
+    /// ordinary playback has no periodic pixel-copy observer or background
+    /// frame sampling cost.
+    func pollVideoOutput() {
+        guard !isStopped,
+              avPlayer.currentItem === avPlayerItem else { return }
+        let hostTime = CMClockGetTime(
+            CMClockGetHostTimeClock()
+        ).seconds
+        let next = videoOutputMonitor.poll(
+            playerTime: avPlayer.currentTime(),
+            hostTimeSeconds: hostTime
+        )
+        if next != videoOutputSnapshot {
+            videoOutputSnapshot = next
+        }
+    }
+
+    private func bindVideoOutput(to item: AVPlayerItem) {
+        videoTrackObservationTask?.cancel()
+        videoTrackObservationTask = nil
+        videoOutputMonitor.bind(to: item)
+        let sourceProfile = preflightResult.sourceProfile
+        if sourceProfile.hasVideoStream {
+            videoOutputMonitor.observeVideoTrack(
+                codec: sourceProfile.videoCodec
+                    .canonicalVideoOutputCodec
+            )
+        }
+        publishVideoOutputSnapshot()
+        videoTrackObservationTask = Task {
+            @MainActor [weak self, weak item] in
+            guard let self, let item else { return }
+            let inspection = await self.observeVideoTracks(
+                for: item
+            )
+            self.handleRuntimeVideoTrackInspection(inspection)
+        }
+    }
+
+    /// A later AVPlayer item or deferred track load is a new route decision
+    /// boundary. Positive HEVC evidence must stop the Native implementation
+    /// immediately and publish the same typed failure used by preparation so
+    /// the unified session can re-resolve a same-source Hybrid route or issue
+    /// one terminal result. Snapshot-only handling would leave HEVC executing
+    /// on Native after the route contract had already been disproven.
+    func handleRuntimeVideoTrackInspection(
+        _ inspection: AetherNativeVideoTrackInspectionResult
+    ) {
+        guard !isStopped,
+              avPlayer.currentItem === avPlayerItem,
+              case .fail(.observedHEVCRequiresHybrid) =
+                AetherNativeVideoTrackPreparationPolicy.decide(
+                    ownership: assetPlayabilityOwnership,
+                    preflightResult: preflightResult,
+                    inspection: inspection
+                ) else { return }
+        lastFailureEvidence = Self.failureEvidence(
+            for: .observedHEVCRequiresHybrid
+        )
+        if let engine {
+            engine.stop()
+        } else {
+            avPlayer.pause()
+            avPlayer.replaceCurrentItem(with: nil)
+        }
+        videoOutputMonitor.clearItem()
+        publishVideoOutputSnapshot()
+        state = .failed(.playerItemFailed)
+    }
+
+    private func observeVideoTracks(
+        for item: AVPlayerItem
+    ) async -> AetherNativeVideoTrackInspectionResult {
+        guard !Task.isCancelled,
+              !isStopped,
+              avPlayerItem === item,
+              avPlayer.currentItem === item else {
+            return .inconclusive
+        }
+        do {
+            let tracks = try await item.asset.loadTracks(
+                withMediaType: .video
+            )
+            guard !Task.isCancelled,
+                  !isStopped,
+                  avPlayerItem === item,
+                  avPlayer.currentItem === item else {
+                return .inconclusive
+            }
+            guard !tracks.isEmpty else {
+                let result = AetherNativeVideoTrackInspectionResult
+                    .resolve(
+                        sourceHasVideo: preflightResult.sourceProfile
+                            .hasVideoStream,
+                        sourceCodec: preflightResult.sourceProfile
+                            .videoCodec,
+                        observedTrackCodec: nil
+                    )
+                switch result {
+                case .expectedVideoMissing(let codec):
+                    videoOutputMonitor.observeVideoTrack(
+                        codec: codec
+                    )
+                case .observedNoVideo:
+                    if preflightResult.sourceProfile
+                        .videoStreamPresence == .provenAbsent {
+                        videoOutputMonitor.observeNoVideoTrack()
+                    } else {
+                        videoOutputMonitor
+                            .observeTrackInspectionFailure()
+                    }
+                case .observedVideo, .unexpectedVideo,
+                     .nativeRouteRejectedHEVC, .inconclusive:
+                    break
+                }
+                publishVideoOutputSnapshot()
+                return result
+            }
+            var descriptions: [CMFormatDescription] = []
+            for track in tracks {
+                descriptions.append(
+                    contentsOf: (try? await track.load(
+                        .formatDescriptions
+                    )) ?? []
+                )
+            }
+            guard !Task.isCancelled,
+                  !isStopped,
+                  avPlayerItem === item else {
+                return .inconclusive
+            }
+            let result = AetherNativeVideoTrackInspectionResult
+                .resolve(
+                    sourceHasVideo: preflightResult.sourceProfile
+                        .hasVideoStream,
+                    sourceCodec: preflightResult.sourceProfile
+                        .videoCodec,
+                    observedTrackCodec:
+                        AetherObservedVideoCodec.canonical(
+                            formatDescriptions: descriptions
+                        )
+                )
+            switch result {
+            case .observedVideo(let codec):
+                videoOutputMonitor.observeVideoTrack(
+                    codec: codec
+                )
+            case .nativeRouteRejectedHEVC:
+                videoOutputMonitor.observeVideoTrack(
+                    codec: .hevc
+                )
+            case .unexpectedVideo(let codec):
+                videoOutputMonitor.observeVideoTrack(
+                    codec: codec
+                )
+            case .observedNoVideo, .expectedVideoMissing,
+                 .inconclusive:
+                return .inconclusive
+            }
+            publishVideoOutputSnapshot()
+            return result
+        } catch is CancellationError {
+            return .inconclusive
+        } catch {
+            guard !Task.isCancelled,
+                  !isStopped,
+                  avPlayerItem === item else {
+                return .inconclusive
+            }
+            if !preflightResult.sourceProfile.hasVideoStream {
+                videoOutputMonitor.observeTrackInspectionFailure()
+            }
+            publishVideoOutputSnapshot()
+            let nsError = error as NSError
+            EngineLog.emit(
+                "[AetherNativePlaybackSession] video track inspection "
+                    + "inconclusive domain=\(nsError.domain) "
+                    + "code=\(nsError.code)",
+                category: .session
+            )
+            return .inconclusive
+        }
+    }
+
+    private func publishVideoOutputSnapshot() {
+        let next = videoOutputMonitor.snapshot
+        if next != videoOutputSnapshot {
+            videoOutputSnapshot = next
+        }
     }
 
     private func installDirectObservers() {
@@ -1193,7 +1730,57 @@ final class AetherNativePlaybackSession: ObservableObject {
         }
     }
 
-    private static func failureEvidence(
+    nonisolated static let assetReportedNotPlayableEvidence =
+        AetherNativePlaybackFailureEvidence(
+            category: .routeRuntime,
+            caseCode: "assetReportedNotPlayable",
+            domain: "AVFoundation",
+            code: 0
+        )
+
+    nonisolated static func failureEvidence(
+        for trackFailure: AetherNativePlaybackSessionError
+    ) -> AetherNativePlaybackFailureEvidence {
+        switch trackFailure {
+        case .expectedVideoTrackMissing:
+            AetherNativePlaybackFailureEvidence(
+                category: .routeRuntime,
+                caseCode: "positiveVideoTrackMissing",
+                domain: "AVFoundation",
+                code: 0
+            )
+        case .videoTrackInspectionInconclusive:
+            AetherNativePlaybackFailureEvidence(
+                category: .routeRuntime,
+                caseCode: "videoTrackInspectionInconclusive",
+                domain: "AVFoundation",
+                code: 0
+            )
+        case .observedHEVCRequiresHybrid:
+            AetherNativePlaybackFailureEvidence(
+                category: .routeRuntime,
+                caseCode: "observedHEVCRequiresHybrid",
+                domain: "AetherPlaybackRoutePolicy",
+                code: 0
+            )
+        case .unexpectedVideoTrack:
+            AetherNativePlaybackFailureEvidence(
+                category: .invariant,
+                caseCode: "unexpectedVideoTrack",
+                domain: "AetherPlaybackSourceIdentity",
+                code: 0
+            )
+        default:
+            AetherNativePlaybackFailureEvidence(
+                category: .invariant,
+                caseCode: "unexpectedVideoTrackPolicyFailure",
+                domain: "AetherPlaybackRoutePolicy",
+                code: 0
+            )
+        }
+    }
+
+    nonisolated static func failureEvidence(
         error: Error?,
         caseCode: String
     ) -> AetherNativePlaybackFailureEvidence {
@@ -1260,6 +1847,7 @@ final class AetherNativePlaybackSession: ObservableObject {
         let freshItem = AVPlayerItem(asset: failedItem.asset)
         avPlayerItem = freshItem
         avPlayer.replaceCurrentItem(with: freshItem)
+        bindVideoOutput(to: freshItem)
         installDirectItemObservers()
         state = .preparing
 
@@ -1429,9 +2017,16 @@ final class AetherNativePlaybackSession: ObservableObject {
             options: [.new]
         ) { [weak self] player, _ in
             Task { @MainActor in
-                guard let self, !self.isStopped,
-                      let item = player.currentItem else { return }
+                guard let self, !self.isStopped else { return }
+                guard let item = player.currentItem else {
+                    self.videoTrackObservationTask?.cancel()
+                    self.videoTrackObservationTask = nil
+                    self.videoOutputMonitor.clearItem()
+                    self.publishVideoOutputSnapshot()
+                    return
+                }
                 self.avPlayerItem = item
+                self.bindVideoOutput(to: item)
             }
         }
         engine.$state
@@ -1497,10 +2092,18 @@ final class AetherNativePlaybackSession: ObservableObject {
     private func refreshSelectedAudioAnalysisTrackIDFromPlayer()
         async
     {
-        guard !Task.isCancelled, !isStopped else { return }
+        let item = avPlayerItem
+        guard !Task.isCancelled,
+              !isStopped,
+              avPlayer.currentItem === item else { return }
         do {
-            guard let group = try await avPlayerItem.asset
-                    .loadMediaSelectionGroup(for: .audible) else {
+            let group = try await item.asset
+                .loadMediaSelectionGroup(for: .audible)
+            guard !Task.isCancelled,
+                  !isStopped,
+                  avPlayerItem === item,
+                  avPlayer.currentItem === item else { return }
+            guard let group else {
                 applySelectedAudioAnalysisTrackID(
                     audioAnalysisBinding.optionTrackIDs.count == 1
                         ? audioAnalysisBinding.optionTrackIDs[0]
@@ -1510,7 +2113,7 @@ final class AetherNativePlaybackSession: ObservableObject {
             }
             guard group.options.count
                     == audioAnalysisBinding.optionTrackIDs.count,
-                  let selected = avPlayerItem.currentMediaSelection
+                  let selected = item.currentMediaSelection
                     .selectedMediaOption(in: group),
                   let selectedIndex = group.options.firstIndex(
                     where: { $0.isEqual(selected) }
@@ -1528,7 +2131,10 @@ final class AetherNativePlaybackSession: ObservableObject {
         } catch is CancellationError {
             return
         } catch {
-            guard !Task.isCancelled, !isStopped else { return }
+            guard !Task.isCancelled,
+                  !isStopped,
+                  avPlayerItem === item,
+                  avPlayer.currentItem === item else { return }
             applySelectedAudioAnalysisTrackID(nil)
         }
     }
@@ -1539,9 +2145,16 @@ final class AetherNativePlaybackSession: ObservableObject {
         guard engine == nil,
               !Task.isCancelled,
               !isStopped else { return }
+        let item = avPlayerItem
+        guard avPlayer.currentItem === item else { return }
         do {
-            guard let group = try await avPlayerItem.asset
-                    .loadMediaSelectionGroup(for: .legible) else {
+            let group = try await item.asset
+                .loadMediaSelectionGroup(for: .legible)
+            guard !Task.isCancelled,
+                  !isStopped,
+                  avPlayerItem === item,
+                  avPlayer.currentItem === item else { return }
+            guard let group else {
                 directSubtitleTracks = []
                 directSelectedSubtitleTrackID = nil
                 return
@@ -1560,7 +2173,7 @@ final class AetherNativePlaybackSession: ObservableObject {
                     )
                 )
             }
-            let selected = avPlayerItem.currentMediaSelection
+            let selected = item.currentMediaSelection
                 .selectedMediaOption(in: group)
             directSelectedSubtitleTrackID = selected.flatMap {
                 selected in
@@ -1569,6 +2182,10 @@ final class AetherNativePlaybackSession: ObservableObject {
                 })
             }
         } catch {
+            guard !Task.isCancelled,
+                  !isStopped,
+                  avPlayerItem === item,
+                  avPlayer.currentItem === item else { return }
             directSubtitleTracks = []
             directSelectedSubtitleTrackID = nil
         }
@@ -1591,6 +2208,7 @@ final class AetherNativePlaybackSession: ObservableObject {
     }
 
     private func requireActive() throws {
+        try Task.checkCancellation()
         guard !isStopped else {
             throw AetherNativePlaybackSessionError.stopped
         }
