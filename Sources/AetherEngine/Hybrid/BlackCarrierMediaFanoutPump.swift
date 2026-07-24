@@ -4,6 +4,180 @@ import Libavcodec
 import Libavformat
 import Libavutil
 
+struct BlackCarrierDemuxFailureEvidence:
+    Sendable,
+    Equatable
+{
+    let category: HybridPlaybackFailureCategory
+    let caseCode: String
+    let domain: String
+    let code: Int
+
+    static func capture(
+        _ error: Error,
+        sourceIsComplete: Bool = false
+    )
+        -> BlackCarrierDemuxFailureEvidence?
+    {
+        if let avio = error as? AVIOReaderError {
+            return captureAVIO(avio)
+        }
+        if let demuxer = error as? DemuxerError {
+            return captureDemuxer(
+                demuxer,
+                sourceIsComplete: sourceIsComplete
+            )
+        }
+        if let store = error as? SourceByteStoreError {
+            return captureSourceStore(store)
+        }
+        return nil
+    }
+
+    private static func captureAVIO(
+        _ error: AVIOReaderError
+    ) -> BlackCarrierDemuxFailureEvidence {
+        switch error {
+        case .allocationFailed:
+            return .init(
+                category: .routeRuntime,
+                caseCode: "avio.allocationFailed",
+                domain: "AetherEngine.AVIOReader",
+                code: 1
+            )
+        case .noResponse:
+            return .init(
+                category: .transientTransport,
+                caseCode: "avio.noResponse",
+                domain: "AetherEngine.AVIOReader",
+                code: 2
+            )
+        case .requestTimeout:
+            return .init(
+                category: .transientTransport,
+                caseCode: "avio.requestTimeout",
+                domain: "AetherEngine.AVIOReader",
+                code: 3
+            )
+        case .httpStatus(let statusCode):
+            let category: HybridPlaybackFailureCategory
+            if statusCode == 401 || statusCode == 403 {
+                category = .authentication
+            } else if statusCode == 408
+                        || statusCode == 425
+                        || statusCode == 429
+                        || statusCode >= 500 {
+                category = .transientTransport
+            } else {
+                category = .malformedMedia
+            }
+            return .init(
+                category: category,
+                caseCode: "avio.httpStatus",
+                domain: "AetherEngine.AVIOReader.HTTP",
+                code: statusCode
+            )
+        case .sourceByteStore(let sourceError):
+            return captureSourceStore(sourceError)
+        case .sourceByteStoreValidationFailed:
+            // Validation that did not yield a typed generation mismatch is
+            // inconclusive transport availability, not positive byte drift.
+            return .init(
+                category: .transientTransport,
+                caseCode: "sourceByteStore.validationFailed",
+                domain: "AetherEngine.SourceByteStore",
+                code: 14
+            )
+        }
+    }
+
+    private static func captureSourceStore(
+        _ error: SourceByteStoreError
+    ) -> BlackCarrierDemuxFailureEvidence {
+        let category: HybridPlaybackFailureCategory
+        let caseCode: String
+        let code: Int
+        switch error {
+        case .invalidCapacity:
+            (category, caseCode, code) =
+                (.invariant, "invalidCapacity", 1)
+        case .invalidGeneration:
+            (category, caseCode, code) =
+                (.invariant, "invalidGeneration", 2)
+        case .generationMismatch:
+            (category, caseCode, code) =
+                (.invariant, "generationMismatch", 3)
+        case .unsupportedContentEncoding:
+            (category, caseCode, code) =
+                (.unsupportedCapability, "unsupportedContentEncoding", 4)
+        case .invalidRange:
+            (category, caseCode, code) =
+                (.invariant, "invalidRange", 5)
+        case .cancelled:
+            (category, caseCode, code) =
+                (.cancelled, "cancelled", 6)
+        case .rangeFetchFailed:
+            (category, caseCode, code) =
+                (.transientTransport, "rangeFetchFailed", 7)
+        case .rangeFetchRateLimited:
+            (category, caseCode, code) =
+                (.transientTransport, "rangeFetchRateLimited", 8)
+        case .closed:
+            (category, caseCode, code) =
+                (.cancelled, "closed", 9)
+        case .directoryCreationFailed:
+            (category, caseCode, code) =
+                (.routeRuntime, "directoryCreationFailed", 10)
+        case .blockOpenFailed:
+            (category, caseCode, code) =
+                (.routeRuntime, "blockOpenFailed", 11)
+        case .blockReadFailed:
+            (category, caseCode, code) =
+                (.routeRuntime, "blockReadFailed", 12)
+        case .blockWriteFailed:
+            (category, caseCode, code) =
+                (.routeRuntime, "blockWriteFailed", 13)
+        }
+        return .init(
+            category: category,
+            caseCode: "sourceByteStore.\(caseCode)",
+            domain: "AetherEngine.SourceByteStore",
+            code: code
+        )
+    }
+
+    private static func captureDemuxer(
+        _ error: DemuxerError,
+        sourceIsComplete: Bool
+    ) -> BlackCarrierDemuxFailureEvidence {
+        let category: HybridPlaybackFailureCategory
+        switch error.ffmpegCode {
+        case FFmpegErr.invalidData, FFmpegErr.eof:
+            // INVALIDDATA/EOF from an incomplete remote generation can be a
+            // truncated read. Only a complete validator-bound store turns it
+            // into positive malformed-media evidence.
+            category = sourceIsComplete
+                ? .malformedMedia
+                : .transientTransport
+        case -5, FFmpegErr.eagain:
+            category = .transientTransport
+        default:
+            category = .routeRuntime
+        }
+        let caseCode: String = switch error {
+        case .openFailed: "demux.openFailed"
+        case .streamInfoFailed: "demux.streamInfoFailed"
+        case .readFailed: "demux.readFailed"
+        }
+        return .init(
+            category: category,
+            caseCode: caseCode,
+            domain: "AetherEngine.Demuxer",
+            code: Int(error.ffmpegCode)
+        )
+    }
+}
+
 enum BlackCarrierMediaFanoutPumpError:
     Error,
     LocalizedError,
@@ -24,8 +198,10 @@ enum BlackCarrierMediaFanoutPumpError:
     case restartTrackContractMismatch
     case generationSuperseded(generation: UInt64)
     case closed
+    case demuxFailure(evidence: BlackCarrierDemuxFailureEvidence)
     case demuxFailed(reason: String)
     case videoPacketSinkFailed(reason: String)
+    case videoDecoderFailed(error: HybridVideoDecodeSinkError)
     case audioMuxerFailed(
         trackID: Int,
         error: BlackCarrierAudioRenditionMuxerError
@@ -63,10 +239,16 @@ enum BlackCarrierMediaFanoutPumpError:
             return "Black carrier generation \(generation) was superseded by an explicit seek"
         case .closed:
             return "Black carrier media fanout pump is closed"
+        case .demuxFailure(let evidence):
+            return "Black carrier media fanout demux failed at "
+                + "\(evidence.caseCode) "
+                + "(\(evidence.domain):\(evidence.code))"
         case .demuxFailed(let reason):
             return "Black carrier media fanout demux failed: \(reason)"
         case .videoPacketSinkFailed(let reason):
             return "Black carrier real-video packet sink failed: \(reason)"
+        case .videoDecoderFailed(let error):
+            return "Black carrier real-video decoder failed: \(error.localizedDescription)"
         case .audioMuxerFailed(let trackID, let error):
             return "Black carrier audio track \(trackID) failed: \(error.localizedDescription)"
         case .audioStoreFailed(let error):
@@ -98,8 +280,17 @@ enum BlackCarrierMediaFanoutPumpError:
             "restartTrackContractMismatch"
         case .generationSuperseded: "generationSuperseded"
         case .closed: "closed"
+        case .demuxFailure(let evidence): evidence.caseCode
         case .demuxFailed: "demuxFailed"
         case .videoPacketSinkFailed: "videoPacketSinkFailed"
+        case .videoDecoderFailed(let error):
+            if error.isPixelBufferConversionCapabilityFailure {
+                "videoDecoder.pixelBufferConversionFailed"
+            } else if error.isLocalQueueInvariantFailure {
+                "videoDecoder.localQueueInvariant"
+            } else {
+                "videoDecoder.failed"
+            }
         case .audioMuxerFailed(_, let error):
             "audioMuxer.\(error.failureCaseCode)"
         case .audioStoreFailed(let error):
@@ -122,6 +313,10 @@ enum BlackCarrierMediaFanoutPumpError:
             "AetherEngine.BlackCarrierAudioRenditionMuxer"
         case .audioStoreFailed:
             "AetherEngine.BlackCarrierAudioRenditionStore"
+        case .videoDecoderFailed:
+            "AetherEngine.HybridVideoDecodeSink"
+        case .demuxFailure(let evidence):
+            evidence.domain
         default:
             "AetherEngine.BlackCarrierMediaFanoutPump"
         }
@@ -143,8 +338,17 @@ enum BlackCarrierMediaFanoutPumpError:
         case .restartTrackContractMismatch: 12
         case .generationSuperseded: 13
         case .closed: 14
+        case .demuxFailure(let evidence): evidence.code
         case .demuxFailed: 15
         case .videoPacketSinkFailed: 16
+        case .videoDecoderFailed(let error):
+            if error.isPixelBufferConversionCapabilityFailure {
+                1
+            } else if error.isLocalQueueInvariantFailure {
+                3
+            } else {
+                2
+            }
         case .audioMuxerFailed(_, let error):
             error.failureCode
         case .audioStoreFailed(let error):
@@ -156,6 +360,76 @@ enum BlackCarrierMediaFanoutPumpError:
             }
         case .requestedSegmentUnavailable: 17
         }
+    }
+
+    var failureCategory: HybridPlaybackFailureCategory {
+        if case .demuxFailure(let evidence) = self {
+            return evidence.category
+        }
+        if case .videoDecoderFailed(let error) = self,
+           error.isPixelBufferConversionCapabilityFailure {
+            return .unsupportedCapability
+        }
+        if case .videoDecoderFailed(let error) = self,
+           error.isLocalQueueInvariantFailure {
+            return .invariant
+        }
+        switch self {
+        case .audioMuxerFailed(
+            _,
+            .bridgeCapabilityUnavailable
+        ),
+             .audioStoreFailed(
+                .muxer(.bridgeCapabilityUnavailable)
+             ):
+            return .unsupportedCapability
+        default:
+            break
+        }
+        return .routeRuntime
+    }
+
+    static func wrappingVideoSinkFailure(
+        _ error: Error
+    ) -> BlackCarrierMediaFanoutPumpError {
+        if let decoder =
+                error as? HybridVideoDecodeSinkError {
+            if decoder == .closed {
+                return .closed
+            }
+            return .videoDecoderFailed(error: decoder)
+        }
+        return .videoPacketSinkFailed(
+            reason: String(describing: error)
+        )
+    }
+
+    static func wrappingDemuxFailure(
+        _ error: Error,
+        sourceIsComplete: Bool = false
+    ) -> BlackCarrierMediaFanoutPumpError {
+        if let typed = BlackCarrierDemuxFailureEvidence.capture(
+            error,
+            sourceIsComplete: sourceIsComplete
+        ) {
+            return .demuxFailure(evidence: typed)
+        }
+        return .demuxFailed(reason: String(describing: error))
+    }
+
+    static func wrappingFreshDemuxerOpenFailure(
+        _ error: Error,
+        sourceIsComplete: Bool = false
+    ) -> BlackCarrierMediaFanoutPumpError {
+        if let typed = BlackCarrierDemuxFailureEvidence.capture(
+            error,
+            sourceIsComplete: sourceIsComplete
+        ) {
+            return .demuxFailure(evidence: typed)
+        }
+        return .freshDemuxerOpenFailed(
+            reason: String(describing: error)
+        )
     }
 }
 
@@ -187,6 +461,25 @@ struct BlackCarrierDemuxContract: Sendable, Equatable {
     }
 }
 
+private final class BlackCarrierIOQuiescenceDiagnosticFence:
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var pending = true
+
+    func finish() {
+        lock.lock()
+        pending = false
+        lock.unlock()
+    }
+
+    var isPending: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return pending
+    }
+}
+
 struct BlackCarrierNativeSubtitleRenditionMetadata:
     Sendable,
     Equatable
@@ -208,6 +501,8 @@ struct BlackCarrierNativeSubtitleRenditionMetadata:
 /// safely invoke them from concurrent HLS request threads.
 final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     typealias FreshDemuxerFactory = @Sendable () throws -> Demuxer
+    typealias DemuxerReleaseFence =
+        @Sendable (Demuxer) -> Void
 
     typealias VideoPacketSink = (
         _ packet: UnsafeMutablePointer<AVPacket>
@@ -257,6 +552,8 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     let nativeSubtitleRenditionMetadata:
         [BlackCarrierNativeSubtitleRenditionMetadata]
     let sourceContract: BlackCarrierDemuxContract
+    let progressiveSourceGeneration:
+        SourceByteStoreGeneration?
     var progressiveSourceFacts: AetherProgressiveSourceFacts {
         sourceContract.progressiveSourceFacts
     }
@@ -268,6 +565,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
 
     private var demuxer: Demuxer
     private let freshDemuxerFactory: FreshDemuxerFactory?
+    private let demuxerReleaseFence: DemuxerReleaseFence
     private var sourceFactory: BlackCarrierDemuxSourceFactory?
     private let timeline: BlackCarrierTimeline
     private let bridgeMode: AudioBridgeMode
@@ -295,6 +593,11 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     private let restartLock = NSLock()
     private let generationLock = NSLock()
     private let demuxerReferenceLock = NSLock()
+    private let routePreparationProgressLock = NSLock()
+    /// Independent from the demux/segment serialization lock so MainActor can
+    /// observe an in-flight carrier request without waiting for weak-network
+    /// I/O to finish.
+    private let segmentProductionActivityLock = NSLock()
 
     private var summaries: [
         Int: BlackCarrierAudioRenditionSummary
@@ -308,6 +611,11 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     private var interruptibleDemuxer: Demuxer
     private var ownsActiveDemuxer = false
     private var videoProductionEnd: CMTime = .invalid
+    private var routePreparationProgressHandler:
+        (@Sendable (
+            AetherRoutePreparationProgressKind
+        ) -> Void)?
+    private var activeSegmentProductionRequests = 0
 
     init(
         demuxer: Demuxer,
@@ -319,7 +627,13 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         initialGeneration: UInt64 = 0,
         freshDemuxerFactory: FreshDemuxerFactory? = nil,
         ownsInitialDemuxer: Bool = false,
-        sourceFactory: BlackCarrierDemuxSourceFactory? = nil
+        sourceFactory: BlackCarrierDemuxSourceFactory? = nil,
+        demuxerReleaseFence:
+            @escaping DemuxerReleaseFence = {
+                demuxer in
+                demuxer.close()
+                demuxer.waitForIOQuiescence()
+            }
     ) throws {
         guard let firstSegmentIndex = timeline.segments.first?.index else {
             throw BlackCarrierMediaFanoutPumpError
@@ -353,9 +667,8 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                     throw HybridVideoDecodeSinkError.streamContractMismatch
                 }
             } catch {
-                throw BlackCarrierMediaFanoutPumpError.videoPacketSinkFailed(
-                    reason: String(describing: error)
-                )
+                throw BlackCarrierMediaFanoutPumpError
+                    .wrappingVideoSinkFailure(error)
             }
         }
         let videoStream = resolvedVideoPacketSink == nil
@@ -509,13 +822,13 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             )
         } catch {
             prepared.forEach { $0.cache.close() }
-            throw BlackCarrierMediaFanoutPumpError.demuxFailed(
-                reason: String(describing: error)
-            )
+            throw BlackCarrierMediaFanoutPumpError
+                .wrappingDemuxFailure(error)
         }
 
         self.demuxer = demuxer
         self.freshDemuxerFactory = freshDemuxerFactory
+        self.demuxerReleaseFence = demuxerReleaseFence
         self.sourceFactory = sourceFactory
         self.timeline = timeline
         self.bridgeMode = bridgeMode
@@ -536,6 +849,8 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                 streamIndex: resolvedVideoStreamIndex
             )
         sourceContract = BlackCarrierDemuxContract(demuxer: demuxer)
+        progressiveSourceGeneration =
+            sourceFactory?.progressiveSourceGeneration
         renditionMetadata = metadata
         renditions = prepared
         renditionDescriptors = prepared.map(\.writer.descriptor)
@@ -582,6 +897,9 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         decodedFrameHandler: HybridVideoDecodeSink.FrameHandler? = nil,
         videoFailureHandler: HybridVideoDecodeSink.FailureHandler? = nil,
         decoderPreference: HybridVideoDecoderPreference = .automatic,
+        videoBacklogConfiguration:
+            HybridCompressedVideoBacklogConfiguration = .production,
+        videoBacklogScratchRoot: URL? = nil,
         initialGeneration: UInt64 = 0,
         selectTitleID: Int? = nil
     ) throws -> BlackCarrierMediaFanoutPump {
@@ -599,6 +917,10 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             decodedFrameHandler: decodedFrameHandler,
             videoFailureHandler: videoFailureHandler,
             decoderPreference: decoderPreference,
+            videoBacklogConfiguration:
+                videoBacklogConfiguration,
+            videoBacklogScratchRoot:
+                videoBacklogScratchRoot,
             initialGeneration: initialGeneration
         )
     }
@@ -612,6 +934,9 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         decodedFrameHandler: HybridVideoDecodeSink.FrameHandler? = nil,
         videoFailureHandler: HybridVideoDecodeSink.FailureHandler? = nil,
         decoderPreference: HybridVideoDecoderPreference = .automatic,
+        videoBacklogConfiguration:
+            HybridCompressedVideoBacklogConfiguration = .production,
+        videoBacklogScratchRoot: URL? = nil,
         initialGeneration: UInt64 = 0
     ) throws -> BlackCarrierMediaFanoutPump {
         do {
@@ -620,6 +945,16 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                 try HybridVideoDecodeSink(
                     demuxer: demuxer,
                     initialGeneration: initialGeneration,
+                    maximumQueuedBytes:
+                        videoBacklogConfiguration
+                            .residentByteLimit,
+                    maximumQueuedPackets:
+                        videoBacklogConfiguration.packetLimit,
+                    maximumSpoolContentBytes:
+                        videoBacklogConfiguration
+                            .spoolContentByteLimit,
+                    backlogScratchRoot:
+                        videoBacklogScratchRoot,
                     decoderPreference: decoderPreference,
                     onFrame: handler,
                     onFailure: videoFailureHandler
@@ -643,6 +978,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             } catch {
                 decodeSink?.close()
                 demuxer.close()
+                demuxer.waitForIOQuiescence()
                 throw error
             }
         } catch {
@@ -697,6 +1033,32 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             ?? .unavailable()
     }
 
+    var compressedVideoBacklogSnapshot:
+        HybridCompressedVideoBacklogSnapshot?
+    {
+        hybridVideoDecodeSink?.compressedBacklogSnapshot
+    }
+
+    func setRoutePreparationProgressHandler(
+        _ handler:
+            (@Sendable (
+                AetherRoutePreparationProgressKind
+            ) -> Void)?
+    ) {
+        routePreparationProgressLock.lock()
+        routePreparationProgressHandler = handler
+        routePreparationProgressLock.unlock()
+    }
+
+    private func reportRoutePreparationProgress(
+        _ kind: AetherRoutePreparationProgressKind
+    ) {
+        routePreparationProgressLock.lock()
+        let handler = routePreparationProgressHandler
+        routePreparationProgressLock.unlock()
+        handler?(kind)
+    }
+
     func restart(
         for intent: HybridSeekIntent
     ) throws -> BlackCarrierMediaFanoutRestartResult {
@@ -728,6 +1090,8 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         retiringDemuxer.markClosed()
 
         let restartFactory: FreshDemuxerFactory
+        let restartSourceFactory:
+            BlackCarrierDemuxSourceFactory?
         let expectedSegmentIndex: Int
         lock.lock()
         guard !isClosed else {
@@ -767,8 +1131,65 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             throw error
         }
         restartFactory = freshDemuxerFactory
+        restartSourceFactory = sourceFactory
         expectedSegmentIndex = resolvedSegmentIndex
         lock.unlock()
+
+        // Closing the AVIO context is not the release fence. The retiring
+        // reader must deliver every terminal URLSession callback before a new
+        // same-source reader is opened.
+        let quiescenceFence =
+            BlackCarrierIOQuiescenceDiagnosticFence()
+        let quiescenceWatchdog = Task.detached {
+            do {
+                try await Task.sleep(
+                    nanoseconds: 2_000_000_000
+                )
+            } catch {
+                return
+            }
+            guard quiescenceFence.isPending else { return }
+            EngineLog.emit(
+                "[BlackCarrierMediaFanoutPump] cancellationUnresponsive "
+                    + "readerOverlap=forbidden",
+                category: .session
+            )
+        }
+        demuxerReleaseFence(retiringDemuxer)
+        quiescenceFence.finish()
+        quiescenceWatchdog.cancel()
+
+        lock.lock()
+        let restartWasClosed = isClosed
+        lock.unlock()
+        guard !restartWasClosed else {
+            clearRequestedRestart()
+            throw BlackCarrierMediaFanoutPumpError.closed
+        }
+
+        do {
+            try restartSourceFactory?
+                .requireProgressiveRestartGeneration(
+                    progressiveSourceGeneration
+                )
+        } catch {
+            let typed = BlackCarrierMediaFanoutPumpError
+                .wrappingDemuxFailure(
+                    error,
+                    sourceIsComplete:
+                        restartSourceFactory?
+                            .progressiveSourceIsComplete
+                            ?? false
+                )
+            lock.lock()
+            if isClosed {
+                lock.unlock()
+                throw BlackCarrierMediaFanoutPumpError.closed
+            }
+            failWhileLocked(typed)
+            lock.unlock()
+            throw typed
+        }
 
         // Fresh source open may contain a non-cooperative synchronous read.
         // It must not hold the production lock: timeout teardown first marks
@@ -780,8 +1201,12 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             freshDemuxer = try restartFactory()
         } catch {
             let typed = BlackCarrierMediaFanoutPumpError
-                .freshDemuxerOpenFailed(
-                    reason: String(describing: error)
+                .wrappingFreshDemuxerOpenFailure(
+                    error,
+                    sourceIsComplete:
+                        restartSourceFactory?
+                            .progressiveSourceIsComplete
+                            ?? false
                 )
             lock.lock()
             if isClosed {
@@ -798,7 +1223,11 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         var retiredDemuxerToClose: Demuxer?
         defer {
             lock.unlock()
-            freshDemuxerToClose?.close()
+            if let freshDemuxerToClose {
+                demuxerReleaseFence(
+                    freshDemuxerToClose
+                )
+            }
             retiredDemuxerToClose?.close()
         }
         guard !isClosed else {
@@ -818,6 +1247,10 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         }
 
         do {
+            try restartSourceFactory?
+                .requireProgressiveRestartGeneration(
+                    progressiveSourceGeneration
+                )
             let timelineOffsets = try renditions.map { rendition in
                 guard let offset =
                         rendition.writer.presentationTimelineOffset else {
@@ -984,9 +1417,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                     )
                 } catch {
                     throw BlackCarrierMediaFanoutPumpError
-                        .videoPacketSinkFailed(
-                            reason: String(describing: error)
-                        )
+                        .wrappingVideoSinkFailure(error)
                 }
             }
             for (rendition, replacement) in zip(
@@ -1053,15 +1484,23 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             failWhileLocked(typed)
             throw typed
         } catch {
-            let typed = BlackCarrierMediaFanoutPumpError.demuxFailed(
-                reason: String(describing: error)
-            )
+            let typed = BlackCarrierMediaFanoutPumpError
+                .wrappingDemuxFailure(
+                    error,
+                    sourceIsComplete:
+                        sourceFactory?
+                            .progressiveSourceIsComplete
+                            ?? false
+                )
             failWhileLocked(typed)
             throw typed
         }
     }
 
     func produce(throughSegment index: Int) throws {
+        beginSegmentProductionRequest()
+        defer { endSegmentProductionRequest() }
+
         lock.lock()
         defer { lock.unlock() }
         let operationGeneration = generationSnapshot()
@@ -1074,9 +1513,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         }
         if let videoError = hybridVideoDecodeSink?.failure {
             let typed = BlackCarrierMediaFanoutPumpError
-                .videoPacketSinkFailed(
-                    reason: videoError.localizedDescription
-                )
+                .videoDecoderFailed(error: videoError)
             fail(typed)
             throw typed
         }
@@ -1109,6 +1546,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                     try finishWriters()
                     break
                 }
+                reportRoutePreparationProgress(.demuxPacket)
                 var packetToFree: UnsafeMutablePointer<AVPacket>? = packet
                 defer { trackedPacketFree(&packetToFree) }
 
@@ -1134,9 +1572,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                         updateVideoProductionEnd(packet)
                     } catch {
                         throw BlackCarrierMediaFanoutPumpError
-                            .videoPacketSinkFailed(
-                                reason: String(describing: error)
-                            )
+                            .wrappingVideoSinkFailure(error)
                     }
                 } else if let contract =
                             subtitleContractsByStream[
@@ -1198,12 +1634,36 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
                         generation: operationGeneration
                     )
             }
-            let typed = BlackCarrierMediaFanoutPumpError.demuxFailed(
-                reason: String(describing: error)
-            )
+            let typed = BlackCarrierMediaFanoutPumpError
+                .wrappingDemuxFailure(
+                    error,
+                    sourceIsComplete:
+                        sourceFactory?
+                            .progressiveSourceIsComplete
+                            ?? false
+                )
             fail(typed)
             throw typed
         }
+    }
+
+    var isCarrierSegmentProductionActive: Bool {
+        segmentProductionActivityLock.lock()
+        defer { segmentProductionActivityLock.unlock() }
+        return activeSegmentProductionRequests > 0
+    }
+
+    private func beginSegmentProductionRequest() {
+        segmentProductionActivityLock.lock()
+        activeSegmentProductionRequests += 1
+        segmentProductionActivityLock.unlock()
+    }
+
+    private func endSegmentProductionRequest() {
+        segmentProductionActivityLock.lock()
+        activeSegmentProductionRequests -= 1
+        assert(activeSegmentProductionRequests >= 0)
+        segmentProductionActivityLock.unlock()
     }
 
     func initSegment(ordinal: Int) throws -> Data? {
@@ -1325,9 +1785,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             try hybridVideoDecodeSink.advanceDecodeDemand(to: time)
         } catch {
             let typed = BlackCarrierMediaFanoutPumpError
-                .videoPacketSinkFailed(
-                    reason: String(describing: error)
-                )
+                .wrappingVideoSinkFailure(error)
             failAfterUnlock(typed)
             throw typed
         }
@@ -1365,9 +1823,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             try hybridVideoDecodeSink.finish()
         } catch {
             let typed = BlackCarrierMediaFanoutPumpError
-                .videoPacketSinkFailed(
-                    reason: String(describing: error)
-                )
+                .wrappingVideoSinkFailure(error)
             failAfterUnlock(typed)
             throw typed
         }
@@ -1423,9 +1879,8 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
             failAfterUnlock(typed)
             throw typed
         } catch {
-            let typed = BlackCarrierMediaFanoutPumpError.demuxFailed(
-                reason: String(describing: error)
-            )
+            let typed = BlackCarrierMediaFanoutPumpError
+                .wrappingDemuxFailure(error)
             lock.unlock()
             failAfterUnlock(typed)
             throw typed
@@ -1465,6 +1920,7 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
     }
 
     func close() {
+        setRoutePreparationProgressHandler(nil)
         demuxerReferenceLock.lock()
         let activeDemuxer = interruptibleDemuxer
         demuxerReferenceLock.unlock()
@@ -1490,15 +1946,28 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         sourceFactoryToClose?.close()
     }
 
+    /// Release fence for route replacement. `close()` performs the fast
+    /// cooperative interrupt; this method additionally waits for a late
+    /// restart factory and every active Demuxer-owned asynchronous callback.
+    func closeAndWaitForIOQuiescence() {
+        close()
+        restartLock.lock()
+        restartLock.unlock()
+
+        demuxerReferenceLock.lock()
+        let finalDemuxer = interruptibleDemuxer
+        demuxerReferenceLock.unlock()
+        demuxerReleaseFence(finalDemuxer)
+    }
+
     private func finishWriters() throws {
         guard !isFinished else { return }
         if let hybridVideoDecodeSink {
             do {
                 try hybridVideoDecodeSink.markEndOfStream()
             } catch {
-                throw BlackCarrierMediaFanoutPumpError.videoPacketSinkFailed(
-                    reason: String(describing: error)
-                )
+                throw BlackCarrierMediaFanoutPumpError
+                    .wrappingVideoSinkFailure(error)
             }
         }
         for rendition in renditions {
@@ -1592,9 +2061,8 @@ final class BlackCarrierMediaFanoutPump: @unchecked Sendable {
         guard let error = hybridVideoDecodeSink?.failure else {
             return
         }
-        throw BlackCarrierMediaFanoutPumpError.videoPacketSinkFailed(
-            reason: error.localizedDescription
-        )
+        throw BlackCarrierMediaFanoutPumpError
+            .videoDecoderFailed(error: error)
     }
 
     private func cachedSegmentExists(_ index: Int) -> Bool {

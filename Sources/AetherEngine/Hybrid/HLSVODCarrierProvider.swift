@@ -94,7 +94,7 @@ final class HLSVODCarrierProvider:
         baseDirectory: URL =
             FileManager.default.temporaryDirectory,
         transportRetryBudget: PlaybackTransportRetryBudget = .init(
-            maximumFailureAttempts: 3
+            maximumFailureAttempts: nil
         ),
         fetchOverride:
             HLSVODOriginResourceLoader.Fetch? = nil

@@ -85,6 +85,140 @@ extension AetherEngine {
             .store(in: &cancellables)
     }
 
+    /// Shared AVPlayer same-item recovery. Generic `.failed` and
+    /// `failedToPlayToEndTime` evidence are transport-inconclusive, so both
+    /// remote-HLS and loopback routes keep the exact host/source contract
+    /// alive until progress or cancellation. Positive display rejection and a
+    /// separately published HLS structural terminal retain fail-closed
+    /// ownership.
+    private func wireNativeItemRecovery(
+        host: NativeAVPlayerHost
+    ) {
+        host.$endFailureCount
+            .dropFirst()
+            .sink { [weak self, weak host] count in
+                guard let self, let host else {
+                    return
+                }
+                let clockAtFailure =
+                    host.renderedTime
+                self.itemDeathConfirmTask?
+                    .cancel()
+                self.itemDeathConfirmTask =
+                    Task {
+                        @MainActor
+                        [weak self, weak host] in
+                        try? await Task.sleep(
+                            nanoseconds:
+                                UInt64(
+                                    Self
+                                        .itemDeathConfirmSeconds
+                                        * 1_000_000_000
+                                )
+                        )
+                        guard !Task.isCancelled,
+                              let self,
+                              let host,
+                              host.endFailureCount
+                                == count,
+                              host
+                                .transportIntentIsPlaying else {
+                            return
+                        }
+                        guard NativeAVPlayerHost
+                            .shouldSurfaceDeferredFailure(
+                                isPlaying:
+                                    host
+                                        .timeControlStatus
+                                        == .playing,
+                                clockAtFailure:
+                                    clockAtFailure,
+                                clockNow:
+                                    host.renderedTime
+                            ) else {
+                            return
+                        }
+                        let position =
+                            host.renderedTime
+                        let decision =
+                            self
+                                .itemDeathReviveGate
+                                .recordFailure(
+                                    position:
+                                        position
+                                )
+                        if let diagnostic =
+                                decision.diagnostic {
+                            EngineLog.emit(
+                                "[AetherEngine] native item "
+                                    + "failure; exact-contract "
+                                    + "retry remains active "
+                                    + "attempt="
+                                    + "\(decision.attempt) "
+                                    + "failures="
+                                    + "\(diagnostic.cumulativeFailureCount) "
+                                    + "elapsed="
+                                    + "\(Int(diagnostic.elapsedSeconds))s "
+                                    + "backoff="
+                                    + "\(Int(decision.backoffSeconds))s"
+                                    + (diagnostic
+                                        .checkpointSeconds
+                                        .map {
+                                            " checkpoint="
+                                                + "\(Int($0))s"
+                                        } ?? " firstFailure"),
+                                category: .engine
+                            )
+                        }
+                        do {
+                            try await Task.sleep(
+                                nanoseconds:
+                                    UInt64(
+                                        decision
+                                            .backoffSeconds
+                                            * 1_000_000_000
+                                    )
+                            )
+                        } catch {
+                            return
+                        }
+                        guard !Task.isCancelled,
+                              host.endFailureCount
+                                == count,
+                              host
+                                .transportIntentIsPlaying,
+                              self.nativeVideoSession?
+                                .terminalReopenFailureSnapshot()
+                                == nil else {
+                            return
+                        }
+                        self.itemDeathConfirmTask =
+                            nil
+                        self.reloadStalledConsumerItem(
+                            position: position,
+                            allowPausedConsumer: true,
+                            logRecovery: false
+                        )
+                    }
+            }
+            .store(in: &nativeCancellables)
+
+        host.$pendingDisplayRejection
+            // A reused host may still hold a prior route's published value
+            // until load() clears it. Never replay that stale terminal into a
+            // newly wired source.
+            .dropFirst()
+            .compactMap { $0 }
+            .sink { [weak self] rejection in
+                Task { @MainActor [weak self] in
+                    self?.handleDisplayRejection(
+                        rejection
+                    )
+                }
+            }
+            .store(in: &nativeCancellables)
+    }
+
     /// Lean native-HLS live path: AVPlayerItem from the remote URL on the reused NativeAVPlayerHost. No Demuxer, no HLSVideoEngine, no loopback, no display-criteria handshake (AVKit drives match-content). Live-window surfaces come from `host.seekableEnd`.
     func loadRemoteHLS(url: URL, options: LoadOptions) async throws {
         playbackBackend = .native
@@ -144,6 +278,7 @@ extension AetherEngine {
             didReachEnd: host.$didReachEnd,
             storeIn: &nativeCancellables
         )
+        wireNativeItemRecovery(host: host)
         // Track AVPlayer's REAL transport state. Eager .playing caused a ~10 s black screen during Jellyfin transcode spin-up.
         host.$timeControlStatus
             .sink { [weak self] status in
@@ -178,8 +313,8 @@ extension AetherEngine {
                   perFrameHDR: true,
                   skipInitialSeek: true,
                   forwardBufferDuration: 0,
-                  // This lean path has no live-reopen / readiness watchdog; let AVPlayer's "gave up"
-                  // signal surface a dead upstream (segment 404 / token expiry) so the host can retune.
+                  // Retained for source compatibility; generic end failures
+                  // now use the shared exact-contract recovery sink.
                   surfaceEndFailures: true,
                   httpHeaders: options.httpHeaders)
 
@@ -206,6 +341,16 @@ extension AetherEngine {
         dvrWindowSeconds: Double? = nil,
         liveRejoin: Bool = false,
         preopenedDemuxer: Demuxer? = nil,
+        progressiveSourceByteStore:
+            SourceByteStore? = nil,
+        progressiveSourceGeneration:
+            SourceByteStoreGeneration? = nil,
+        progressiveFetchedByteProgressLedger:
+            AetherFetchedByteProgressLedger? = nil,
+        progressiveFetchedByteProgress:
+            (@Sendable (AetherFetchedByteProgress) -> Void)? = nil,
+        progressiveProbeMilestone:
+            (@Sendable () -> Void)? = nil,
         generation: UInt64
     ) async throws {
         try checkLoadCurrent(generation)
@@ -234,6 +379,16 @@ extension AetherEngine {
             probesize: loadedOptions.probesize,
             maxAnalyzeDuration: loadedOptions.maxAnalyzeDuration,
             forwardBufferSegments: loadedOptions.forwardBufferSegments
+        )
+        session.adoptProgressiveSourceIdentity(
+            byteStore: progressiveSourceByteStore,
+            generation: progressiveSourceGeneration,
+            fetchedByteProgressLedger:
+                progressiveFetchedByteProgressLedger,
+            onFetchedByteProgress:
+                progressiveFetchedByteProgress,
+            onProbeMilestone:
+                progressiveProbeMilestone
         )
         session.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }
@@ -380,6 +535,20 @@ extension AetherEngine {
                     return
                 }
                 self.state = .error("Source read failed before any media was produced (code \(code))")
+            }
+        }
+        session.onTerminalReopenFailure = {
+            [weak self, weak session] failure in
+            Task { @MainActor in
+                guard let self, let session,
+                      self.nativeVideoSession === session else {
+                    return
+                }
+                self.state = .error(
+                    "Playback source terminated "
+                        + "(\(failure.kind.rawValue), "
+                        + "code \(failure.code))"
+                )
             }
         }
         // prepareNativeSubtitles + non-bitmap text tracks: builds the native subtitle table; must be set before start().
@@ -632,9 +801,21 @@ extension AetherEngine {
             didReachEnd: host.$didReachEnd,
             storeIn: &nativeCancellables
         )
+        wireNativeItemRecovery(host: host)
         host.$timeControlStatus
             .sink { [weak self, weak host] status in
-                guard let self = self else { return }
+                guard let self,
+                      let host else {
+                    return
+                }
+                if case .error = self.state {
+                    return
+                }
+                if self.state == .idle
+                    || self.state == .ended
+                    || self.state == .seeking {
+                    return
+                }
                 // #93 residual: during active stall recovery AVPlayer can drop a SPURIOUS .paused
                 // (rate 0, no wait reason, no user action). Latching it kills both recovery paths,
                 // so re-assert play() within the bounded window instead (see stallRecoveryWindowUntil).
@@ -650,7 +831,7 @@ extension AetherEngine {
                         + "(\(self.stallRecoveryReasserts)/\(Self.maxStallRecoveryReasserts))",
                         category: .engine
                     )
-                    host?.play()
+                    host.play()
                     return
                 }
                 // #65 pause false-positive: mirror AVPlayer's play intent for the off-main producer wedge detector.
@@ -662,19 +843,23 @@ extension AetherEngine {
                 // stays suspended before this so a slow DV-master pre-roll is never re-anchored. Latched
                 // for the item (reset only by load()), so a later backward-seek wedge (#93) still trips.
                 if status == .playing { self.hasRenderedFirstFrameMirror.set(true) }
-                // Reconcile state with external transport commands (AVKit bar, Control Center, hardware button); without this togglePlayPause() is a no-op (swallowed press). .waitingToPlayAtSpecifiedRate maps to .playing so the icon doesn't flicker on rebuffer.
-                // isBuffering only once playback has started (not during initial load spin-up).
-                let startedPlaying = self.state == .playing || self.state == .paused
-                self.isBuffering = startedPlaying && status == .waitingToPlayAtSpecifiedRate
-                guard startedPlaying else { return }
-                switch status {
-                case .paused:
-                    if self.state != .paused { self.state = .paused }
-                case .playing, .waitingToPlayAtSpecifiedRate:
-                    if self.state != .playing { self.state = .playing }
-                @unknown default:
-                    break
-                }
+                let hasPresentedFrame =
+                    self
+                        .hasRenderedFirstFrameMirror
+                        .get()
+                self.isBuffering =
+                    hasPresentedFrame
+                    && status
+                        == .waitingToPlayAtSpecifiedRate
+                self.state =
+                    Self.nativeObservedPlaybackState(
+                        status: status,
+                        playIntent:
+                            host
+                                .transportIntentIsPlaying,
+                        hasPresentedFrame:
+                            hasPresentedFrame
+                    )
             }
             .store(in: &nativeCancellables)
 
@@ -719,57 +904,6 @@ extension AetherEngine {
                           player2.currentItem?.status != .failed else { return }
                     self.reloadStalledConsumerItem(position: player2.currentTime().seconds)
                 }
-            }
-            .store(in: &nativeCancellables)
-
-        // #93 round 3: accumulated -12889 media timeouts (a wedge-window segment outliving
-        // AVPlayer's ~3.5 s time-to-first-byte watchdog) fire failedToPlayToEndTime and park the
-        // item at rate 0 / tcs .paused with item.status often still readyToPlay. Every recovery
-        // layer above reads that pause as user intent and disarms (producer wedge detector
-        // suspends, nudge and stage-2 guard on .paused), which made the session terminal from the
-        // couch. Item death is categorically NOT user intent: confirm it survived the deferred
-        // window (a transient that resumes self-clears, same contract as the .failed KVO), then
-        // reload through the stage-2 chain with the pause guard bypassed, bounded by the revive
-        // gate (a frozen position across deaths exhausts; progress or a user seek restores).
-        host.$endFailureCount
-            .dropFirst()
-            .sink { [weak self, weak host] count in
-                guard let self, let host else { return }
-                let clockAtFailure = host.renderedTime
-                self.itemDeathConfirmTask?.cancel()
-                self.itemDeathConfirmTask = Task { @MainActor [weak self, weak host] in
-                    try? await Task.sleep(
-                        nanoseconds: UInt64(Self.itemDeathConfirmSeconds * 1_000_000_000))
-                    guard !Task.isCancelled, let self, let host,
-                          host.endFailureCount == count else { return }
-                    guard NativeAVPlayerHost.shouldSurfaceDeferredFailure(
-                        isPlaying: host.timeControlStatus == .playing,
-                        clockAtFailure: clockAtFailure,
-                        clockNow: host.renderedTime) else { return }
-                    let position = host.renderedTime
-                    guard self.itemDeathReviveGate.admit(position: position) else {
-                        EngineLog.emit(
-                            "[AetherEngine] #93 item death (failedToPlayToEndTime) at "
-                            + "\(String(format: "%.2f", position))s; revive budget exhausted, giving up",
-                            category: .engine)
-                        return
-                    }
-                    EngineLog.emit(
-                        "[AetherEngine] #93 item death (failedToPlayToEndTime) at "
-                        + "\(String(format: "%.2f", position))s; reloading item through stage-2 "
-                        + "recovery (attempt \(self.itemDeathReviveGate.attempts), pause guard bypassed)",
-                        category: .engine)
-                    self.reloadStalledConsumerItem(position: position, allowPausedConsumer: true)
-                }
-            }
-            .store(in: &nativeCancellables)
-
-        // #98: a display rejecting the served master fails the item at startup; reload the media
-        // playlist in place instead of hard-failing. Gated + single-shot in fallBackToMediaPlaylist.
-        host.$pendingDisplayRejection
-            .compactMap { $0 }
-            .sink { [weak self] rejection in
-                Task { @MainActor [weak self] in self?.fallBackToMediaPlaylist(rejection) }
             }
             .store(in: &nativeCancellables)
 

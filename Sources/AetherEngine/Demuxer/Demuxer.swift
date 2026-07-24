@@ -3,6 +3,15 @@ import Libavformat
 import Libavcodec
 import Libavutil
 
+private func aetherDemuxerInterruptCallback(
+    _ opaque: UnsafeMutableRawPointer?
+) -> Int32 {
+    guard let opaque else { return 0 }
+    let demuxer = Unmanaged<Demuxer>
+        .fromOpaque(opaque)
+        .takeUnretainedValue()
+    return demuxer.shouldInterruptFFmpeg ? 1 : 0
+}
 
 /// Open-time tuning for the demuxer + its AVIO reader. `.playback` is
 /// the default everywhere; `.stillExtraction` switches AVIO to a
@@ -131,8 +140,15 @@ public final class Demuxer: @unchecked Sendable {
     private let accessLock = NSLock()
 
     private var avioProvider: AVIOProvider?
+    /// Retained after `close()` so progressive retry can wait for URLSession
+    /// terminal callbacks before constructing a successor reader.
+    private var ioQuiescenceProvider: AVIOProvider?
     private var ownedIOReader: IOReader?
     private var openProfile: DemuxerOpenProfile = .playback
+    private let interruptionLock = NSLock()
+    private var interruptionRequested = false
+    private var _openCancellationRequested:
+        (@Sendable () -> Bool)?
 
     /// Positive container fact from the active AVInputFormat. FFmpeg may
     /// advertise aliases (for example `matroska,webm`), so admission matches
@@ -200,6 +216,16 @@ public final class Demuxer: @unchecked Sendable {
         (avioProvider as? AVIOReader)?.sourceStoreBytesServed ?? 0
     }
 
+    /// Privacy-safe terminal I/O evidence retained by the active provider.
+    ///
+    /// FFmpeg reduces callback failures to a negative integer, which is not
+    /// enough to distinguish a transient seek miss from canonical 401/403/
+    /// 404/410 evidence. Callers must snapshot this before `close()` releases
+    /// the provider.
+    var terminalIOError: AVIOReaderError? {
+        avioProvider?.terminalError
+    }
+
     // Forward-only custom sources report false.
     var isSourceSeekable: Bool { avioProvider?.isSeekable ?? true }
 
@@ -216,6 +242,56 @@ public final class Demuxer: @unchecked Sendable {
     /// custom providers without an `AVIOReader` simply never emit.
     var onNetworkPhaseChanged: (@Sendable (ReaderNetworkPhase) -> Void)? {
         didSet { (avioProvider as? AVIOReader)?.onNetworkPhaseChanged = onNetworkPhaseChanged }
+    }
+
+    /// Privacy-safe monotonic origin/store byte counters from the active URL
+    /// reader. Set before `open()` by launch policy that owns inactivity.
+    var onFetchedByteProgress:
+        (@Sendable (AetherFetchedByteProgress) -> Void)? {
+        didSet {
+            (avioProvider as? AVIOReader)?
+                .onFetchedByteProgress = onFetchedByteProgress
+        }
+    }
+
+    /// Unique-range ledger shared by every quiesced progressive preflight
+    /// attempt and the exact successful playback Demuxer.
+    var fetchedByteProgressLedger =
+        AetherFetchedByteProgressLedger() {
+        didSet {
+            (avioProvider as? AVIOReader)?
+                .fetchedByteProgressLedger =
+                    fetchedByteProgressLedger
+        }
+    }
+
+    /// Privacy-safe effective-progress signal for completed AVIO/container
+    /// probe stages. It carries no URL, format, track or credential detail.
+    var onProbeMilestone: (@Sendable () -> Void)?
+
+    /// Optional owner cancellation latch checked after the AVIO provider is
+    /// installed but before it starts blocking. `markClosed()` can then abort
+    /// every later AVIO suspension through the installed provider.
+    var openCancellationRequested: (@Sendable () -> Bool)? {
+        get {
+            interruptionLock.lock()
+            defer { interruptionLock.unlock() }
+            return _openCancellationRequested
+        }
+        set {
+            interruptionLock.lock()
+            _openCancellationRequested = newValue
+            interruptionLock.unlock()
+        }
+    }
+
+    var shouldInterruptFFmpeg: Bool {
+        let ownerCancellation: (@Sendable () -> Bool)?
+        interruptionLock.lock()
+        let requested = interruptionRequested
+        ownerCancellation = _openCancellationRequested
+        interruptionLock.unlock()
+        return requested || ownerCancellation?() == true
     }
 
     // MARK: - Disc titles / chapters (#67)
@@ -358,6 +434,7 @@ public final class Demuxer: @unchecked Sendable {
         guard let allocated = ctx else {
             throw DemuxerError.openFailed(code: -1)
         }
+        installInterruptCallback(allocated)
         applyProbeBudget(allocated)
 
         let urlString = url.isFileURL ? url.path : url.absoluteString
@@ -442,6 +519,9 @@ public final class Demuxer: @unchecked Sendable {
             sourceByteStore: sourceByteStore
         )
         reader.onNetworkPhaseChanged = onNetworkPhaseChanged
+        reader.fetchedByteProgressLedger =
+            fetchedByteProgressLedger
+        reader.onFetchedByteProgress = onFetchedByteProgress
         try openWithProvider(reader, isLive: isLive)
     }
 
@@ -453,8 +533,25 @@ public final class Demuxer: @unchecked Sendable {
         inputFormat: UnsafePointer<AVInputFormat>? = nil,
         isLive: Bool = false
     ) throws {
-        try provider.open()
+        ioQuiescenceProvider = provider
         avioProvider = provider
+        do {
+            // `markClosed()` may win before this provider is installed. Its
+            // interruption latch must fence that late open even though there
+            // was no provider available for markClosed to cancel directly.
+            if shouldInterruptFFmpeg {
+                throw CancellationError()
+            }
+            try provider.open()
+            if shouldInterruptFFmpeg {
+                throw CancellationError()
+            }
+        } catch {
+            provider.markClosed()
+            provider.close()
+            avioProvider = nil
+            throw error
+        }
 
         guard let ctx = avformat_alloc_context() else {
             avioProvider?.close()
@@ -462,6 +559,7 @@ public final class Demuxer: @unchecked Sendable {
             throw DemuxerError.openFailed(code: -1)
         }
         ctx.pointee.pb = provider.context
+        installInterruptCallback(ctx)
         applyProbeBudget(ctx)
         formatContext = ctx
 
@@ -472,14 +570,28 @@ public final class Demuxer: @unchecked Sendable {
         let ret = avformat_open_input(&ctxPtr, nil, inputFormat, &opts)
         av_dict_free(&opts)
         guard ret == 0 else {
+            let terminalError =
+                provider.terminalError
             formatContext = nil
             avioProvider?.close()
             avioProvider = nil
+            if let terminalError {
+                throw terminalError
+            }
             throw DemuxerError.openFailed(code: ret)
         }
         formatContext = ctxPtr  // avformat_open_input may reallocate
+        onProbeMilestone?()
 
-        try probeStreams(ctxPtr!)
+        do {
+            try probeStreams(ctxPtr!)
+        } catch {
+            if let terminalError =
+                    provider.terminalError {
+                throw terminalError
+            }
+            throw error
+        }
     }
 
     /// Default 5 MB/5s budgets miss sparse PGS/DVB tracks on 10-20 GB Blu-ray rips.
@@ -487,6 +599,20 @@ public final class Demuxer: @unchecked Sendable {
     private func applyProbeBudget(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
         ctx.pointee.probesize = openProfile.probesize
         ctx.pointee.max_analyze_duration = openProfile.maxAnalyzeDuration
+    }
+
+    /// FFmpeg can remain inside container parsing after AVIO itself has been
+    /// unblocked. The interrupt callback gives the owner cancellation latch
+    /// authority over `avformat_open_input`, stream probing and packet reads.
+    /// The opaque pointer is unretained: the context is always closed before
+    /// this Demuxer can deallocate.
+    private func installInterruptCallback(
+        _ context: UnsafeMutablePointer<AVFormatContext>
+    ) {
+        context.pointee.interrupt_callback = AVIOInterruptCB(
+            callback: aetherDemuxerInterruptCallback,
+            opaque: Unmanaged.passUnretained(self).toOpaque()
+        )
     }
 
     /// Demuxer fflags applied to every avformat_open_input.
@@ -546,6 +672,7 @@ public final class Demuxer: @unchecked Sendable {
         guard findRet >= 0 else {
             throw DemuxerError.streamInfoFailed(code: findRet)
         }
+        onProbeMilestone?()
         logStreams(ctx)
     }
 
@@ -942,6 +1069,10 @@ public final class Demuxer: @unchecked Sendable {
         let ret = av_read_frame(ctx, packet)
         if ret < 0 {
             trackedPacketFree(&packet)
+            if let terminalError =
+                    avioProvider?.terminalError {
+                throw terminalError
+            }
             let isEOF = (ret == FFmpegErr.eof)
             if isEOF {
                 return nil
@@ -1279,13 +1410,25 @@ public final class Demuxer: @unchecked Sendable {
         avioProvider?.endReadDeadline()
     }
 
-    /// Fast lock-free unblock: AVIO read callback returns -1, av_read_frame returns
-    /// at once. No resource freeing. Call before close() when cancelling a pump.
+    /// Fast cooperative unblock: both the FFmpeg interrupt callback and AVIO
+    /// read callback abort. No resource freeing. Call before `close()` when
+    /// cancelling a pump.
     func markClosed() {
+        interruptionLock.lock()
+        interruptionRequested = true
+        interruptionLock.unlock()
         avioProvider?.markClosed()
     }
 
+    func waitForIOQuiescence() {
+        ioQuiescenceProvider?
+            .waitForIOQuiescence()
+    }
+
     func close() {
+        interruptionLock.lock()
+        interruptionRequested = true
+        interruptionLock.unlock()
         avioProvider?.markClosed()  // unblocks av_read_frame (tvOS suspends threads in background)
         accessLock.lock()
         if formatContext != nil {

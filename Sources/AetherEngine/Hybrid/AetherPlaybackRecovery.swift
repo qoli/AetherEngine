@@ -154,25 +154,229 @@ public struct AetherPlaybackTerminalFailure:
     }
 }
 
-/// Bounded policy for Aether-owned recovery of one canonical playback request.
+/// Progress-aware liveness policy for one canonical playback request.
 ///
-/// Production allows 15 seconds for the complete initial preparation window
-/// and 30 seconds for a later recovery episode. Session operations are clamped
-/// to the applicable remaining window. Expiry is reported through failure
-/// domain `AetherPlaybackOperationDeadline` and case code
-/// `operation.deadlineExceeded`; it is never permission to substitute another
-/// source, media identity, credential scope, DRM meaning, or server URL.
+/// These windows schedule same-request reconnect work. They are not terminal
+/// playback deadlines: transport recovery remains active until the caller
+/// cancels the session or Aether proves a non-recoverable semantic failure.
+public struct AetherPlaybackLivenessPolicy:
+    Sendable,
+    Equatable
+{
+    public let noProgressWindowsSeconds: [TimeInterval]
+    public let retryBackoffSeconds: [TimeInterval]
+    public let diagnosticCheckpointsSeconds: [TimeInterval]
+    public let repeatingDiagnosticIntervalSeconds: TimeInterval
+
+    public init(
+        noProgressWindowsSeconds: [TimeInterval] = [
+            35,
+            60,
+            120,
+            300,
+        ],
+        retryBackoffSeconds: [TimeInterval] = [
+            1,
+            2,
+            4,
+            8,
+            15,
+            30,
+        ],
+        diagnosticCheckpointsSeconds: [TimeInterval] = [
+            15,
+            45,
+            90,
+            300,
+        ],
+        repeatingDiagnosticIntervalSeconds: TimeInterval = 300
+    ) {
+        precondition(!noProgressWindowsSeconds.isEmpty)
+        precondition(!retryBackoffSeconds.isEmpty)
+        precondition(
+            noProgressWindowsSeconds.allSatisfy {
+                $0.isFinite && $0 > 0
+            }
+        )
+        precondition(
+            retryBackoffSeconds.allSatisfy {
+                $0.isFinite && $0 >= 0
+            }
+        )
+        precondition(
+            diagnosticCheckpointsSeconds.allSatisfy {
+                $0.isFinite && $0 > 0
+            }
+        )
+        precondition(
+            zip(
+                noProgressWindowsSeconds,
+                noProgressWindowsSeconds.dropFirst()
+            ).allSatisfy { previous, next in
+                previous <= next
+            }
+        )
+        precondition(
+            zip(
+                retryBackoffSeconds,
+                retryBackoffSeconds.dropFirst()
+            ).allSatisfy { previous, next in
+                previous <= next
+            }
+        )
+        precondition(
+            zip(
+                diagnosticCheckpointsSeconds,
+                diagnosticCheckpointsSeconds.dropFirst()
+            ).allSatisfy { previous, next in
+                previous < next
+            }
+        )
+        precondition(
+            repeatingDiagnosticIntervalSeconds.isFinite
+                && repeatingDiagnosticIntervalSeconds > 0
+        )
+        self.noProgressWindowsSeconds =
+            noProgressWindowsSeconds
+        self.retryBackoffSeconds = retryBackoffSeconds
+        self.diagnosticCheckpointsSeconds =
+            diagnosticCheckpointsSeconds
+        self.repeatingDiagnosticIntervalSeconds =
+            repeatingDiagnosticIntervalSeconds
+    }
+
+    public func noProgressWindowSeconds(
+        forAttempt attempt: Int
+    ) -> TimeInterval {
+        value(
+            from: noProgressWindowsSeconds,
+            forAttempt: attempt
+        )
+    }
+
+    public func retryBackoffSeconds(
+        forAttempt attempt: Int
+    ) -> TimeInterval {
+        value(from: retryBackoffSeconds, forAttempt: attempt)
+    }
+
+    private func value(
+        from values: [TimeInterval],
+        forAttempt attempt: Int
+    ) -> TimeInterval {
+        precondition(attempt > 0)
+        return values[min(attempt - 1, values.count - 1)]
+    }
+
+    public static let production =
+        AetherPlaybackLivenessPolicy()
+}
+
+public enum AetherPlaybackLivenessPhase:
+    String,
+    Sendable,
+    Equatable
+{
+    case idle
+    case classifying
+    case preflighting
+    case preparingRoute
+    case waitingForSource
+    case retryScheduled
+    case buffering
+    case flowing
+    case cancelling
+    case cancelled
+    case failed
+    case stopped
+}
+
+/// Privacy-safe, session-monotonic evidence for a long-running playback task.
+///
+/// URL values, offsets, headers, cookies and credentials are deliberately not
+/// represented. `uniqueBytesFetched` is scoped to the admitted source
+/// generation and never counts duplicate responses or keepalive traffic.
+public struct AetherPlaybackLivenessSnapshot:
+    Sendable,
+    Equatable
+{
+    public let phase: AetherPlaybackLivenessPhase
+    public let generation: UInt64
+    public let attempt: Int
+    public let uniqueBytesFetched: Int64
+    public let lastMeaningfulProgressUptimeSeconds:
+        TimeInterval?
+    public let nextRetryUptimeSeconds: TimeInterval?
+
+    public init(
+        phase: AetherPlaybackLivenessPhase,
+        generation: UInt64,
+        attempt: Int,
+        uniqueBytesFetched: Int64,
+        lastMeaningfulProgressUptimeSeconds:
+            TimeInterval?,
+        nextRetryUptimeSeconds: TimeInterval?
+    ) {
+        precondition(attempt >= 0)
+        precondition(uniqueBytesFetched >= 0)
+        self.phase = phase
+        self.generation = generation
+        self.attempt = attempt
+        self.uniqueBytesFetched = uniqueBytesFetched
+        self.lastMeaningfulProgressUptimeSeconds =
+            lastMeaningfulProgressUptimeSeconds
+        self.nextRetryUptimeSeconds =
+            nextRetryUptimeSeconds
+    }
+
+    public static let idle = AetherPlaybackLivenessSnapshot(
+        phase: .idle,
+        generation: 0,
+        attempt: 0,
+        uniqueBytesFetched: 0,
+        lastMeaningfulProgressUptimeSeconds: nil,
+        nextRetryUptimeSeconds: nil
+    )
+}
+
+/// Structural policy for Aether-owned recovery of one canonical playback
+/// request.
+///
+/// The finite transport fields remain source-compatible while callers migrate
+/// to `livenessPolicy`. Production network classification, progressive
+/// preflight and same-request reconnects must not use them as terminal
+/// playback deadlines.
 public struct AetherPlaybackRecoveryBudget:
     Sendable,
     Equatable
 {
+    @available(
+        *,
+        deprecated,
+        message:
+            "Transport attempts are unbounded until cancellation; use livenessPolicy"
+    )
     public let maximumTransportAttempts: Int
     public let maximumSameRouteRebuilds: Int
     public let maximumSoftwareDecoderTransitions: Int
     public let maximumRouteTransitions: Int
-    /// Wall-clock limit shared by canonical resolution and route preparation.
+    /// Legacy source-compatible value. Production source resolution and route
+    /// preparation do not use elapsed time as a terminal condition.
+    @available(
+        *,
+        deprecated,
+        message:
+            "Initial preparation has no elapsed-time terminal; use livenessPolicy"
+    )
     public let initialPreparationSettleSeconds: TimeInterval
-    /// Wall-clock limit shared by every action in one recovery episode.
+    /// Legacy source-compatible value retained for bounded structural context
+    /// restoration. It must not terminate transport or no-progress recovery.
+    @available(
+        *,
+        deprecated,
+        message:
+            "Transport recovery has no episode-duration terminal; use structural recovery limits"
+    )
     public let maximumEpisodeDurationSeconds: TimeInterval
     /// Time allowed for a positive transport intent to demonstrate real
     /// media-time progress before Aether begins one recovery episode.
@@ -181,10 +385,16 @@ public struct AetherPlaybackRecoveryBudget:
     /// This is not an additional retry or observation budget.
     public let startupTerminalPublicationHeadroomSeconds: TimeInterval
     public let healthyProgressResetSeconds: TimeInterval
+    public let livenessPolicy: AetherPlaybackLivenessPolicy
 
-    /// Maximum time from a startup transport command to Aether's typed
-    /// progress or terminal outcome. Hosts may add only their own polling
-    /// granularity; they must not pre-empt this engine-owned window.
+    /// Legacy finite observation estimate. It must not be used by a host to
+    /// cancel, dismiss or synthesize a playback terminal.
+    @available(
+        *,
+        deprecated,
+        message:
+            "Playback transport has no finite terminal deadline; observe AetherPlaybackLivenessSnapshot instead"
+    )
     public var maximumStartupOutcomeSeconds: TimeInterval {
         startupProgressObservationSeconds
             + maximumEpisodeDurationSeconds
@@ -213,7 +423,8 @@ public struct AetherPlaybackRecoveryBudget:
         maximumEpisodeDurationSeconds: TimeInterval = 30,
         startupProgressObservationSeconds: TimeInterval = 30,
         startupTerminalPublicationHeadroomSeconds: TimeInterval = 0.25,
-        healthyProgressResetSeconds: TimeInterval = 2
+        healthyProgressResetSeconds: TimeInterval = 2,
+        livenessPolicy: AetherPlaybackLivenessPolicy = .production
     ) {
         precondition(maximumTransportAttempts > 0)
         precondition(maximumSameRouteRebuilds >= 0)
@@ -243,33 +454,35 @@ public struct AetherPlaybackRecoveryBudget:
         self.startupTerminalPublicationHeadroomSeconds =
             startupTerminalPublicationHeadroomSeconds
         self.healthyProgressResetSeconds = healthyProgressResetSeconds
+        self.livenessPolicy = livenessPolicy
     }
 
-    /// The production same-request recovery policy: 15-second preparation,
-    /// 30-second recovery episodes, and two seconds of healthy progress before
-    /// an episode budget may reset.
+    /// Production keeps structural route/decoder transitions bounded while
+    /// transport and no-progress retry remain active until cancellation.
     public static let production = AetherPlaybackRecoveryBudget()
 }
 
-/// One recovery-episode transport failure budget shared by classification,
-/// preflight and graph-bound origin requests. Successful requests do not
-/// consume it; the third retryable failure closes the budget until explicit
-/// Seek/load or two seconds of healthy playback resets the episode.
+/// Compatibility counter shared by classification, preflight and graph-bound
+/// origin requests. Production constructs it without a maximum, so it records
+/// attempts for diagnostics but never closes the same-source playback task.
 final class PlaybackTransportRetryBudget:
     @unchecked Sendable
 {
     private let lock = NSLock()
-    private let maximumFailureAttempts: Int
+    private let maximumFailureAttempts: Int?
     private var failureAttempts = 0
 
-    init(maximumFailureAttempts: Int) {
-        precondition(maximumFailureAttempts > 0)
+    init(maximumFailureAttempts: Int?) {
+        if let maximumFailureAttempts {
+            precondition(maximumFailureAttempts > 0)
+        }
         self.maximumFailureAttempts = maximumFailureAttempts
     }
 
     var isExhausted: Bool {
         lock.lock()
         defer { lock.unlock() }
+        guard let maximumFailureAttempts else { return false }
         return failureAttempts >= maximumFailureAttempts
     }
 
@@ -277,7 +490,12 @@ final class PlaybackTransportRetryBudget:
     func recordRetryableFailure() -> Int {
         lock.lock()
         defer { lock.unlock() }
-        if failureAttempts < maximumFailureAttempts {
+        if let maximumFailureAttempts {
+            failureAttempts = min(
+                failureAttempts + 1,
+                maximumFailureAttempts
+            )
+        } else if failureAttempts < Int.max {
             failureAttempts += 1
         }
         return failureAttempts
@@ -402,11 +620,12 @@ public enum AetherPlaybackRecoveryAction:
     case terminate
 }
 
-/// Pure bounded-recovery policy. It never discovers or substitutes a source;
-/// the caller must provide an alternate route that fresh evidence has already
-/// admitted for the same canonical request.
+/// Pure structural-recovery policy. It never discovers or substitutes a
+/// source; the caller must provide an alternate route that fresh evidence has
+/// already admitted for the same canonical request. Transport liveness is
+/// deliberately not bounded by elapsed time or attempt count here.
 public enum PlaybackRecoveryDecision {
-    /// Startup transport recovery may rebuild the exact admitted route once,
+    /// Startup transport recovery may rebuild only the exact admitted route,
     /// but it must never reinterpret a parked/no-progress player as evidence
     /// for another route. The original failure remains authoritative even if
     /// the rebuild later fails with a different preparation error.
@@ -422,7 +641,8 @@ public enum PlaybackRecoveryDecision {
     public static func permitsRouteTransition(
         afterInitialFailure failure: AetherPlaybackFailure
     ) -> Bool {
-        !requiresSameRouteTransportRecovery(failure: failure)
+        _ = failure
+        return false
     }
 
     /// Positive runtime HEVC evidence invalidates Native itself, not merely
@@ -455,21 +675,19 @@ public enum PlaybackRecoveryDecision {
         context: AetherPlaybackRecoveryContext,
         budget: AetherPlaybackRecoveryBudget = .production
     ) -> AetherPlaybackRecoveryAction {
-        guard context.failure.kind != .cancelled,
-              context.elapsedSeconds
-                < budget.maximumEpisodeDurationSeconds else {
+        guard context.failure.kind != .cancelled else {
             return .terminate
         }
 
         switch context.failure.kind {
         case .transientTransport, .inconclusiveEvidence:
-            guard context.transportAttempt
-                    < budget.maximumTransportAttempts else {
-                return .terminate
-            }
+            let policyDelay = budget.livenessPolicy
+                .retryBackoffSeconds(
+                    forAttempt: max(1, context.transportAttempt)
+                )
             let delay = context.retryAfterSeconds.map {
-                min(5, max(0, $0))
-            } ?? (context.transportAttempt <= 1 ? 1.0 : 2.0)
+                min(30, max(policyDelay, max(0, $0)))
+            } ?? policyDelay
             return .retrySameOperation(afterSeconds: delay)
 
         case .routeRuntimeFailure, .decoderRuntimeFailure:
@@ -477,24 +695,16 @@ public enum PlaybackRecoveryDecision {
                 failure: context.failure,
                 activeRoute: context.activeRoute
             ) {
-                guard context.routeTransitionCount
-                        < budget.maximumRouteTransitions,
-                      context.positivelyAdmittedAlternateRoute
-                        == .hybridCarrier,
-                      !context.systemActivity
-                        .blocksHybridTransition else {
-                    return .terminate
-                }
-                return .transition(to: .hybridCarrier)
-            }
-            if context.sameRouteRebuildCount
-                    < budget.maximumSameRouteRebuilds {
-                return .rebuildSameRoute
+                return .terminate
             }
             if requiresSameRouteTransportRecovery(
                 failure: context.failure
             ) {
-                return .terminate
+                return .rebuildSameRoute
+            }
+            if context.sameRouteRebuildCount
+                    < budget.maximumSameRouteRebuilds {
+                return .rebuildSameRoute
             }
             if context.failure.kind == .decoderRuntimeFailure,
                context.softwareDecoderRecoveryEligible,
@@ -502,19 +712,7 @@ public enum PlaybackRecoveryDecision {
                     < budget.maximumSoftwareDecoderTransitions {
                 return .switchToSoftwareDecoder
             }
-            guard context.routeTransitionCount
-                    < budget.maximumRouteTransitions,
-                  let route = context
-                    .positivelyAdmittedAlternateRoute,
-                  route != .unsupported,
-                  route != context.activeRoute else {
-                return .terminate
-            }
-            if route == .hybridCarrier,
-               context.systemActivity.blocksHybridTransition {
-                return .terminate
-            }
-            return .transition(to: route)
+            return .terminate
 
         case .unsupportedCapability,
              .authenticationRejected,

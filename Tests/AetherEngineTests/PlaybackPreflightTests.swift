@@ -4,6 +4,17 @@ import XCTest
 final class PlaybackPreflightTests: XCTestCase {
     private let fullHybridCapabilities = HybridPlaybackCapabilities(
         hasDirectVideoDecoder: true,
+        libavcodecDecodableVideoCodecs: [
+            .h264,
+            .prores,
+            .av1,
+            .vp9,
+            .vp8,
+            .mpeg2,
+            .mpeg4Part2,
+            .vc1,
+        ],
+        libavcodecDecodableAudioCodecs: [.pcmS24LE, .vorbis],
         hasSampleBufferRenderer: true,
         hasAudioBridgeCarrier: true,
         supportedVideoFormats: [.sdr, .hdr10, .hdr10Plus, .hlg, .dolbyVision],
@@ -484,6 +495,207 @@ final class PlaybackPreflightTests: XCTestCase {
         XCTAssertEqual(result.reason, .hybridNonAVPlayerCodec)
     }
 
+    func testProbeConfirmedProResPCMUsesInitialHybridRoute() {
+        let probe = SourceProbe(
+            url: URL(
+                string: "https://example.invalid/prores-pcm.mov"
+            )!,
+            durationSeconds: 1_200,
+            videoFormat: .sdr,
+            videoCodecID: 147,
+            videoCodecName: "prores",
+            sourceContainer: .isoBaseMedia,
+            videoWidth: 3_840,
+            videoHeight: 2_160,
+            videoFrameRate: 24,
+            videoScanType: .progressive,
+            isDolbyVision: false,
+            audioTracks: [
+                TrackInfo(
+                    id: 1,
+                    name: "PCM",
+                    codec: "pcm_s24le",
+                    language: nil,
+                    isDefault: true
+                ),
+            ],
+            subtitleTracks: [],
+            isSourceSeekable: true,
+            isLive: false
+        )
+
+        for sourceKind in [
+            AetherMediaSourceKind.progressive,
+            .custom,
+        ] {
+            let profile = AetherSourceProfile(
+                probe: probe,
+                sourceKind: sourceKind,
+                isSeekableVOD: probe.isFiniteSeekableVOD
+            )
+            let result = PlaybackPreflight.resolve(
+                sourceProfile: profile,
+                hlsPackaging: nil,
+                hybridCapabilities: fullHybridCapabilities
+            )
+
+            XCTAssertEqual(profile.videoCodec, .prores)
+            XCTAssertEqual(profile.audioCodecs, [.pcmS24LE])
+            XCTAssertEqual(result.route, .hybridCarrier)
+            XCTAssertEqual(result.reason, .hybridProRes)
+            XCTAssertNil(
+                PlaybackPreflight.resolveRecoveryAlternate(
+                    sourceProfile: profile,
+                    hlsPackaging: nil,
+                    excluding: .hybridCarrier,
+                    hybridCapabilities: fullHybridCapabilities
+                )
+            )
+        }
+    }
+
+    func testProResRequiresPositiveLibavcodecDecoderCapability() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(
+                kind: .progressive,
+                codec: .prores,
+                audioCodecs: [.pcmS24LE],
+                container: .isoBaseMedia
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities: HybridPlaybackCapabilities(
+                hasDirectVideoDecoder: true,
+                hasSampleBufferRenderer: true,
+                hasAudioBridgeCarrier: true,
+                supportedVideoFormats: [.sdr]
+            )
+        )
+
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(
+            result.reason,
+            .unsupportedHybridDecoderUnavailable
+        )
+    }
+
+    func testProResPCMRequiresPositiveLibavcodecAudioCapability() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(
+                kind: .progressive,
+                codec: .prores,
+                audioCodecs: [.pcmS24LE],
+                container: .isoBaseMedia
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities: HybridPlaybackCapabilities(
+                hasDirectVideoDecoder: true,
+                libavcodecDecodableVideoCodecs: [.prores],
+                hasSampleBufferRenderer: true,
+                hasAudioBridgeCarrier: true,
+                supportedVideoFormats: [.sdr]
+            )
+        )
+
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(
+            result.reason,
+            .unsupportedHybridAudioBridgeUnavailable
+        )
+    }
+
+    func testProResPCMRequiresPositiveAudioBridgeEncoderCapability() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(
+                kind: .progressive,
+                codec: .prores,
+                audioCodecs: [.pcmS24LE],
+                container: .isoBaseMedia
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities: HybridPlaybackCapabilities(
+                hasDirectVideoDecoder: true,
+                libavcodecDecodableVideoCodecs: [.prores],
+                libavcodecDecodableAudioCodecs: [.pcmS24LE],
+                hasSampleBufferRenderer: true,
+                hasAudioBridgeCarrier: false,
+                supportedVideoFormats: [.sdr]
+            )
+        )
+
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(
+            result.reason,
+            .unsupportedHybridAudioBridgeUnavailable
+        )
+    }
+
+    func testProResPCMRequiresTheSelectedAudioBridgeMode() {
+        let capabilities = HybridPlaybackCapabilities(
+            hasDirectVideoDecoder: true,
+            libavcodecDecodableVideoCodecs: [.prores],
+            libavcodecDecodableAudioCodecs: [.pcmS24LE],
+            hasSampleBufferRenderer: true,
+            hasAudioBridgeCarrier: true,
+            supportedAudioBridgeModes: [.lossless],
+            supportedVideoFormats: [.sdr]
+        )
+        let profile = source(
+            kind: .progressive,
+            codec: .prores,
+            audioCodecs: [.pcmS24LE],
+            container: .isoBaseMedia
+        )
+
+        let unavailable = PlaybackPreflight.resolve(
+            sourceProfile: profile,
+            hlsPackaging: nil,
+            hybridCapabilities: capabilities,
+            requiredAudioBridgeMode: .surroundCompat
+        )
+        let available = PlaybackPreflight.resolve(
+            sourceProfile: profile,
+            hlsPackaging: nil,
+            hybridCapabilities: capabilities,
+            requiredAudioBridgeMode: .lossless
+        )
+
+        XCTAssertEqual(unavailable.route, .unsupported)
+        XCTAssertEqual(
+            unavailable.reason,
+            .unsupportedHybridAudioBridgeUnavailable
+        )
+        XCTAssertEqual(available.route, .hybridCarrier)
+        XCTAssertEqual(available.reason, .hybridProRes)
+    }
+
+    func testProductionCapabilitiesDeclareProResPCMDecoders() {
+        XCTAssertTrue(
+            AetherHybridPlaybackSession.capabilities
+                .libavcodecDecodableVideoCodecs
+                .contains(.prores)
+        )
+        XCTAssertTrue(
+            AetherHybridPlaybackSession.capabilities
+                .libavcodecDecodableAudioCodecs
+                .contains(.pcmS24LE)
+        )
+        XCTAssertTrue(
+            AetherHybridPlaybackSession.capabilities
+                .libavcodecDecodableAudioCodecs
+                .contains(.vorbis)
+        )
+        XCTAssertEqual(
+            AetherHybridPlaybackSession.capabilities
+                .supportedAudioBridgeModes,
+            AudioBridge.supportedModes
+        )
+        XCTAssertEqual(
+            AetherHybridPlaybackSession.capabilities
+                .hasAudioBridgeCarrier,
+            !AudioBridge.supportedModes.isEmpty
+        )
+    }
+
     func testMatroskaHEVCUsesHybrid() {
         let result = PlaybackPreflight.resolve(
             sourceProfile: source(
@@ -630,7 +842,33 @@ final class PlaybackPreflightTests: XCTestCase {
         XCTAssertEqual(result.reason, .unsupportedVideoCodec)
     }
 
-    func testUnclassifiedURLOnlyAdmitsInconclusiveFacts() {
+    func testProResHLSDoesNotInheritProgressiveAdmission() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(
+                kind: .hls,
+                codec: .prores,
+                audioCodecs: [.pcmS24LE],
+                container: .isoBaseMedia
+            ),
+            hlsPackaging: HLSVideoPackaging(
+                container: .fragmentedMP4,
+                sampleEntry: .unknown,
+                manifestCodecs: ["apch"],
+                actualVideoCodec: .prores,
+                codecVerification: .verified,
+                contentProtection: .none
+            ),
+            hybridCapabilities: fullHybridCapabilities
+        )
+
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(
+            result.reason,
+            .unsupportedHLSVideoPackaging
+        )
+    }
+
+    func testUnclassifiedURLNeverAdmitsPlayback() {
         let inconclusive = AetherSourceProfile(
             sourceKind: .unclassifiedURL,
             isSeekableVOD: true,
@@ -655,13 +893,15 @@ final class PlaybackPreflightTests: XCTestCase {
             videoFormat: .hdr10
         )
 
+        let unresolved = PlaybackPreflight.resolve(
+            sourceProfile: inconclusive,
+            hlsPackaging: nil,
+            hybridCapabilities: fullHybridCapabilities
+        )
+        XCTAssertEqual(unresolved.route, .unsupported)
         XCTAssertEqual(
-            PlaybackPreflight.resolve(
-                sourceProfile: inconclusive,
-                hlsPackaging: nil,
-                hybridCapabilities: fullHybridCapabilities
-            ).route,
-            .nativeAVPlayer
+            unresolved.reason,
+            .unsupportedSourceClassificationInconclusive
         )
         for forged in [
             positiveHEVC,
@@ -794,6 +1034,31 @@ final class PlaybackPreflightTests: XCTestCase {
                 hasDirectVideoDecoder: true,
                 hasSampleBufferRenderer: true,
                 hasAudioBridgeCarrier: false,
+                supportedVideoFormats: [.sdr]
+            )
+        )
+
+        XCTAssertEqual(result.route, .unsupported)
+        XCTAssertEqual(
+            result.reason,
+            .unsupportedHybridAudioBridgeUnavailable
+        )
+    }
+
+    func testVorbisAudioOnlyRequiresPositiveDecoderCapability() {
+        let result = PlaybackPreflight.resolve(
+            sourceProfile: source(
+                kind: .progressive,
+                hasVideo: false,
+                codec: .unknown,
+                audioCodecs: [.vorbis],
+                container: .other
+            ),
+            hlsPackaging: nil,
+            hybridCapabilities: HybridPlaybackCapabilities(
+                hasDirectVideoDecoder: true,
+                hasSampleBufferRenderer: true,
+                hasAudioBridgeCarrier: true,
                 supportedVideoFormats: [.sdr]
             )
         )

@@ -222,6 +222,7 @@ enum AetherPlaybackTransportDecision {
         itemIsReady: Bool,
         actualRate: Float,
         timeControlStatus: AetherPlaybackTimeControlStatus,
+        routeApplicationIsTemporarilyUnavailable: Bool = false,
         reassertCount: Int
     ) -> Bool {
         requestedSequence == currentSequence
@@ -232,6 +233,7 @@ enum AetherPlaybackTransportDecision {
             && itemIsReady
             && actualRate == 0
             && timeControlStatus == .paused
+            && !routeApplicationIsTemporarilyUnavailable
             && reassertCount == 0
     }
 
@@ -473,6 +475,10 @@ public final class AetherPlaybackPresentationView:
 @MainActor
 protocol AetherPlaybackTransportRoute {
     var transportIdentity: ObjectIdentifier { get }
+    /// True only while the same admitted route is completing an operation
+    /// that temporarily cannot accept another transport command. This is not
+    /// a route failure and must not start outer recovery.
+    var transportApplicationIsTemporarilyUnavailable: Bool { get }
 
     func play() throws
     func pause() throws
@@ -481,6 +487,10 @@ protocol AetherPlaybackTransportRoute {
         to target: CMTime,
         timeout: TimeInterval
     ) async throws -> AetherPlaybackSeekResult
+}
+
+extension AetherPlaybackTransportRoute {
+    var transportApplicationIsTemporarilyUnavailable: Bool { false }
 }
 
 @MainActor
@@ -501,6 +511,14 @@ private enum AetherActiveRouteSession:
         switch self {
         case .native(let session): ObjectIdentifier(session)
         case .hybrid(let session): ObjectIdentifier(session)
+        }
+    }
+
+    var transportApplicationIsTemporarilyUnavailable: Bool {
+        guard case .hybrid(let session) = self else { return false }
+        return switch session.state {
+        case .preparing, .seeking: true
+        case .idle, .ready, .ended, .failed, .stopped: false
         }
     }
 
@@ -657,6 +675,20 @@ private enum AetherActiveRouteSession:
         }
     }
 
+    func setRoutePreparationProgressHandler(
+        _ handler:
+            (@Sendable (
+                AetherRoutePreparationProgressKind
+            ) -> Void)?
+    ) {
+        switch self {
+        case .native:
+            break
+        case .hybrid(let session):
+            session.setRoutePreparationProgressHandler(handler)
+        }
+    }
+
     func play() throws {
         switch self {
         case .native(let session): try session.play()
@@ -790,6 +822,15 @@ private enum AetherActiveRouteSession:
         case .hybrid(let session): session.stop()
         }
     }
+
+    func stopAndWaitForIOQuiescence() async {
+        switch self {
+        case .native(let session):
+            await session.stopAndWaitForIOQuiescence()
+        case .hybrid(let session):
+            await session.stopAndWaitForIOQuiescence()
+        }
+    }
 }
 
 @MainActor
@@ -800,13 +841,15 @@ private enum AetherResolvedPlaybackSource {
         result: PlaybackPreflightResult,
         preparedSource: AetherPreparedURLSource?
     )
-    case provisionalNative(PlaybackPreflightResult)
+    /// Package-test-only route fixture. Production source resolution never
+    /// constructs this case and cannot use it as playback admission.
+    case startupWatchdogTestHarness(PlaybackPreflightResult)
 
     var result: PlaybackPreflightResult {
         switch self {
         case .hls(let preflight): preflight.result
         case .progressive(_, let result, _): result
-        case .provisionalNative(let result): result
+        case .startupWatchdogTestHarness(let result): result
         }
     }
 
@@ -826,65 +869,59 @@ private enum AetherResolvedPlaybackSource {
         return AetherProgressiveSourceFacts(probe: probe)
     }
 
+    var progressiveSourceGeneration:
+        SourceByteStoreGeneration?
+    {
+        guard case .progressive(
+            _, _, let preparedSource
+        ) = self else {
+            return nil
+        }
+        return preparedSource?.sourceGeneration
+    }
+
+    /// Generic FFmpeg INVALIDDATA/EOF is positive malformed-media evidence
+    /// only after the exact validator-bound generation is fully resident.
+    /// Partial or unvalidated remote bytes remain transport availability.
+    var progressiveSourceIsCompleteAndValidatorBound: Bool {
+        guard case .progressive(
+            _, _, let preparedSource
+        ) = self,
+        let snapshot = preparedSource?
+            .sourceByteStore?.snapshot,
+        snapshot.isComplete,
+        snapshot.generation.validator != nil else {
+            return false
+        }
+        return true
+    }
+
     var hlsResourceIdentity: String? {
         guard case .hls(let preflight) = self else { return nil }
         return preflight.resourceIdentity
     }
 
-    func admitting(
-        route: PlaybackRenderRoute
-    ) -> AetherResolvedPlaybackSource? {
-        if result.route == route { return self }
-        guard let alternate = PlaybackPreflight
-                .resolveRecoveryAlternate(
-                    sourceProfile: result.sourceProfile,
-                    hlsPackaging: result.hlsPackaging,
-                    excluding: result.route,
-                    hybridCapabilities:
-                        AetherHybridPlaybackSession.capabilities
-                ),
-              alternate.route == route else {
-            return nil
+    func discardUnconsumedPreparedSourceAndWaitForIOQuiescence()
+        async
+    {
+        guard case .progressive(
+            _, _, let preparedSource
+        ) = self,
+        let preparedSource else {
+            return
         }
-        switch self {
-        case .hls(let preflight):
-            return .hls(preflight.replacingResult(alternate))
-        case .progressive(let probe, _, let preparedSource):
-            return .progressive(
-                probe: probe,
-                result: alternate,
-                preparedSource: preparedSource
-            )
-        case .provisionalNative:
-            return nil
-        }
+        await Task.detached(priority: .userInitiated) {
+            preparedSource
+                .discardAndWaitForIOQuiescence()
+        }.value
     }
 
-    func alternate(
-        excluding route: PlaybackRenderRoute
+    func admitting(
+        route: PlaybackRenderRoute,
+        requiredAudioBridgeMode: AudioBridgeMode
     ) -> AetherResolvedPlaybackSource? {
-        guard let result = PlaybackPreflight
-                .resolveRecoveryAlternate(
-                    sourceProfile: self.result.sourceProfile,
-                    hlsPackaging: self.result.hlsPackaging,
-                    excluding: route,
-                    hybridCapabilities:
-                        AetherHybridPlaybackSession.capabilities
-                ) else {
-            return nil
-        }
-        switch self {
-        case .hls(let preflight):
-            return .hls(preflight.replacingResult(result))
-        case .progressive(let probe, _, let preparedSource):
-            return .progressive(
-                probe: probe,
-                result: result,
-                preparedSource: preparedSource
-            )
-        case .provisionalNative:
-            return nil
-        }
+        _ = requiredAudioBridgeMode
+        return result.route == route ? self : nil
     }
 }
 
@@ -939,6 +976,25 @@ private struct AetherPendingTransportStartupFailure {
     let sequence: UInt64
     let generation: UInt64
     let failure: AetherPlaybackFailure
+}
+
+private final class AetherCancellationQuiescenceFence:
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var didQuiesce = false
+
+    func markQuiesced() {
+        lock.lock()
+        didQuiesce = true
+        lock.unlock()
+    }
+
+    var isPending: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !didQuiesce
+    }
 }
 
 @MainActor
@@ -1107,6 +1163,8 @@ public final class AetherPlaybackSession: ObservableObject {
         AetherPlaybackFailure?
     @Published public private(set) var terminalFailure:
         AetherPlaybackTerminalFailure?
+    @Published public private(set) var livenessSnapshot:
+        AetherPlaybackLivenessSnapshot = .idle
     @Published public private(set) var selectedAudioAnalysisTrackID:
         Int?
     @Published public private(set) var audioTracks:
@@ -1167,6 +1225,14 @@ public final class AetherPlaybackSession: ObservableObject {
         )
     }
 
+    /// Monotonic count of all recovery events emitted by this session.
+    ///
+    /// `recoveryHistory` intentionally retains only the latest 64 events; this
+    /// counter preserves the full attempt/event total without unbounded memory.
+    public var totalRecoveryEventCount: UInt64 {
+        eventSequence
+    }
+
     nonisolated static func transportSnapshotMediaTime(
         _ time: CMTime
     ) -> Double? {
@@ -1208,6 +1274,14 @@ public final class AetherPlaybackSession: ObservableObject {
     private var playbackProgressEpoch = PlaybackProgressEpoch()
     private var lastConfirmedMediaTime: CMTime = .zero
     private var recoveryTask: Task<Void, Never>?
+    private var routeIOQuiescenceTask:
+        Task<Void, Never>?
+    private var routeIOQuiescenceGeneration: UInt64 = 0
+    private var pendingIOOwnershipOperationCount = 0
+    private var ioOwnershipQuiescenceWaiters:
+        [CheckedContinuation<Void, Never>] = []
+    private var shutdownTask: Task<Void, Never>?
+    private var shutdownGeneration: UInt64 = 0
     private var isStopped = false
     private var isPreparingOrRecovering = false
     private var didCompleteInitialPrepare = false
@@ -1240,14 +1314,34 @@ public final class AetherPlaybackSession: ObservableObject {
     private var recoveryCoordinator = PlaybackRecoveryCoordinator(
         now: ProcessInfo.processInfo.systemUptime
     )
+    private var recoveryLogCadence:
+        AetherBoundedRetryLogCadence
+    private var progressLogCadence =
+        AetherBoundedProgressLogCadence()
+    private var routePreparationRetryProjection =
+        AetherRoutePreparationRetryProjection()
     private var capabilitiesBeforeRecoveryAttempt:
         AetherPlaybackCapabilities?
     private var mergedRuntimeFailureKeys = Set<String>()
     private var lastRecoveryFailure: AetherPlaybackFailure?
-    private var initialPreparationDeadline: PlaybackRecoveryDeadline?
     private let transportRetryBudget:
         PlaybackTransportRetryBudget
-    private var lowerVariantRecoveryWasAttempted = false
+    private var transportLivenessAttempt = 0
+    private var livenessGeneration: UInt64 = 0
+    private var livenessDiagnosticTask: Task<Void, Never>?
+    private let livenessDiagnosticClock:
+        any AetherLivenessDiagnosticClock
+    private let livenessDiagnosticCheckpointObserver:
+        (@MainActor (TimeInterval) -> Void)?
+    private var activeProgressivePreflight:
+        AetherProgressivePreflight?
+    private var progressiveLivenessObservationTask:
+        Task<Void, Never>?
+    private var progressivePreflightEpoch: UInt64 = 0
+    private var classificationProgressFence =
+        AetherClassificationProgressFence()
+    private let progressiveFetchedByteProgressLedger =
+        AetherFetchedByteProgressLedger()
     private var audioAnalysisProxies: [
         UUID: AetherPlaybackAudioAnalysisProxy
     ] = [:]
@@ -1260,15 +1354,28 @@ public final class AetherPlaybackSession: ObservableObject {
         url: URL,
         options: LoadOptions,
         variantSelection: HLSPreflightVariantSelection,
-        recoveryBudget: AetherPlaybackRecoveryBudget = .production
+        recoveryBudget: AetherPlaybackRecoveryBudget = .production,
+        livenessDiagnosticClock:
+            any AetherLivenessDiagnosticClock =
+                AetherSystemLivenessDiagnosticClock(),
+        livenessDiagnosticCheckpointObserver:
+            (@MainActor (TimeInterval) -> Void)? = nil
     ) {
         self.url = url
         self.options = options
         self.variantSelection = variantSelection
         self.recoveryBudget = recoveryBudget
+        recoveryLogCadence = AetherBoundedRetryLogCadence(
+            policy: recoveryBudget.livenessPolicy
+        )
+        self.livenessDiagnosticClock =
+            livenessDiagnosticClock
+        self.livenessDiagnosticCheckpointObserver =
+            livenessDiagnosticCheckpointObserver
+        // Transport liveness is intentionally unbounded. Structural route and
+        // decoder transitions remain governed by `recoveryBudget`.
         transportRetryBudget = PlaybackTransportRetryBudget(
-            maximumFailureAttempts:
-                recoveryBudget.maximumTransportAttempts
+            maximumFailureAttempts: nil
         )
         let stablePlayer = AVPlayer()
         avPlayer = stablePlayer
@@ -1336,18 +1443,11 @@ public final class AetherPlaybackSession: ObservableObject {
         guard !isStopped, state == .idle else {
             throw AetherPlaybackSessionError.invalidState
         }
+        beginLivenessObservation(phase: .classifying)
         state = .preparing
         isPreparingOrRecovering = true
-        initialPreparationDeadline = PlaybackRecoveryDeadline(
-            startedAt: ProcessInfo.processInfo.systemUptime,
-            durationSeconds:
-                recoveryBudget.initialPreparationSettleSeconds
-        )
-        defer { initialPreparationDeadline = nil }
         do {
-            let source = try await resolveCanonicalSource(
-                allowProvisionalNative: true
-            )
+            let source = try await resolveCanonicalSource()
             try await installAndPrepare(source)
             try await applyCanonicalDefaultTrackIntent()
             didCompleteInitialPrepare = true
@@ -1363,12 +1463,7 @@ public final class AetherPlaybackSession: ObservableObject {
             resetRecoveryEpisode()
         } catch is CancellationError {
             isPreparingOrRecovering = false
-            teardownActiveRoute()
-            let failure = failure(
-                stage: .preparation,
-                error: CancellationError()
-            )
-            publishTerminal(failure)
+            await stopAndWaitForIOQuiescence()
             throw CancellationError()
         } catch {
             let initialFailure = failure(
@@ -1557,23 +1652,22 @@ public final class AetherPlaybackSession: ObservableObject {
         cancelTransportMonitoring()
         let monitoringGeneration = transportMonitoringGeneration
         let baseline = avPlayer.currentTime()
+        let baselineUniqueBytes =
+            livenessSnapshot.uniqueBytesFetched
+        let baselineLoadedRangeEnd =
+            Self.maximumLoadedRangeEndSeconds(
+                avPlayer.currentItem
+            )
+        let baselinePresentedFrameSequence =
+            videoOutputSnapshot.frameSequence
         let watchdogTarget = AetherPlaybackStartupWatchdogTarget
             .resolve(
                 activeRoute: activeRoute,
                 nativeExecutionMode: activeNativeExecutionMode
             )
-        let recoveryRemaining = recoveryCoordinator
-            .episodeFirstFailure == nil ? nil
-            : currentRecoveryDeadline.remainingSeconds(
-                now: ProcessInfo.processInfo.systemUptime
-            )
-        let observation = AetherPlaybackTransportDecision
-            .startupObservationDelay(
-                configuredSeconds: recoveryBudget
-                    .startupProgressObservationSeconds,
-                recoveryRemainingSeconds: recoveryRemaining,
-                publicationHeadroomSeconds: recoveryBudget
-                    .startupTerminalPublicationHeadroomSeconds
+        let observation = recoveryBudget.livenessPolicy
+            .noProgressWindowSeconds(
+                forAttempt: max(1, transportLivenessAttempt + 1)
             )
         transportReassertTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -1600,6 +1694,7 @@ public final class AetherPlaybackSession: ObservableObject {
             }
             guard self.transportMonitoringGeneration
                     == monitoringGeneration else { return }
+            self.activeSession?.pollVideoOutput()
             let item = self.avPlayer.currentItem
             guard AetherPlaybackTransportDecision.shouldReassert(
                 requestedSequence: sequence,
@@ -1613,8 +1708,23 @@ public final class AetherPlaybackSession: ObservableObject {
                 timeControlStatus: Self.timeControlStatus(
                     self.avPlayer.timeControlStatus
                 ),
+                routeApplicationIsTemporarilyUnavailable:
+                    self.transportRoute?
+                        .transportApplicationIsTemporarilyUnavailable
+                        ?? false,
                 reassertCount: self.transportReassertCount
-            ) else { return }
+            ) else {
+                if self.transportRoute?
+                    .transportApplicationIsTemporarilyUnavailable
+                    == true {
+                    self.publishTransientRouteBuffering(
+                        sequence: sequence,
+                        generation: generation,
+                        reason: "reassert-deferred"
+                    )
+                }
+                return
+            }
             do {
                 try self.applyTransportIntent(
                     sequence: sequence,
@@ -1622,6 +1732,16 @@ public final class AetherPlaybackSession: ObservableObject {
                     isReassertion: true
                 )
             } catch {
+                if self.transportRoute?
+                    .transportApplicationIsTemporarilyUnavailable
+                    == true {
+                    self.publishTransientRouteBuffering(
+                        sequence: sequence,
+                        generation: generation,
+                        reason: "reassert-raced-route-activity"
+                    )
+                    return
+                }
                 self.scheduleTransportStartupRecovery(
                     .transportIntentNotApplied,
                     sequence: sequence,
@@ -1652,11 +1772,84 @@ public final class AetherPlaybackSession: ObservableObject {
             }
             guard self.transportMonitoringGeneration
                     == monitoringGeneration else { return }
+            self.activeSession?.pollVideoOutput()
             let item = self.avPlayer.currentItem
-            let madeProgress = Self.madeStartupProgress(
+            let currentTime = self.avPlayer.currentTime()
+            let nativeMediaTimeMadeProgress =
+                self.activeRoute == .nativeAVPlayer
+                && Self.madeStartupProgress(
                 from: baseline,
-                to: self.avPlayer.currentTime()
+                to: currentTime
             )
+            let presentedFrameMadeProgress =
+                self.videoOutputSnapshot.outputStatus
+                    == .presented
+                && self.videoOutputSnapshot.frameSequence
+                    > baselinePresentedFrameSequence
+            let madeProgress =
+                nativeMediaTimeMadeProgress
+                || presentedFrameMadeProgress
+            let loadedRangeEnd =
+                Self.maximumLoadedRangeEndSeconds(item)
+            let loadedRangeMadeProgress =
+                self.activeRoute == .nativeAVPlayer
+                && loadedRangeEnd
+                    > baselineLoadedRangeEnd + 0.05
+            let sourceMadeProgress =
+                self.livenessSnapshot.uniqueBytesFetched
+                    > baselineUniqueBytes
+                || loadedRangeMadeProgress
+            if madeProgress {
+                self.transportLivenessAttempt = 0
+                self.publishLiveness(
+                    phase: .flowing,
+                    attempt: 0,
+                    uniqueBytesFetched:
+                        self.livenessSnapshot.uniqueBytesFetched,
+                    lastMeaningfulProgressUptimeSeconds:
+                        ProcessInfo.processInfo.systemUptime,
+                    nextRetryUptimeSeconds: nil
+                )
+                self.scheduleTransportMonitoring(
+                    sequence: sequence,
+                    generation: generation
+                )
+                return
+            }
+            if !madeProgress, sourceMadeProgress {
+                self.transportLivenessAttempt = 0
+                if loadedRangeMadeProgress {
+                    let progressUptime =
+                        ProcessInfo.processInfo.systemUptime
+                    _ = self.emitBoundedProgressLog(
+                        .loadedRange(
+                            phase: .buffering,
+                            generation:
+                                self.livenessGeneration,
+                            attempt: 0,
+                            fromSeconds:
+                                baselineLoadedRangeEnd,
+                            toSeconds: loadedRangeEnd,
+                            progressUptime: progressUptime,
+                            observedUptime: progressUptime
+                        )
+                    )
+                }
+                self.publishLiveness(
+                    phase: .buffering,
+                    attempt: 0,
+                    uniqueBytesFetched:
+                        self.livenessSnapshot.uniqueBytesFetched,
+                    lastMeaningfulProgressUptimeSeconds:
+                        ProcessInfo.processInfo.systemUptime,
+                    nextRetryUptimeSeconds: nil
+                )
+                self.scheduleTransportMonitoring(
+                    sequence: sequence,
+                    generation: generation
+                )
+                return
+            }
             guard let failureCase =
                     AetherPlaybackTransportDecision.startupFailure(
                 requestedSequence: sequence,
@@ -1692,6 +1885,35 @@ public final class AetherPlaybackSession: ObservableObject {
                 watchdogTarget: watchdogTarget
             )
         }
+    }
+
+    private func publishTransientRouteBuffering(
+        sequence: UInt64,
+        generation: UInt64,
+        reason: String
+    ) {
+        guard sequence == transportCommandSequence,
+              generation == transportRouteGeneration,
+              desiredPlaying,
+              !isStopped,
+              terminalFailure == nil else { return }
+        publishLiveness(
+            phase: .buffering,
+            attempt: livenessSnapshot.attempt,
+            uniqueBytesFetched:
+                livenessSnapshot.uniqueBytesFetched,
+            lastMeaningfulProgressUptimeSeconds:
+                livenessSnapshot
+                    .lastMeaningfulProgressUptimeSeconds,
+            nextRetryUptimeSeconds: nil
+        )
+        EngineLog.emit(
+            "[AetherPlaybackSession] transport buffering "
+                + "session=\(sessionID.uuidString.prefix(8)) "
+                + "command=\(sequence) generation=\(generation) "
+                + "reason=\(reason)",
+            category: .session
+        )
     }
 
     private func scheduleTransportStartupRecovery(
@@ -1796,6 +2018,19 @@ public final class AetherPlaybackSession: ObservableObject {
         return CMTimeSubtract(current, baseline).seconds > 0.1
     }
 
+    nonisolated static func maximumLoadedRangeEndSeconds(
+        _ item: AVPlayerItem?
+    ) -> Double {
+        item?.loadedTimeRanges.reduce(0) { current, value in
+            let range = value.timeRangeValue
+            let end = CMTimeGetSeconds(
+                CMTimeRangeGetEnd(range)
+            )
+            guard end.isFinite else { return current }
+            return max(current, end)
+        } ?? 0
+    }
+
     /// Package-test seam for exercising the real async outer-session command
     /// coordinator. The controllable fake remains in the test target; this
     /// method only installs its narrow transport boundary.
@@ -1810,6 +2045,22 @@ public final class AetherPlaybackSession: ObservableObject {
         activeRoute = renderRoute
         didCompleteInitialPrepare = true
         transportRouteGeneration &+= 1
+        state = .ready
+    }
+
+    /// Package-test seam for the release-fence publication contract. The
+    /// supplied operation models an already-detached route whose reader has
+    /// not yet emitted `ioStopped`.
+    func installRouteIOQuiescenceTestHarness(
+        _ operation:
+            @escaping @MainActor @Sendable () async -> Void
+    ) {
+        precondition(state == .idle)
+        precondition(routeIOQuiescenceTask == nil)
+        routeIOQuiescenceGeneration &+= 1
+        routeIOQuiescenceTask = Task { @MainActor in
+            await operation()
+        }
         state = .ready
     }
 
@@ -1840,7 +2091,7 @@ public final class AetherPlaybackSession: ObservableObject {
         deferMonitoringUntilRecoveryHandoff: Bool = false
     ) {
         precondition(state == .idle)
-        resolvedSource = provisionalNativeSource()
+        resolvedSource = startupWatchdogTestHarnessSource()
         activeRoute = target.route
         activeNativeExecutionMode = switch target {
         case .directNative: .directAsset
@@ -1945,9 +2196,16 @@ public final class AetherPlaybackSession: ObservableObject {
         state = .seeking
         activeSeekOperationSequence = operationSequence
         do {
+            let seekAttempt = max(
+                1,
+                transportLivenessAttempt + 1
+            )
             let result = try await transportRoute.seek(
                 to: target,
-                timeout: try remainingRecoveryOperationTimeout()
+                timeout: recoveryBudget.livenessPolicy
+                    .noProgressWindowSeconds(
+                        forAttempt: seekAttempt
+                    )
             )
             if activeSeekOperationSequence == operationSequence {
                 activeSeekOperationSequence = nil
@@ -1988,7 +2246,16 @@ public final class AetherPlaybackSession: ObservableObject {
             guard operationCoordinator.isCurrentSeek(operationSequence) else {
                 return .superseded
             }
-            let seekFailure = failure(stage: .playback, error: error)
+            let seekFailure = if let evidence =
+                    activeSession?.nativeFailureEvidence,
+                !Self.isNativeSeekTimeout(error) {
+                Self.nativeFailure(
+                    stage: .playback,
+                    evidence: evidence
+                )
+            } else {
+                failure(stage: .playback, error: error)
+            }
             try await recoverOrTerminate(
                 from: seekFailure,
                 duringInitialPrepare: false,
@@ -2132,6 +2399,10 @@ public final class AetherPlaybackSession: ObservableObject {
             case .playing, .paused, .seeking: .paused
             }
         }
+        if transportRoute?
+            .transportApplicationIsTemporarilyUnavailable == true {
+            return .waiting
+        }
         switch avPlayer.timeControlStatus {
         case .playing:
             return .playing
@@ -2165,14 +2436,11 @@ public final class AetherPlaybackSession: ObservableObject {
         return capabilities
     }
 
-    /// Fresh-fact route reclassification is admitted only when it completes an
-    /// earlier inconclusive URL classification: unknown provisional Native may
-    /// become positively verified HEVC Hybrid, interlaced-H.264 Hybrid, or
-    /// positively verified audio-only Vorbis Hybrid. A committed codec/route
-    /// identity is otherwise immutable; drift is a typed terminal invariant
-    /// failure, never an invitation to reinterpret the media.
+    /// Once a route is committed, a fresh source result cannot reinterpret the
+    /// same request as another player route. Classification must finish before
+    /// admission; route drift is a typed terminal invariant failure.
     nonisolated static func freshRouteReclassificationFailure(
-        previousResult: PlaybackPreflightResult?,
+        previousResult _: PlaybackPreflightResult?,
         from failedRoute: PlaybackRenderRoute,
         freshResult: PlaybackPreflightResult
     ) -> AetherPlaybackFailure? {
@@ -2180,57 +2448,14 @@ public final class AetherPlaybackSession: ObservableObject {
         guard freshRoute != .unsupported,
               freshRoute != failedRoute else { return nil }
 
-        let freshReasonIsPositiveHEVC = switch freshResult.reason {
-        case .hybridHEVC, .hybridHEV1SampleEntry,
-             .hybridHEVCInMPEGTransport,
-             .hybridHLSManifestMissingCodecs,
-             .hybridHLSMasterContainsHEVCVariant:
-            true
-        default:
-            false
-        }
-        let completedProvisionalClassification =
-            previousResult?.route == .nativeAVPlayer
-            && previousResult?.reason == .nativeProvisionalURL
-            && previousResult?.sourceProfile.sourceKind
-                == .unclassifiedURL
-            && previousResult?.sourceProfile.videoCodec == .unknown
-            && failedRoute == .nativeAVPlayer
-            && freshRoute == .hybridCarrier
-            && freshResult.sourceProfile.sourceKind != .unclassifiedURL
-        let isCompletedProvisionalHEVCClassification =
-            completedProvisionalClassification
-            && (freshResult.sourceProfile.videoCodec == .hevc
-                || freshResult.reason
-                    == .hybridHLSMasterContainsHEVCVariant)
-            && freshReasonIsPositiveHEVC
-        let isCompletedProvisionalVorbisClassification =
-            completedProvisionalClassification
-            && freshResult.reason == .hybridAudioBridge
-            && freshResult.sourceProfile.videoStreamPresence
-                == .provenAbsent
-            && freshResult.sourceProfile.videoCodec == .unknown
-            && freshResult.sourceProfile.audioCodecs == [.vorbis]
-        let isCompletedProvisionalInterlacedH264Classification =
-            completedProvisionalClassification
-            && freshResult.reason == .hybridInterlacedH264
-            && freshResult.sourceProfile.videoCodec == .h264
-            && freshResult.sourceProfile.videoScanType == .interlaced
-        let isCompletedProvisionalHybridClassification =
-            isCompletedProvisionalHEVCClassification
-                || isCompletedProvisionalVorbisClassification
-                || isCompletedProvisionalInterlacedH264Classification
-
         return AetherPlaybackFailure(
             stage: .preflight,
-            kind: isCompletedProvisionalHybridClassification
-                ? .routeRuntimeFailure
-                : .invariantViolation,
+            kind: .invariantViolation,
             domain: "AetherPlaybackRoutePolicy",
             code: 0,
-            reason: isCompletedProvisionalHybridClassification
-                ? "provisional Native source was positively classified for Hybrid"
-                : "fresh source facts diverged from committed codec or route identity"
+            caseCode: "routeIdentityChanged",
+            reason:
+                "fresh source facts diverged from committed codec or route identity"
         )
     }
 
@@ -2251,6 +2476,43 @@ public final class AetherPlaybackSession: ObservableObject {
                 domain: "AetherPlaybackSourceIdentity",
                 code: 0,
                 reason: "fresh progressive facts diverged from committed source identity"
+            )
+        }
+        return nil
+    }
+
+    /// Media metadata can remain unchanged while the bytes behind the request
+    /// change. Every same-session replacement must therefore prove that both
+    /// generations are validator-bound and exactly equal. Content length alone
+    /// is not source identity, even when both generations report the same
+    /// value.
+    nonisolated static func freshProgressiveSourceGenerationFailure(
+        previousGeneration: SourceByteStoreGeneration?,
+        freshGeneration: SourceByteStoreGeneration?
+    ) -> AetherPlaybackFailure? {
+        guard let previousGeneration else { return nil }
+        guard previousGeneration.validator != nil,
+              let freshGeneration,
+              freshGeneration.validator != nil else {
+            return AetherPlaybackFailure(
+                stage: .preflight,
+                kind: .invariantViolation,
+                domain: "AetherPlaybackSourceIdentity",
+                code: 0,
+                caseCode: "progressiveSourceGenerationUnverifiable",
+                reason:
+                    "same-source progressive recovery requires validator-bound generations"
+            )
+        }
+        guard freshGeneration == previousGeneration else {
+            return AetherPlaybackFailure(
+                stage: .preflight,
+                kind: .invariantViolation,
+                domain: "AetherPlaybackSourceIdentity",
+                code: 0,
+                caseCode: "progressiveSourceGenerationChanged",
+                reason:
+                    "fresh progressive bytes diverged from the pinned source generation"
             )
         }
         return nil
@@ -2644,16 +2906,46 @@ public final class AetherPlaybackSession: ObservableObject {
     }
 
     public func stop() {
-        guard !isStopped else { return }
+        _ = beginShutdown()
+    }
+
+    private func beginShutdown() -> Task<Void, Never> {
+        if let shutdownTask {
+            return shutdownTask
+        }
+        if isStopped {
+            return Task {}
+        }
+
         isStopped = true
+        shutdownGeneration &+= 1
+        let generation = shutdownGeneration
+        activeProgressivePreflight?.requestCancellation()
+        activeProgressivePreflight = nil
+        progressiveLivenessObservationTask?.cancel()
+        progressiveLivenessObservationTask = nil
+        livenessDiagnosticTask?.cancel()
+        livenessDiagnosticTask = nil
+        publishLiveness(
+            phase: .cancelling,
+            attempt: livenessSnapshot.attempt,
+            uniqueBytesFetched:
+                livenessSnapshot.uniqueBytesFetched,
+            lastMeaningfulProgressUptimeSeconds:
+                livenessSnapshot
+                    .lastMeaningfulProgressUptimeSeconds,
+            nextRetryUptimeSeconds: nil
+        )
         cancelTransportMonitoring()
         transportRouteGeneration &+= 1
         routeTransactions.invalidate()
-        recoveryTask?.cancel()
+        let recoveryTaskToAwait = recoveryTask
+        recoveryTaskToAwait?.cancel()
         recoveryTask = nil
         routeCancellables.removeAll()
-        activeSession?.stop()
-        activeSession = nil
+        teardownActiveRoute()
+        let resolvedSourceToDiscard = resolvedSource
+        resolvedSource = nil
         transportTestRoute = nil
         restoreRouteNeutralPlayerCapabilities()
         invalidateVideoOutputRoute()
@@ -2677,42 +2969,486 @@ public final class AetherPlaybackSession: ObservableObject {
         selectedAudioTrackID = nil
         selectedSubtitleTrackID = nil
         capabilities = Self.capabilities(for: nil, source: nil)
-        state = .stopped
         #if os(tvOS)
         if playerViewController?.player === avPlayer {
             playerViewController?.player = nil
         }
         playerViewController = nil
         #endif
+
+        let shutdownQuiescenceFence =
+            AetherCancellationQuiescenceFence()
+        let shutdownWatchdog = Task.detached {
+            do {
+                try await Task.sleep(
+                    nanoseconds: 2_000_000_000
+                )
+            } catch {
+                return
+            }
+            guard shutdownQuiescenceFence.isPending else {
+                return
+            }
+            EngineLog.emit(
+                "[AetherPlaybackSession] cancellationUnresponsive "
+                    + "scope=shutdown generation=\(generation) "
+                    + "readerOverlap=forbidden",
+                category: .session
+            )
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else {
+                await resolvedSourceToDiscard?
+                    .discardUnconsumedPreparedSourceAndWaitForIOQuiescence()
+                shutdownQuiescenceFence.markQuiesced()
+                shutdownWatchdog.cancel()
+                return
+            }
+            await self.waitForIOOwnershipOperationsToQuiesce()
+            await recoveryTaskToAwait?.value
+            await self.teardownActiveRouteAndWaitForIOQuiescence()
+            await resolvedSourceToDiscard?
+                .discardUnconsumedPreparedSourceAndWaitForIOQuiescence()
+            shutdownQuiescenceFence.markQuiesced()
+            shutdownWatchdog.cancel()
+            self.publishLiveness(
+                phase: .cancelled,
+                attempt: self.livenessSnapshot.attempt,
+                uniqueBytesFetched:
+                    self.livenessSnapshot.uniqueBytesFetched,
+                lastMeaningfulProgressUptimeSeconds:
+                    self.livenessSnapshot
+                        .lastMeaningfulProgressUptimeSeconds,
+                nextRetryUptimeSeconds: nil
+            )
+            self.state = .stopped
+            self.shutdownTask = nil
+        }
+        shutdownTask = task
+        return task
     }
 
-    private func resolveCanonicalSource(
-        allowProvisionalNative: Bool,
-        variantSelectionOverride:
-            HLSPreflightVariantSelection? = nil
-    ) async throws -> AetherResolvedPlaybackSource {
+    private func stopAndWaitForIOQuiescence() async {
+        let task = beginShutdown()
+        await task.value
+    }
+
+    /// Test-visible release fence for the externally synchronous `stop()`.
+    func waitForStopIOQuiescence() async {
+        await shutdownTask?.value
+    }
+
+    func beginLivenessObservation(
+        phase: AetherPlaybackLivenessPhase
+    ) {
+        progressLogCadence.reset(
+            now: ProcessInfo.processInfo.systemUptime
+        )
+        routePreparationRetryProjection.reset()
+        livenessGeneration &+= 1
+        transportLivenessAttempt = 0
+        publishLiveness(
+            phase: phase,
+            attempt: 0,
+            uniqueBytesFetched: 0,
+            lastMeaningfulProgressUptimeSeconds: nil,
+            nextRetryUptimeSeconds: nil
+        )
+        livenessDiagnosticTask?.cancel()
+        let scheduler = AetherLivenessDiagnosticScheduler(
+            policy: recoveryBudget.livenessPolicy,
+            clock: livenessDiagnosticClock
+        )
+        livenessDiagnosticTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await scheduler.run(
+                while: {
+                    !self.isStopped
+                        && self.terminalFailure == nil
+                },
+                onCheckpoint: { elapsed in
+                    self.logLivenessCheckpoint(
+                        elapsedSeconds: elapsed
+                    )
+                    self.livenessDiagnosticCheckpointObserver?(
+                        elapsed
+                    )
+                }
+            )
+        }
+    }
+
+    private func publishLiveness(
+        phase: AetherPlaybackLivenessPhase,
+        attempt: Int,
+        uniqueBytesFetched: Int64,
+        lastMeaningfulProgressUptimeSeconds:
+            TimeInterval?,
+        nextRetryUptimeSeconds: TimeInterval?
+    ) {
+        livenessSnapshot = AetherPlaybackLivenessSnapshot(
+            phase: phase,
+            generation: livenessGeneration,
+            attempt: attempt,
+            uniqueBytesFetched: uniqueBytesFetched,
+            lastMeaningfulProgressUptimeSeconds:
+                lastMeaningfulProgressUptimeSeconds,
+            nextRetryUptimeSeconds:
+                nextRetryUptimeSeconds
+        )
+    }
+
+    private func logLivenessCheckpoint(
+        elapsedSeconds: TimeInterval
+    ) {
+        let snapshot = livenessSnapshot
+        let lastProgressAge: TimeInterval
+        if let last = snapshot
+            .lastMeaningfulProgressUptimeSeconds {
+            lastProgressAge = max(
+                0,
+                ProcessInfo.processInfo.systemUptime - last
+            )
+        } else {
+            lastProgressAge = elapsedSeconds
+        }
+        EngineLog.emit(
+            "[AetherPlaybackSession] liveness checkpoint "
+                + "session=\(sessionID.uuidString.prefix(8)) "
+                + "generation=\(snapshot.generation) "
+                + "elapsed=\(Int(elapsedSeconds)) "
+                + "phase=\(snapshot.phase.rawValue) "
+                + "attempt=\(snapshot.attempt) "
+                + "bytes=\(snapshot.uniqueBytesFetched) "
+                + "lastProgressAge=\(Int(lastProgressAge))",
+            category: .session
+        )
+    }
+
+    @discardableResult
+    private func emitBoundedProgressLog(
+        _ sample: AetherPlaybackProgressLogSample
+    ) -> Bool {
+        let decision = progressLogCadence.record(sample)
+        if let emission = decision.emission {
+            EngineLog.emit(
+                "[AetherPlaybackSession] progress "
+                    + "session=\(sessionID.uuidString.prefix(8)) "
+                    + emission.logFields,
+                category: .session
+            )
+        }
+        return decision.acceptedProgress
+    }
+
+    private func observeProgressivePreflightEvents(
+        _ events: AsyncStream<AetherProgressivePreflightEvent>
+    ) {
+        progressiveLivenessObservationTask?.cancel()
+        progressivePreflightEpoch &+= 1
+        let preflightEpoch = progressivePreflightEpoch
+        livenessGeneration &+= 1
+        progressiveLivenessObservationTask = Task {
+            @MainActor [weak self] in
+            guard let self else { return }
+            for await event in events {
+                guard !Task.isCancelled,
+                      !self.isStopped,
+                      self.progressivePreflightEpoch
+                        == preflightEpoch else {
+                    return
+                }
+                if case .attemptStarted(let attempt, _) = event {
+                    self.publishLiveness(
+                        phase: .preflighting,
+                        attempt: attempt,
+                        uniqueBytesFetched:
+                            self.livenessSnapshot
+                                .uniqueBytesFetched,
+                        lastMeaningfulProgressUptimeSeconds:
+                            self.livenessSnapshot
+                                .lastMeaningfulProgressUptimeSeconds,
+                        nextRetryUptimeSeconds: nil
+                    )
+                }
+                if case .byteProgress(_, let snapshot) = event {
+                    self.applyProgressiveLivenessSnapshot(
+                        snapshot
+                    )
+                }
+                if case .probeMilestone(
+                    let attempt,
+                    let ordinal,
+                    let snapshot
+                ) = event {
+                    self.applyProgressiveProbeMilestone(
+                        preflightEpoch: preflightEpoch,
+                        attempt: attempt,
+                        ordinal: ordinal,
+                        snapshot: snapshot
+                    )
+                }
+                if case .prepared(_, let snapshot) = event {
+                    self.applyProgressiveLivenessSnapshot(
+                        snapshot
+                    )
+                }
+                if case .retryScheduled(
+                    _,
+                    let nextAttempt,
+                    let backoff,
+                    _
+                ) = event {
+                    self.publishLiveness(
+                        phase: .retryScheduled,
+                        attempt: nextAttempt,
+                        uniqueBytesFetched:
+                            self.livenessSnapshot
+                                .uniqueBytesFetched,
+                        lastMeaningfulProgressUptimeSeconds:
+                            self.livenessSnapshot
+                                .lastMeaningfulProgressUptimeSeconds,
+                        nextRetryUptimeSeconds:
+                            ProcessInfo.processInfo.systemUptime
+                            + backoff
+                    )
+                }
+                if case .cancellationRequested = event {
+                    self.publishLiveness(
+                        phase: .cancelling,
+                        attempt:
+                            self.livenessSnapshot.attempt,
+                        uniqueBytesFetched:
+                            self.livenessSnapshot
+                                .uniqueBytesFetched,
+                        lastMeaningfulProgressUptimeSeconds:
+                            self.livenessSnapshot
+                                .lastMeaningfulProgressUptimeSeconds,
+                        nextRetryUptimeSeconds: nil
+                    )
+                }
+                if case .cancelled = event {
+                    self.publishLiveness(
+                        phase: .cancelled,
+                        attempt:
+                            self.livenessSnapshot.attempt,
+                        uniqueBytesFetched:
+                            self.livenessSnapshot
+                                .uniqueBytesFetched,
+                        lastMeaningfulProgressUptimeSeconds:
+                            self.livenessSnapshot
+                                .lastMeaningfulProgressUptimeSeconds,
+                        nextRetryUptimeSeconds: nil
+                    )
+                }
+            }
+        }
+    }
+
+    private func observeProgressiveLiveness(
+        _ liveness: AetherProgressivePreflightLiveness?
+    ) {
+        progressiveLivenessObservationTask?.cancel()
+        guard let liveness else {
+            progressiveLivenessObservationTask = nil
+            return
+        }
+        progressiveLivenessObservationTask = Task {
+            @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled, !self.isStopped {
+                self.applyProgressiveLivenessSnapshot(
+                    liveness.snapshot
+                )
+                do {
+                    try await Task.sleep(
+                        nanoseconds: 250_000_000
+                    )
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    private func applyProgressiveLivenessSnapshot(
+        _ snapshot:
+            AetherProgressivePreflightLivenessSnapshot
+    ) {
+        guard livenessSnapshot.phase != .cancelling,
+              livenessSnapshot.phase != .cancelled else {
+            return
+        }
+        let ledgerSnapshot =
+            progressiveFetchedByteProgressLedger.snapshot
+        let combinedBytes = max(
+            livenessSnapshot.uniqueBytesFetched,
+            ledgerSnapshot.totalAdvancedBytes
+        )
+        let didAdvance =
+            combinedBytes > livenessSnapshot.uniqueBytesFetched
+        if didAdvance {
+            transportLivenessAttempt = 0
+            transportRetryBudget.reset()
+            recoveryLogCadence.resetAfterProgress()
+        }
+        let sourcePhase: AetherPlaybackLivenessPhase = switch snapshot.state {
+        case .idle: .waitingForSource
+        case .probing: .preflighting
+        case .backingOff: .retryScheduled
+        case .prepared:
+            desiredPlaying ? .buffering : .preparingRoute
+        case .cancelled: .cancelled
+        case .failed: .preflighting
+        }
+        let phase =
+            routePreparationRetryProjection.phase
+                ?? sourcePhase
+        let attempt =
+            routePreparationRetryProjection.attempt
+                ?? snapshot.attempt
+                ?? livenessSnapshot.attempt
+        if didAdvance {
+            let observedUptime =
+                ProcessInfo.processInfo.systemUptime
+            emitBoundedProgressLog(
+                .sourceBytes(
+                    phase: phase,
+                    generation: livenessGeneration,
+                    attempt: attempt,
+                    uniqueBytes: combinedBytes,
+                    progressUptime:
+                        snapshot.lastProgressUptime
+                        ?? observedUptime,
+                    observedUptime: observedUptime
+                )
+            )
+        }
+        publishLiveness(
+            phase: phase,
+            attempt: attempt,
+            uniqueBytesFetched: combinedBytes,
+            lastMeaningfulProgressUptimeSeconds:
+                didAdvance
+                    ? (snapshot.lastProgressUptime
+                        ?? ProcessInfo.processInfo.systemUptime)
+                    : livenessSnapshot
+                        .lastMeaningfulProgressUptimeSeconds,
+            nextRetryUptimeSeconds:
+                routePreparationRetryProjection
+                    .nextRetryUptimeSeconds
+                    ?? (phase == .retryScheduled
+                        ? livenessSnapshot
+                            .nextRetryUptimeSeconds
+                        : nil)
+        )
+    }
+
+    private func applyProgressiveProbeMilestone(
+        preflightEpoch: UInt64,
+        attempt: Int,
+        ordinal: UInt64,
+        snapshot:
+            AetherProgressivePreflightLivenessSnapshot
+    ) {
+        let observedUptime =
+            ProcessInfo.processInfo.systemUptime
+        let progressUptime =
+            snapshot.lastProgressUptime
+                ?? observedUptime
+        transportLivenessAttempt = 0
+        transportRetryBudget.reset()
+        recoveryLogCadence.resetAfterProgress()
+        emitBoundedProgressLog(
+            .containerMilestone(
+                phase: .preflighting,
+                generation: livenessGeneration,
+                attempt: attempt,
+                preflightEpoch: preflightEpoch,
+                ordinal: ordinal,
+                progressUptime: progressUptime,
+                observedUptime: observedUptime
+            )
+        )
+        publishLiveness(
+            phase: .preflighting,
+            attempt: attempt,
+            uniqueBytesFetched:
+                livenessSnapshot.uniqueBytesFetched,
+            lastMeaningfulProgressUptimeSeconds:
+                progressUptime,
+            nextRetryUptimeSeconds: nil
+        )
+    }
+
+    private func resolveCanonicalSource()
+        async throws -> AetherResolvedPlaybackSource
+    {
+        await waitForPendingRouteIOQuiescence()
+        try Task.checkCancellation()
+        guard !isStopped else {
+            throw CancellationError()
+        }
         let sourceSignature: AetherURLPlaybackSourceSignature
+        classificationProgressFence.beginEpoch()
+        let classificationLivenessGeneration =
+            livenessGeneration
         do {
             sourceSignature = try await retryTransport(
                 stage: .classification
             ) {
-                try await AetherURLPlaybackSourceClassifier.inspect(
+                let progressToken =
+                    self.classificationProgressFence
+                        .beginReader()
+                let progressRelay =
+                    AetherClassificationProgressRelay()
+                defer {
+                    self.recordVerifiedPrefixProgress(
+                        progressToken: progressToken,
+                        livenessGeneration:
+                            classificationLivenessGeneration,
+                        verifiedByteCount:
+                            progressRelay.snapshot
+                    )
+                    self.classificationProgressFence
+                        .retire(progressToken)
+                }
+                return try await AetherURLPlaybackSourceClassifier.inspect(
                     url: self.url,
-                    options: self.options
+                    options: self.options,
+                    onVerifiedPrefixProgress: {
+                        [weak self] verifiedByteCount in
+                        progressRelay.record(verifiedByteCount)
+                        Task { @MainActor [weak self] in
+                            self?.recordVerifiedPrefixProgress(
+                                progressToken:
+                                    progressToken,
+                                livenessGeneration:
+                                    classificationLivenessGeneration,
+                                verifiedByteCount:
+                                    verifiedByteCount
+                            )
+                        }
+                    }
                 )
             }
         } catch {
             let failure = failure(stage: .classification, error: error)
-            if allowProvisionalNative,
-               failure.kind == .transientTransport
-                    || failure.kind == .inconclusiveEvidence {
-                return provisionalNativeSource()
-            }
             throw failure
         }
 
         switch sourceSignature.canonicalResolutionStep {
         case .inspectHLS:
+            publishLiveness(
+                phase: .preflighting,
+                attempt: transportLivenessAttempt,
+                uniqueBytesFetched:
+                    livenessSnapshot.uniqueBytesFetched,
+                lastMeaningfulProgressUptimeSeconds:
+                    livenessSnapshot
+                        .lastMeaningfulProgressUptimeSeconds,
+                nextRetryUptimeSeconds: nil
+            )
             do {
                 let preflight = try await retryTransport(
                     stage: .preflight
@@ -2721,9 +3457,7 @@ public final class AetherPlaybackSession: ObservableObject {
                     return try await operation.inspectHLS(
                         url: self.url,
                         sourceIsSeekableVOD: true,
-                        variantSelection:
-                            variantSelectionOverride
-                            ?? self.variantSelection,
+                        variantSelection: self.variantSelection,
                         hybridCapabilities:
                             AetherHybridPlaybackSession.capabilities,
                         options: self.options
@@ -2735,16 +3469,56 @@ public final class AetherPlaybackSession: ObservableObject {
             }
 
         case .probeProgressive:
+            publishLiveness(
+                phase: .preflighting,
+                attempt: transportLivenessAttempt,
+                uniqueBytesFetched:
+                    livenessSnapshot.uniqueBytesFetched,
+                lastMeaningfulProgressUptimeSeconds:
+                    livenessSnapshot
+                        .lastMeaningfulProgressUptimeSeconds,
+                nextRetryUptimeSeconds: nil
+            )
             do {
                 let preparedSource = try await retryTransport(
                     stage: .preflight
                 ) {
-                    try await Task.detached(priority: .userInitiated) {
-                        try AetherEngine.prepareURLSource(
-                            url: self.url,
-                            options: self.options
-                        )
-                    }.value
+                    let preflight = try AetherProgressivePreflight(
+                        url: self.url,
+                        options: self.options,
+                        retryPolicy:
+                            AetherProgressivePreflightRetryPolicy(
+                                inactivitySeconds:
+                                    self.recoveryBudget
+                                        .livenessPolicy
+                                        .noProgressWindowsSeconds,
+                                backoffSeconds:
+                                    self.recoveryBudget
+                                        .livenessPolicy
+                                        .retryBackoffSeconds
+                            ),
+                        fetchedByteProgressLedger:
+                            self.progressiveFetchedByteProgressLedger
+                    )
+                    self.activeProgressivePreflight = preflight
+                    self.observeProgressivePreflightEvents(
+                        preflight.events
+                    )
+                    defer {
+                        if self.activeProgressivePreflight
+                            === preflight {
+                            self.activeProgressivePreflight = nil
+                        }
+                    }
+                    self.beginIOOwnershipOperation()
+                    defer {
+                        self.endIOOwnershipOperation()
+                    }
+                    let prepared = try await preflight.prepare()
+                    self.observeProgressiveLiveness(
+                        prepared.progressiveLiveness
+                    )
+                    return prepared
                 }
                 let probe = preparedSource.probe
                 let profile = AetherSourceProfile(
@@ -2756,7 +3530,9 @@ public final class AetherPlaybackSession: ObservableObject {
                     sourceProfile: profile,
                     hlsPackaging: nil,
                     hybridCapabilities:
-                        AetherHybridPlaybackSession.capabilities
+                        AetherHybridPlaybackSession.capabilities,
+                    requiredAudioBridgeMode:
+                        options.audioBridgeMode
                 )
                 let retainedPreparedSource:
                     AetherPreparedURLSource?
@@ -2765,7 +3541,16 @@ public final class AetherPlaybackSession: ObservableObject {
                         && result.reason == .nativeHLSFMP4Remux) {
                     retainedPreparedSource = preparedSource
                 } else {
-                    preparedSource.discard()
+                    // Direct Native/unsupported admission would otherwise
+                    // open a successor while the probe URLSession can still
+                    // deliver late callbacks. Retire and fence the exact
+                    // prepared reader before exposing the result.
+                    await Task.detached(priority: .userInitiated) {
+                        preparedSource
+                            .discardAndWaitForIOQuiescence()
+                    }.value
+                    progressiveLivenessObservationTask?.cancel()
+                    progressiveLivenessObservationTask = nil
                     retainedPreparedSource = nil
                 }
                 return .progressive(
@@ -2779,7 +3564,57 @@ public final class AetherPlaybackSession: ObservableObject {
         }
     }
 
-    private func provisionalNativeSource(
+    private func recordVerifiedPrefixProgress(
+        progressToken:
+            AetherClassificationProgressToken,
+        livenessGeneration expectedGeneration: UInt64,
+        verifiedByteCount: Int
+    ) {
+        guard classificationProgressFence
+                .admits(progressToken),
+              expectedGeneration == livenessGeneration,
+              !isStopped,
+              terminalFailure == nil else {
+            return
+        }
+        let progressUptime =
+            ProcessInfo.processInfo.systemUptime
+        guard let ledgerSnapshot =
+                progressiveFetchedByteProgressLedger.record(
+                    offset: 0,
+                    count: verifiedByteCount,
+                    kind: .origin
+                ) else {
+            return
+        }
+        guard emitBoundedProgressLog(
+            .sourceBytes(
+                phase: .classifying,
+                generation: expectedGeneration,
+                attempt: transportLivenessAttempt,
+                uniqueBytes:
+                    ledgerSnapshot.totalAdvancedBytes,
+                progressUptime: progressUptime,
+                observedUptime: progressUptime
+            )
+        ) else {
+            return
+        }
+        transportLivenessAttempt = 0
+        transportRetryBudget.reset()
+        recoveryLogCadence.resetAfterProgress()
+        publishLiveness(
+            phase: .classifying,
+            attempt: 0,
+            uniqueBytesFetched:
+                ledgerSnapshot.totalAdvancedBytes,
+            lastMeaningfulProgressUptimeSeconds:
+                progressUptime,
+            nextRetryUptimeSeconds: nil
+        )
+    }
+
+    private func startupWatchdogTestHarnessSource(
         sourceContainer: AetherSourceContainer = .unknown
     )
         -> AetherResolvedPlaybackSource
@@ -2790,15 +3625,15 @@ public final class AetherPlaybackSession: ObservableObject {
             videoStreamPresence: .unknown,
             videoCodec: .unknown,
             sourceContainer: sourceContainer,
-            // Ignored by the provisional Native-only contract.
+            // The watchdog harness does not perform source admission.
             videoFormat: .sdr
         )
-        return .provisionalNative(
-            PlaybackPreflight.resolve(
+        return .startupWatchdogTestHarness(
+            PlaybackPreflightResult(
                 sourceProfile: profile,
                 hlsPackaging: nil,
-                hybridCapabilities:
-                    AetherHybridPlaybackSession.capabilities
+                route: .nativeAVPlayer,
+                reason: .nativeHLSContractVerified
             )
         )
     }
@@ -2807,28 +3642,34 @@ public final class AetherPlaybackSession: ObservableObject {
         _ source: AetherResolvedPlaybackSource,
         decoderPreference: HybridVideoDecoderPreference = .automatic
     ) async throws {
-        let deadline = try operationDeadline(
-            stage: .preparation
+        publishLiveness(
+            phase: .preparingRoute,
+            attempt: transportLivenessAttempt,
+            uniqueBytesFetched:
+                livenessSnapshot.uniqueBytesFetched,
+            lastMeaningfulProgressUptimeSeconds:
+                livenessSnapshot
+                    .lastMeaningfulProgressUptimeSeconds,
+            nextRetryUptimeSeconds: nil
         )
-        let race = AetherPlaybackOperationDeadlineRace<Void>()
-        try await race.run(
-            timeout: deadline.timeout,
-            timeoutFailure: deadline.failure,
-            onAbandon: { [weak self] in
-                self?.teardownActiveRoute()
-            }
-        ) { [self] in
-            try await installAndPrepareWithoutDeadline(
-                source,
-                decoderPreference: decoderPreference
-            )
-        }
+        // Route preparation may depend on the same slow canonical source.
+        // A wall-clock race cannot distinguish slow progress from a dead
+        // operation and therefore must not own the terminal outcome.
+        try await installAndPrepareWithoutDeadline(
+            source,
+            decoderPreference: decoderPreference
+        )
     }
 
     private func installAndPrepareWithoutDeadline(
         _ source: AetherResolvedPlaybackSource,
         decoderPreference: HybridVideoDecoderPreference
     ) async throws {
+        await waitForPendingRouteIOQuiescence()
+        try Task.checkCancellation()
+        guard !isStopped else {
+            throw CancellationError()
+        }
         guard source.result.route != .unsupported else {
             throw AetherPlaybackSessionError.unsupported(
                 source.result.reason
@@ -2840,6 +3681,10 @@ public final class AetherPlaybackSession: ObservableObject {
         resolvedSource = source
         let transaction = routeTransactions.begin()
         let route: AetherActiveRouteSession
+        beginIOOwnershipOperation()
+        defer {
+            endIOOwnershipOperation()
+        }
         do {
             route = try await makeRouteSession(
                 source,
@@ -2860,37 +3705,259 @@ public final class AetherPlaybackSession: ObservableObject {
                 transaction: transaction
             )
         } catch is CancellationError {
-            route.stop()
+            await route.stopAndWaitForIOQuiescence()
             throw CancellationError()
         } catch {
-            route.stop()
+            await route.stopAndWaitForIOQuiescence()
             throw failure(stage: .routeCreation, error: error)
                 .recordingRecoveryDiagnostic(step: .install)
         }
+        let routePreparationProgress =
+            AetherRoutePreparationProgressLedger()
+        let supervisesProgressiveHybridPreparation: Bool
+        if case .progressive = source,
+           route.route == .hybridCarrier {
+            supervisesProgressiveHybridPreparation = true
+        } else {
+            supervisesProgressiveHybridPreparation = false
+        }
+        if supervisesProgressiveHybridPreparation {
+            route.setRoutePreparationProgressHandler {
+                [routePreparationProgress] kind in
+                routePreparationProgress.record(kind)
+            }
+        }
+        defer {
+            route.setRoutePreparationProgressHandler(nil)
+        }
         do {
-            try await route.prepare()
+            if supervisesProgressiveHybridPreparation {
+                try await prepareRouteWithLiveness(
+                    route,
+                    progress:
+                        routePreparationProgress
+                )
+            } else {
+                try await route.prepare()
+            }
         } catch is CancellationError {
             throw CancellationError()
         } catch {
+            if let evidence = route.nativeFailureEvidence {
+                throw Self.nativeFailure(
+                    stage: .preparation,
+                    evidence: evidence
+                ).recordingRecoveryDiagnostic(step: .prepare)
+            }
             throw failure(stage: .preparation, error: error)
                 .recordingRecoveryDiagnostic(step: .prepare)
         }
         do {
             try requireCurrentRouteTransaction(transaction)
-            try commit(
+            try await commit(
                 route,
                 source: source,
                 transaction: transaction
             )
         } catch is CancellationError {
-            route.stop()
+            await route.stopAndWaitForIOQuiescence()
             throw CancellationError()
         } catch {
-            route.stop()
+            await route.stopAndWaitForIOQuiescence()
             throw failure(stage: .routeCreation, error: error)
                 .recordingRecoveryDiagnostic(step: .install)
         }
         publishCurrentItem(avPlayer.currentItem)
+    }
+
+    private func prepareRouteWithLiveness(
+        _ route: AetherActiveRouteSession,
+        progress:
+            AetherRoutePreparationProgressLedger
+    ) async throws {
+        let attempt = max(
+            1,
+            transportLivenessAttempt + 1
+        )
+        let supervisor =
+            AetherRoutePreparationLivenessSupervisor(
+                policy: recoveryBudget.livenessPolicy
+            )
+        let byteLedger =
+            progressiveFetchedByteProgressLedger
+
+        let race =
+            AetherRoutePreparationLivenessRace()
+        do {
+            try await race.run(
+                operation: {
+                    try await route.prepare()
+                },
+                monitor: { @MainActor [weak self] in
+                guard let self else {
+                    throw CancellationError()
+                }
+                return try await supervisor
+                    .waitForNoProgress(
+                        attempt: attempt,
+                        evidence: {
+                            let semantic = progress.snapshot
+                            return AetherRoutePreparationProgressEvidence(
+                                uniqueBytes:
+                                    byteLedger.snapshot
+                                        .totalAdvancedBytes,
+                                semanticOrdinal:
+                                    semantic.ordinal,
+                                semanticProgressUptimeSeconds:
+                                    semantic
+                                        .lastProgressUptimeSeconds
+                            )
+                        },
+                        recoveryOwnerPhase: {
+                            self
+                                .routePreparationRetryProjection
+                                .phase
+                        },
+                        onProgress: {
+                            [weak self] evidence in
+                            self?
+                                .recordRoutePreparationProgress(
+                                    evidence
+                                )
+                        }
+                    )
+                },
+                stopAndWaitForIOQuiescence: {
+                    [weak self] noProgress in
+                    await self?
+                        .stopRoutePreparationAfterNoProgress(
+                            route,
+                            evidence: noProgress
+                        )
+                }
+            )
+        } catch let noProgress
+                as AetherRoutePreparationNoProgress {
+            throw Self.routePreparationNoProgressFailure(
+                noProgress
+            )
+        }
+    }
+
+    private func recordRoutePreparationProgress(
+        _ evidence:
+            AetherRoutePreparationProgressEvidence
+    ) {
+        let observedUptime =
+            ProcessInfo.processInfo.systemUptime
+        let progressUptime =
+            evidence.semanticProgressUptimeSeconds
+                ?? observedUptime
+        if evidence.semanticOrdinal > 0 {
+            emitBoundedProgressLog(
+                .routePreparationMilestone(
+                    phase:
+                        routePreparationRetryProjection.phase
+                            ?? .preparingRoute,
+                    generation: livenessGeneration,
+                    attempt:
+                        routePreparationRetryProjection.attempt
+                            ?? 0,
+                    ordinal:
+                        evidence.semanticOrdinal,
+                    progressUptime: progressUptime,
+                    observedUptime: observedUptime
+                )
+            )
+        }
+        transportLivenessAttempt = 0
+        transportRetryBudget.reset()
+        recoveryLogCadence.resetAfterProgress()
+        publishLiveness(
+            phase:
+                routePreparationRetryProjection.phase
+                    ?? .preparingRoute,
+            attempt:
+                routePreparationRetryProjection.attempt
+                    ?? 0,
+            uniqueBytesFetched: max(
+                livenessSnapshot.uniqueBytesFetched,
+                evidence.uniqueBytes
+            ),
+            lastMeaningfulProgressUptimeSeconds:
+                max(
+                    livenessSnapshot
+                        .lastMeaningfulProgressUptimeSeconds
+                        ?? 0,
+                    progressUptime
+                ),
+            nextRetryUptimeSeconds:
+                routePreparationRetryProjection
+                    .nextRetryUptimeSeconds
+        )
+    }
+
+    private func stopRoutePreparationAfterNoProgress(
+        _ route: AetherActiveRouteSession,
+        evidence: AetherRoutePreparationNoProgress
+    ) async {
+        publishLiveness(
+            phase: .cancelling,
+            attempt: evidence.attempt,
+            uniqueBytesFetched:
+                livenessSnapshot.uniqueBytesFetched,
+            lastMeaningfulProgressUptimeSeconds:
+                livenessSnapshot
+                    .lastMeaningfulProgressUptimeSeconds,
+            nextRetryUptimeSeconds: nil
+        )
+        let fence =
+            AetherCancellationQuiescenceFence()
+        let generation = livenessGeneration
+        let watchdog = Task.detached {
+            do {
+                try await Task.sleep(
+                    nanoseconds: 2_000_000_000
+                )
+            } catch {
+                return
+            }
+            guard fence.isPending else { return }
+            EngineLog.emit(
+                "[AetherPlaybackSession] cancellationUnresponsive "
+                    + "scope=routePreparation "
+                    + "generation=\(generation) "
+                    + "readerOverlap=forbidden",
+                category: .session
+            )
+        }
+        await route.stopAndWaitForIOQuiescence()
+        fence.markQuiesced()
+        watchdog.cancel()
+        EngineLog.emit(
+            "[AetherPlaybackSession] route preparation ioStopped "
+                + "generation=\(generation) "
+                + "attempt=\(evidence.attempt)",
+            category: .session
+        )
+    }
+
+    nonisolated private static func
+        routePreparationNoProgressFailure(
+            _ noProgress:
+                AetherRoutePreparationNoProgress
+        ) -> AetherPlaybackFailure {
+        AetherPlaybackFailure(
+            stage: .preparation,
+            kind: .transientTransport,
+            domain:
+                "AetherEngine.RoutePreparationLiveness",
+            code: 1,
+            caseCode: "routePreparation.noProgress",
+            reason:
+                "route preparation made no unique-byte or semantic progress "
+                + "for \(Int(noProgress.windowSeconds)) seconds"
+        )
     }
 
     private func makeRouteSession(
@@ -2916,7 +3983,7 @@ public final class AetherPlaybackSession: ObservableObject {
                     httpHeaders: options.httpHeaders,
                     probe: probe
                 )
-            case .provisionalNative:
+            case .startupWatchdogTestHarness:
                 binding = .unavailable(
                     sourceURL: url,
                     httpHeaders: options.httpHeaders,
@@ -2941,7 +4008,7 @@ public final class AetherPlaybackSession: ObservableObject {
                         audioAnalysisBinding: binding,
                         avPlayer: avPlayer
                     )
-                return try admitConstructedRoute(
+                return try await admitConstructedRoute(
                     .native(session),
                     transaction: transaction
                 )
@@ -2954,7 +4021,7 @@ public final class AetherPlaybackSession: ObservableObject {
                         audioAnalysisBinding: binding,
                         avPlayer: avPlayer
                     )
-                return try admitConstructedRoute(
+                return try await admitConstructedRoute(
                     .native(session),
                     transaction: transaction
                 )
@@ -2970,7 +4037,7 @@ public final class AetherPlaybackSession: ObservableObject {
                         decoderPreference: decoderPreference,
                         transportRetryBudget: transportRetryBudget
                     )
-                return try admitConstructedRoute(
+                return try await admitConstructedRoute(
                     .hybrid(session),
                     transaction: transaction
                 )
@@ -2982,12 +4049,51 @@ public final class AetherPlaybackSession: ObservableObject {
                 guard let preparedSource else {
                     throw AetherPlaybackSessionError.invalidFactorySource
                 }
-                let timeline = try BlackCarrierTimeline.fileVOD(
-                    duration: CMTime(
-                        seconds: probe.durationSeconds,
-                        preferredTimescale: 90_000
-                    )
+                let timelineDuration = CMTime(
+                    seconds: probe.durationSeconds,
+                    preferredTimescale:
+                        BlackCarrierProfile.approved.timescale
                 )
+                let segmentDecision =
+                    try AetherProgressiveProResSegmentPolicy
+                        .decide(
+                            sourceKind:
+                                result.sourceProfile.sourceKind,
+                            route: result.route,
+                            reason: result.reason,
+                            sourceGeneration:
+                                preparedSource.sourceGeneration,
+                            durationSeconds:
+                                probe.durationSeconds
+                        )
+                EngineLog.emit(
+                    "[AetherPlaybackSession] progressive file-VOD segment policy "
+                        + "source_kind=\(result.sourceProfile.sourceKind.rawValue) "
+                        + "route=\(result.route.rawValue) "
+                        + "route_reason=\(result.reason.rawValue) "
+                        + "selection=\(segmentDecision.selection.rawValue) "
+                        + "validator_bound=\(preparedSource.sourceGeneration?.validator != nil) "
+                        + "content_length_bytes=\(segmentDecision.contentLengthBytes.map(String.init) ?? "unavailable") "
+                        + "duration_ticks=\(segmentDecision.durationTicks.map(String.init) ?? "unavailable") "
+                        + "average_source_bytes_per_second=\(segmentDecision.averageSourceBytesPerSecond.map(String.init) ?? "unavailable") "
+                        + "nominal_segment_bytes=\(segmentDecision.nominalSegmentBytes.map(String.init) ?? "unavailable") "
+                        + "segment_count=\(segmentDecision.segmentCount.map(String.init) ?? "unavailable") "
+                        + "segment_duration_ticks=\(segmentDecision.segmentDurationTicks)",
+                    category: .session
+                )
+                let timeline: BlackCarrierTimeline
+                if segmentDecision.isAdaptive {
+                    timeline = try BlackCarrierTimeline.fileVOD(
+                        duration: timelineDuration,
+                        segmentDurationTicks:
+                            segmentDecision
+                                .segmentDurationTicks
+                    )
+                } else {
+                    timeline = try BlackCarrierTimeline.fileVOD(
+                        duration: timelineDuration
+                    )
+                }
                 let session = try await AetherHybridPlaybackSession
                     .makeSeekableVOD(
                         source: .url(url),
@@ -2998,11 +4104,11 @@ public final class AetherPlaybackSession: ObservableObject {
                         avPlayer: avPlayer,
                         decoderPreference: decoderPreference
                     )
-                return try admitConstructedRoute(
+                return try await admitConstructedRoute(
                     .hybrid(session),
                     transaction: transaction
                 )
-            case .provisionalNative:
+            case .startupWatchdogTestHarness:
                 throw AetherPlaybackSessionError.invalidFactorySource
             }
 
@@ -3025,12 +4131,12 @@ public final class AetherPlaybackSession: ObservableObject {
     private func admitConstructedRoute(
         _ route: AetherActiveRouteSession,
         transaction: UInt64
-    ) throws -> AetherActiveRouteSession {
+    ) async throws -> AetherActiveRouteSession {
         do {
             try requireCurrentRouteTransaction(transaction)
             return route
         } catch {
-            route.stop()
+            await route.stopAndWaitForIOQuiescence()
             throw error
         }
     }
@@ -3073,11 +4179,11 @@ public final class AetherPlaybackSession: ObservableObject {
         _ session: AetherActiveRouteSession,
         source: AetherResolvedPlaybackSource,
         transaction: UInt64
-    ) throws {
+    ) async throws {
         guard routeTransactions.isActive(transaction),
               let activeSession,
               activeSession.isIdentical(to: session) else {
-            session.stop()
+            await session.stopAndWaitForIOQuiescence()
             throw CancellationError()
         }
         resolvedSource = source
@@ -3136,6 +4242,18 @@ public final class AetherPlaybackSession: ObservableObject {
     private func bind(
         _ session: AetherHybridPlaybackSession
     ) {
+        routePreparationRetryProjection.reset()
+        session.routePreparationRetryEventDidChange = {
+            [weak self, weak session] event in
+            guard let self,
+                  let session,
+                  case .hybrid(let active) =
+                    self.activeSession,
+                  active === session else {
+                return
+            }
+            self.applyRoutePreparationRetryEvent(event)
+        }
         bindVideoOutput(
             session.$videoOutputSnapshot,
             initial: session.videoOutputSnapshot
@@ -3170,6 +4288,37 @@ public final class AetherPlaybackSession: ObservableObject {
             .store(in: &routeCancellables)
     }
 
+    private func applyRoutePreparationRetryEvent(
+        _ event: AetherRoutePreparationRetryEvent
+    ) {
+        routePreparationRetryProjection.apply(event)
+        guard !isStopped,
+              livenessSnapshot.phase != .cancelling,
+              livenessSnapshot.phase != .cancelled else {
+            return
+        }
+        publishLiveness(
+            phase:
+                routePreparationRetryProjection.phase
+                    ?? (isPreparingOrRecovering
+                        ? .preparingRoute
+                        : livenessSnapshot.phase),
+            attempt:
+                routePreparationRetryProjection.attempt
+                    ?? (isPreparingOrRecovering
+                        ? transportLivenessAttempt
+                        : livenessSnapshot.attempt),
+            uniqueBytesFetched:
+                livenessSnapshot.uniqueBytesFetched,
+            lastMeaningfulProgressUptimeSeconds:
+                livenessSnapshot
+                    .lastMeaningfulProgressUptimeSeconds,
+            nextRetryUptimeSeconds:
+                routePreparationRetryProjection
+                    .nextRetryUptimeSeconds
+        )
+    }
+
     private func bindVideoOutput(
         _ publisher: Published<
             AetherVideoOutputSnapshot
@@ -3185,7 +4334,54 @@ public final class AetherPlaybackSession: ObservableObject {
                     bindingToken: bindingToken
                   ) else { return }
             self.videoOutputSnapshot = outerSnapshot
+            self.recordPresentedVideoOutput(outerSnapshot)
         }.store(in: &routeCancellables)
+    }
+
+    private func recordPresentedVideoOutput(
+        _ snapshot: AetherVideoOutputSnapshot
+    ) {
+        guard snapshot.outputStatus == .presented,
+              let mediaTime =
+                snapshot.lastPresentedFrameMediaTimeSeconds else {
+            return
+        }
+        let observedUptime =
+            ProcessInfo.processInfo.systemUptime
+        let progressUptime =
+            snapshot.observedAtUptimeSeconds
+                ?? observedUptime
+        let phase: AetherPlaybackLivenessPhase =
+            desiredPlaying
+                ? .flowing
+                : livenessSnapshot.phase
+        guard emitBoundedProgressLog(
+            .presentedFrame(
+                phase: phase,
+                generation: livenessGeneration,
+                attempt: livenessSnapshot.attempt,
+                frameGeneration:
+                    snapshot.frameGeneration,
+                frameSequence: snapshot.frameSequence,
+                mediaTimeSeconds: mediaTime,
+                progressUptime: progressUptime,
+                observedUptime: observedUptime
+            )
+        ) else {
+            return
+        }
+        transportLivenessAttempt = 0
+        transportRetryBudget.reset()
+        recoveryLogCadence.resetAfterProgress()
+        publishLiveness(
+            phase: phase,
+            attempt: 0,
+            uniqueBytesFetched:
+                livenessSnapshot.uniqueBytesFetched,
+            lastMeaningfulProgressUptimeSeconds:
+                progressUptime,
+            nextRetryUptimeSeconds: nil
+        )
     }
 
     private func invalidateVideoOutputRoute() {
@@ -3252,24 +4448,19 @@ public final class AetherPlaybackSession: ObservableObject {
               !recoveryCoordinator.terminalOutcomeWasIssued else {
             return
         }
+        if Self.isPermanentFailure(failure.kind) {
+            recoveryTask?.cancel()
+            _ = finishRecoveryAsTerminal(
+                initialFailure:
+                    recoveryCoordinator.sessionFirstFailure
+                    ?? failure,
+                finalFailure: failure,
+                exhaustionReason:
+                    "permanent failure superseded recovery"
+            )
+            return
+        }
         if recoveryTask != nil {
-            if Self.isPermanentFailure(failure.kind) {
-                recoveryTask?.cancel()
-                publishRecovery(
-                    failure: failure,
-                    action: .terminate,
-                    from: activeRoute,
-                    to: nil,
-                    outcome: .exhausted
-                )
-                publishTerminal(
-                    recoveryCoordinator.sessionFirstFailure ?? failure,
-                    finalFailure: failure,
-                    exhaustionReason:
-                        "permanent failure superseded active recovery"
-                )
-                return
-            }
             let key = "\(failure.stage.rawValue):\(failure.kind.rawValue):\(failure.domain):\(failure.code)"
             if mergedRuntimeFailureKeys.insert(key).inserted {
                 publishRecovery(
@@ -3285,21 +4476,33 @@ public final class AetherPlaybackSession: ObservableObject {
         recoveryTask = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                let recovered = try await self.recover(
-                    from: failure,
-                    duringInitialPrepare: false
-                )
-                if !recovered {
-                    _ = self.finishRecoveryAsTerminal(
-                        initialFailure: failure,
-                        finalFailure:
-                            self.lastRecoveryFailure ?? failure,
-                        exhaustionReason:
-                            "runtime recovery exhausted"
+                if Self.requiresPersistentSameSourceRecovery(
+                    failure
+                ) {
+                    try await self
+                        .recoverSameSourceTransportUntilSuccess(
+                            from: failure,
+                            duringInitialPrepare: false
+                        )
+                } else {
+                    let recovered = try await self.recover(
+                        from: failure,
+                        duringInitialPrepare: false
                     )
+                    if !recovered {
+                        _ = self.finishRecoveryAsTerminal(
+                            initialFailure: failure,
+                            finalFailure:
+                                self.lastRecoveryFailure ?? failure,
+                            exhaustionReason:
+                                "runtime structural recovery exhausted"
+                        )
+                    }
                 }
             } catch is CancellationError {
-                if !self.isStopped {
+                if !self.isStopped,
+                   !self.recoveryCoordinator
+                    .terminalOutcomeWasIssued {
                     let cancelled = self.failure(
                         stage: .playback,
                         error: CancellationError()
@@ -3328,6 +4531,310 @@ public final class AetherPlaybackSession: ObservableObject {
         }
     }
 
+    nonisolated static func
+        requiresPersistentSameSourceRecovery(
+            _ failure: AetherPlaybackFailure
+        ) -> Bool
+    {
+        failure.kind == .transientTransport
+            || failure.kind == .inconclusiveEvidence
+            || PlaybackRecoveryDecision
+                .requiresSameRouteTransportRecovery(
+                    failure: failure
+                )
+    }
+
+    /// Rebuilds only the already-admitted route for the same canonical
+    /// request. Transport and startup no-progress never consume a total
+    /// attempt or wall-clock budget; every failed generation is stopped
+    /// before the next generation is admitted.
+    private func recoverSameSourceTransportUntilSuccess(
+        from initialFailure: AetherPlaybackFailure,
+        duringInitialPrepare: Bool
+    ) async throws {
+        guard !isStopped else { throw CancellationError() }
+        isPreparingOrRecovering = true
+        firstFailure = firstFailure ?? initialFailure
+        beginRecoveryEpisodeIfNeeded(initialFailure)
+
+        let failedRoute = activeSession?.route
+            ?? activeRoute
+            ?? resolvedSource?.result.route
+        let failedSourceResult = resolvedSource?.result
+        let failedProgressiveSourceFacts =
+            resolvedSource?.progressiveSourceFacts
+        let failedProgressiveSourceGeneration =
+            resolvedSource?.progressiveSourceGeneration
+        let failedHLSResourceIdentity =
+            resolvedSource?.hlsResourceIdentity
+        let playbackContext = snapshotPlaybackContext()
+        var latestFailure = initialFailure
+
+        guard let failedRoute,
+              failedRoute != .unsupported else {
+            isPreparingOrRecovering = false
+            throw AetherPlaybackFailure(
+                stage: initialFailure.stage,
+                kind: .invariantViolation,
+                domain: "AetherPlaybackSameSourceRecovery",
+                code: 0,
+                caseCode: "sameSourceRouteMissing",
+                reason:
+                    "same-source transport recovery has no admitted route"
+            )
+        }
+
+        while !isStopped {
+            try Task.checkCancellation()
+            transportLivenessAttempt += 1
+            let attempt = transportLivenessAttempt
+            let delay = recoveryBudget.livenessPolicy
+                .retryBackoffSeconds(forAttempt: attempt)
+            let action =
+                AetherPlaybackRecoveryAction.retrySameOperation(
+                    afterSeconds: delay
+                )
+            recoveryCoordinator.recordAttempt(action)
+            publishRecovery(
+                failure: latestFailure,
+                action: action,
+                from: failedRoute,
+                to: failedRoute,
+                outcome: .scheduled
+            )
+
+            publishLiveness(
+                phase: .cancelling,
+                attempt: attempt,
+                uniqueBytesFetched:
+                    livenessSnapshot.uniqueBytesFetched,
+                lastMeaningfulProgressUptimeSeconds:
+                    livenessSnapshot
+                        .lastMeaningfulProgressUptimeSeconds,
+                nextRetryUptimeSeconds: nil
+            )
+            let cancellationFence =
+                AetherCancellationQuiescenceFence()
+            let cancellationGeneration = livenessGeneration
+            let cancellationWatchdog = Task.detached {
+                do {
+                    try await Task.sleep(
+                        nanoseconds: 2_000_000_000
+                    )
+                } catch {
+                    return
+                }
+                guard cancellationFence.isPending else { return }
+                EngineLog.emit(
+                    "[AetherPlaybackSession] cancellationUnresponsive "
+                        + "generation=\(cancellationGeneration) "
+                        + "readerOverlap=forbidden",
+                    category: .session
+                )
+            }
+            await teardownActiveRouteAndWaitForIOQuiescence()
+            await resolvedSource?
+                .discardUnconsumedPreparedSourceAndWaitForIOQuiescence()
+            resolvedSource = nil
+            cancellationFence.markQuiesced()
+            cancellationWatchdog.cancel()
+
+            publishLiveness(
+                phase: .retryScheduled,
+                attempt: attempt,
+                uniqueBytesFetched:
+                    livenessSnapshot.uniqueBytesFetched,
+                lastMeaningfulProgressUptimeSeconds:
+                    livenessSnapshot
+                        .lastMeaningfulProgressUptimeSeconds,
+                nextRetryUptimeSeconds:
+                    ProcessInfo.processInfo.systemUptime + delay
+            )
+            if delay > 0 {
+                try await Task.sleep(
+                    nanoseconds: UInt64(delay * 1_000_000_000)
+                )
+            }
+            try Task.checkCancellation()
+            livenessGeneration &+= 1
+
+            do {
+                let freshSource = try await resolveCanonicalSource()
+                if let sourceDivergence = Self
+                    .freshProgressiveSourceIdentityFailure(
+                        previousFacts:
+                            failedProgressiveSourceFacts,
+                        freshFacts:
+                            freshSource.progressiveSourceFacts
+                    ) {
+                    throw sourceDivergence
+                }
+                if let generationDivergence = Self
+                    .freshProgressiveSourceGenerationFailure(
+                        previousGeneration:
+                            failedProgressiveSourceGeneration,
+                        freshGeneration:
+                            freshSource.progressiveSourceGeneration
+                    ) {
+                    await freshSource
+                        .discardUnconsumedPreparedSourceAndWaitForIOQuiescence()
+                    throw generationDivergence
+                }
+                if let failedHLSResourceIdentity,
+                   freshSource.hlsResourceIdentity
+                    != failedHLSResourceIdentity {
+                    throw AetherPlaybackFailure(
+                        stage: .preflight,
+                        kind: .invariantViolation,
+                        domain: "AetherPlaybackSourceIdentity",
+                        code: 0,
+                        caseCode: "hlsResourceIdentityChanged",
+                        reason:
+                            "fresh HLS facts diverged from committed source identity"
+                    )
+                }
+                if let failedSourceResult,
+                   freshSource.result != failedSourceResult {
+                    throw AetherPlaybackFailure(
+                        stage: .preflight,
+                        kind: .invariantViolation,
+                        domain: "AetherPlaybackSourceIdentity",
+                        code: 0,
+                        caseCode: "preflightIdentityChanged",
+                        reason:
+                            "fresh source facts diverged from committed playback identity"
+                    )
+                }
+                guard let admitted = freshSource.admitting(
+                    route: failedRoute,
+                    requiredAudioBridgeMode:
+                        options.audioBridgeMode
+                ) else {
+                    throw AetherPlaybackFailure(
+                        stage: .preflight,
+                        kind: .invariantViolation,
+                        domain: "AetherPlaybackSourceIdentity",
+                        code: 0,
+                        caseCode: "sameRouteAdmissionChanged",
+                        reason:
+                            "same-source transport recovery changed route admission"
+                    )
+                }
+
+                try await installAndPrepare(admitted)
+                try await restorePlaybackContextForTransportLiveness(
+                    playbackContext,
+                    duringInitialPrepare: duringInitialPrepare,
+                    attempt: attempt
+                )
+                publishRecovery(
+                    failure: latestFailure,
+                    action: action,
+                    from: failedRoute,
+                    to: failedRoute,
+                    outcome: .succeeded
+                )
+                transportLivenessAttempt = 0
+                transportRetryBudget.reset()
+                recoveryLogCadence.resetAfterProgress()
+                isPreparingOrRecovering = false
+                publishLiveness(
+                    phase: desiredPlaying ? .buffering : .preparingRoute,
+                    attempt: 0,
+                    uniqueBytesFetched:
+                        livenessSnapshot.uniqueBytesFetched,
+                    lastMeaningfulProgressUptimeSeconds:
+                        ProcessInfo.processInfo.systemUptime,
+                    nextRetryUptimeSeconds: nil
+                )
+                return
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                latestFailure = failure(
+                    stage: .preparation,
+                    error: error
+                )
+                publishRecovery(
+                    failure: latestFailure,
+                    action: action,
+                    from: failedRoute,
+                    to: failedRoute,
+                    outcome: .failed
+                )
+                guard Self.requiresPersistentSameSourceRecovery(
+                    latestFailure
+                ) else {
+                    isPreparingOrRecovering = false
+                    throw latestFailure
+                }
+            }
+        }
+        throw CancellationError()
+    }
+
+    private func restorePlaybackContextForTransportLiveness(
+        _ context: AetherPlaybackContextSnapshot,
+        duringInitialPrepare: Bool,
+        attempt: Int
+    ) async throws {
+        do {
+            if !duringInitialPrepare {
+                guard let activeSession else {
+                    throw AetherPlaybackSessionError.noActiveRoute
+                }
+                let resumeTime = desiredSeekTarget ?? context.position
+                if resumeTime.isValid,
+                   resumeTime.isNumeric,
+                   resumeTime.seconds.isFinite,
+                   resumeTime.seconds >= 0 {
+                    let result = try await activeSession.seek(
+                        to: resumeTime,
+                        timeout: recoveryBudget.livenessPolicy
+                            .noProgressWindowSeconds(
+                                forAttempt: attempt
+                            )
+                    )
+                    guard result == .applied else {
+                        throw AetherPlaybackFailure(
+                            stage: .playback,
+                            kind: .routeRuntimeFailure,
+                            domain:
+                                "AetherPlaybackSameSourceRecovery",
+                            code: 0,
+                            caseCode: "startupNoProgress",
+                            reason:
+                                "recovery seek was superseded before media progress"
+                        )
+                    }
+                    lastConfirmedMediaTime = resumeTime
+                }
+            }
+            try await applyRestoredPlaybackContext()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            let typed = failure(stage: .playback, error: error)
+            if Self.isPermanentFailure(typed.kind)
+                || typed.kind == .decoderRuntimeFailure {
+                throw typed
+            }
+            if typed.kind == .transientTransport
+                || typed.kind == .inconclusiveEvidence {
+                throw typed
+            }
+            throw AetherPlaybackFailure(
+                stage: .playback,
+                kind: .routeRuntimeFailure,
+                domain: typed.domain,
+                code: typed.code,
+                caseCode: "startupNoProgress",
+                reason:
+                    "same-source recovery context made no usable media progress"
+            )
+        }
+    }
+
     private func recover(
         from initialFailure: AetherPlaybackFailure,
         duringInitialPrepare: Bool
@@ -3336,14 +4843,14 @@ public final class AetherPlaybackSession: ObservableObject {
         isPreparingOrRecovering = true
         firstFailure = firstFailure ?? initialFailure
         beginRecoveryEpisodeIfNeeded(initialFailure)
-        let recoveryDeadline = currentRecoveryDeadline
-        try ensureRecoveryDeadline(recoveryDeadline)
         let failedRoute = activeSession?.route
             ?? activeRoute
             ?? resolvedSource?.result.route
         let failedSourceResult = resolvedSource?.result
         let failedProgressiveSourceFacts =
             resolvedSource?.progressiveSourceFacts
+        let failedProgressiveSourceGeneration =
+            resolvedSource?.progressiveSourceGeneration
         let failedHLSResourceIdentity =
             resolvedSource?.hlsResourceIdentity
         let playbackContext = snapshotPlaybackContext()
@@ -3373,11 +4880,9 @@ public final class AetherPlaybackSession: ObservableObject {
              .routeRuntimeFailure, .decoderRuntimeFailure:
             break
         }
-
-        // Classification/preflight/remux transport work has already passed
-        // through retryTransport's single three-attempt session budget. With
-        // no candidate route there is nothing to rebuild and starting another
-        // classifier loop here would double-count that budget.
+        // Persistent transport work is routed before this structural method.
+        // Without an admitted route there is no decoder or implementation
+        // structure to rebuild.
         guard failedRoute != nil else {
             publishRecovery(
                 failure: initialFailure,
@@ -3391,16 +4896,22 @@ public final class AetherPlaybackSession: ObservableObject {
         }
 
         if requiresImmediateNativeExit {
-            // Positive HEVC disproves the Native implementation. Tear it down
-            // before re-resolution so no same-route rebuild can continue
-            // presenting the violating item. Only a freshly admitted source
-            // for this same canonical request may supply Hybrid.
+            // Positive codec evidence disproves the installed Native route.
+            // This session cannot change players after launch, so terminate
+            // rather than silently admitting Hybrid.
+            publishRecovery(
+                failure: initialFailure,
+                action: .terminate,
+                from: failedRoute,
+                to: nil,
+                outcome: .exhausted
+            )
             teardownActiveRoute()
-            freshSource = nil
+            isPreparingOrRecovering = false
+            return false
         }
 
-        if !requiresImmediateNativeExit,
-           recoveryCoordinator.sameRouteRebuildCount
+        if recoveryCoordinator.sameRouteRebuildCount
                 < recoveryBudget.maximumSameRouteRebuilds,
            let failedRoute {
             let action = AetherPlaybackRecoveryAction.rebuildSameRoute
@@ -3414,14 +4925,7 @@ public final class AetherPlaybackSession: ObservableObject {
             )
             teardownActiveRoute()
             do {
-                try ensureRecoveryDeadline(recoveryDeadline)
-                freshSource = try await resolveSameRouteRecoverySource(
-                    failedRoute: failedRoute,
-                    allowLowerVariant:
-                        isSelectedVariantAvailabilityFailure(
-                            initialFailure
-                        )
-                )
+                freshSource = try await resolveCanonicalSource()
                 guard let freshSource else {
                     throw AetherPlaybackSessionError.unsupported(
                         .unsupportedVideoCodec
@@ -3436,8 +4940,50 @@ public final class AetherPlaybackSession: ObservableObject {
                     ) {
                     throw sourceDivergence
                 }
+                if let generationDivergence = Self
+                    .freshProgressiveSourceGenerationFailure(
+                        previousGeneration:
+                            failedProgressiveSourceGeneration,
+                        freshGeneration:
+                            freshSource.progressiveSourceGeneration
+                    ) {
+                    await freshSource
+                        .discardUnconsumedPreparedSourceAndWaitForIOQuiescence()
+                    throw generationDivergence
+                }
+                if let failedHLSResourceIdentity,
+                   freshSource.hlsResourceIdentity
+                    != failedHLSResourceIdentity {
+                    await freshSource
+                        .discardUnconsumedPreparedSourceAndWaitForIOQuiescence()
+                    throw AetherPlaybackFailure(
+                        stage: .preflight,
+                        kind: .invariantViolation,
+                        domain: "AetherPlaybackSourceIdentity",
+                        code: 0,
+                        caseCode: "hlsResourceIdentityChanged",
+                        reason:
+                            "fresh HLS facts diverged from committed source identity"
+                    )
+                }
+                if let failedSourceResult,
+                   freshSource.result != failedSourceResult {
+                    await freshSource
+                        .discardUnconsumedPreparedSourceAndWaitForIOQuiescence()
+                    throw AetherPlaybackFailure(
+                        stage: .preflight,
+                        kind: .invariantViolation,
+                        domain: "AetherPlaybackSourceIdentity",
+                        code: 0,
+                        caseCode: "preflightIdentityChanged",
+                        reason:
+                            "fresh source facts diverged from committed playback identity"
+                    )
+                }
                 guard let admitted = freshSource.admitting(
-                    route: failedRoute
+                    route: failedRoute,
+                    requiredAudioBridgeMode:
+                        options.audioBridgeMode
                 ) else {
                     if let reclassified = Self
                         .freshRouteReclassificationFailure(
@@ -3452,7 +4998,6 @@ public final class AetherPlaybackSession: ObservableObject {
                     )
                 }
                 try await installAndPrepare(admitted)
-                try ensureRecoveryDeadline(recoveryDeadline)
                 try await restorePlaybackContext(
                     playbackContext,
                     duringInitialPrepare: duringInitialPrepare
@@ -3480,17 +5025,34 @@ public final class AetherPlaybackSession: ObservableObject {
                     to: failedRoute,
                     outcome: .failed
                 )
+                if Self.requiresPersistentSameSourceRecovery(
+                    latestFailure
+                ) {
+                    try await recoverSameSourceTransportUntilSuccess(
+                        from: latestFailure,
+                        duringInitialPrepare:
+                            duringInitialPrepare
+                    )
+                    return true
+                }
             }
         }
 
         if freshSource == nil {
             do {
-                try ensureRecoveryDeadline(recoveryDeadline)
-                freshSource = try await resolveCanonicalSource(
-                    allowProvisionalNative: false
-                )
+                freshSource = try await resolveCanonicalSource()
             } catch {
                 latestFailure = failure(stage: .preflight, error: error)
+                if Self.requiresPersistentSameSourceRecovery(
+                    latestFailure
+                ) {
+                    try await recoverSameSourceTransportUntilSuccess(
+                        from: latestFailure,
+                        duringInitialPrepare:
+                            duringInitialPrepare
+                    )
+                    return true
+                }
             }
         }
         var softwareRecoverySource: AetherResolvedPlaybackSource?
@@ -3498,10 +5060,18 @@ public final class AetherPlaybackSession: ObservableObject {
            initialFailure.kind == .decoderRuntimeFailure,
            !Self.isPermanentFailure(latestFailure.kind) {
             do {
-                try ensureRecoveryDeadline(recoveryDeadline)
-                let candidate = try await resolveCanonicalSource(
-                    allowProvisionalNative: false
-                )
+                let candidate = try await resolveCanonicalSource()
+                if let generationDivergence = Self
+                    .freshProgressiveSourceGenerationFailure(
+                        previousGeneration:
+                            failedProgressiveSourceGeneration,
+                        freshGeneration:
+                            candidate.progressiveSourceGeneration
+                    ) {
+                    await candidate
+                        .discardUnconsumedPreparedSourceAndWaitForIOQuiescence()
+                    throw generationDivergence
+                }
                 if let sourceDivergence = Self
                     .freshSoftwareRecoverySourceIdentityFailure(
                         previousResult: failedSourceResult,
@@ -3519,7 +5089,9 @@ public final class AetherPlaybackSession: ObservableObject {
                 }
                 freshSource = candidate
                 softwareRecoverySource = candidate.admitting(
-                    route: .hybridCarrier
+                    route: .hybridCarrier,
+                    requiredAudioBridgeMode:
+                        options.audioBridgeMode
                 )
             } catch is CancellationError {
                 throw CancellationError()
@@ -3528,6 +5100,16 @@ public final class AetherPlaybackSession: ObservableObject {
                     stage: .preflight,
                     error: error
                 )
+                if Self.requiresPersistentSameSourceRecovery(
+                    latestFailure
+                ) {
+                    try await recoverSameSourceTransportUntilSuccess(
+                        from: latestFailure,
+                        duringInitialPrepare:
+                            duringInitialPrepare
+                    )
+                    return true
+                }
             }
         }
         if failedRoute == .hybridCarrier,
@@ -3540,7 +5122,11 @@ public final class AetherPlaybackSession: ObservableObject {
                     activeRoute: failedRoute,
                     positivelyAdmittedAlternateRoute: nil,
                     transportAttempt:
-                        recoveryBudget.maximumTransportAttempts,
+                        max(
+                            1,
+                            transportRetryBudget
+                                .currentFailureAttempt
+                        ),
                     sameRouteRebuildCount:
                         recoveryCoordinator.sameRouteRebuildCount,
                     softwareDecoderTransitionCount:
@@ -3565,7 +5151,6 @@ public final class AetherPlaybackSession: ObservableObject {
                 )
                 teardownActiveRoute()
                 do {
-                    try ensureRecoveryDeadline(recoveryDeadline)
                     try await installAndPrepare(
                         softwareSource,
                         decoderPreference: .softwareHEVCRecovery
@@ -3597,100 +5182,38 @@ public final class AetherPlaybackSession: ObservableObject {
                         to: failedRoute,
                         outcome: .failed
                     )
+                    if Self.requiresPersistentSameSourceRecovery(
+                        latestFailure
+                    ) {
+                        try await
+                            recoverSameSourceTransportUntilSuccess(
+                                from: latestFailure,
+                                duringInitialPrepare:
+                                    duringInitialPrepare
+                            )
+                        return true
+                    }
                 }
             }
         }
-        let alternate = failedRoute.flatMap {
-            freshSource?.alternate(excluding: $0)
-                ?? freshSource?.admitting(
-                    route: freshSource?.result.route ?? .unsupported
-                )
-        }
-        let selectionCompatibleAlternate:
-            AetherResolvedPlaybackSource? = alternate.flatMap {
-                source -> AetherResolvedPlaybackSource? in
-            guard permitsRouteTransition(after: latestFailure),
-                  PlaybackRecoveryDecision.permitsRouteTransition(
-                    afterInitialFailure: initialFailure
-                  ) else {
-                return nil
-            }
-            return source
-        }
-        let action = PlaybackRecoveryDecision.resolve(
-            context: AetherPlaybackRecoveryContext(
-                failure: latestFailure,
-                activeRoute: failedRoute,
-                positivelyAdmittedAlternateRoute:
-                    selectionCompatibleAlternate?.result.route,
-                transportAttempt: recoveryBudget.maximumTransportAttempts,
-                sameRouteRebuildCount:
-                    recoveryCoordinator.sameRouteRebuildCount,
-                softwareDecoderTransitionCount:
-                    recoveryCoordinator
-                        .softwareDecoderTransitionCount,
-                softwareDecoderRecoveryEligible: false,
-                routeTransitionCount:
-                    recoveryCoordinator.routeTransitionCount,
-                elapsedSeconds: episodeElapsedSeconds,
-                systemActivity: systemActivity
-            ),
-            budget: recoveryBudget
-        )
-        guard case .transition(let targetRoute) = action,
-              let alternate = selectionCompatibleAlternate,
-              alternate.result.route == targetRoute else {
-            publishRecovery(
-                failure: latestFailure,
-                action: .terminate,
-                from: failedRoute,
-                to: nil,
-                outcome: .exhausted
-            )
-            isPreparingOrRecovering = false
-            return false
-        }
-
-        recoveryCoordinator.recordAttempt(action)
-        publishRecovery(
-            failure: latestFailure,
-            action: action,
-            from: failedRoute,
-            to: targetRoute,
-            outcome: .scheduled
-        )
-        teardownActiveRoute()
-        do {
-            try ensureRecoveryDeadline(recoveryDeadline)
-            try await installAndPrepare(alternate)
-            try ensureRecoveryDeadline(recoveryDeadline)
-            try await restorePlaybackContext(
-                playbackContext,
+        if Self.requiresPersistentSameSourceRecovery(
+            latestFailure
+        ) {
+            try await recoverSameSourceTransportUntilSuccess(
+                from: latestFailure,
                 duringInitialPrepare: duringInitialPrepare
             )
-            publishRecovery(
-                failure: latestFailure,
-                action: action,
-                from: failedRoute,
-                to: targetRoute,
-                outcome: .succeeded
-            )
-            isPreparingOrRecovering = false
             return true
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            latestFailure = failure(stage: .preparation, error: error)
-            publishRecovery(
-                failure: latestFailure,
-                action: action,
-                from: failedRoute,
-                to: targetRoute,
-                outcome: .failed
-            )
-            isPreparingOrRecovering = false
-            return false
         }
+        publishRecovery(
+            failure: latestFailure,
+            action: .terminate,
+            from: failedRoute,
+            to: nil,
+            outcome: .exhausted
+        )
+        isPreparingOrRecovering = false
+        return false
     }
 
     private func recoverOrTerminate(
@@ -3700,6 +5223,16 @@ public final class AetherPlaybackSession: ObservableObject {
         exhaustionReason: String
     ) async throws {
         do {
+            if Self.requiresPersistentSameSourceRecovery(
+                initialFailure
+            ) {
+                try await recoverSameSourceTransportUntilSuccess(
+                    from: initialFailure,
+                    duringInitialPrepare: duringInitialPrepare
+                )
+                completeRecoveryTransportHandoff()
+                return
+            }
             if try await recover(
                 from: initialFailure,
                 duringInitialPrepare: duringInitialPrepare
@@ -3714,6 +5247,10 @@ public final class AetherPlaybackSession: ObservableObject {
             )
             throw AetherPlaybackSessionError.terminal(terminal)
         } catch is CancellationError {
+            if isStopped {
+                isPreparingOrRecovering = false
+                throw CancellationError()
+            }
             let cancelled = failure(
                 stage: failureStage,
                 error: CancellationError()
@@ -3788,16 +5325,16 @@ public final class AetherPlaybackSession: ObservableObject {
     ) async throws {
         let stage: AetherPlaybackRecoveryStage =
             duringInitialPrepare ? .preparation : .playback
-        let episodeRemaining = currentRecoveryDeadline.remainingSeconds(
-            now: ProcessInfo.processInfo.systemUptime
-        )
-        let envelope = try Self.recoveryContextRestoreDeadline(
+        let envelope = Self.recoveryLivenessOperationDeadline(
             stage: stage,
             firstStep: duringInitialPrepare
                 ? .contextApply
                 : .contextSeek,
-            budget: recoveryBudget,
-            episodeRemainingSeconds: episodeRemaining,
+            policy: recoveryBudget.livenessPolicy,
+            attempt: max(
+                1,
+                transportLivenessAttempt + 1
+            ),
             now: ProcessInfo.processInfo.systemUptime
         )
         if !duringInitialPrepare {
@@ -3851,11 +5388,11 @@ public final class AetherPlaybackSession: ObservableObject {
             now: ProcessInfo.processInfo.systemUptime
         )
         guard seekTimeout > 0 else {
-            throw AetherPlaybackSessionError
-                .recoveryDeadlineExceeded(
-                    seconds:
-                        recoveryBudget.maximumEpisodeDurationSeconds
-                )
+            throw Self.seekTimeoutFailure(
+                seconds: deadline.durationSeconds
+            ).recordingRecoveryDiagnostic(
+                step: .contextSeek
+            )
         }
         let seekResult = try await activeSession.seek(
             to: resumeTime,
@@ -3954,27 +5491,31 @@ public final class AetherPlaybackSession: ObservableObject {
         }
     }
 
-    nonisolated static func recoveryContextRestoreDeadline(
+    /// Production structural context restoration owns an independent
+    /// no-progress observation window. The deprecated recovery-episode
+    /// duration is not a wall-clock terminal for route recovery.
+    nonisolated static func recoveryLivenessOperationDeadline(
         stage: AetherPlaybackRecoveryStage,
         firstStep: AetherPlaybackRecoveryStep,
-        budget: AetherPlaybackRecoveryBudget,
-        episodeRemainingSeconds: TimeInterval,
+        policy: AetherPlaybackLivenessPolicy,
+        attempt: Int,
         now: TimeInterval
-    ) throws -> (
+    ) -> (
         deadline: PlaybackRecoveryDeadline,
         failure: AetherPlaybackFailure
     ) {
         precondition(now.isFinite)
-        let failure = Self.operationDeadlineFailure(
-            stage: stage,
-            seconds: budget.maximumEpisodeDurationSeconds
+        let timeout = policy.noProgressWindowSeconds(
+            forAttempt: max(1, attempt)
+        )
+        let failure = (
+            firstStep == .contextSeek
+                ? Self.seekTimeoutFailure(seconds: timeout)
+                : Self.recoveryContextNoProgressFailure(
+                    stage: stage,
+                    seconds: timeout
+                )
         ).recordingRecoveryDiagnostic(step: firstStep)
-        guard let timeout = budget
-                .recoveryContextRestoreTimeout(
-                    episodeRemainingSeconds: episodeRemainingSeconds
-                ) else {
-            throw failure
-        }
         return (
             PlaybackRecoveryDeadline(
                 startedAt: now,
@@ -4052,68 +5593,12 @@ public final class AetherPlaybackSession: ObservableObject {
         )
     }
 
-    private func lowerCompatibleVariantSelection(
-        for failedRoute: PlaybackRenderRoute
-    ) -> HLSPreflightVariantSelection? {
-        guard failedRoute == .hybridCarrier,
-              case .hls(let preflight) = resolvedSource,
-              let graph = preflight.resourceGraph,
-              let bandwidth = graph.selectedVariantBandwidth else {
-            return nil
-        }
-        return .nextLowerCompatible(
-            thanBandwidth: bandwidth,
-            audioGroupID: graph.separateAudioGroupID,
-            subtitleGroupID: graph.separateSubtitleGroupID
-        )
-    }
-
-    private func resolveSameRouteRecoverySource(
-        failedRoute: PlaybackRenderRoute,
-        allowLowerVariant: Bool
-    ) async throws -> AetherResolvedPlaybackSource {
-        guard allowLowerVariant,
-              !lowerVariantRecoveryWasAttempted,
-              let lowerSelection = lowerCompatibleVariantSelection(
-            for: failedRoute
-        ) else {
-            return try await resolveCanonicalSource(
-                allowProvisionalNative: false
-            )
-        }
-        lowerVariantRecoveryWasAttempted = true
-        do {
-            return try await resolveCanonicalSource(
-                allowProvisionalNative: false,
-                variantSelectionOverride: lowerSelection
-            )
-        } catch let failure as AetherPlaybackFailure
-        where failure.kind == .inconclusiveEvidence {
-            return try await resolveCanonicalSource(
-                allowProvisionalNative: false
-            )
-        }
-    }
-
     private func isSoftwareHEVCRecoveryEligible(
         _ source: AetherResolvedPlaybackSource
     ) -> Bool {
         PlaybackRecoveryDecision.permitsSoftwareHEVCRecovery(
             sourceProfile: source.result.sourceProfile
         )
-    }
-
-    private func isSelectedVariantAvailabilityFailure(
-        _ failure: AetherPlaybackFailure
-    ) -> Bool {
-        failure.kind == .transientTransport
-            && failure.reason == "hybrid.origin.selectedVariantUnavailable"
-    }
-
-    private func permitsRouteTransition(
-        after failure: AetherPlaybackFailure
-    ) -> Bool {
-        !failure.reason.hasPrefix("hybrid.presentation.mediaDivergence")
     }
 
     private func retryTransport<T: Sendable>(
@@ -4124,30 +5609,8 @@ public final class AetherPlaybackSession: ObservableObject {
             (AetherPlaybackFailure, AetherPlaybackRecoveryAction)?
         while true {
             do {
-                if recoveryCoordinator.episodeFirstFailure != nil {
-                    try ensureRecoveryDeadline(currentRecoveryDeadline)
-                    if transportRetryBudget.isExhausted {
-                        throw AetherPlaybackFailure(
-                            stage: stage,
-                            kind: .transientTransport,
-                            domain: "AetherPlaybackRecovery",
-                            code: recoveryBudget
-                                .maximumTransportAttempts,
-                            reason:
-                                "transport recovery budget exhausted"
-                        )
-                    }
-                }
-                let deadline = try operationDeadline(stage: stage)
-                let value = try await AetherPlaybackOperationDeadlineRace<T>()
-                    .run(
-                        timeout: deadline.timeout,
-                        timeoutFailure: deadline.failure,
-                        operation: operation
-                    )
-                if recoveryCoordinator.episodeFirstFailure != nil {
-                    try ensureRecoveryDeadline(currentRecoveryDeadline)
-                }
+                try Task.checkCancellation()
+                let value = try await operation()
                 if let pendingRetry {
                     publishRecovery(
                         failure: pendingRetry.0,
@@ -4157,6 +5620,20 @@ public final class AetherPlaybackSession: ObservableObject {
                         outcome: .succeeded
                     )
                 }
+                transportLivenessAttempt = 0
+                transportRetryBudget.reset()
+                recoveryLogCadence.resetAfterProgress()
+                publishLiveness(
+                    phase: stage == .classification
+                        ? .classifying
+                        : .preflighting,
+                    attempt: 0,
+                    uniqueBytesFetched:
+                        livenessSnapshot.uniqueBytesFetched,
+                    lastMeaningfulProgressUptimeSeconds:
+                        ProcessInfo.processInfo.systemUptime,
+                    nextRetryUptimeSeconds: nil
+                )
                 return value
             } catch is CancellationError {
                 throw CancellationError()
@@ -4175,30 +5652,21 @@ public final class AetherPlaybackSession: ObservableObject {
                 beginRecoveryEpisodeIfNeeded(typed)
                 let isRetryable = typed.kind == .transientTransport
                     || typed.kind == .inconclusiveEvidence
-                let transportAttempt = isRetryable
-                    ? transportRetryBudget.recordRetryableFailure()
-                    : transportRetryBudget.currentFailureAttempt
-                let action = PlaybackRecoveryDecision.resolve(
-                    context: AetherPlaybackRecoveryContext(
-                        failure: typed,
-                        activeRoute: activeRoute,
-                        positivelyAdmittedAlternateRoute: nil,
-                        transportAttempt: max(1, transportAttempt),
-                        sameRouteRebuildCount:
-                            recoveryCoordinator.sameRouteRebuildCount,
-                        softwareDecoderTransitionCount:
-                            recoveryCoordinator
-                                .softwareDecoderTransitionCount,
-                        routeTransitionCount:
-                            recoveryCoordinator.routeTransitionCount,
-                        elapsedSeconds: episodeElapsedSeconds,
-                        systemActivity: systemActivity
-                    ),
-                    budget: recoveryBudget
-                )
-                guard case .retrySameOperation(let delay) = action else {
+                guard isRetryable else {
                     throw typed
                 }
+                transportLivenessAttempt += 1
+                let transportAttempt =
+                    transportRetryBudget.recordRetryableFailure()
+                let delay = recoveryBudget.livenessPolicy
+                    .retryBackoffSeconds(
+                        forAttempt: transportLivenessAttempt
+                    )
+                let action =
+                    AetherPlaybackRecoveryAction
+                        .retrySameOperation(
+                            afterSeconds: delay
+                        )
                 recoveryCoordinator.recordAttempt(action)
                 publishRecovery(
                     failure: typed,
@@ -4208,16 +5676,21 @@ public final class AetherPlaybackSession: ObservableObject {
                     outcome: .scheduled
                 )
                 pendingRetry = (typed, action)
-                let remaining = currentRecoveryDeadline.remainingSeconds(
-                    now: ProcessInfo.processInfo.systemUptime
+                let nextRetry =
+                    ProcessInfo.processInfo.systemUptime + delay
+                publishLiveness(
+                    phase: .retryScheduled,
+                    attempt: max(
+                        transportLivenessAttempt,
+                        transportAttempt
+                    ),
+                    uniqueBytesFetched:
+                        livenessSnapshot.uniqueBytesFetched,
+                    lastMeaningfulProgressUptimeSeconds:
+                        livenessSnapshot
+                            .lastMeaningfulProgressUptimeSeconds,
+                    nextRetryUptimeSeconds: nextRetry
                 )
-                guard delay < remaining else {
-                    throw AetherPlaybackSessionError
-                        .recoveryDeadlineExceeded(
-                            seconds: recoveryBudget
-                                .maximumEpisodeDurationSeconds
-                        )
-                }
                 try await Task.sleep(
                     nanoseconds: UInt64(delay * 1_000_000_000)
                 )
@@ -4225,75 +5698,21 @@ public final class AetherPlaybackSession: ObservableObject {
         }
     }
 
-    private var currentRecoveryDeadline: PlaybackRecoveryDeadline {
-        PlaybackRecoveryDeadline(
-            startedAt: recoveryCoordinator.episodeStartedAt,
-            durationSeconds:
-                recoveryBudget.maximumEpisodeDurationSeconds
-        )
-    }
-
-    private func ensureRecoveryDeadline(
-        _ deadline: PlaybackRecoveryDeadline
-    ) throws {
-        guard !deadline.isExpired(
-            now: ProcessInfo.processInfo.systemUptime
-        ) else {
-            throw AetherPlaybackSessionError
-                .recoveryDeadlineExceeded(
-                    seconds:
-                        recoveryBudget.maximumEpisodeDurationSeconds
-                )
-        }
-    }
-
-    private func remainingRecoveryOperationTimeout()
-        throws -> TimeInterval
-    {
-        let remaining = currentRecoveryDeadline.remainingSeconds(
-            now: ProcessInfo.processInfo.systemUptime
-        )
-        guard remaining > 0 else {
-            throw AetherPlaybackSessionError
-                .recoveryDeadlineExceeded(
-                    seconds:
-                        recoveryBudget.maximumEpisodeDurationSeconds
-                )
-        }
-        return remaining
-    }
-
     private func operationDeadline(
         stage: AetherPlaybackRecoveryStage
     ) throws -> (timeout: TimeInterval, failure: AetherPlaybackFailure) {
-        let perOperationLimit =
-            recoveryBudget.initialPreparationSettleSeconds
-        let totalBudget: TimeInterval
-        let remaining: TimeInterval
-        if recoveryCoordinator.episodeFirstFailure != nil {
-            totalBudget = recoveryBudget.maximumEpisodeDurationSeconds
-            remaining = max(
-                0,
-                currentRecoveryDeadline.remainingSeconds(
-                    now: ProcessInfo.processInfo.systemUptime
-                ) - recoveryBudget
-                    .startupTerminalPublicationHeadroomSeconds
+        let timeout = recoveryBudget.livenessPolicy
+            .noProgressWindowSeconds(
+                forAttempt: max(
+                    1,
+                    transportLivenessAttempt + 1
+                )
             )
-        } else if let initialPreparationDeadline {
-            totalBudget = recoveryBudget.initialPreparationSettleSeconds
-            remaining = initialPreparationDeadline.remainingSeconds(
-                now: ProcessInfo.processInfo.systemUptime
-            )
-        } else {
-            totalBudget = perOperationLimit
-            remaining = perOperationLimit
-        }
         let failure = Self.operationDeadlineFailure(
             stage: stage,
-            seconds: totalBudget
+            seconds: timeout
         )
-        guard remaining > 0 else { throw failure }
-        return (min(perOperationLimit, remaining), failure)
+        return (timeout, failure)
     }
 
     nonisolated static func operationDeadlineFailure(
@@ -4317,6 +5736,36 @@ public final class AetherPlaybackSession: ObservableObject {
         )
     }
 
+    nonisolated static func seekTimeoutFailure(
+        seconds: TimeInterval
+    ) -> AetherPlaybackFailure {
+        AetherPlaybackFailure(
+            stage: .playback,
+            kind: .transientTransport,
+            domain: "AetherPlaybackSeekDeadline",
+            code: Int(seconds.rounded(.up)),
+            caseCode: "seekTimedOut",
+            reason: "aether.seek.noProgress"
+        )
+    }
+
+    /// Restoring the committed route can wait on transport-backed track or
+    /// player work. An elapsed no-progress window therefore requests another
+    /// same-source generation; it is never structural exhaustion by itself.
+    nonisolated static func recoveryContextNoProgressFailure(
+        stage: AetherPlaybackRecoveryStage,
+        seconds: TimeInterval
+    ) -> AetherPlaybackFailure {
+        AetherPlaybackFailure(
+            stage: stage,
+            kind: .transientTransport,
+            domain: "AetherPlaybackRecoveryContext",
+            code: Int(seconds.rounded(.up)),
+            caseCode: "startupNoProgress",
+            reason: "aether.recovery.context.noProgress"
+        )
+    }
+
     private func failure(
         stage: AetherPlaybackRecoveryStage,
         error: Error
@@ -4334,6 +5783,7 @@ public final class AetherPlaybackSession: ObservableObject {
             )
         }
         if error is AetherNativePlaybackSessionError,
+           !Self.isNativeSeekTimeout(error),
            let evidence = activeSession?.nativeFailureEvidence {
             return Self.nativeFailure(
                 stage: stage,
@@ -4390,9 +5840,28 @@ public final class AetherPlaybackSession: ObservableObject {
         case let error as HybridPlaybackSessionError:
             kind = Self.classify(error)
         case let error as DemuxerError:
+            kind = Self.classify(
+                error,
+                sourceIsCompleteAndValidatorBound:
+                    activeSession != nil
+                    && (resolvedSource?
+                        .progressiveSourceIsCompleteAndValidatorBound
+                        ?? false)
+            )
+        case let error as AVIOReaderError:
+            return Self.nativeFailure(
+                stage: stage,
+                evidence: AetherNativePlaybackSession
+                    .failureEvidence(
+                        error: error,
+                        caseCode: "engineSourceRead"
+                    )
+            )
+        case let error as AetherNativePlaybackSessionError:
             kind = Self.classify(error)
-        case is AetherNativePlaybackSessionError:
-            kind = .routeRuntimeFailure
+        case let error as
+                AetherProgressiveProResSegmentPolicyError:
+            kind = Self.classify(error)
         case let error as AetherPlaybackSessionError:
             switch error {
             case .unsupported: kind = .unsupportedCapability
@@ -4416,6 +5885,11 @@ public final class AetherPlaybackSession: ObservableObject {
         case let error as AetherURLPlaybackSourceClassificationError:
             Self.failureCaseCode(error)
         case let error as DemuxerError:
+            Self.failureCaseCode(error)
+        case let error as AetherNativePlaybackSessionError:
+            Self.failureCaseCode(error)
+        case let error as
+                AetherProgressiveProResSegmentPolicyError:
             Self.failureCaseCode(error)
         default:
             nil
@@ -4444,10 +5918,15 @@ public final class AetherPlaybackSession: ObservableObject {
         stage: AetherPlaybackRecoveryStage,
         evidence: AetherNativePlaybackFailureEvidence
     ) -> AetherPlaybackFailure {
+        if let pretypedFailure =
+                evidence.pretypedFailure {
+            return pretypedFailure
+        }
         let kind: AetherPlaybackFailureKind = switch evidence.category {
         case .transientTransport: .transientTransport
         case .authentication: .authenticationRejected
         case .security: .securityBoundary
+        case .unsupportedCapability: .unsupportedCapability
         case .decoder: .decoderRuntimeFailure
         case .malformed: .malformedMedia
         case .routeRuntime: .routeRuntimeFailure
@@ -4494,9 +5973,19 @@ public final class AetherPlaybackSession: ObservableObject {
         case .preparation: .preparation
         case .seek, .runtime, .provider, .carrier: .playback
         }
+        let kind: AetherPlaybackFailureKind = switch evidence.category {
+        case .routeRuntime: .routeRuntimeFailure
+        case .transientTransport: .transientTransport
+        case .authentication: .authenticationRejected
+        case .security: .securityBoundary
+        case .unsupportedCapability: .unsupportedCapability
+        case .malformedMedia: .malformedMedia
+        case .cancelled: .cancelled
+        case .invariant: .invariantViolation
+        }
         return AetherPlaybackFailure(
             stage: stage,
-            kind: .routeRuntimeFailure,
+            kind: kind,
             domain: evidence.underlyingDomain,
             code: evidence.underlyingCode,
             caseCode: publicHybridCaseCode(evidence.caseCode),
@@ -4513,7 +6002,34 @@ public final class AetherPlaybackSession: ObservableObject {
     ) -> String? {
         switch caseCode {
         case "progressive.audioMuxer.emptySegment",
-             "presentationRebuildTimedOut": caseCode
+             "progressive.audioMuxer.bridgeCapabilityUnavailable",
+             "progressive.audioStore.muxer.bridgeCapabilityUnavailable",
+             "videoDecoder.pixelBufferConversionFailed",
+             "progressive.videoDecoder.pixelBufferConversionFailed",
+             "seekTimedOut",
+             "presentationRebuildTimedOut",
+             "progressive.avio.allocationFailed",
+             "progressive.avio.noResponse",
+             "progressive.avio.requestTimeout",
+             "progressive.avio.httpStatus",
+             "progressive.sourceByteStore.invalidCapacity",
+             "progressive.sourceByteStore.invalidGeneration",
+             "progressive.sourceByteStore.generationMismatch",
+             "progressive.sourceByteStore.unsupportedContentEncoding",
+             "progressive.sourceByteStore.invalidRange",
+             "progressive.sourceByteStore.cancelled",
+             "progressive.sourceByteStore.rangeFetchFailed",
+             "progressive.sourceByteStore.rangeFetchRateLimited",
+             "progressive.sourceByteStore.closed",
+             "progressive.sourceByteStore.directoryCreationFailed",
+             "progressive.sourceByteStore.blockOpenFailed",
+             "progressive.sourceByteStore.blockReadFailed",
+             "progressive.sourceByteStore.blockWriteFailed",
+             "progressive.sourceByteStore.validationFailed",
+             "progressive.demux.openFailed",
+             "progressive.demux.streamInfoFailed",
+             "progressive.demux.readFailed":
+            caseCode
         default: nil
         }
     }
@@ -4540,17 +6056,21 @@ public final class AetherPlaybackSession: ObservableObject {
         case .nonMediaPayload:
             .malformedMedia
         case .unsupportedURLScheme, .unreadableFile,
-             .nonHTTPResponse, .unsupportedContentEncoding:
+             .nonHTTPResponse, .unsupportedContentEncoding,
+             .sourceIdentityChanged:
             .invariantViolation
         }
     }
 
     nonisolated static func classify(
-        _ error: DemuxerError
+        _ error: DemuxerError,
+        sourceIsCompleteAndValidatorBound: Bool = false
     ) -> AetherPlaybackFailureKind {
         switch error.ffmpegCode {
         case FFmpegErr.invalidData, FFmpegErr.eof:
-            .malformedMedia
+            sourceIsCompleteAndValidatorBound
+                ? .malformedMedia
+                : .transientTransport
         case -5, FFmpegErr.eagain:
             // Aether's AVIO boundary reports exhausted I/O as EIO. EAGAIN is
             // likewise transport availability, not evidence that the media
@@ -4563,6 +6083,51 @@ public final class AetherPlaybackSession: ObservableObject {
         }
     }
 
+    nonisolated static func classify(
+        _ error: AetherNativePlaybackSessionError
+    ) -> AetherPlaybackFailureKind {
+        switch error {
+        case .seekTimedOut:
+            .transientTransport
+        case .preflightRequiresNative, .assetNotPlayable,
+             .itemFailed:
+            .routeRuntimeFailure
+        case .expectedVideoTrackMissing,
+             .videoTrackInspectionInconclusive,
+             .observedHEVCRequiresHybrid,
+             .seekDidNotApply:
+            .routeRuntimeFailure
+        case .audioAnalysisBindingSourceMismatch,
+             .nativeRemuxRequiresPreparedSource,
+             .incompatibleRemuxOptions,
+             .sourceFactsDiverged,
+             .engineRouteContractDiverged,
+             .unexpectedVideoTrack,
+             .stopped, .invalidRate, .invalidSeekTarget:
+            .invariantViolation
+        }
+    }
+
+    nonisolated static func classify(
+        _ error: AetherProgressiveProResSegmentPolicyError
+    ) -> AetherPlaybackFailureKind {
+        _ = error
+        return .unsupportedCapability
+    }
+
+    nonisolated static func isNativeSeekTimeout(
+        _ error: Error
+    ) -> Bool {
+        guard let native =
+                error as? AetherNativePlaybackSessionError else {
+            return false
+        }
+        if case .seekTimedOut = native {
+            return true
+        }
+        return false
+    }
+
     nonisolated static func failureCaseCode(
         _ error: AetherURLPlaybackSourceClassificationError
     ) -> String? {
@@ -4573,6 +6138,8 @@ public final class AetherPlaybackSession: ObservableObject {
             .libavformatASFDemuxer
         ):
             "dependency.libavformat.asfDemuxerUnavailable"
+        case .sourceIdentityChanged:
+            "classification.sourceIdentityChanged"
         default:
             nil
         }
@@ -4588,6 +6155,30 @@ public final class AetherPlaybackSession: ObservableObject {
             "demux.streamInfoFailed"
         case .readFailed:
             "demux.readFailed"
+        }
+    }
+
+    nonisolated static func failureCaseCode(
+        _ error: AetherNativePlaybackSessionError
+    ) -> String? {
+        switch error {
+        case .seekTimedOut:
+            "native.seekTimedOut"
+        case .itemFailed:
+            "native.itemFailed"
+        default:
+            nil
+        }
+    }
+
+    nonisolated static func failureCaseCode(
+        _ error: AetherProgressiveProResSegmentPolicyError
+    ) -> String {
+        switch error {
+        case .durationOutsideTimelineRange:
+            "progressiveProRes.timelineDurationUnsupported"
+        case .segmentCountExceedsCapacity:
+            "progressiveProRes.segmentPlanCapacityExceeded"
         }
     }
 
@@ -4776,6 +6367,7 @@ public final class AetherPlaybackSession: ObservableObject {
         recoveryCoordinator.resetEpisode(
             now: ProcessInfo.processInfo.systemUptime
         )
+        recoveryLogCadence.resetAfterProgress()
         if beginProgressEpoch {
             playbackProgressEpoch.begin()
         }
@@ -4784,7 +6376,7 @@ public final class AetherPlaybackSession: ObservableObject {
         transportRetryBudget.reset()
     }
 
-    private static func isPermanentFailure(
+    nonisolated static func isPermanentFailure(
         _ kind: AetherPlaybackFailureKind
     ) -> Bool {
         switch kind {
@@ -4805,7 +6397,23 @@ public final class AetherPlaybackSession: ObservableObject {
               time.seconds.isFinite else {
             return
         }
+        let previousTime = lastConfirmedMediaTime
         lastConfirmedMediaTime = time
+        if previousTime.isValid,
+           previousTime.isNumeric,
+           previousTime.seconds.isFinite,
+           time.seconds > previousTime.seconds {
+            transportLivenessAttempt = 0
+            publishLiveness(
+                phase: .flowing,
+                attempt: 0,
+                uniqueBytesFetched:
+                    livenessSnapshot.uniqueBytesFetched,
+                lastMeaningfulProgressUptimeSeconds:
+                    ProcessInfo.processInfo.systemUptime,
+                nextRetryUptimeSeconds: nil
+            )
+        }
         let demonstratedHealthyProgress = playbackProgressEpoch.observe(
             seconds: time.seconds,
             eligible: desiredPlaying
@@ -4876,16 +6484,30 @@ public final class AetherPlaybackSession: ObservableObject {
             )
         }
         state = .recovering(event)
-        EngineLog.emit(
-            "[AetherPlaybackSession] recovery sequence=\(event.sequence) "
-                + "attempt=\(event.attempt) "
-                + "from=\(from?.rawValue ?? "none") "
-                + "to=\(to?.rawValue ?? "none") "
-                + "kind=\(failure.kind.rawValue) "
-                + "capabilityChanged=\(capabilityDelta.map { $0.before != $0.after } ?? false) "
-                + "outcome=\(outcome.rawValue)",
-            category: .session
-        )
+        if let emission = recoveryLogCadence.recordFailure(
+            now: ProcessInfo.processInfo.systemUptime
+        ) {
+            let firstFailure = recoveryCoordinator.episodeFirstFailure
+                ?? failure
+            let checkpoint = emission.checkpointSeconds.map {
+                String(Int($0))
+            } ?? "first"
+            EngineLog.emit(
+                "[AetherPlaybackSession] recovery checkpoint=\(checkpoint) "
+                    + "elapsed=\(Int(emission.elapsedSeconds)) "
+                    + "firstStage=\(firstFailure.stage.rawValue) "
+                    + "firstKind=\(firstFailure.kind.rawValue) "
+                    + "cumulative=\(emission.cumulativeFailureCount) "
+                    + "sequence=\(event.sequence) "
+                    + "attempt=\(event.attempt) "
+                    + "from=\(from?.rawValue ?? "none") "
+                    + "to=\(to?.rawValue ?? "none") "
+                    + "kind=\(failure.kind.rawValue) "
+                    + "capabilityChanged=\(capabilityDelta.map { $0.before != $0.after } ?? false) "
+                    + "outcome=\(outcome.rawValue)",
+                category: .session
+            )
+        }
     }
 
     private func publishTerminal(
@@ -4915,6 +6537,20 @@ public final class AetherPlaybackSession: ObservableObject {
             firstFailure: original,
             finalFailure: finalFailure,
             exhaustionReason: exhaustionReason
+        )
+        livenessDiagnosticTask?.cancel()
+        livenessDiagnosticTask = nil
+        progressiveLivenessObservationTask?.cancel()
+        progressiveLivenessObservationTask = nil
+        publishLiveness(
+            phase: .failed,
+            attempt: livenessSnapshot.attempt,
+            uniqueBytesFetched:
+                livenessSnapshot.uniqueBytesFetched,
+            lastMeaningfulProgressUptimeSeconds:
+                livenessSnapshot
+                    .lastMeaningfulProgressUptimeSeconds,
+            nextRetryUptimeSeconds: nil
         )
         teardownActiveRoute()
         EngineLog.emit(
@@ -4955,17 +6591,87 @@ public final class AetherPlaybackSession: ObservableObject {
     }
 
     private func teardownActiveRoute() {
+        let session = detachActiveRouteForTeardown()
+        guard let session else { return }
+        // Begin cancellation immediately, then retain an engine-owned release
+        // fence. Any later source resolution or route construction awaits this
+        // task before it can admit another reader.
+        session.stop()
+        let predecessor = routeIOQuiescenceTask
+        routeIOQuiescenceGeneration &+= 1
+        let generation = routeIOQuiescenceGeneration
+        routeIOQuiescenceTask = Task { @MainActor in
+            await predecessor?.value
+            await session.stopAndWaitForIOQuiescence()
+            EngineLog.emit(
+                "[AetherPlaybackSession] route ioStopped "
+                    + "generation=\(generation)",
+                category: .session
+            )
+        }
+    }
+
+    private func teardownActiveRouteAndWaitForIOQuiescence()
+        async
+    {
+        teardownActiveRoute()
+        await waitForPendingRouteIOQuiescence()
+    }
+
+    private func waitForPendingRouteIOQuiescence() async {
+        while let task = routeIOQuiescenceTask {
+            let generation = routeIOQuiescenceGeneration
+            await task.value
+            if routeIOQuiescenceGeneration == generation {
+                routeIOQuiescenceTask = nil
+            }
+        }
+    }
+
+    private func beginIOOwnershipOperation() {
+        pendingIOOwnershipOperationCount += 1
+    }
+
+    private func endIOOwnershipOperation() {
+        precondition(pendingIOOwnershipOperationCount > 0)
+        pendingIOOwnershipOperationCount -= 1
+        guard pendingIOOwnershipOperationCount == 0 else {
+            return
+        }
+        let waiters = ioOwnershipQuiescenceWaiters
+        ioOwnershipQuiescenceWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    private func waitForIOOwnershipOperationsToQuiesce()
+        async
+    {
+        guard pendingIOOwnershipOperationCount > 0 else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            ioOwnershipQuiescenceWaiters.append(
+                continuation
+            )
+        }
+    }
+
+    private func detachActiveRouteForTeardown()
+        -> AetherActiveRouteSession?
+    {
         cancelTransportMonitoring()
         transportRouteGeneration &+= 1
         routeTransactions.invalidate()
         routeCancellables.removeAll()
-        activeSession?.cancelAudioAnalysisStreams()
-        activeSession?.stop()
+        routePreparationRetryProjection.reset()
+        let session = activeSession
+        session?.cancelAudioAnalysisStreams()
         activeSession = nil
         transportTestRoute = nil
         restoreRouteNeutralPlayerCapabilities()
         invalidateVideoOutputRoute()
         presentationView.install(nil)
+        return session
     }
 
     private func restoreRouteNeutralPlayerCapabilities() {

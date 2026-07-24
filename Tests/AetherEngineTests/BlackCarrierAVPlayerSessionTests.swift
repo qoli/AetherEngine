@@ -67,6 +67,174 @@ struct BlackCarrierAVPlayerSessionTests {
         }
     }
 
+    @MainActor
+    private final class ReadinessAttemptRecorder {
+        private(set) var windows: [TimeInterval] = []
+        private(set) var itemIDs: [ObjectIdentifier] = []
+        private(set) var assetURLs: [URL] = []
+        private(set) var retryEvents:
+            [AetherRoutePreparationRetryEvent] = []
+        private(set) var maximumConcurrentAttempts = 0
+        private var activeAttempts = 0
+
+        func observe(
+            item: AVPlayerItem,
+            noProgressWindow: TimeInterval
+        ) -> BlackCarrierReadinessObservationResult {
+            activeAttempts += 1
+            maximumConcurrentAttempts = max(
+                maximumConcurrentAttempts,
+                activeAttempts
+            )
+            defer {
+                activeAttempts -= 1
+            }
+            windows.append(noProgressWindow)
+            itemIDs.append(ObjectIdentifier(item))
+            if let asset = item.asset as? AVURLAsset {
+                assetURLs.append(asset.url)
+            }
+            return windows.count <= 4
+                ? .noProgress
+                : .ready
+        }
+
+        func record(
+            _ event: AetherRoutePreparationRetryEvent
+        ) {
+            retryEvents.append(event)
+        }
+    }
+
+    @Test(
+        "Inconclusive local item failures retry while structural failures remain typed"
+    )
+    func localReadinessFailureClassification() {
+        #expect(
+            BlackCarrierAVPlayerSession
+                .isTransientReadinessFailure(
+                    .assetLoadFailed(
+                        reason: "transport"
+                    )
+                )
+        )
+        #expect(
+            BlackCarrierAVPlayerSession
+                .isTransientReadinessFailure(
+                    .itemFailed(
+                        reason: "consumer"
+                    )
+                )
+        )
+        #expect(
+            !BlackCarrierAVPlayerSession
+                .isTransientReadinessFailure(
+                    .assetNotPlayable
+                )
+        )
+        #expect(
+            !BlackCarrierAVPlayerSession
+                .isTransientReadinessFailure(
+                    .preparationCancelled
+                )
+        )
+    }
+
+    @Test(
+        "Unknown readiness uses escalating zero-progress windows and replaces one local item at a time"
+    )
+    @MainActor
+    func unknownReadinessRetriesSameLocalItemWithoutOverlap()
+        async throws
+    {
+        let recorder = ReadinessAttemptRecorder()
+        let player = AVPlayer()
+        let session = BlackCarrierAVPlayerSession(
+            provider: TrackingProvider(),
+            avPlayer: player,
+            livenessPolicy:
+                AetherPlaybackLivenessPolicy(
+                    noProgressWindowsSeconds: [
+                        35,
+                        60,
+                        120,
+                        300,
+                    ],
+                    retryBackoffSeconds: [0]
+                ),
+            readinessAttemptOverride: {
+                item,
+                noProgressWindow in
+                recorder.observe(
+                    item: item,
+                    noProgressWindow:
+                        noProgressWindow
+                )
+            }
+        )
+        session.setRoutePreparationRetryEventHandler {
+            recorder.record($0)
+        }
+        try session.start()
+        let playlistURL = try #require(
+            session.playlistURL
+        )
+
+        try await session.prepare(timeout: 1)
+
+        #expect(
+            recorder.windows
+                == [35, 60, 120, 300, 300]
+        )
+        #expect(
+            Set(recorder.itemIDs).count
+                == recorder.itemIDs.count
+        )
+        #expect(recorder.maximumConcurrentAttempts == 1)
+        #expect(
+            recorder.assetURLs
+                == Array(
+                    repeating: playlistURL,
+                    count: recorder.assetURLs.count
+                )
+        )
+        #expect(session.transportState == .ready)
+        #expect(
+            player.currentItem.map(ObjectIdentifier.init)
+                == recorder.itemIDs.last
+        )
+        #expect(recorder.retryEvents.count == 10)
+        #expect(
+            recorder.retryEvents.first
+                == .attemptStarted(attempt: 1)
+        )
+        for retryIndex in 0..<4 {
+            let eventIndex = retryIndex * 2 + 1
+            guard case .retryScheduled(
+                let completedAttempt,
+                let nextAttempt,
+                let nextRetry
+            ) = recorder.retryEvents[eventIndex] else {
+                Issue.record(
+                    "missing retry projection at \(eventIndex)"
+                )
+                continue
+            }
+            #expect(completedAttempt == retryIndex + 1)
+            #expect(nextAttempt == retryIndex + 2)
+            #expect(nextRetry.isFinite)
+            #expect(
+                recorder.retryEvents[eventIndex + 1]
+                    == .attemptStarted(
+                        attempt: retryIndex + 2
+                    )
+            )
+        }
+        #expect(recorder.retryEvents.last == .completed)
+
+        session.stop()
+    }
+
     @Test("Session serves the composite carrier and creates a restricted AVPlayer item")
     @MainActor
     func sessionLifecycle() async throws {
@@ -155,7 +323,9 @@ struct BlackCarrierAVPlayerSessionTests {
         #expect(!audioInit.isEmpty)
         #expect(!audioSegment.isEmpty)
 
-        try await session.prepare(timeout: 10)
+        // The legacy readiness value is diagnostic-only. Even a value far
+        // shorter than AVFoundation can satisfy must not terminate prepare.
+        try await session.prepare(timeout: 0.000_001)
         #expect(session.transportState == .ready)
         try await session.prepare(timeout: 10)
 

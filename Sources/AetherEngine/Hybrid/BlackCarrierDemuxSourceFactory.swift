@@ -50,6 +50,14 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
 
     private let backing: Backing
     private let sourceByteStore: SourceByteStore?
+    private let preparedSourceGeneration:
+        SourceByteStoreGeneration?
+    private let fetchedByteProgressLedger:
+        AetherFetchedByteProgressLedger?
+    private let onFetchedByteProgress:
+        (@Sendable (AetherFetchedByteProgress) -> Void)?
+    private let onProbeMilestone:
+        (@Sendable () -> Void)?
     private let lock = NSLock()
     private var isClosed = false
     /// Exact demuxer that established progressive preflight facts. The first
@@ -72,6 +80,10 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
         switch source {
         case .url(let url):
             sourceByteStore = try SourceByteStore()
+            preparedSourceGeneration = nil
+            fetchedByteProgressLedger = nil
+            onFetchedByteProgress = nil
+            onProbeMilestone = nil
             preparedInitialDemuxer = nil
             backing = .url(
                 url,
@@ -81,6 +93,10 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
             )
         case .custom(let reader, let formatHint):
             sourceByteStore = nil
+            preparedSourceGeneration = nil
+            fetchedByteProgressLedger = nil
+            onFetchedByteProgress = nil
+            onProbeMilestone = nil
             preparedInitialDemuxer = nil
             backing = .custom(
                 reader,
@@ -104,7 +120,18 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
             probesize: options.probesize,
             maxAnalyzeDuration: options.maxAnalyzeDuration
         )
-        sourceByteStore = try SourceByteStore()
+        // Progressive preflight and every Hybrid generation must share one
+        // exact-source store. Creating a second store here would discard the
+        // already fetched generation and break unique-byte liveness.
+        sourceByteStore = preparedURLSource.sourceByteStore
+        preparedSourceGeneration =
+            preparedURLSource.sourceGeneration
+        fetchedByteProgressLedger =
+            preparedURLSource.fetchedByteProgressLedger
+        onFetchedByteProgress =
+            preparedURLSource.onFetchedByteProgress
+        onProbeMilestone =
+            preparedURLSource.onProbeMilestone
         backing = .url(
             url,
             headers: options.httpHeaders,
@@ -170,6 +197,7 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
         }
 
         let demuxer = Demuxer()
+        installProgressiveProgress(on: demuxer)
         do {
             switch source {
             case .url(
@@ -213,15 +241,82 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
                 }
             }
             return demuxer
-        } catch let error as BlackCarrierDemuxSourceFactoryError {
-            demuxer.close()
-            throw error
         } catch {
             demuxer.close()
+            demuxer.waitForIOQuiescence()
+            if let typed =
+                    error as? BlackCarrierDemuxSourceFactoryError {
+                throw typed
+            }
+            if let typed = error as? AVIOReaderError {
+                throw typed
+            }
+            if let typed = error as? DemuxerError {
+                throw typed
+            }
+            if let typed = error as? SourceByteStoreError {
+                throw typed
+            }
             throw BlackCarrierDemuxSourceFactoryError.openFailed(
                 reason: String(describing: error)
             )
         }
+    }
+
+    /// A later progressive generation is admissible only when the exact
+    /// committed generation can be revalidated. Content length without a
+    /// strong ETag or Last-Modified value cannot prove that a mutable URL still
+    /// names the same bytes, so validatorless sources fail closed before a
+    /// successor reader is created.
+    func requireProgressiveRestartGeneration(
+        _ expected: SourceByteStoreGeneration?
+    ) throws {
+        let store: SourceByteStore?
+        lock.lock()
+        guard !isClosed else {
+            lock.unlock()
+            throw BlackCarrierDemuxSourceFactoryError.closed
+        }
+        store = sourceByteStore
+        lock.unlock()
+
+        guard let store else {
+            return
+        }
+        guard let expected,
+              expected.validator != nil,
+              store.snapshot?.generation == expected else {
+            throw SourceByteStoreError.generationMismatch
+        }
+    }
+
+    private func installProgressiveProgress(
+        on demuxer: Demuxer
+    ) {
+        if let fetchedByteProgressLedger {
+            demuxer.fetchedByteProgressLedger =
+                fetchedByteProgressLedger
+        }
+        demuxer.onFetchedByteProgress =
+            onFetchedByteProgress
+        demuxer.onProbeMilestone =
+            onProbeMilestone
+    }
+
+    /// Exact validator-bound generation for upper same-source recovery.
+    /// No URL, header, credential or byte offset is exposed.
+    var progressiveSourceGeneration:
+        SourceByteStoreGeneration?
+    {
+        preparedSourceGeneration
+            ?? sourceByteStore?.snapshot?.generation
+    }
+
+    /// Whether the exact progressive source store currently covers every byte
+    /// in its admitted generation. No URL, header, credential, byte count or
+    /// coverage range is exposed.
+    var progressiveSourceIsComplete: Bool {
+        sourceByteStore?.snapshot?.isComplete ?? false
     }
 
     func makeAudioAnalysisInput() throws -> AudioAnalysisInput {
@@ -268,7 +363,22 @@ final class BlackCarrierDemuxSourceFactory: @unchecked Sendable {
         }
         lock.unlock()
         initialDemuxer?.close()
+        initialDemuxer?.waitForIOQuiescence()
         customReader?.close()
         sourceByteStore?.close()
     }
+
+    #if DEBUG
+    var sourceByteStoreForTesting: SourceByteStore? {
+        sourceByteStore
+    }
+
+    func makeProgressConfiguredDemuxerForTesting()
+        -> Demuxer
+    {
+        let demuxer = Demuxer()
+        installProgressiveProgress(on: demuxer)
+        return demuxer
+    }
+    #endif
 }

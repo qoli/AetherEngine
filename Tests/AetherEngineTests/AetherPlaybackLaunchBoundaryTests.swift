@@ -26,14 +26,6 @@ private func launchNativePreflight(
     )
 }
 
-private let launchDirectProgressive = launchNativePreflight(
-    sourceKind: .progressive,
-    videoStreamPresence: .provenPresent,
-    videoCodec: .h264,
-    sourceContainer: .isoBaseMedia,
-    reason: .nativeProvisionalURL
-)
-
 private let launchNativeRemux = launchNativePreflight(
     sourceKind: .progressive,
     videoStreamPresence: .provenPresent,
@@ -83,7 +75,7 @@ private func launchH264HLS(
 
 @Suite("Aether playback launch boundary")
 struct AetherPlaybackLaunchBoundaryTests {
-    @Test("Native readiness keeps a slow item inside its bounded startup window")
+    @Test("Native readiness keeps a slow item waiting without elapsed terminal")
     func nativeReadinessAllowsSlowItem() {
         let gate = AetherNativeItemReadinessGate()
 
@@ -96,22 +88,131 @@ struct AetherPlaybackLaunchBoundaryTests {
                 == .wait
         )
         #expect(
-            gate.decide(status: .readyToPlay, elapsed: 14.999)
+            gate.decide(status: .unknown, elapsed: 300)
+                == .wait
+        )
+        #expect(
+            gate.decide(status: .readyToPlay, elapsed: 300)
                 == .ready
         )
     }
 
-    @Test("Native readiness remains bounded and preserves explicit item failure")
+    @Test("Native readiness preserves only explicit item failure")
     func nativeReadinessTimesOutOrFails() {
         let gate = AetherNativeItemReadinessGate()
 
         #expect(
             gate.decide(status: .unknown, elapsed: 15)
-                == .timedOut
+                == .wait
         )
         #expect(
             gate.decide(status: .failed, elapsed: 0)
                 == .failed
+        )
+    }
+
+    @Test("Generic Native startup item failure remains exact-item retryable")
+    func genericNativeStartupFailureRetries() {
+        let evidence =
+            AetherNativePlaybackSession
+                .failureEvidence(
+                    error: nil,
+                    caseCode:
+                        "itemStatusFailed"
+                )
+
+        #expect(
+            evidence.category
+                == .routeRuntime
+        )
+        #expect(
+            AetherNativePlaybackSession
+                .itemFailureDisposition(
+                    evidence
+                )
+                == .retryExactItem
+        )
+    }
+
+    @Test("Native display rejection is typed permanent evidence")
+    func nativeDisplayRejectionFailsTyped() {
+        let evidence =
+            AetherNativePlaybackSession
+                .failureEvidence(
+                    error: NSError(
+                        domain:
+                            "AVFoundationErrorDomain",
+                        code: -11868
+                    ),
+                    caseCode:
+                        "itemStatusFailed"
+                )
+
+        #expect(
+            evidence.category
+                == .unsupportedCapability
+        )
+        #expect(
+            AetherNativePlaybackSession
+                .itemFailureDisposition(
+                    evidence
+                )
+                == .failTyped
+        )
+    }
+
+    @MainActor
+    @Test("Direct Native recovery preserves exact asset identity and item policy")
+    func nativeRecoveryPreservesExactAsset() {
+        let asset = AVURLAsset(
+            url: URL(
+                string:
+                    "https://media.example/p/item.mov?sign=test"
+            )!,
+            options: [
+                "AVURLAssetHTTPHeaderFieldsKey":
+                    [
+                        "Authorization":
+                            "Bearer test",
+                    ],
+            ]
+        )
+        let failed =
+            AVPlayerItem(asset: asset)
+        failed.preferredForwardBufferDuration =
+            12
+        failed.appliesPerFrameHDRDisplayMetadata =
+            false
+        failed.preferredPeakBitRate =
+            4_000_000
+        failed.canUseNetworkResourcesForLiveStreamingWhilePaused =
+            true
+
+        let replacement =
+            AetherNativePlaybackSession
+                .makeExactRecoveryItem(
+                    from: failed
+                )
+
+        #expect(
+            replacement.asset === asset
+        )
+        #expect(
+            replacement
+                .preferredForwardBufferDuration
+                == 12
+        )
+        #expect(
+            !replacement
+                .appliesPerFrameHDRDisplayMetadata
+        )
+        #expect(
+            replacement.preferredPeakBitRate
+                == 4_000_000
+        )
+        #expect(
+            replacement
+                .canUseNetworkResourcesForLiveStreamingWhilePaused
         )
     }
 
@@ -120,21 +221,21 @@ struct AetherPlaybackLaunchBoundaryTests {
         #expect(
             AetherNativeAssetPlayabilityPolicy.decide(
                 ownership: .directAsset,
-                preflightResult: launchDirectProgressive,
+                preflightResult: launchVerifiedNativeHLS,
                 observation: .reportedPlayable
             ) == .proceed
         )
         #expect(
             AetherNativeAssetPlayabilityPolicy.decide(
                 ownership: .directAsset,
-                preflightResult: launchDirectProgressive,
+                preflightResult: launchVerifiedNativeHLS,
                 observation: .reportedNotPlayable
             ) == .fail
         )
         #expect(
             AetherNativeAssetPlayabilityPolicy.decide(
                 ownership: .directAsset,
-                preflightResult: launchDirectProgressive,
+                preflightResult: launchVerifiedNativeHLS,
                 observation: .loadFailed
             ) == .fail
         )
@@ -237,7 +338,7 @@ struct AetherPlaybackLaunchBoundaryTests {
             protectedManifestOnly,
             uninspected,
             unknownPackaging,
-            launchDirectProgressive,
+            launchNativeRemux,
         ] {
             #expect(
                 AetherNativeEarlyAssetAdvisoryContract.directOwnership(
@@ -249,11 +350,11 @@ struct AetherPlaybackLaunchBoundaryTests {
 
     @Test("Verified-HLS ownership token is fail-closed for unknown and HEVC facts")
     func verifiedNativeHLSTokenCannotBroadenRoute() {
-        let provisional = launchNativePreflight(
+        let unclassified = launchNativePreflight(
             sourceKind: .unclassifiedURL,
             videoStreamPresence: .unknown,
             videoCodec: .unknown,
-            reason: .nativeProvisionalURL
+            reason: .unsupportedSourceClassificationInconclusive
         )
         let invalidHEVC = launchNativePreflight(
             sourceKind: .hls,
@@ -270,7 +371,7 @@ struct AetherPlaybackLaunchBoundaryTests {
             reason: .nativeHLSContractVerified
         )
 
-        for result in [provisional, invalidHEVC] {
+        for result in [unclassified, invalidHEVC] {
             #expect(
                 !AetherNativeEarlyAssetAdvisoryContract.permits(
                     ownership: .verifiedNativeHLS,
@@ -337,6 +438,65 @@ struct AetherPlaybackLaunchBoundaryTests {
             failure.caseCode
                 == "native.assetPlayableLoadFailed"
         )
+    }
+
+    @Test("Pretyped HLS terminal failure crosses Native boundary unchanged")
+    func pretypedHLSTerminalFailurePassesThroughExactly() {
+        let original = AetherPlaybackFailure(
+            stage: .playback,
+            kind: .invariantViolation,
+            domain: "AetherEngine.HLSReopen",
+            code: 17,
+            caseCode: "vod.streamShapeDrift",
+            reason: "hls.reopen.vod.streamShapeDrift"
+        )
+        let evidence = AetherNativePlaybackSession.failureEvidence(
+            original
+        )
+        let mapped = AetherPlaybackSession.nativeFailure(
+            stage: .playback,
+            evidence: evidence
+        )
+
+        #expect(evidence.pretypedFailure == original)
+        #expect(mapped == original)
+    }
+
+    @Test("Native diagnostics redact signed source URL")
+    func nativeDiagnosticsRedactSignedSourceURL() throws {
+        let url = try #require(
+            URL(
+                string:
+                    "https://media.example/p/object.mov?sign=secret-token"
+            )
+        )
+        let label = NativeAVPlayerHost.privacySafeSourceLabel(url)
+
+        #expect(label == "source=remote host=media.example")
+        #expect(!label.contains("object.mov"))
+        #expect(!label.contains("secret-token"))
+        #expect(!label.contains("sign="))
+    }
+
+    @Test("Native AVPlayer event diagnostics redact resource details")
+    func nativeEventDiagnosticsRedactSignedResource() {
+        let label =
+            NativeAVPlayerHost
+                .privacySafeResourceLabel(
+                    uri:
+                        "https://cdn.example/p/object.mov?sign=secret-token",
+                    serverAddress:
+                        "edge.example:443/private?token=also-secret"
+                )
+
+        #expect(
+            label
+                == "uriClass=remote uriHost=cdn.example serverHost=edge.example"
+        )
+        #expect(!label.contains("object.mov"))
+        #expect(!label.contains("secret-token"))
+        #expect(!label.contains("private"))
+        #expect(!label.contains("also-secret"))
     }
 
     @Test("Installed route preparation cannot be reported as preflight")
@@ -407,13 +567,21 @@ struct AetherPlaybackLaunchBoundaryTests {
     private func nativePreflight() -> PlaybackPreflightResult {
         PlaybackPreflight.resolve(
             sourceProfile: AetherSourceProfile(
-                sourceKind: .unclassifiedURL,
+                sourceKind: .hls,
                 isSeekableVOD: true,
-                videoStreamPresence: .unknown,
-                videoCodec: .unknown,
+                videoStreamPresence: .provenPresent,
+                videoCodec: .h264,
+                sourceContainer: .mpegTransport,
                 videoFormat: .sdr
             ),
-            hlsPackaging: nil,
+            hlsPackaging: HLSVideoPackaging(
+                container: .mpegTransport,
+                sampleEntry: .avc1,
+                manifestCodecs: ["avc1.640028"],
+                actualVideoCodec: .h264,
+                codecVerification: .verified,
+                contentProtection: .none
+            ),
             hybridCapabilities:
                 AetherHybridPlaybackSession.capabilities
         )
@@ -546,7 +714,7 @@ struct AetherPlaybackLaunchBoundaryTests {
         )
     }
 
-    @Test("Demux failure preserves FFmpeg code and only typed evidence changes ownership")
+    @Test("Generic demux corruption is permanent only for a complete validator-bound source")
     func demuxFailureClassification() {
         let malformed = DemuxerError.openFailed(
             code: FFmpegErr.invalidData
@@ -554,7 +722,13 @@ struct AetherPlaybackLaunchBoundaryTests {
         #expect(malformed.ffmpegCode == FFmpegErr.invalidData)
         #expect(
             AetherPlaybackSession.classify(malformed)
-                == .malformedMedia
+                == .transientTransport
+        )
+        #expect(
+            AetherPlaybackSession.classify(
+                malformed,
+                sourceIsCompleteAndValidatorBound: true
+            ) == .malformedMedia
         )
         #expect(
             AetherPlaybackSession.failureCaseCode(malformed)
@@ -577,6 +751,57 @@ struct AetherPlaybackLaunchBoundaryTests {
         #expect(
             AetherPlaybackSession.failureCaseCode(ambiguous)
                 == "demux.streamInfoFailed"
+        )
+    }
+
+    @Test("Native remux preserves typed AVIO ownership")
+    func nativeRemuxAVIOFailureEvidence() {
+        let timeout = AetherNativePlaybackSession
+            .failureEvidence(
+                error: AVIOReaderError.requestTimeout,
+                caseCode: "engineSourceRead"
+            )
+        #expect(timeout.category == .transientTransport)
+        #expect(
+            timeout.caseCode
+                == "engineSourceRead.requestTimeout"
+        )
+        #expect(timeout.domain == NSURLErrorDomain)
+        #expect(timeout.code == URLError.timedOut.rawValue)
+        let timeoutFailure = AetherPlaybackSession.nativeFailure(
+            stage: .playback,
+            evidence: timeout
+        )
+        #expect(timeoutFailure.kind == .transientTransport)
+        #expect(
+            AetherPlaybackSession
+                .requiresPersistentSameSourceRecovery(
+                    timeoutFailure
+                )
+        )
+
+        let changedGeneration = AetherNativePlaybackSession
+            .failureEvidence(
+                error: AVIOReaderError.sourceByteStore(
+                    .generationMismatch
+                ),
+                caseCode: "engineSourceRead"
+            )
+        #expect(changedGeneration.category == .invariant)
+        #expect(
+            changedGeneration.caseCode
+                == "engineSourceRead.store.generationMismatch"
+        )
+        let identityFailure = AetherPlaybackSession.nativeFailure(
+            stage: .playback,
+            evidence: changedGeneration
+        )
+        #expect(identityFailure.kind == .invariantViolation)
+        #expect(
+            !AetherPlaybackSession
+                .requiresPersistentSameSourceRecovery(
+                    identityFailure
+                )
         )
     }
 

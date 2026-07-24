@@ -567,7 +567,7 @@ actor HLSVODOriginResourceLoader {
             HLSVODOriginResourceLoader.defaultCapacityBytes,
         baseDirectory: URL = FileManager.default.temporaryDirectory,
         transportRetryBudget: PlaybackTransportRetryBudget = .init(
-            maximumFailureAttempts: 3
+            maximumFailureAttempts: nil
         ),
         fetchOverride: Fetch? = nil
     ) throws {
@@ -970,7 +970,11 @@ actor HLSVODOriginResourceLoader {
         maximumBytes: Int,
         resourceKey: HLSVODOriginResourceKey
     ) async throws -> HLSVODOriginFetchResponse {
-        var attempt = 1
+        // One graph-bound flight owns this sequential retry loop. A transient
+        // failure never admits a second reader or a replacement origin; only
+        // the owning task's cancellation releases it.
+        var retryLogCadence =
+            AetherBoundedRetryLogCadence()
         while true {
             guard !transportRetryBudget.isExhausted else {
                 throw HLSVODOriginResourceError
@@ -981,36 +985,68 @@ actor HLSVODOriginResourceLoader {
                     request,
                     maximumBytes
                 )
-                if (200..<300).contains(response.statusCode),
-                   response.data.isEmpty {
-                    throw HLSVODOriginResourceError.emptyResource(
-                        resourceKey
-                    )
+                if (200..<300).contains(
+                    response.statusCode
+                ) {
+                    guard !response.data.isEmpty else {
+                        throw HLSVODOriginResourceError
+                            .emptyResource(
+                                resourceKey
+                            )
+                    }
+                    // Any delivered resource bytes are valid transport
+                    // progress. The next failure belongs to a fresh liveness
+                    // episode and therefore restarts at 1 second.
+                    transportRetryBudget.reset()
+                    retryLogCadence
+                        .resetAfterProgress()
+                    return response
                 }
                 guard Self.isRetryableStatus(response.statusCode) else {
                     return response
                 }
                 let sharedAttempt = transportRetryBudget
                     .recordRetryableFailure()
-                guard attempt < 3,
-                      !transportRetryBudget.isExhausted else {
+                guard !transportRetryBudget.isExhausted else {
                     return response
                 }
                 let delay = response.retryAfterSeconds.map {
-                    min(5, max(0, $0))
-                } ?? (sharedAttempt <= 1 ? 1 : 2)
-                EngineLog.emit(
-                    "[HLSVODOriginResourceLoader] transport retry "
-                        + "resource=\(resourceKey.cacheFileName) "
-                        + "attempt=\(attempt + 1) "
-                        + "status=\(response.statusCode) "
-                        + "delay=\(delay)",
-                    category: .session
+                    min(30, max(0, $0))
+                } ?? Self.retryDelay(
+                    forAttempt: sharedAttempt
                 )
+                let nextAttempt = sharedAttempt == Int.max
+                    ? Int.max
+                    : sharedAttempt + 1
+                if let diagnostic =
+                        retryLogCadence
+                            .recordFailure(
+                                now:
+                                    ProcessInfo
+                                        .processInfo
+                                        .systemUptime
+                            ) {
+                    EngineLog.emit(
+                        "[HLSVODOriginResourceLoader] "
+                            + "transport retry resource="
+                            + "\(resourceKey.cacheFileName) "
+                            + "attempt=\(nextAttempt) "
+                            + "status=\(response.statusCode) "
+                            + "delay=\(delay) failures="
+                            + "\(diagnostic.cumulativeFailureCount) "
+                            + "elapsed="
+                            + "\(Int(diagnostic.elapsedSeconds))s"
+                            + (diagnostic
+                                .checkpointSeconds
+                                .map {
+                                    " checkpoint=\(Int($0))s"
+                                } ?? " firstFailure"),
+                        category: .session
+                    )
+                }
                 try await Task.sleep(
                     nanoseconds: UInt64(delay * 1_000_000_000)
                 )
-                attempt += 1
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -1020,26 +1056,58 @@ actor HLSVODOriginResourceLoader {
                 }
                 let sharedAttempt = transportRetryBudget
                     .recordRetryableFailure()
-                guard attempt < 3,
-                      !transportRetryBudget.isExhausted else {
+                guard !transportRetryBudget.isExhausted else {
                     throw typed
                 }
-                let delay: TimeInterval =
-                    sharedAttempt <= 1 ? 1 : 2
-                EngineLog.emit(
-                    "[HLSVODOriginResourceLoader] transport retry "
-                        + "resource=\(resourceKey.cacheFileName) "
-                        + "attempt=\(attempt + 1) "
-                        + "code=\(Self.transportCaseCode(typed)) "
-                        + "delay=\(delay)",
-                    category: .session
+                let delay = Self.retryDelay(
+                    forAttempt: sharedAttempt
                 )
+                let nextAttempt = sharedAttempt == Int.max
+                    ? Int.max
+                    : sharedAttempt + 1
+                if let diagnostic =
+                        retryLogCadence
+                            .recordFailure(
+                                now:
+                                    ProcessInfo
+                                        .processInfo
+                                        .systemUptime
+                            ) {
+                    EngineLog.emit(
+                        "[HLSVODOriginResourceLoader] "
+                            + "transport retry resource="
+                            + "\(resourceKey.cacheFileName) "
+                            + "attempt=\(nextAttempt) "
+                            + "code="
+                            + "\(Self.transportCaseCode(typed)) "
+                            + "delay=\(delay) failures="
+                            + "\(diagnostic.cumulativeFailureCount) "
+                            + "elapsed="
+                            + "\(Int(diagnostic.elapsedSeconds))s"
+                            + (diagnostic
+                                .checkpointSeconds
+                                .map {
+                                    " checkpoint=\(Int($0))s"
+                                } ?? " firstFailure"),
+                        category: .session
+                    )
+                }
                 try await Task.sleep(
                     nanoseconds: UInt64(delay * 1_000_000_000)
                 )
-                attempt += 1
             }
         }
+    }
+
+    private nonisolated static func retryDelay(
+        forAttempt attempt: Int
+    ) -> TimeInterval {
+        let schedule: [TimeInterval] = [
+            1, 2, 4, 8, 15, 30,
+        ]
+        return schedule[
+            min(max(1, attempt), schedule.count) - 1
+        ]
     }
 
     private nonisolated static func isRetryableStatus(
@@ -1724,6 +1792,8 @@ final class HLSVODBoundedHTTPFetcher:
     private let request: URLRequest
     private let maximumBytes: Int
     private let configuration: URLSessionConfiguration
+    private let inactivityTimeoutSeconds:
+        TimeInterval
     private let lock = NSLock()
     private var continuation:
         CheckedContinuation<
@@ -1739,22 +1809,40 @@ final class HLSVODBoundedHTTPFetcher:
     private init(
         request: URLRequest,
         maximumBytes: Int,
-        configuration: URLSessionConfiguration
+        configuration: URLSessionConfiguration,
+        inactivityTimeoutSeconds:
+            TimeInterval
     ) {
         self.request = request
         self.maximumBytes = maximumBytes
         self.configuration = configuration
+        self.inactivityTimeoutSeconds =
+            inactivityTimeoutSeconds
     }
 
     static func fetch(
         request: URLRequest,
         maximumBytes: Int,
-        configuration: URLSessionConfiguration = .ephemeral
+        configuration: URLSessionConfiguration = .ephemeral,
+        inactivityTimeoutSeconds:
+            TimeInterval =
+                AetherPlaybackLivenessPolicy
+                    .production
+                    .noProgressWindowSeconds(
+                        forAttempt: 1
+                    )
     ) async throws -> HLSVODOriginFetchResponse {
+        guard inactivityTimeoutSeconds.isFinite,
+              inactivityTimeoutSeconds > 0 else {
+            throw HLSVODOriginResourceError
+                .invalidLimits
+        }
         let fetcher = HLSVODBoundedHTTPFetcher(
             request: request,
             maximumBytes: maximumBytes,
-            configuration: configuration
+            configuration: configuration,
+            inactivityTimeoutSeconds:
+                inactivityTimeoutSeconds
         )
         return try await withTaskCancellationHandler {
             try await fetcher.start()
@@ -1778,8 +1866,14 @@ final class HLSVODBoundedHTTPFetcher:
                 return
             }
             self.continuation = continuation
-            configuration.timeoutIntervalForRequest = 10
-            configuration.timeoutIntervalForResource = 30
+            // `timeoutIntervalForRequest` is the additional-data inactivity
+            // window and is refreshed as response bytes arrive. Resource
+            // timeout is intentionally non-terminal: a large segment may
+            // take arbitrarily long while still delivering valid bytes.
+            configuration.timeoutIntervalForRequest =
+                inactivityTimeoutSeconds
+            configuration.timeoutIntervalForResource =
+                .greatestFiniteMagnitude
             configuration.httpCookieStorage = nil
             configuration.httpShouldSetCookies = false
             configuration.urlCredentialStorage = nil
@@ -1788,7 +1882,16 @@ final class HLSVODBoundedHTTPFetcher:
                 delegate: self,
                 delegateQueue: nil
             )
-            let task = session.dataTask(with: request)
+            // URLRequest's default timeout (normally 60 seconds) overrides
+            // the session configuration. Stamp the liveness inactivity
+            // window explicitly on every task so this remains an
+            // additional-data timeout, never an accidental elapsed terminal.
+            var taskRequest = request
+            taskRequest.timeoutInterval =
+                inactivityTimeoutSeconds
+            let task = session.dataTask(
+                with: taskRequest
+            )
             self.session = session
             self.task = task
             lock.unlock()
@@ -1861,6 +1964,8 @@ final class HLSVODBoundedHTTPFetcher:
             "identity",
             forHTTPHeaderField: "Accept-Encoding"
         )
+        redirected.timeoutInterval =
+            inactivityTimeoutSeconds
         completionHandler(redirected)
     }
 

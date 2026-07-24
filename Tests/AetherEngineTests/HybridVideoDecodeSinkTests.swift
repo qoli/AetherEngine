@@ -1,4 +1,5 @@
 import CoreMedia
+import CoreVideo
 import Foundation
 import Libavcodec
 import Libavformat
@@ -22,6 +23,66 @@ struct HybridVideoDecodeSinkTests {
             lock.lock()
             defer { lock.unlock() }
             return frames
+        }
+    }
+
+    private final class FailureBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var errors: [HybridVideoDecodeSinkError] = []
+
+        func append(_ error: HybridVideoDecodeSinkError) {
+            lock.lock()
+            errors.append(error)
+            lock.unlock()
+        }
+
+        func snapshot() -> [HybridVideoDecodeSinkError] {
+            lock.lock()
+            defer { lock.unlock() }
+            return errors
+        }
+    }
+
+    private final class ErrorBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var error: Error?
+
+        func store(_ error: Error) {
+            lock.lock()
+            self.error = error
+            lock.unlock()
+        }
+
+        func snapshot() -> Error? {
+            lock.lock()
+            defer { lock.unlock() }
+            return error
+        }
+    }
+
+    private final class PacketBox: @unchecked Sendable {
+        let packet: UnsafeMutablePointer<AVPacket>
+
+        init(_ packet: UnsafeMutablePointer<AVPacket>) {
+            self.packet = packet
+        }
+    }
+
+    private final class IOChunkBarrier: @unchecked Sendable {
+        let firstChunkCompleted = DispatchSemaphore(value: 0)
+        let releaseFirstChunk = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
+        private var completedChunkCount = 0
+
+        func didCompleteChunk() {
+            lock.lock()
+            completedChunkCount += 1
+            let shouldBlock = completedChunkCount == 1
+            lock.unlock()
+            if shouldBlock {
+                firstChunkCompleted.signal()
+                releaseFirstChunk.wait()
+            }
         }
     }
 
@@ -100,6 +161,27 @@ struct HybridVideoDecodeSinkTests {
             SoftwareVideoDecoder.boundedLatencyThreadCount(
                 activeProcessorCount: 0
             ) == 1
+        )
+    }
+
+    @Test("10-bit 4:2:2 ProRes takes the swscale P010 output path")
+    func proRes422TenBitUsesP010() {
+        let uses10Bit = SoftwareVideoDecoder.uses10BitOutput(
+            bitsPerRawSample: 10,
+            colorTransfer: AVCOL_TRC_BT709
+        )
+
+        #expect(uses10Bit)
+        #expect(
+            SoftwareVideoDecoder.conversionPixelFormat(
+                uses10BitOutput: uses10Bit
+            ) == AV_PIX_FMT_P010LE
+        )
+        #expect(
+            SoftwareVideoDecoder.coreVideoPixelFormat(
+                uses10BitOutput: uses10Bit
+            )
+                == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
         )
     }
 
@@ -277,6 +359,121 @@ struct HybridVideoDecodeSinkTests {
         #expect(throws: HybridVideoDecodeSinkError.closed) {
             try sink.consume(packet)
         }
+    }
+
+    @Test("Close cooperatively cancels a blocked spool chunk without terminal failure")
+    func closeCancelsBlockedBacklogIO() throws {
+        let data = try BlackCarrierEncodedSample.verifiedMP4Data()
+        let demuxer = try openDemuxer(data: data)
+        defer { demuxer.close() }
+        let scratchRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "HybridVideoDecodeSinkCancel-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        let chunkBarrier = IOChunkBarrier()
+        let failures = FailureBox()
+        let sink = try HybridVideoDecodeSink(
+            demuxer: demuxer,
+            initialGeneration: 0,
+            maximumQueuedBytes: 1,
+            maximumQueuedPackets: 8,
+            maximumSpoolContentBytes: 8 * 1_024 * 1_024,
+            backlogScratchRoot: scratchRoot,
+            backlogIOChunkDidComplete: {
+                chunkBarrier.didCompleteChunk()
+            },
+            onFrame: { _ in },
+            onFailure: { failures.append($0) }
+        )
+        let packet = try #require(trackedPacketAlloc())
+        var packetToFree: UnsafeMutablePointer<AVPacket>? = packet
+        let consumeCompleted = DispatchSemaphore(value: 0)
+        let consumeError = ErrorBox()
+        var consumeDidComplete = false
+        defer {
+            chunkBarrier.releaseFirstChunk.signal()
+            if !consumeDidComplete {
+                _ = consumeCompleted.wait(timeout: .now() + 2)
+            }
+            sink.close()
+            trackedPacketFree(&packetToFree)
+            try? FileManager.default.removeItem(at: scratchRoot)
+        }
+
+        let packetBytes = 3 * 1_024 * 1_024
+        #expect(av_new_packet(packet, Int32(packetBytes)) >= 0)
+        let timeBase = AVRational(
+            num: sink.streamContract.packetTimeBaseNumerator,
+            den: sink.streamContract.packetTimeBaseDenominator
+        )
+        let timestamp = av_rescale_q(
+            10,
+            AVRational(num: 1, den: 1),
+            timeBase
+        )
+        packet.pointee.pts = timestamp
+        packet.pointee.dts = timestamp
+        packet.pointee.duration = av_rescale_q(
+            1,
+            AVRational(num: 1, den: 1),
+            timeBase
+        )
+        packet.pointee.stream_index = demuxer.videoStreamIndex
+        packet.pointee.time_base = timeBase
+
+        let packetBox = PacketBox(packet)
+        DispatchQueue.global().async {
+            do {
+                try sink.consume(packetBox.packet)
+            } catch {
+                consumeError.store(error)
+            }
+            consumeCompleted.signal()
+        }
+        #expect(
+            chunkBarrier.firstChunkCompleted.wait(
+                timeout: .now() + 2
+            ) == .success
+        )
+
+        let closeCompleted = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            sink.close()
+            closeCompleted.signal()
+        }
+        let cancellationDeadline =
+            ProcessInfo.processInfo.systemUptime + 1
+        while !sink.backlogCancellationRequestedForTesting,
+              ProcessInfo.processInfo.systemUptime
+                < cancellationDeadline {
+            Thread.sleep(forTimeInterval: 0.001)
+        }
+        #expect(sink.backlogCancellationRequestedForTesting)
+
+        let releaseUptime = ProcessInfo.processInfo.systemUptime
+        chunkBarrier.releaseFirstChunk.signal()
+        consumeDidComplete =
+            consumeCompleted.wait(timeout: .now() + 1)
+                == .success
+        #expect(consumeDidComplete)
+        #expect(
+            closeCompleted.wait(timeout: .now() + 1)
+                == .success
+        )
+        #expect(
+            ProcessInfo.processInfo.systemUptime - releaseUptime
+                < 1
+        )
+        #expect(
+            consumeError.snapshot()
+                as? HybridVideoDecodeSinkError == .closed
+        )
+        #expect(failures.snapshot().isEmpty)
+        #expect(sink.failure == nil)
+        #expect(!FileManager.default.fileExists(
+            atPath: scratchRoot.path
+        ))
     }
 
     @Test("Software recovery refuses a non-HEVC stream")

@@ -244,7 +244,13 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                 return // teardown rides through as cancellation, not a terminal error
             }
             startLock.withLock { _terminalError = .playlistUnreachable(status: -1) }
-            EngineLog.emit("[HLSIngest] terminal (transport): \(error.localizedDescription)", category: .engine)
+            let evidence = error as NSError
+            EngineLog.emit(
+                "[HLSIngest] terminal transport "
+                    + "domain=\(evidence.domain) "
+                    + "code=\(evidence.code)",
+                category: .engine
+            )
             fifo.cancel()
         }
     }

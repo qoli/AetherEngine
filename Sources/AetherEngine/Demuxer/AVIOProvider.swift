@@ -38,6 +38,20 @@ protocol AVIOProvider: AnyObject {
     /// seek fallback when a timestamp seek times out on an index-less container.
     var resolvedByteSize: Int64? { get }
 
+    /// Typed terminal transport/store evidence hidden behind FFmpeg's integer
+    /// AVIO callback result. Demuxer checks this before reducing a read/open
+    /// failure to a generic libavformat code.
+    var terminalError: AVIOReaderError? { get }
+
     /// Free the `AVIOContext` and release the underlying source. Idempotent.
     func close()
+
+    /// Wait until every provider-owned asynchronous I/O task has delivered its
+    /// terminal callback. Call only after `markClosed()`/`close()`.
+    func waitForIOQuiescence()
+}
+
+extension AVIOProvider {
+    var terminalError: AVIOReaderError? { nil }
+    func waitForIOQuiescence() {}
 }

@@ -115,12 +115,35 @@ public struct BlackCarrierTimeline: Sendable, Equatable {
     public let segments: [BlackCarrierSegmentTiming]
 
     public static func fileVOD(duration: CMTime) throws -> BlackCarrierTimeline {
+        try fileVOD(
+            duration: duration,
+            segmentDurationTicks:
+                BlackCarrierProfile.approved
+                    .nominalFileSegmentDurationTicks
+        )
+    }
+
+    /// Internal source-scoped refinement used only after positive route
+    /// evidence has selected a shorter progressive ProRes segment. The public
+    /// file-VOD entry point above remains locked to four seconds.
+    static func fileVOD(
+        duration: CMTime,
+        segmentDurationTicks: CMTimeValue
+    ) throws -> BlackCarrierTimeline {
         let profile = BlackCarrierProfile.approved
         let durationTicks = try validatedTicks(duration, error: .invalidDuration)
+        guard segmentDurationTicks > 0,
+              segmentDurationTicks
+                <= profile.nominalFileSegmentDurationTicks else {
+            throw BlackCarrierTimelineError.invalidDuration
+        }
         var segmentDurations: [CMTimeValue] = []
         var remaining = durationTicks
         while remaining > 0 {
-            let segmentDuration = min(profile.nominalFileSegmentDurationTicks, remaining)
+            let segmentDuration = min(
+                segmentDurationTicks,
+                remaining
+            )
             segmentDurations.append(segmentDuration)
             remaining -= segmentDuration
         }

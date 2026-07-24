@@ -1255,6 +1255,10 @@ struct HLSPreflightInspector {
         if token.hasPrefix("av01") {
             return .av1
         }
+        if ["apch", "apcn", "apcs", "apco", "ap4h", "ap4x"]
+            .contains(where: token.hasPrefix) {
+            return .prores
+        }
         if token.hasPrefix("vp09") {
             return .vp9
         }
@@ -1561,7 +1565,11 @@ struct HLSPreflightInspector {
     }
 
     private static func isVideoCodecToken(_ token: String) -> Bool {
-        ["avc1", "avc3", "hvc1", "hev1", "dvh1", "dvhe", "av01", "vp09", "vp08", "mp4v", "mpeg2", "vc-1"].contains {
+        [
+            "avc1", "avc3", "hvc1", "hev1", "dvh1", "dvhe",
+            "av01", "apch", "apcn", "apcs", "apco", "ap4h",
+            "ap4x", "vp09", "vp08", "mp4v", "mpeg2", "vc-1",
+        ].contains {
             token.hasPrefix($0)
         }
     }
@@ -1570,6 +1578,9 @@ struct HLSPreflightInspector {
         switch actualCodec {
         case .h264: token.hasPrefix("avc1") || token.hasPrefix("avc3")
         case .hevc: token.hasPrefix("hvc1") || token.hasPrefix("hev1") || token.hasPrefix("dvh1") || token.hasPrefix("dvhe")
+        case .prores:
+            ["apch", "apcn", "apcs", "apco", "ap4h", "ap4x"]
+                .contains(where: token.hasPrefix)
         case .av1: token.hasPrefix("av01")
         case .vp9: token.hasPrefix("vp09")
         case .vp8: token.hasPrefix("vp08")

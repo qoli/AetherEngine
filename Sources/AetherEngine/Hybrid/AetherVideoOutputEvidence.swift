@@ -23,6 +23,7 @@ public enum AetherVideoOutputStatus: String, Sendable, Equatable {
 public enum AetherCanonicalVideoCodec: String, Sendable, Equatable {
     case h264
     case hevc
+    case prores
     case av1
     case vp9
     case vp8
@@ -87,6 +88,7 @@ extension AetherVideoCodec {
         switch self {
         case .h264: .h264
         case .hevc: .hevc
+        case .prores: .prores
         case .av1: .av1
         case .vp9: .vp9
         case .vp8: .vp8
@@ -195,6 +197,8 @@ enum AetherObservedVideoCodec {
             ).lowercased() {
             case "avc1", "avc3": return .h264
             case "hvc1", "hev1", "dvh1", "dvhe": return .hevc
+            case "apch", "apcn", "apcs", "apco", "ap4h", "ap4x":
+                return .prores
             case "av01": return .av1
             case "vp09": return .vp9
             case "vp08": return .vp8

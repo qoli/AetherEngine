@@ -1768,6 +1768,7 @@ final class HLSVODMediaPumpTests: XCTestCase {
             hybridCapabilities:
                 HybridPlaybackCapabilities(
                     hasDirectVideoDecoder: true,
+                    libavcodecDecodableVideoCodecs: [.vp9],
                     hasSampleBufferRenderer: true,
                     supportedVideoFormats: [.hdr10Plus]
                 )
@@ -2622,6 +2623,7 @@ final class HLSVODMediaPumpTests: XCTestCase {
             hybridCapabilities:
                 HybridPlaybackCapabilities(
                     hasDirectVideoDecoder: true,
+                    libavcodecDecodableVideoCodecs: [.vp9],
                     hasSampleBufferRenderer: true,
                     supportedVideoFormats:
                         supportedVideoFormats

@@ -143,14 +143,14 @@ struct VideoOutputEvidenceTests {
         )
     }
 
-    @Test("Provisional Native rejects observed HEVC before ready")
-    func provisionalNativeObservedHEVCRequiresHybrid() {
-        let provisional = nativeTrackPreflight(
-            sourceKind: .unclassifiedURL,
-            videoStreamPresence: .unknown,
-            videoCodec: .unknown,
-            sourceContainer: .unknown,
-            reason: .nativeProvisionalURL
+    @Test("Verified Native rejects observed HEVC before ready")
+    func verifiedNativeObservedHEVCRequiresHybrid() {
+        let verifiedNative = nativeTrackPreflight(
+            sourceKind: .hls,
+            videoStreamPresence: .provenPresent,
+            videoCodec: .h264,
+            sourceContainer: .mpegTransport,
+            reason: .nativeHLSContractVerified
         )
         let inspection = AetherNativeVideoTrackInspectionResult
             .resolve(
@@ -162,28 +162,28 @@ struct VideoOutputEvidenceTests {
         #expect(
             AetherNativeVideoTrackPreparationPolicy.decide(
                 ownership: .directAsset,
-                preflightResult: provisional,
+                preflightResult: verifiedNative,
                 inspection: inspection
             ) == .fail(.observedHEVCRequiresHybrid)
         )
         #expect(
             AetherNativeVideoTrackPreparationPolicy.decide(
                 ownership: .directAsset,
-                preflightResult: provisional,
+                preflightResult: verifiedNative,
                 inspection: .observedVideo(.h264)
             ) == .proceed
         )
         #expect(
             AetherNativeVideoTrackPreparationPolicy.decide(
                 ownership: .directAsset,
-                preflightResult: provisional,
+                preflightResult: verifiedNative,
                 inspection: .observedNoVideo
             ) == .fail(.videoTrackInspectionInconclusive)
         )
         #expect(
             AetherNativeVideoTrackPreparationPolicy.decide(
                 ownership: .directAsset,
-                preflightResult: provisional,
+                preflightResult: verifiedNative,
                 inspection: .unexpectedVideo(.h264)
             ) == .fail(.unexpectedVideoTrack(codec: .h264))
         )
@@ -197,27 +197,61 @@ struct VideoOutputEvidenceTests {
         #expect(
             AetherNativeVideoTrackPreparationPolicy.decide(
                 ownership: .directAsset,
-                preflightResult: provisional,
+                preflightResult: verifiedNative,
                 inspection: .unexpectedVideo(.hevc)
             ) == .fail(.observedHEVCRequiresHybrid)
         )
     }
 
     @MainActor
+    @Test("Unclassified URL facts cannot construct a Native session")
+    func unclassifiedURLCannotConstructNativeSession() {
+        let unresolved = PlaybackPreflightResult(
+            sourceProfile: AetherSourceProfile(
+                sourceKind: .unclassifiedURL,
+                isSeekableVOD: false,
+                videoStreamPresence: .unknown,
+                videoCodec: .unknown,
+                videoFormat: .sdr
+            ),
+            hlsPackaging: nil,
+            route: .nativeAVPlayer,
+            reason: .nativeProvisionalURL
+        )
+        let expected =
+            AetherNativePlaybackSessionError
+                .preflightRequiresNative(
+                    route: .unsupported,
+                    reason:
+                        .unsupportedSourceClassificationInconclusive
+                )
+
+        #expect(throws: expected) {
+            try AetherNativePlaybackSession.make(
+                url: URL(
+                    string:
+                        "https://example.invalid/unclassified"
+                )!,
+                preflightResult: unresolved
+            )
+        }
+    }
+
+    @MainActor
     @Test("Late Native item HEVC inspection exits through typed Aether boundary")
     func lateNativeItemHEVCInspectionExitsNative() throws {
-        let provisional = nativeTrackPreflight(
-            sourceKind: .unclassifiedURL,
-            videoStreamPresence: .unknown,
-            videoCodec: .unknown,
-            sourceContainer: .unknown,
-            reason: .nativeProvisionalURL
+        let verifiedNative = nativeTrackPreflight(
+            sourceKind: .hls,
+            videoStreamPresence: .provenPresent,
+            videoCodec: .h264,
+            sourceContainer: .mpegTransport,
+            reason: .nativeHLSContractVerified
         )
         let session = try AetherNativePlaybackSession.make(
             url: URL(
                 string: "https://example.invalid/runtime-item.m3u8"
             )!,
-            preflightResult: provisional
+            preflightResult: verifiedNative
         )
         #expect(session.avPlayer.currentItem != nil)
 
@@ -277,14 +311,14 @@ struct VideoOutputEvidenceTests {
         )
     }
 
-    @Test("Remux ownership cannot excuse provisional or non-remux track absence")
+    @Test("Remux ownership cannot excuse unclassified or non-remux track absence")
     func nativeRemuxEmptyTrackAdvisoryRequiresExactFacts() {
-        let provisional = nativeTrackPreflight(
+        let unclassified = nativeTrackPreflight(
             sourceKind: .unclassifiedURL,
             videoStreamPresence: .unknown,
             videoCodec: .unknown,
             sourceContainer: .unknown,
-            reason: .nativeProvisionalURL
+            reason: .unsupportedSourceClassificationInconclusive
         )
         let directHLS = nativeTrackPreflight(
             sourceKind: .hls,
@@ -297,7 +331,7 @@ struct VideoOutputEvidenceTests {
         #expect(
             AetherNativeVideoTrackPreparationPolicy.decide(
                 ownership: .aetherOwnedHLSFMP4Remux,
-                preflightResult: provisional,
+                preflightResult: unclassified,
                 inspection: .observedNoVideo
             ) == .fail(.videoTrackInspectionInconclusive)
         )
@@ -662,8 +696,44 @@ struct VideoOutputEvidenceTests {
             AetherVideoCodec.mpeg4Part2
                 .canonicalVideoOutputCodec.rawValue == "mpeg4"
         )
+        #expect(AetherVideoCodec.prores.rawValue == "prores")
+        #expect(
+            AetherVideoCodec.prores
+                .canonicalVideoOutputCodec.rawValue == "prores"
+        )
+        #expect(AetherAudioCodec.pcmS24LE.rawValue == "pcm_s24le")
         #expect(AetherCanonicalVideoCodec.none.rawValue == "none")
         #expect(AetherCanonicalVideoCodec.hevc.rawValue == "hevc")
+        #expect(AetherCanonicalVideoCodec.prores.rawValue == "prores")
+    }
+
+    @Test("Observed ProRes sample entries use the canonical wire codec")
+    func observedProResSampleEntriesAreCanonical() throws {
+        for codecType: CMVideoCodecType in [
+            0x6170_6368, // apch
+            0x6170_636E, // apcn
+            0x6170_6373, // apcs
+            0x6170_636F, // apco
+            0x6170_3468, // ap4h
+            0x6170_3478, // ap4x
+        ] {
+            var formatDescription: CMVideoFormatDescription?
+            let status = CMVideoFormatDescriptionCreate(
+                allocator: kCFAllocatorDefault,
+                codecType: codecType,
+                width: 1_920,
+                height: 1_080,
+                extensions: nil,
+                formatDescriptionOut: &formatDescription
+            )
+            #expect(status == noErr)
+            let description = try #require(formatDescription)
+            #expect(
+                AetherObservedVideoCodec.canonical(
+                    formatDescriptions: [description]
+                ) == .prores
+            )
+        }
     }
 
     @Test("A stale metrics completion cannot retire the newer sample")

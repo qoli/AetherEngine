@@ -187,8 +187,9 @@ public struct LoadOptions: Sendable, Equatable {
     /// of 10 (~ 40 s). Ignored for `nativeRemoteHLS`, where AVPlayer talks to the remote server directly.
     public var forwardBufferSegments: Int?
 
-    /// Autostart at load completion. Default `true`: every load path ends in `host.play()` and a
-    /// `.playing` state (current behavior, byte-identical). Set `false` to mount PAUSED: a host that
+    /// Autostart at load completion. Default `true`: every load path ends in `host.play()` and
+    /// publishes the playback state actually observed from the host (`.loading` until native
+    /// playback really starts). Set `false` to mount PAUSED: a host that
     /// holds a pause at mount (synchronized-start lobby that loads several devices and starts them on
     /// a signal, or a hold-at-mount / resume prompt) no longer eats an engine-initiated resume it has
     /// to claw back. With `false` the load skips the terminal `host.play()` (and, on the native VOD

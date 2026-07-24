@@ -7,6 +7,102 @@ import Testing
 
 @Suite("Source byte store AVIO integration", .serialized)
 struct SourceByteStoreAVIOTests {
+    @Test("Redirected upstream expiry re-resolves the canonical source")
+    func redirectedUpstreamExpiryReResolvesCanonical() throws {
+        let body = Data("redirect-refresh".utf8)
+        let server = try RedirectExpiryFixtureServer(
+            mode: .redirectedExpiryThenSuccess,
+            body: body
+        )
+        defer { server.close() }
+        let reader = AVIOReader(
+            url: server.canonicalURL,
+            chunkSize: body.count,
+            prefetchEnabled: false,
+            chunkMaxRetries: 1
+        )
+        defer {
+            reader.close()
+            reader.waitForIOQuiescence()
+        }
+
+        #expect(
+            reader.fetchChunkForTesting(
+                from: 0,
+                size: body.count
+            ) == body
+        )
+        #expect(reader.terminalError == nil)
+        #expect(
+            server.snapshot
+                == RedirectExpiryFixtureServer.Snapshot(
+                    canonicalRequestCount: 2,
+                    upstreamRequestCount: 2
+                )
+        )
+    }
+
+    @Test("Canonical hard rejection remains terminal")
+    func canonicalHardRejectionRemainsTerminal() throws {
+        let server = try RedirectExpiryFixtureServer(
+            mode: .canonicalRejected,
+            body: Data("unreachable".utf8)
+        )
+        defer { server.close() }
+        let reader = AVIOReader(
+            url: server.canonicalURL,
+            chunkSize: 4,
+            prefetchEnabled: false,
+            chunkMaxRetries: 1
+        )
+        defer {
+            reader.close()
+            reader.waitForIOQuiescence()
+        }
+
+        #expect(
+            reader.fetchChunkForTesting(
+                from: 0,
+                size: 4
+            ) == nil
+        )
+        #expect(
+            reader.terminalError
+                == .httpStatus(statusCode: 403)
+        )
+        #expect(
+            server.snapshot
+                == RedirectExpiryFixtureServer.Snapshot(
+                    canonicalRequestCount: 1,
+                    upstreamRequestCount: 0
+                )
+        )
+    }
+
+    @Test(
+        "markClosed before provider install fences a late URL open"
+    )
+    func markClosedBeforeOpenStartsNoReader()
+        throws
+    {
+        let server = try RangeFixtureServer(
+            body: makeWAV(seconds: 0.1),
+            eTag: "\"late-open-fence\""
+        )
+        defer { server.close() }
+        let demuxer = Demuxer()
+        demuxer.markClosed()
+        defer {
+            demuxer.close()
+            demuxer.waitForIOQuiescence()
+        }
+
+        #expect(throws: CancellationError.self) {
+            try demuxer.open(url: server.url)
+        }
+        #expect(server.snapshot.requestCount == 0)
+    }
+
     @Test("Concurrent AVIO readers fetch one exact origin range")
     func concurrentReaderRangeSingleFlight() async throws {
         let source = makeWAV(seconds: 1)
@@ -128,8 +224,8 @@ struct SourceByteStoreAVIOTests {
         )
     }
 
-    @Test("A changed validator invalidates cached bytes before the next open")
-    func changedValidatorInvalidatesGeneration() throws {
+    @Test("A changed validator fails closed before cached generations can mix")
+    func changedValidatorFailsClosed() throws {
         let firstSource = makeWAV(seconds: 1)
         let replacement = makeWAV(seconds: 1.25)
         let server = try RangeFixtureServer(
@@ -160,21 +256,22 @@ struct SourceByteStoreAVIOTests {
             eTag: "\"source-generation-b\""
         )
         let second = Demuxer()
-        try second.open(
-            url: server.url,
-            sourceByteStore: store
-        )
-        while let packet = try second.readPacket() {
-            var packetToFree: UnsafeMutablePointer<AVPacket>? = packet
-            trackedPacketFree(&packetToFree)
+        #expect(
+            throws: AVIOReaderError.sourceByteStore(
+                .generationMismatch
+            )
+        ) {
+            try second.open(
+                url: server.url,
+                sourceByteStore: store
+            )
         }
-        #expect(abs(second.duration - 1.25) < 0.01)
         second.close()
-        let expectedGeneration = try SourceByteStoreGeneration(
-            contentLength: Int64(replacement.count),
-            validator: .strongETag("\"source-generation-b\"")
+        let originalGeneration = try SourceByteStoreGeneration(
+            contentLength: Int64(firstSource.count),
+            validator: .strongETag("\"source-generation-a\"")
         )
-        #expect(store.snapshot?.generation == expectedGeneration)
+        #expect(store.snapshot?.generation == originalGeneration)
         #expect(store.snapshot?.isComplete == true)
     }
 
@@ -223,6 +320,122 @@ struct SourceByteStoreAVIOTests {
             afterSecond.bodyBytesSent - afterFirst.bodyBytesSent
                 >= source.count
         )
+    }
+
+    @Test("Validatorless Hybrid source fails closed before a seek generation reopens")
+    func validatorlessHybridSeekGenerationFailsClosed() throws {
+        let source = makeWAV(seconds: 5.25)
+        let server = try RangeFixtureServer(
+            body: source,
+            eTag: nil
+        )
+        defer { server.close() }
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(
+                seconds: 5.25,
+                preferredTimescale: 90_000
+            )
+        )
+        let pump = try BlackCarrierMediaFanoutPump
+            .makeSeekableVOD(
+                source: .url(server.url),
+                options: LoadOptions(),
+                timeline: timeline
+            )
+        defer { pump.closeAndWaitForIOQuiescence() }
+        _ = try #require(
+            try pump.initSegment(ordinal: 0)
+        )
+        let beforeRestart = server.snapshot
+
+        var replacement = source
+        replacement[replacement.count - 1] ^= 0x01
+        server.replace(body: replacement, eTag: nil)
+
+        var classifier = HybridSeekIntentClassifier(
+            timeline: timeline
+        )
+        let intent = try classifier.registerExplicitHostSeek(
+            to: CMTime(
+                seconds: 4.5,
+                preferredTimescale: 90_000
+            )
+        )
+        let expected = BlackCarrierMediaFanoutPumpError
+            .demuxFailure(
+                evidence: BlackCarrierDemuxFailureEvidence(
+                    category: .invariant,
+                    caseCode:
+                        "sourceByteStore.generationMismatch",
+                    domain:
+                        "AetherEngine.SourceByteStore",
+                    code: 3
+                )
+            )
+        #expect(throws: expected) {
+            _ = try pump.restart(for: intent)
+        }
+        #expect(server.snapshot == beforeRestart)
+        #expect(pump.generation == 0)
+    }
+
+    @Test("Hybrid fresh demux keeps validator drift as typed generation evidence")
+    func hybridFreshDemuxPreservesValidatorDrift() throws {
+        let source = makeWAV(seconds: 5.25)
+        let server = try RangeFixtureServer(
+            body: source,
+            eTag: "\"hybrid-generation-a\""
+        )
+        defer { server.close() }
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(
+                seconds: 5.25,
+                preferredTimescale: 90_000
+            )
+        )
+        let pump = try BlackCarrierMediaFanoutPump
+            .makeSeekableVOD(
+                source: .url(server.url),
+                options: LoadOptions(),
+                timeline: timeline
+            )
+        defer { pump.closeAndWaitForIOQuiescence() }
+        _ = try #require(
+            try pump.initSegment(ordinal: 0)
+        )
+
+        var replacement = source
+        replacement[replacement.count - 1] ^= 0x01
+        server.replace(
+            body: replacement,
+            eTag: "\"hybrid-generation-b\""
+        )
+
+        var classifier = HybridSeekIntentClassifier(
+            timeline: timeline
+        )
+        let intent = try classifier.registerExplicitHostSeek(
+            to: CMTime(
+                seconds: 4.5,
+                preferredTimescale: 90_000
+            )
+        )
+        let expected = BlackCarrierMediaFanoutPumpError
+            .demuxFailure(
+                evidence: BlackCarrierDemuxFailureEvidence(
+                    category: .invariant,
+                    caseCode:
+                        "sourceByteStore.generationMismatch",
+                    domain:
+                        "AetherEngine.SourceByteStore",
+                    code: 3
+                )
+            )
+        #expect(throws: expected) {
+            _ = try pump.restart(for: intent)
+        }
+        #expect(server.snapshot.conditionalRequestCount == 1)
+        #expect(pump.generation == 0)
     }
 
     @Test("Black-carrier startup reuses its original demux without a measurement pass")
@@ -376,6 +589,294 @@ struct SourceByteStoreAVIOTests {
         appendUInt32(UInt32(pcm.count))
         data.append(pcm)
         return data
+    }
+}
+
+private final class RedirectExpiryFixtureServer:
+    @unchecked Sendable
+{
+    enum Mode: Sendable {
+        case redirectedExpiryThenSuccess
+        case canonicalRejected
+    }
+
+    struct Snapshot: Sendable, Equatable {
+        let canonicalRequestCount: Int
+        let upstreamRequestCount: Int
+    }
+
+    private let listener: Int32
+    private let queue = DispatchQueue(
+        label: "com.aetherengine.tests.redirect-expiry-server"
+    )
+    private let lock = NSLock()
+    private let mode: Mode
+    private let body: Data
+    private var canonicalRequestCount = 0
+    private var upstreamRequestCount = 0
+    private var isClosed = false
+
+    let canonicalURL: URL
+    private let upstreamURL: URL
+
+    init(mode: Mode, body: Data) throws {
+        self.mode = mode
+        self.body = body
+        let bound = try Self.makeListener()
+        listener = bound.descriptor
+        canonicalURL = URL(
+            string: "http://127.0.0.1:\(bound.port)/p/source"
+        )!
+        upstreamURL = URL(
+            string: "http://127.0.0.1:\(bound.port)/upstream"
+        )!
+        queue.async { [weak self] in
+            self?.acceptLoop()
+        }
+    }
+
+    deinit {
+        close()
+    }
+
+    var snapshot: Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return Snapshot(
+            canonicalRequestCount: canonicalRequestCount,
+            upstreamRequestCount: upstreamRequestCount
+        )
+    }
+
+    func close() {
+        lock.lock()
+        guard !isClosed else {
+            lock.unlock()
+            return
+        }
+        isClosed = true
+        lock.unlock()
+        shutdown(listener, SHUT_RDWR)
+        Darwin.close(listener)
+    }
+
+    private static func makeListener() throws -> (
+        descriptor: Int32,
+        port: UInt16
+    ) {
+        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else {
+            throw POSIXError(.EIO)
+        }
+        var reuse: Int32 = 1
+        setsockopt(
+            descriptor,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            &reuse,
+            socklen_t(MemoryLayout<Int32>.size)
+        )
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = 0
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bindResult = withUnsafePointer(to: &address) {
+            pointer in
+            pointer.withMemoryRebound(
+                to: sockaddr.self,
+                capacity: 1
+            ) {
+                Darwin.bind(
+                    descriptor,
+                    $0,
+                    socklen_t(
+                        MemoryLayout<sockaddr_in>.size
+                    )
+                )
+            }
+        }
+        guard bindResult == 0,
+              Darwin.listen(descriptor, 8) == 0 else {
+            Darwin.close(descriptor)
+            throw POSIXError(.EIO)
+        }
+        var boundAddress = sockaddr_in()
+        var boundLength = socklen_t(
+            MemoryLayout<sockaddr_in>.size
+        )
+        let nameResult = withUnsafeMutablePointer(
+            to: &boundAddress
+        ) { pointer in
+            pointer.withMemoryRebound(
+                to: sockaddr.self,
+                capacity: 1
+            ) {
+                getsockname(
+                    descriptor,
+                    $0,
+                    &boundLength
+                )
+            }
+        }
+        guard nameResult == 0 else {
+            Darwin.close(descriptor)
+            throw POSIXError(.EIO)
+        }
+        return (
+            descriptor,
+            UInt16(bigEndian: boundAddress.sin_port)
+        )
+    }
+
+    private func acceptLoop() {
+        while true {
+            let client = accept(listener, nil, nil)
+            guard client >= 0 else { return }
+            var noSignal: Int32 = 1
+            setsockopt(
+                client,
+                SOL_SOCKET,
+                SO_NOSIGPIPE,
+                &noSignal,
+                socklen_t(MemoryLayout<Int32>.size)
+            )
+            handle(client)
+            Darwin.close(client)
+        }
+    }
+
+    private func handle(_ client: Int32) {
+        guard let path = readRequestPath(client) else {
+            return
+        }
+        switch path {
+        case "/p/source":
+            lock.lock()
+            canonicalRequestCount += 1
+            lock.unlock()
+            switch mode {
+            case .redirectedExpiryThenSuccess:
+                sendResponse(
+                    client,
+                    status: "302 Found",
+                    headers: [
+                        "Location: \(upstreamURL.absoluteString)",
+                    ],
+                    body: Data()
+                )
+            case .canonicalRejected:
+                sendResponse(
+                    client,
+                    status: "403 Forbidden",
+                    body: Data()
+                )
+            }
+
+        case "/upstream":
+            lock.lock()
+            upstreamRequestCount += 1
+            let attempt = upstreamRequestCount
+            lock.unlock()
+            if attempt == 1 {
+                sendResponse(
+                    client,
+                    status: "403 Forbidden",
+                    body: Data()
+                )
+            } else {
+                sendResponse(
+                    client,
+                    status: "206 Partial Content",
+                    headers: [
+                        "Accept-Ranges: bytes",
+                        "Content-Range: bytes 0-\(body.count - 1)/\(body.count)",
+                    ],
+                    body: body
+                )
+            }
+
+        default:
+            sendResponse(
+                client,
+                status: "404 Not Found",
+                body: Data()
+            )
+        }
+    }
+
+    private func readRequestPath(_ client: Int32) -> String? {
+        var requestData = Data()
+        var buffer = [UInt8](repeating: 0, count: 4 * 1024)
+        while requestData.range(
+            of: Data("\r\n\r\n".utf8)
+        ) == nil {
+            let count = recv(
+                client,
+                &buffer,
+                buffer.count,
+                0
+            )
+            guard count > 0 else { return nil }
+            requestData.append(
+                contentsOf: buffer[0..<count]
+            )
+            guard requestData.count <= 64 * 1024 else {
+                return nil
+            }
+        }
+        guard let request = String(
+            data: requestData,
+            encoding: .utf8
+        ),
+        let requestLine = request
+            .components(separatedBy: "\r\n")
+            .first else {
+            return nil
+        }
+        let fields = requestLine.split(separator: " ")
+        guard fields.count >= 2 else { return nil }
+        return String(fields[1])
+    }
+
+    private func sendResponse(
+        _ client: Int32,
+        status: String,
+        headers: [String] = [],
+        body: Data
+    ) {
+        let responseHeaders = [
+            "HTTP/1.1 \(status)",
+            "Content-Length: \(body.count)",
+            "Connection: close",
+        ] + headers
+        let head = Data(
+            (responseHeaders.joined(separator: "\r\n")
+                + "\r\n\r\n").utf8
+        )
+        sendAll(head, to: client)
+        sendAll(body, to: client)
+    }
+
+    private func sendAll(
+        _ data: Data,
+        to client: Int32
+    ) {
+        data.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.baseAddress else {
+                return
+            }
+            var sent = 0
+            while sent < rawBuffer.count {
+                let count = Darwin.send(
+                    client,
+                    base.advanced(by: sent),
+                    rawBuffer.count - sent,
+                    0
+                )
+                guard count > 0 else { return }
+                sent += count
+            }
+        }
     }
 }
 

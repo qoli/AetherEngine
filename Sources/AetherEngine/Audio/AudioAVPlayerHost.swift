@@ -124,7 +124,9 @@ final class AudioAVPlayerHost {
         }
 
         EngineLog.emit(
-            "[AudioAVPlayerHost] load url=\(url.absoluteString) "
+            "[AudioAVPlayerHost] load source="
+            + "\(url.isFileURL ? "file" : "remote") "
+            + "host=\(url.host ?? "none") "
             + "startPos=\(startPosition.map { String(format: "%.2fs", $0) } ?? "nil") "
             + "headers=\(httpHeaders.isEmpty ? "none" : "\(httpHeaders.count)")",
             category: .swPlayback
@@ -162,7 +164,11 @@ final class AudioAVPlayerHost {
                     }
                 }
             case .failed:
-                let message = item.error?.localizedDescription ?? "AVPlayerItem failed (no description)"
+                let error = item.error as NSError?
+                let message =
+                    "AVPlayerItem failed domain="
+                    + "\(error?.domain ?? "AVFoundation") "
+                    + "code=\(error?.code ?? -1)"
                 Task { @MainActor [weak self] in
                     self?.failureMessage = message
                 }
@@ -218,7 +224,10 @@ final class AudioAVPlayerHost {
             queue: .main
         ) { [weak self] notification in
             let err = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
-            let message = err?.localizedDescription ?? "Playback failed to reach end"
+            let message =
+                "Playback failed to reach end domain="
+                + "\(err?.domain ?? "AVFoundation") "
+                + "code=\(err?.code ?? -1)"
             Task { @MainActor [weak self] in
                 self?.failureMessage = message
             }

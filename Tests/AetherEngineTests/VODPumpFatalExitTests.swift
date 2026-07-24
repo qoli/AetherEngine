@@ -1,50 +1,51 @@
 import Testing
 @testable import AetherEngine
 
-/// Issue #126: an unknown-length HTTP MP4 degraded to forward-only streaming mode, the first
-/// readPacket failed, and the VOD pump died silently with zero packets while AVPlayer waited
-/// forever on a playlist that would never gain a segment. These pin the fatal-exit decision
-/// that now surfaces such a death to the host.
-struct VODPumpFatalExitTests {
+/// A VOD transport exit must either reopen the exact source or publish a
+/// typed permanent failure; it must never leave the loopback playlist parked.
+struct VODPumpRecoveryTests {
 
-    @Test("VOD readError with nothing produced is fatal")
-    func zeroProgressReadErrorIsFatal() {
-        #expect(HLSVideoEngine.isFatalVODPumpExit(
+    @Test("VOD readError with nothing produced requires source recovery")
+    func zeroProgressReadErrorRequiresRecovery() {
+        #expect(HLSVideoEngine.requiresVODSourceRecovery(
             reason: .readError(code: -1), isLive: false,
             packetsWritten: 0, cachedSegments: 0))
     }
 
-    @Test("VOD readError after packets were written is not fatal (mid-session transient)")
-    func midSessionReadErrorIsNotFatal() {
-        #expect(!HLSVideoEngine.isFatalVODPumpExit(
+    @Test("Mid-session VOD readError also requires source recovery")
+    func midSessionReadErrorRequiresRecovery() {
+        #expect(HLSVideoEngine.requiresVODSourceRecovery(
             reason: .readError(code: -5), isLive: false,
             packetsWritten: 4821, cachedSegments: 0))
     }
 
-    @Test("VOD readError with cached segments is not fatal (restart arms cover recovery)")
-    func cachedSegmentsAreNotFatal() {
-        #expect(!HLSVideoEngine.isFatalVODPumpExit(
+    @Test("Cached segments do not permit a dead VOD reader")
+    func cachedSegmentsStillRequireRecovery() {
+        #expect(HLSVideoEngine.requiresVODSourceRecovery(
             reason: .readError(code: -1), isLive: false,
             packetsWritten: 0, cachedSegments: 12))
     }
 
-    @Test("live readError is never fatal here (live reopen owns recovery)")
-    func liveReadErrorIsNotFatal() {
-        #expect(!HLSVideoEngine.isFatalVODPumpExit(
+    @Test("Live readError is owned by the live reopen loop")
+    func liveReadErrorIsNotVODRecovery() {
+        #expect(!HLSVideoEngine.requiresVODSourceRecovery(
             reason: .readError(code: -1), isLive: true,
             packetsWritten: 0, cachedSegments: 0))
     }
 
-    @Test("VOD eof with zero packets is not a fatal read exit")
-    func eofIsNotFatal() {
-        #expect(!HLSVideoEngine.isFatalVODPumpExit(
+    @Test("Zero-output VOD EOF requires source recovery")
+    func zeroOutputEOFRequiresRecovery() {
+        #expect(HLSVideoEngine.requiresVODSourceRecovery(
             reason: .eof, isLive: false,
             packetsWritten: 0, cachedSegments: 0))
     }
 
-    @Test("teardown exits are not fatal")
-    func stopRequestedIsNotFatal() {
-        #expect(!HLSVideoEngine.isFatalVODPumpExit(
+    @Test("Natural VOD EOF and teardown do not recover")
+    func completedEOFAndStopDoNotRecover() {
+        #expect(!HLSVideoEngine.requiresVODSourceRecovery(
+            reason: .eof, isLive: false,
+            packetsWritten: 20, cachedSegments: 4))
+        #expect(!HLSVideoEngine.requiresVODSourceRecovery(
             reason: .stopRequested, isLive: false,
             packetsWritten: 0, cachedSegments: 0))
     }

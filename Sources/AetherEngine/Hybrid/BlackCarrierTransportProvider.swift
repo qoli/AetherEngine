@@ -8,8 +8,13 @@ import Foundation
 protocol BlackCarrierTransportProvider: HLSSegmentProvider {
     func prepareForTransportStart() throws
     func close()
+    func closeAndWaitForIOQuiescence() async
 }
 
 extension BlackCarrierTransportProvider {
     func prepareForTransportStart() throws {}
+
+    func closeAndWaitForIOQuiescence() async {
+        close()
+    }
 }

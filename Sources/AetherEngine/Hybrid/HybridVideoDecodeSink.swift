@@ -261,7 +261,41 @@ enum HybridVideoDecodeSinkError:
     case invalidDecodeDemand
     case invalidQueueBounds(bytes: Int, packets: Int)
     case packetQueueOverflow(bytes: Int, packets: Int)
+    case packetSpoolCapacityExceeded(bytes: Int, packets: Int)
+    case packetSpoolCreateFailed
+    case packetSpoolWriteFailed
+    case packetSpoolReadFailed
+    case packetSpoolCleanupFailed
+    case packetSpoolRecordCorrupt
+    case packetSideDataElementLimitExceeded(elements: Int, limit: Int)
+    case packetSpoolUnsupportedOpaqueMetadata
     case closed
+
+    var isPixelBufferConversionCapabilityFailure: Bool {
+        guard case .decoderFailed(
+            .pixelBufferConversionFailed
+        ) = self else {
+            return false
+        }
+        return true
+    }
+
+    var isLocalQueueInvariantFailure: Bool {
+        switch self {
+        case .packetQueueOverflow,
+             .packetSpoolCapacityExceeded,
+             .packetSpoolCreateFailed,
+             .packetSpoolWriteFailed,
+             .packetSpoolReadFailed,
+             .packetSpoolCleanupFailed,
+             .packetSpoolRecordCorrupt,
+             .packetSideDataElementLimitExceeded,
+             .packetSpoolUnsupportedOpaqueMetadata:
+            return true
+        default:
+            return false
+        }
+    }
 
     var errorDescription: String? {
         switch self {
@@ -315,6 +349,25 @@ enum HybridVideoDecodeSinkError:
             return "Hybrid compressed-video queue bounds are invalid: \(bytes) bytes / \(packets) packets"
         case .packetQueueOverflow(let bytes, let packets):
             return "Hybrid compressed-video queue exceeded its bound: \(bytes) bytes / \(packets) packets"
+        case .packetSpoolCapacityExceeded(let bytes, let packets):
+            return "Hybrid compressed-video disk backlog exceeded its local bound: \(bytes) bytes / \(packets) packets"
+        case .packetSpoolCreateFailed:
+            return "Hybrid compressed-video disk backlog could not create private scratch storage"
+        case .packetSpoolWriteFailed:
+            return "Hybrid compressed-video disk backlog could not persist a packet"
+        case .packetSpoolReadFailed:
+            return "Hybrid compressed-video disk backlog could not restore a packet"
+        case .packetSpoolCleanupFailed:
+            return "Hybrid compressed-video disk backlog could not retire packet storage losslessly"
+        case .packetSpoolRecordCorrupt:
+            return "Hybrid compressed-video disk backlog encountered an invalid packet record"
+        case .packetSideDataElementLimitExceeded(
+            let elements,
+            let limit
+        ):
+            return "Hybrid compressed-video packet has \(elements) side-data elements, exceeding the lossless backlog limit of \(limit)"
+        case .packetSpoolUnsupportedOpaqueMetadata:
+            return "Hybrid compressed-video packet contains opaque metadata that cannot be persisted losslessly"
         case .closed:
             return "Hybrid video decoder is closed"
         }
@@ -324,6 +377,25 @@ enum HybridVideoDecodeSinkError:
 enum HybridVideoDecoderPreference: Sendable, Equatable {
     case automatic
     case softwareHEVCRecovery
+}
+
+private final class HybridVideoBacklogCancellationGate:
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var cancellationRequested = false
+
+    var isCancellationRequested: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancellationRequested
+    }
+
+    func cancel() {
+        lock.lock()
+        cancellationRequested = true
+        lock.unlock()
+    }
 }
 
 /// Generation-aware adapter from the shared demux packet fanout to `DecodedVideoFrame`.
@@ -339,12 +411,6 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         weak var sink: HybridVideoDecodeSink?
     }
 
-    private struct QueuedPacket {
-        let packet: UnsafeMutablePointer<AVPacket>
-        let decodeTime: CMTime
-        let byteCount: Int
-    }
-
     let streamContract: HybridVideoStreamContract
 
     private let decoder: any VideoDecodingPipeline
@@ -354,8 +420,10 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
     private let lock = NSLock()
     private let operationLock = NSLock()
     private let presentationOrderLock = NSLock()
-    private let maximumQueuedBytes: Int
-    private let maximumQueuedPackets: Int
+    private let backlogCancellationGate:
+        HybridVideoBacklogCancellationGate
+    private let compressedBacklog:
+        HybridCompressedVideoBacklog
 
     private var generation: UInt64
     private var targetTime: CMTime
@@ -364,8 +432,6 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
     private var isClosed = false
     private var clockDecodeDemand: CMTime
     private var readinessDecodeLimit: CMTime
-    private var queuedPackets: [QueuedPacket] = []
-    private var queuedBytes = 0
     private var sourceEnded = false
     private var didFinishDecoder = false
     private var sourceOriginPacketPosition: Int64?
@@ -379,6 +445,7 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         HybridFramePresentationOrder<DecodedVideoFrame>
     private var presentationReadyFrames: [DecodedVideoFrame] = []
     private var presentationDrainIsActive = false
+    private var didLogBacklogSpill = false
 
     init(
         demuxer: Demuxer,
@@ -387,6 +454,9 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         sourceStartPTSOverride: Int64? = nil,
         maximumQueuedBytes: Int = 96 * 1_024 * 1_024,
         maximumQueuedPackets: Int = 8_192,
+        maximumSpoolContentBytes: Int = 256 * 1_024 * 1_024,
+        backlogScratchRoot: URL? = nil,
+        backlogIOChunkDidComplete: (() -> Void)? = nil,
         decoderPreference: HybridVideoDecoderPreference = .automatic,
         onFrame: @escaping FrameHandler,
         onFailure: FailureHandler? = nil
@@ -394,7 +464,9 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         guard Self.isValidTimelineTime(initialTargetTime) else {
             throw HybridVideoDecodeSinkError.invalidTargetTime
         }
-        guard maximumQueuedBytes > 0, maximumQueuedPackets > 0 else {
+        guard maximumQueuedBytes > 0,
+              maximumQueuedPackets > 0,
+              maximumSpoolContentBytes > 0 else {
             throw HybridVideoDecodeSinkError.invalidQueueBounds(
                 bytes: maximumQueuedBytes,
                 packets: maximumQueuedPackets
@@ -426,8 +498,32 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
             initialTargetTime,
             CMTime(seconds: 4, preferredTimescale: 600)
         )
-        self.maximumQueuedBytes = maximumQueuedBytes
-        self.maximumQueuedPackets = maximumQueuedPackets
+        let cancellationGate =
+            HybridVideoBacklogCancellationGate()
+        backlogCancellationGate = cancellationGate
+        do {
+            compressedBacklog = try HybridCompressedVideoBacklog(
+                configuration:
+                    HybridCompressedVideoBacklogConfiguration(
+                        residentByteLimit: maximumQueuedBytes,
+                        packetLimit: maximumQueuedPackets,
+                        spoolContentByteLimit:
+                            maximumSpoolContentBytes
+                    ),
+                scratchRoot: backlogScratchRoot,
+                shouldCancelIO: {
+                    cancellationGate
+                        .isCancellationRequested
+                },
+                ioChunkDidComplete:
+                    backlogIOChunkDidComplete
+            )
+        } catch {
+            throw HybridVideoDecodeSinkError.invalidQueueBounds(
+                bytes: maximumQueuedBytes,
+                packets: maximumQueuedPackets
+            )
+        }
         frameHandler = onFrame
         failureHandler = onFailure
         switch decoderPreference {
@@ -491,6 +587,18 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         return targetFrameReady
     }
 
+    var compressedBacklogSnapshot:
+        HybridCompressedVideoBacklogSnapshot
+    {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        return compressedBacklog.snapshot
+    }
+
+    var backlogCancellationRequestedForTesting: Bool {
+        backlogCancellationGate.isCancellationRequested
+    }
+
     var realVideoBitrateTelemetry:
         AetherHybridRealVideoBitrateTelemetry
     {
@@ -533,31 +641,38 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
             timeBaseDenominator:
                 streamContract.packetTimeBaseDenominator
         )
-        if queuedPackets.isEmpty,
+        if compressedBacklog.isEmpty,
            shouldDecode(decodeTime: decodeTime) {
             try decodePacketLocked(packet, decodeTime: decodeTime)
             return
         }
-        guard let copy = av_packet_clone(packet) else {
-            let error = HybridVideoDecodeSinkError.packetCloneFailed
-            recordFailure(error)
-            throw error
-        }
-        let byteCount = max(0, Int(copy.pointee.size))
-        queuedPackets.append(QueuedPacket(
-            packet: copy,
-            decodeTime: decodeTime,
-            byteCount: byteCount
-        ))
-        queuedBytes += byteCount
-        guard queuedBytes <= maximumQueuedBytes,
-              queuedPackets.count <= maximumQueuedPackets else {
-            let error = HybridVideoDecodeSinkError.packetQueueOverflow(
-                bytes: queuedBytes,
-                packets: queuedPackets.count
+        let priorSnapshot = compressedBacklog.snapshot
+        do {
+            try compressedBacklog.append(
+                packet: packet,
+                decodeTime: decodeTime
             )
-            recordFailure(error)
-            throw error
+        } catch {
+            let typed = Self.mapBacklogError(error)
+            if !Self.isBacklogCancellation(error) {
+                recordFailure(typed)
+            }
+            throw typed
+        }
+        let backlogSnapshot = compressedBacklog.snapshot
+        if !didLogBacklogSpill,
+           priorSnapshot.totalSpooledPackets == 0,
+           backlogSnapshot.totalSpooledPackets > 0 {
+            didLogBacklogSpill = true
+            EngineLog.emit(
+                "[HybridVideoDecodeSink] compressed backlog spill started "
+                    + "resident_content_bytes=\(backlogSnapshot.residentContentBytes) "
+                    + "resident_packets=\(backlogSnapshot.residentPackets) "
+                    + "queued_content_bytes=\(backlogSnapshot.queuedContentBytes) "
+                    + "queued_payload_bytes=\(backlogSnapshot.queuedPayloadBytes) "
+                    + "queued_packets=\(backlogSnapshot.queuedPackets)",
+                category: .session
+            )
         }
         try drainQueuedPacketsLocked()
     }
@@ -616,7 +731,7 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
             throw error
         }
         try throwIfUnavailable()
-        clearQueuedPacketsLocked()
+        try clearQueuedPacketsLocked()
         decoder.flush()
         try throwIfUnavailable()
         discardPendingPresentationFrames()
@@ -679,6 +794,7 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         }
         sourceEnded = false
         didFinishDecoder = false
+        didLogBacklogSpill = false
         realVideoBitrateAccumulator.reset()
     }
 
@@ -697,7 +813,7 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         operationLock.lock()
         defer { operationLock.unlock() }
         try throwIfUnavailable()
-        while !queuedPackets.isEmpty {
+        while !compressedBacklog.isEmpty {
             try decodeFirstQueuedPacketLocked()
         }
         sourceEnded = true
@@ -707,6 +823,7 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
     }
 
     func close() {
+        backlogCancellationGate.cancel()
         operationLock.lock()
         lock.lock()
         guard !isClosed else {
@@ -716,7 +833,17 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         }
         isClosed = true
         lock.unlock()
-        clearQueuedPacketsLocked()
+        let backlogSnapshot = compressedBacklog.snapshot
+        if let cleanupError = compressedBacklog.close() {
+            EngineLog.emit(
+                "[HybridVideoDecodeSink] compressed backlog cleanup failed "
+                    + "retained_spool_content_bytes=\(backlogSnapshot.spooledContentBytes) "
+                    + "retained_spool_packets=\(backlogSnapshot.spooledPackets) "
+                    + "error=\(String(describing: cleanupError))",
+                category: .session
+            )
+        }
+        logBacklogRetirement(backlogSnapshot)
         decoder.close()
         discardPendingPresentationFrames()
         operationLock.unlock()
@@ -1041,15 +1168,27 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
     }
 
     private func drainQueuedPacketsLocked() throws {
-        while let first = queuedPackets.first,
-              shouldDecode(decodeTime: first.decodeTime) {
+        while let decodeTime = compressedBacklog.firstDecodeTime(),
+              shouldDecode(decodeTime: decodeTime) {
             try decodeFirstQueuedPacketLocked()
         }
     }
 
     private func decodeFirstQueuedPacketLocked() throws {
-        let queued = queuedPackets.removeFirst()
-        queuedBytes -= queued.byteCount
+        let queued:
+            HybridCompressedVideoBacklog.DequeuedPacket
+        do {
+            guard let packet = try compressedBacklog.popFirst() else {
+                return
+            }
+            queued = packet
+        } catch {
+            let typed = Self.mapBacklogError(error)
+            if !Self.isBacklogCancellation(error) {
+                recordFailure(typed)
+            }
+            throw typed
+        }
         var packetToFree: UnsafeMutablePointer<AVPacket>? = queued.packet
         defer { trackedPacketFree(&packetToFree) }
         try decodePacketLocked(
@@ -1099,7 +1238,9 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
     }
 
     private func finishDecoderIfReadyLocked() throws {
-        guard sourceEnded, queuedPackets.isEmpty, !didFinishDecoder else {
+        guard sourceEnded,
+              compressedBacklog.isEmpty,
+              !didFinishDecoder else {
             return
         }
         didFinishDecoder = true
@@ -1197,13 +1338,87 @@ final class HybridVideoDecodeSink: @unchecked Sendable {
         frameHandler(frame)
     }
 
-    private func clearQueuedPacketsLocked() {
-        for queued in queuedPackets {
-            var packetToFree: UnsafeMutablePointer<AVPacket>? = queued.packet
-            trackedPacketFree(&packetToFree)
+    private func clearQueuedPacketsLocked() throws {
+        let snapshot = compressedBacklog.snapshot
+        do {
+            try compressedBacklog.resetForGeneration()
+        } catch {
+            let typed = Self.mapBacklogError(error)
+            recordFailure(typed)
+            throw typed
         }
-        queuedPackets.removeAll(keepingCapacity: true)
-        queuedBytes = 0
+        logBacklogRetirement(snapshot)
+    }
+
+    private func logBacklogRetirement(
+        _ snapshot: HybridCompressedVideoBacklogSnapshot
+    ) {
+        if snapshot.totalSpooledPackets > 0 {
+            EngineLog.emit(
+                "[HybridVideoDecodeSink] compressed backlog retired "
+                    + "max_resident_content_bytes=\(snapshot.maximumResidentContentBytes) "
+                    + "max_resident_packets=\(snapshot.maximumResidentPackets) "
+                    + "max_spooled_content_bytes=\(snapshot.maximumSpooledContentBytes) "
+                    + "spooled_packets=\(snapshot.totalSpooledPackets)",
+                category: .session
+            )
+        }
+    }
+
+    private static func mapBacklogError(
+        _ error: Error
+    ) -> HybridVideoDecodeSinkError {
+        guard let backlogError =
+                error as? HybridCompressedVideoBacklogError else {
+            return .packetSpoolRecordCorrupt
+        }
+        switch backlogError {
+        case .invalidConfiguration:
+            return .invalidQueueBounds(bytes: 0, packets: 0)
+        case .packetCloneFailed:
+            return .packetCloneFailed
+        case .packetLimitExceeded(let bytes, let packets):
+            return .packetQueueOverflow(
+                bytes: bytes,
+                packets: packets
+            )
+        case .spoolCapacityExceeded(let bytes, let packets):
+            return .packetSpoolCapacityExceeded(
+                bytes: bytes,
+                packets: packets
+            )
+        case .spoolCreateFailed:
+            return .packetSpoolCreateFailed
+        case .spoolWriteFailed:
+            return .packetSpoolWriteFailed
+        case .spoolReadFailed:
+            return .packetSpoolReadFailed
+        case .spoolCleanupFailed:
+            return .packetSpoolCleanupFailed
+        case .spoolRecordCorrupt:
+            return .packetSpoolRecordCorrupt
+        case .sideDataElementLimitExceeded(
+            let elements,
+            let limit
+        ):
+            return .packetSideDataElementLimitExceeded(
+                elements: elements,
+                limit: limit
+            )
+        case .unsupportedOpaquePacketMetadata:
+            return .packetSpoolUnsupportedOpaqueMetadata
+        case .cancelled:
+            return .closed
+        case .closed:
+            return .closed
+        }
+    }
+
+    private static func isBacklogCancellation(
+        _ error: Error
+    ) -> Bool {
+        error as? HybridCompressedVideoBacklogError
+            == .cancelled
     }
 
     private static func isValidTimelineTime(_ time: CMTime) -> Bool {

@@ -8,6 +8,126 @@ import Testing
 
 @Suite("Black carrier audio rendition pump", .serialized)
 struct BlackCarrierAudioRenditionMuxerTests {
+    @Test("AudioBridge rejects an unknown channel layout instead of guessing stereo")
+    func unknownChannelLayoutFailsClosed() throws {
+        var codecParameters: UnsafeMutablePointer<AVCodecParameters>? =
+            avcodec_parameters_alloc()
+        let parameters = try #require(codecParameters)
+        defer { avcodec_parameters_free(&codecParameters) }
+        parameters.pointee.codec_type = AVMEDIA_TYPE_AUDIO
+        parameters.pointee.codec_id = AV_CODEC_ID_PCM_S24LE
+        parameters.pointee.sample_rate = 48_000
+
+        do {
+            let bridge = try AudioBridge(
+                srcCodecpar: parameters,
+                srcTimeBase: AVRational(num: 1, den: 48_000),
+                mode: .lossless
+            )
+            bridge.close()
+            Issue.record(
+                "AudioBridge unexpectedly guessed a channel layout"
+            )
+        } catch let error as AudioBridge.AudioBridgeError {
+            #expect(
+                error == .sourceChannelLayoutUnavailable(
+                    containerChannels: 0,
+                    decoderChannels: 0
+                )
+            )
+        }
+    }
+
+    @Test("A positive channel count admits FFmpeg's unspecified-order layout")
+    func unspecifiedChannelOrderWithKnownCountIsUsable() {
+        var layout = AVChannelLayout()
+        layout.order = AV_CHANNEL_ORDER_UNSPEC
+        layout.nb_channels = 6
+
+        #expect(
+            AudioBridge.channelLayoutIsUsable(&layout)
+        )
+    }
+
+    @Test("PCM S24LE is admitted by the lossless AudioBridge")
+    func pcmS24LELosslessBridge() throws {
+        let demuxer = Demuxer()
+        try demuxer.open(reader: DataIOReader(data: makeWAV24(
+            sampleRate: 48_000,
+            channels: 6,
+            seconds: 0.02
+        )))
+        defer { demuxer.close() }
+
+        let sourceStream = try #require(
+            demuxer.stream(at: demuxer.audioStreamIndex)
+        )
+        #expect(
+            sourceStream.pointee.codecpar.pointee.codec_id
+                == AV_CODEC_ID_PCM_S24LE
+        )
+
+        let bridge = try AudioBridge(
+            srcCodecpar: sourceStream.pointee.codecpar,
+            srcTimeBase: sourceStream.pointee.time_base,
+            mode: .lossless
+        )
+        defer { bridge.close() }
+
+        let encoderParameters = try #require(bridge.encoderCodecpar)
+        #expect(encoderParameters.pointee.codec_id == AV_CODEC_ID_FLAC)
+        #expect(encoderParameters.pointee.bits_per_raw_sample == 24)
+        #expect(encoderParameters.pointee.ch_layout.nb_channels == 6)
+    }
+
+    @Test("PCM S24LE is admitted by the default surround AudioBridge")
+    func pcmS24LESurroundBridge() throws {
+        let demuxer = Demuxer()
+        try demuxer.open(reader: DataIOReader(data: makeWAV24(
+            sampleRate: 48_000,
+            channels: 6,
+            seconds: 0.08
+        )))
+        defer { demuxer.close() }
+
+        let sourceStream = try #require(
+            demuxer.stream(at: demuxer.audioStreamIndex)
+        )
+        let bridge = try AudioBridge(
+            srcCodecpar: sourceStream.pointee.codecpar,
+            srcTimeBase: sourceStream.pointee.time_base,
+            mode: .surroundCompat
+        )
+        defer { bridge.close() }
+
+        let encoderParameters = try #require(bridge.encoderCodecpar)
+        #expect(encoderParameters.pointee.codec_id == AV_CODEC_ID_EAC3)
+        #expect(encoderParameters.pointee.ch_layout.nb_channels == 6)
+
+        var encodedPacketCount = 0
+        while let packet = try demuxer.readPacket() {
+            var packetToFree: UnsafeMutablePointer<AVPacket>? = packet
+            defer { trackedPacketFree(&packetToFree) }
+            guard packet.pointee.stream_index
+                    == demuxer.audioStreamIndex else {
+                continue
+            }
+            for encodedPacket in try bridge.feed(packet: packet) {
+                var encodedPacketToFree:
+                    UnsafeMutablePointer<AVPacket>? = encodedPacket
+                defer { trackedPacketFree(&encodedPacketToFree) }
+                encodedPacketCount += 1
+            }
+        }
+        for encodedPacket in bridge.flush() {
+            var encodedPacketToFree:
+                UnsafeMutablePointer<AVPacket>? = encodedPacket
+            defer { trackedPacketFree(&encodedPacketToFree) }
+            encodedPacketCount += 1
+        }
+        #expect(encodedPacketCount > 0)
+    }
+
     @Test("PCM source bridges to EAC3 and follows the carrier segment timeline")
     func bridgedPCM() throws {
         let sourceData = makeWAV(
@@ -894,6 +1014,61 @@ struct BlackCarrierAudioRenditionMuxerTests {
         appendUInt32(UInt32(sampleRate * channels * 2))
         appendUInt16(UInt16(channels * 2))
         appendUInt16(16)
+        appendString("data")
+        appendUInt32(UInt32(pcm.count))
+        data.append(pcm)
+        return data
+    }
+
+    private func makeWAV24(
+        sampleRate: Int,
+        channels: Int,
+        seconds: Double
+    ) -> Data {
+        let frames = Int(Double(sampleRate) * seconds)
+        var pcm = Data(capacity: frames * channels * 3)
+        for frame in 0..<frames {
+            let value = Int32(
+                2_000_000
+                    * sin(
+                        2 * .pi * 440 * Double(frame)
+                            / Double(sampleRate)
+                    )
+            )
+            let littleEndian = value.littleEndian
+            for _ in 0..<channels {
+                withUnsafeBytes(of: littleEndian) {
+                    pcm.append(contentsOf: $0.prefix(3))
+                }
+            }
+        }
+
+        var data = Data()
+        func appendString(_ value: String) {
+            data.append(value.data(using: .ascii)!)
+        }
+        func appendUInt32(_ value: UInt32) {
+            withUnsafeBytes(of: value.littleEndian) {
+                data.append(contentsOf: $0)
+            }
+        }
+        func appendUInt16(_ value: UInt16) {
+            withUnsafeBytes(of: value.littleEndian) {
+                data.append(contentsOf: $0)
+            }
+        }
+
+        appendString("RIFF")
+        appendUInt32(UInt32(36 + pcm.count))
+        appendString("WAVE")
+        appendString("fmt ")
+        appendUInt32(16)
+        appendUInt16(1)
+        appendUInt16(UInt16(channels))
+        appendUInt32(UInt32(sampleRate))
+        appendUInt32(UInt32(sampleRate * channels * 3))
+        appendUInt16(UInt16(channels * 3))
+        appendUInt16(24)
         appendString("data")
         appendUInt32(UInt32(pcm.count))
         data.append(pcm)

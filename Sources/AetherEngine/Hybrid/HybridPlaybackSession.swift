@@ -52,11 +52,27 @@ public enum HybridPlaybackFailureStage:
     case carrier
 }
 
+public enum HybridPlaybackFailureCategory:
+    String,
+    Sendable,
+    Equatable
+{
+    case routeRuntime
+    case transientTransport
+    case authentication
+    case security
+    case unsupportedCapability
+    case malformedMedia
+    case cancelled
+    case invariant
+}
+
 public struct HybridPlaybackFailureEvidence:
     Sendable,
     Equatable
 {
     public let stage: HybridPlaybackFailureStage
+    public let category: HybridPlaybackFailureCategory
     public let caseCode: String
     public let underlyingDomain: String
     public let underlyingCode: Int
@@ -65,6 +81,7 @@ public struct HybridPlaybackFailureEvidence:
 
     public init(
         stage: HybridPlaybackFailureStage,
+        category: HybridPlaybackFailureCategory = .routeRuntime,
         caseCode: String,
         underlyingDomain: String,
         underlyingCode: Int,
@@ -72,6 +89,7 @@ public struct HybridPlaybackFailureEvidence:
         recoveryStep: AetherPlaybackRecoveryStep? = nil
     ) {
         self.stage = stage
+        self.category = category
         self.caseCode = caseCode
         self.underlyingDomain = underlyingDomain
         self.underlyingCode = underlyingCode
@@ -81,6 +99,7 @@ public struct HybridPlaybackFailureEvidence:
 
     init(
         stage: HybridPlaybackFailureStage,
+        category: HybridPlaybackFailureCategory = .routeRuntime,
         caseCode: String,
         error: Error,
         recoveryTrigger: AetherPlaybackRecoveryTrigger? = nil,
@@ -89,6 +108,7 @@ public struct HybridPlaybackFailureEvidence:
         let nsError = error as NSError
         self.init(
             stage: stage,
+            category: category,
             caseCode: caseCode,
             underlyingDomain: nsError.domain,
             underlyingCode: nsError.code,
@@ -311,6 +331,12 @@ protocol HybridCarrierTransportProvider:
     func sourceTrackID(
         forAudioOrdinal ordinal: Int
     ) -> Int?
+    func setRoutePreparationProgressHandler(
+        _ handler:
+            (@Sendable (
+                AetherRoutePreparationProgressKind
+            ) -> Void)?
+    )
 
     func restartMedia(
         for intent: HybridSeekIntent
@@ -321,6 +347,15 @@ protocol HybridCarrierTransportProvider:
 
 extension HybridCarrierTransportProvider {
     var progressiveSourceFacts: AetherProgressiveSourceFacts? { nil }
+
+    func setRoutePreparationProgressHandler(
+        _ handler:
+            (@Sendable (
+                AetherRoutePreparationProgressKind
+            ) -> Void)?
+    ) {
+        _ = handler
+    }
 }
 
 extension BlackCarrierLazyCompositeProvider:
@@ -338,6 +373,15 @@ protocol HybridPlaybackTerminalErrorSource:
                 HybridPlaybackSessionError
             ) -> Void)?
     )
+}
+
+/// Nonblocking evidence that the current carrier generation is still
+/// producing a requested segment. Implementations must not wait on source,
+/// demux, decode or segment-cache I/O when sampling this value.
+protocol HybridCarrierSegmentProductionActivitySource:
+    Sendable
+{
+    var isCarrierSegmentProductionActive: Bool { get }
 }
 
 protocol HybridAudioAnalysisSource: Sendable {
@@ -366,9 +410,26 @@ protocol HybridCarrierPlayerTransport: AnyObject {
         timeout: TimeInterval
     ) async -> Bool
     func stop()
+    func setRoutePreparationRetryEventHandler(
+        _ handler:
+            (@MainActor @Sendable (
+                AetherRoutePreparationRetryEvent
+            ) -> Void)?
+    )
 }
 
 extension BlackCarrierAVPlayerSession: HybridCarrierPlayerTransport {}
+
+extension HybridCarrierPlayerTransport {
+    func setRoutePreparationRetryEventHandler(
+        _ handler:
+            (@MainActor @Sendable (
+                AetherRoutePreparationRetryEvent
+            ) -> Void)?
+    ) {
+        _ = handler
+    }
+}
 
 @MainActor
 protocol HybridPlaybackRenderSurface: AnyObject {
@@ -436,57 +497,6 @@ extension AetherHybridPresentationView: HybridPlaybackRenderSurface {
     var retainsAcceptedFramesUntilCapacityCallback: Bool { true }
 }
 
-@MainActor
-private final class HybridSeekDeadlineRace<Value: Sendable> {
-    private var continuation:
-        CheckedContinuation<Value, Error>?
-    private var operationTask: Task<Void, Never>?
-    private var timeoutTask: Task<Void, Never>?
-
-    func start(
-        continuation: CheckedContinuation<Value, Error>,
-        timeout: TimeInterval,
-        timeoutError: HybridPlaybackSessionError,
-        operation: @escaping @Sendable () async throws -> Value
-    ) {
-        self.continuation = continuation
-        operationTask = Task { @MainActor [self] in
-            do {
-                let value = try await operation()
-                resolve(.success(value))
-            } catch {
-                resolve(.failure(error))
-            }
-        }
-        timeoutTask = Task { @MainActor [self] in
-            do {
-                try await Task.sleep(
-                    nanoseconds: UInt64(
-                        timeout * 1_000_000_000
-                    )
-                )
-            } catch {
-                return
-            }
-            resolve(.failure(timeoutError))
-        }
-    }
-
-    func cancel() {
-        resolve(.failure(CancellationError()))
-    }
-
-    private func resolve(_ result: Result<Value, Error>) {
-        guard let continuation else { return }
-        self.continuation = nil
-        operationTask?.cancel()
-        timeoutTask?.cancel()
-        operationTask = nil
-        timeoutTask = nil
-        continuation.resume(with: result)
-    }
-}
-
 actor HybridPlaybackProviderCoordinator {
     /// The provider is Sendable and owns the lock/generation boundary that
     /// linearizes a restart against in-flight production. Restart must not be
@@ -511,6 +521,15 @@ actor HybridPlaybackProviderCoordinator {
 
     func prepareInitialGeneration() throws {
         try provider.prepareForTransportStart()
+    }
+
+    nonisolated func setRoutePreparationProgressHandler(
+        _ handler:
+            (@Sendable (
+                AetherRoutePreparationProgressKind
+            ) -> Void)?
+    ) {
+        provider.setRoutePreparationProgressHandler(handler)
     }
 
     nonisolated func restart(
@@ -540,6 +559,10 @@ actor HybridPlaybackProviderCoordinator {
     {
         terminalErrorSource?
             .terminalHybridPlaybackError
+    }
+
+    func closeAndWaitForIOQuiescence() async {
+        await provider.closeAndWaitForIOQuiescence()
     }
 
     func setAudioAnalysisPlaybackPressure(
@@ -837,11 +860,10 @@ final class HybridPlaybackSession {
     nonisolated private static let observedJumpThresholdSeconds = 0.5
     /// Natural carrier completion is only provisional until the exact finite
     /// timeline demand has crossed the provider coordinator and every decoded
-    /// frame has left the engine relay for the presentation surface. This is a
-    /// short fail-closed budget, not extra decode lookahead: normal playback
-    /// remains bounded to `decodeLookahead` and only a positively admitted VOD
-    /// can enter this drain.
-    nonisolated static let carrierCompletionDrainTimeoutSeconds = 5.0
+    /// frame has left the engine relay for the presentation surface. Elapsed
+    /// time is diagnostic-only here: a weak origin may still be advancing the
+    /// same typed provider task, so only provider failure or cancellation may
+    /// end the drain before completion.
     nonisolated private static let carrierCompletionDrainPollNanoseconds:
         UInt64 = 10_000_000
     /// `didPlayToEnd` normally lands on the exact carrier duration, but its
@@ -867,6 +889,8 @@ final class HybridPlaybackSession {
     private let coordinator: HybridPlaybackProviderCoordinator
     private let providerTelemetrySampler:
         HybridProviderTelemetrySampler
+    private let carrierSegmentProductionActivitySource:
+        (any HybridCarrierSegmentProductionActivitySource)?
     private let timeline: BlackCarrierTimeline
     private let internalPresentationRebuildTimeout: TimeInterval
     /// False only for positively admitted source-audio-only carrier sessions.
@@ -981,6 +1005,10 @@ final class HybridPlaybackSession {
         (@MainActor @Sendable (Int?) -> Void)?
     var runtimePresentationValidation:
         (@MainActor () throws -> Void) = {}
+    var routePreparationRetryEventDidChange:
+        (@MainActor @Sendable (
+            AetherRoutePreparationRetryEvent
+        ) -> Void)?
 
     var sourceVideoFormat: VideoFormat {
         videoFormat
@@ -1108,6 +1136,9 @@ final class HybridPlaybackSession {
         coordinator = HybridPlaybackProviderCoordinator(provider: provider)
         providerTelemetrySampler =
             HybridProviderTelemetrySampler(provider: provider)
+        carrierSegmentProductionActivitySource =
+            provider as?
+                any HybridCarrierSegmentProductionActivitySource
         self.timeline = timeline
         self.internalPresentationRebuildTimeout =
             internalPresentationRebuildTimeout
@@ -1296,6 +1327,10 @@ final class HybridPlaybackSession {
                     }
                 }
         }
+        transport.setRoutePreparationRetryEventHandler {
+            [weak self] event in
+            self?.routePreparationRetryEventDidChange?(event)
+        }
     }
 
     static func makeSeekableVOD(
@@ -1305,29 +1340,57 @@ final class HybridPlaybackSession {
         timeline: BlackCarrierTimeline,
         avPlayer: AVPlayer = AVPlayer(),
         decoderPreference: HybridVideoDecoderPreference = .automatic,
+        videoBacklogConfiguration:
+            HybridCompressedVideoBacklogConfiguration = .production,
+        videoBacklogScratchRoot: URL? = nil,
         initialGeneration: UInt64 = 0,
         selectTitleID: Int? = nil
     ) async throws -> HybridPlaybackSession {
         let relay = HybridPlaybackFrameRelay()
-        let provider = try await Task.detached {
-            let videoProvider = try BlackCarrierVideoProvider(
-                timeline: timeline
-            )
-            return try BlackCarrierLazyCompositeProvider
-                .buildSeekableVOD(
-                    videoProvider: videoProvider,
-                    source: source,
-                    preparedURLSource: preparedURLSource,
-                    options: options,
-                    timeline: timeline,
-                    bridgeMode: options.audioBridgeMode,
-                    decodedFrameHandler: { relay.emit($0) },
-                    videoFailureHandler: { relay.fail($0) },
-                    decoderPreference: decoderPreference,
-                    initialGeneration: initialGeneration,
-                    selectTitleID: selectTitleID
+        let provider: BlackCarrierLazyCompositeProvider
+        do {
+            provider = try await Task.detached {
+                let videoProvider = try BlackCarrierVideoProvider(
+                    timeline: timeline
                 )
-        }.value
+                return try BlackCarrierLazyCompositeProvider
+                    .buildSeekableVOD(
+                        videoProvider: videoProvider,
+                        source: source,
+                        preparedURLSource:
+                            preparedURLSource,
+                        options: options,
+                        timeline: timeline,
+                        bridgeMode:
+                            options.audioBridgeMode,
+                        decodedFrameHandler: {
+                            relay.emit($0)
+                        },
+                        videoFailureHandler: {
+                            relay.fail($0)
+                        },
+                        decoderPreference:
+                            decoderPreference,
+                        videoBacklogConfiguration:
+                            videoBacklogConfiguration,
+                        videoBacklogScratchRoot:
+                            videoBacklogScratchRoot,
+                        initialGeneration:
+                            initialGeneration,
+                        selectTitleID: selectTitleID
+                    )
+            }.value
+        } catch {
+            relay.detach()
+            if let typed = BlackCarrierLazyCompositeProvider
+                .hybridPlaybackSessionError(
+                    from: error,
+                    stage: .routeCreation
+                ) {
+                throw typed
+            }
+            throw error
+        }
         do {
             try Task.checkCancellation()
         } catch {
@@ -1372,24 +1435,40 @@ final class HybridPlaybackSession {
         selectTitleID: Int? = nil
     ) async throws -> HybridPlaybackSession {
         let relay = HybridPlaybackFrameRelay()
-        let provider = try await Task.detached {
-            let videoProvider = try BlackCarrierVideoProvider(
-                timeline: timeline
-            )
-            return try BlackCarrierLazyCompositeProvider
-                .buildSeekableVOD(
-                    videoProvider: videoProvider,
-                    source: source,
-                    preparedURLSource: preparedURLSource,
-                    options: options,
-                    timeline: timeline,
-                    bridgeMode: options.audioBridgeMode,
-                    decodedFrameHandler: nil,
-                    videoFailureHandler: nil,
-                    initialGeneration: initialGeneration,
-                    selectTitleID: selectTitleID
+        let provider: BlackCarrierLazyCompositeProvider
+        do {
+            provider = try await Task.detached {
+                let videoProvider = try BlackCarrierVideoProvider(
+                    timeline: timeline
                 )
-        }.value
+                return try BlackCarrierLazyCompositeProvider
+                    .buildSeekableVOD(
+                        videoProvider: videoProvider,
+                        source: source,
+                        preparedURLSource:
+                            preparedURLSource,
+                        options: options,
+                        timeline: timeline,
+                        bridgeMode:
+                            options.audioBridgeMode,
+                        decodedFrameHandler: nil,
+                        videoFailureHandler: nil,
+                        initialGeneration:
+                            initialGeneration,
+                        selectTitleID: selectTitleID
+                    )
+            }.value
+        } catch {
+            relay.detach()
+            if let typed = BlackCarrierLazyCompositeProvider
+                .hybridPlaybackSessionError(
+                    from: error,
+                    stage: .routeCreation
+                ) {
+                throw typed
+            }
+            throw error
+        }
         do {
             try Task.checkCancellation()
         } catch {
@@ -1427,7 +1506,7 @@ final class HybridPlaybackSession {
         decoderPreference: HybridVideoDecoderPreference = .automatic,
         initialGeneration: UInt64 = 0,
         transportRetryBudget: PlaybackTransportRetryBudget = .init(
-            maximumFailureAttempts: 3
+            maximumFailureAttempts: nil
         ),
         fetchOverride:
             HLSVODOriginResourceLoader.Fetch? = nil
@@ -1554,7 +1633,6 @@ final class HybridPlaybackSession {
                 timeline.segmentIndex(containing: target) else {
             throw HybridPlaybackSessionError.invalidSeekTarget
         }
-        let deadline = ProcessInfo.processInfo.systemUptime + timeout
         state = .preparing(generation: generation, target: target)
 
         do {
@@ -1592,7 +1670,16 @@ final class HybridPlaybackSession {
             try await coordinator.prepareInitialGeneration()
             try ensureActiveGeneration(generation)
             try presentationValidation()
+            // Upstream preparation may make slow but valid byte progress for
+            // an arbitrarily long time. Carrier and presentation readiness
+            // likewise remain pending until positive readiness, a typed
+            // structural failure, or cancellation. `timeout` is retained for
+            // source compatibility and diagnostics only; elapsed wall time is
+            // never terminal.
             try transport.startPrepared()
+            try await transport.prepare(
+                timeout: timeout
+            )
             try bindCarrierClock()
             if let nativeWebVTTBridge {
                 guard let item = avPlayer.currentItem else {
@@ -1602,12 +1689,6 @@ final class HybridPlaybackSession {
                 try nativeWebVTTBridge.attach(to: item)
             }
             installClockObservers()
-            try await transport.prepare(
-                timeout: try remainingTime(
-                    until: deadline,
-                    originalTimeout: timeout
-                )
-            )
             await refreshSelectedAudioAnalysisTrackIDFromCarrier()
             try ensureActiveGeneration(generation)
             try validateCarrierClock()
@@ -1623,9 +1704,7 @@ final class HybridPlaybackSession {
             )
             if videoExpected {
                 try await waitForPresentationReadiness(
-                    generation: generation,
-                    deadline: deadline,
-                    originalTimeout: timeout
+                    generation: generation
                 )
             }
             let initialTime = avPlayer.currentTime()
@@ -1658,6 +1737,15 @@ final class HybridPlaybackSession {
             terminate(with: typed)
             throw typed
         }
+    }
+
+    func setRoutePreparationProgressHandler(
+        _ handler:
+            (@Sendable (
+                AetherRoutePreparationProgressKind
+            ) -> Void)?
+    ) {
+        coordinator.setRoutePreparationProgressHandler(handler)
     }
 
     func play() throws {
@@ -2027,11 +2115,17 @@ final class HybridPlaybackSession {
         relay.detach()
         renderSurface.invalidate()
         transport.stop()
+        transport.setRoutePreparationRetryEventHandler(nil)
         displayCriteriaController.reset()
         EngineLog.emit(
             "[HybridPlaybackSession] stopped",
             category: .session
         )
+    }
+
+    func stopAndWaitForIOQuiescence() async {
+        stop()
+        await coordinator.closeAndWaitForIOQuiescence()
     }
 
     private func removeAudioAnalysisSession(id: UUID) {
@@ -2129,6 +2223,34 @@ final class HybridPlaybackSession {
             generation: generation,
             reason: error.localizedDescription
         )
+        if error.isPixelBufferConversionCapabilityFailure {
+            terminate(with: .providerFailed(
+                HybridPlaybackFailureEvidence(
+                    stage: .runtime,
+                    category: .unsupportedCapability,
+                    caseCode:
+                        "videoDecoder.pixelBufferConversionFailed",
+                    underlyingDomain:
+                        "AetherEngine.HybridVideoDecodeSink",
+                    underlyingCode: 1
+                )
+            ))
+            return
+        }
+        if error.isLocalQueueInvariantFailure {
+            terminate(with: .providerFailed(
+                HybridPlaybackFailureEvidence(
+                    stage: .runtime,
+                    category: .invariant,
+                    caseCode:
+                        "progressive.videoDecoder.localQueueInvariant",
+                    underlyingDomain:
+                        "AetherEngine.HybridVideoDecodeSink",
+                    underlyingCode: 3
+                )
+            ))
+            return
+        }
         terminate(with: .decoderFailed(
             reason: error.localizedDescription
         ))
@@ -2233,7 +2355,6 @@ final class HybridPlaybackSession {
         readinessPrerollFramesRejected = 0
         didEmitPlaybackCompletedTelemetry = false
 
-        let deadline = ProcessInfo.processInfo.systemUptime + timeout
         var recoveryStep: AetherPlaybackRecoveryStep = .providerRestart
         let resumeIntent: ResumeIntent
         if let pendingResumeIntent {
@@ -2280,14 +2401,10 @@ final class HybridPlaybackSession {
                     segmentIndex: segmentIndex
                 )
             }
-            let restart = try await performWithinSeekDeadline(
-                step: .providerRestart,
-                generation: generation,
-                deadline: deadline,
-                originalTimeout: timeout
-            ) { [coordinator] in
-                try await coordinator.restart(for: intent)
-            }
+            // Provider work is same-source network I/O. Its AVIO boundary
+            // owns progress-aware retry and cancellation; a seek-wide wall
+            // clock cannot distinguish slow valid bytes from dead transport.
+            let restart = try await coordinator.restart(for: intent)
             switch restart {
             case .applied:
                 break
@@ -2316,10 +2433,7 @@ final class HybridPlaybackSession {
                     ProcessInfo.processInfo.systemUptime + 2
                 let landed = await transport.seek(
                     to: target,
-                    timeout: try remainingTime(
-                        until: deadline,
-                        originalTimeout: timeout
-                    )
+                    timeout: timeout
                 )
                 guard generation == classifier.generation else {
                     return supersededResult(
@@ -2350,16 +2464,9 @@ final class HybridPlaybackSession {
             // the paused, pre-seek renderer cannot release those frames until
             // the carrier timebase reaches the target.
             recoveryStep = .providerPrepare
-            try await performWithinSeekDeadline(
-                step: .providerPrepare,
-                generation: generation,
-                deadline: deadline,
-                originalTimeout: timeout
-            ) { [coordinator] in
-                try await coordinator.prepareGeneration(
-                    segmentIndex: segmentIndex
-                )
-            }
+            try await coordinator.prepareGeneration(
+                segmentIndex: segmentIndex
+            )
             guard generation == classifier.generation else {
                 return supersededResult(
                     currentGeneration: classifier.generation
@@ -2369,9 +2476,7 @@ final class HybridPlaybackSession {
             if videoExpected {
                 recoveryStep = .presentationReadiness
                 try await waitForPresentationReadiness(
-                    generation: generation,
-                    deadline: deadline,
-                    originalTimeout: timeout
+                    generation: generation
                 )
             }
             guard generation == classifier.generation else {
@@ -2413,6 +2518,14 @@ final class HybridPlaybackSession {
                             "AetherEngine.HybridPresentationRebuild",
                         underlyingCode: Int(seconds.rounded(.up)),
                         recoveryTrigger: recoveryTrigger,
+                        recoveryStep: recoveryStep
+                    )
+                )
+            }
+            if case .readinessTimedOut(let seconds) = typed {
+                throw HybridPlaybackSessionError.providerFailed(
+                    Self.seekTimeoutFailureEvidence(
+                        seconds: seconds,
                         recoveryStep: recoveryStep
                     )
                 )
@@ -2663,6 +2776,17 @@ final class HybridPlaybackSession {
         reevaluateAudioAnalysisPlaybackPressure(
             allowClearingStall: false
         )
+        if carrierSegmentProductionActivitySource?
+                .isCarrierSegmentProductionActive == true {
+            EngineLog.emit(
+                "[HybridPlaybackSession] carrier stall "
+                    + "action=continueBuffering "
+                    + "reason=carrierSegmentProductionActive "
+                    + "generation=\(classifier.generation)",
+                category: .session
+            )
+            return
+        }
         rebuildPresentationAtCarrierTime(
             trigger: .playbackStalled
         )
@@ -3210,11 +3334,54 @@ final class HybridPlaybackSession {
         generation: UInt64
     ) {
         carrierCompletionDrainTask?.cancel()
-        let deadline = ProcessInfo.processInfo.systemUptime
-            + Self.carrierCompletionDrainTimeoutSeconds
         carrierCompletionDrainTask = Task {
             @MainActor [weak self] in
             guard let self else { return }
+            let diagnosticTask = Task {
+                @MainActor [weak self] in
+                guard let self else { return }
+                await AetherLivenessDiagnosticScheduler(
+                    policy: .production
+                ).run(
+                    while: { [weak self] in
+                        guard let self else {
+                            return false
+                        }
+                        return self
+                            .pendingCarrierCompletionGeneration
+                                == generation
+                            && self.state
+                                == .ready(
+                                    generation:
+                                        generation
+                                )
+                    },
+                    onCheckpoint: {
+                        [weak self] elapsed in
+                        guard let self else { return }
+                        let relayDiagnostics =
+                            self.relay.diagnostics
+                        EngineLog.emit(
+                            "[HybridPlaybackSession] "
+                                + "carrier completion drain "
+                                + "still active generation="
+                                + "\(generation) "
+                                + "elapsed="
+                                + "\(Int(elapsed))s "
+                                + "decodeWorker="
+                                + "\(self.decodeDemandWorker != nil) "
+                                + "pendingDemand="
+                                + "\(self.latestDecodeDemand != nil) "
+                                + "queuedFrames="
+                                + "\(relayDiagnostics.queuedFrames)",
+                            category: .session
+                        )
+                    }
+                )
+            }
+            defer {
+                diagnosticTask.cancel()
+            }
             while !Task.isCancelled {
                 guard self.pendingCarrierCompletionGeneration
                         == generation,
@@ -3228,22 +3395,6 @@ final class HybridPlaybackSession {
                    relayDiagnostics.queuedFrames == 0 {
                     self.finishCarrierCompletionDrain(
                         generation: generation
-                    )
-                    return
-                }
-
-                if ProcessInfo.processInfo.systemUptime >= deadline {
-                    self.terminate(
-                        with: .providerFailed(
-                            HybridPlaybackFailureEvidence(
-                                stage: .runtime,
-                                caseCode:
-                                    "carrierCompletionVideoDrainTimedOut",
-                                underlyingDomain:
-                                    "AetherEngine.HybridCarrierCompletionDrain",
-                                underlyingCode: 1
-                            )
-                        )
                     )
                     return
                 }
@@ -3290,11 +3441,9 @@ final class HybridPlaybackSession {
     }
 
     private func waitForPresentationReadiness(
-        generation: UInt64,
-        deadline: TimeInterval,
-        originalTimeout: TimeInterval
+        generation: UInt64
     ) async throws {
-        while ProcessInfo.processInfo.systemUptime < deadline {
+        while true {
             try ensureActiveGeneration(generation)
             switch readinessGate.state {
             case .ready(let readyGeneration, _)
@@ -3312,64 +3461,6 @@ final class HybridPlaybackSession {
                 throw HybridPlaybackSessionError.cancelled
             }
             try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        throw HybridPlaybackSessionError.readinessTimedOut(
-            seconds: originalTimeout
-        )
-    }
-
-    private func remainingTime(
-        until deadline: TimeInterval,
-        originalTimeout: TimeInterval
-    ) throws -> TimeInterval {
-        let remaining =
-            deadline - ProcessInfo.processInfo.systemUptime
-        guard remaining > 0 else {
-            throw HybridPlaybackSessionError.readinessTimedOut(
-                seconds: originalTimeout
-            )
-        }
-        return remaining
-    }
-
-    private func performWithinSeekDeadline<Value: Sendable>(
-        step: AetherPlaybackRecoveryStep,
-        generation: UInt64,
-        deadline: TimeInterval,
-        originalTimeout: TimeInterval,
-        operation: @escaping @Sendable () async throws -> Value
-    ) async throws -> Value {
-        let remaining = try remainingTime(
-            until: deadline,
-            originalTimeout: originalTimeout
-        )
-        let race = HybridSeekDeadlineRace<Value>()
-        do {
-            return try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation {
-                    continuation in
-                    race.start(
-                        continuation: continuation,
-                        timeout: remaining,
-                        timeoutError: .readinessTimedOut(
-                            seconds: originalTimeout
-                        ),
-                        operation: operation
-                    )
-                }
-            } onCancel: {
-                Task { @MainActor in race.cancel() }
-            }
-        } catch let error as HybridPlaybackSessionError {
-            if case .readinessTimedOut = error {
-                EngineLog.emit(
-                    "[HybridPlaybackSession] seek deadline exceeded "
-                        + "generation=\(generation) step=\(step) "
-                        + "budget=\(originalTimeout)s",
-                    category: .session
-                )
-            }
-            throw error
         }
     }
 
@@ -3616,6 +3707,20 @@ final class HybridPlaybackSession {
                 caseCode: "seek",
                 error: error
             )
+        )
+    }
+
+    nonisolated static func seekTimeoutFailureEvidence(
+        seconds: TimeInterval,
+        recoveryStep: AetherPlaybackRecoveryStep
+    ) -> HybridPlaybackFailureEvidence {
+        HybridPlaybackFailureEvidence(
+            stage: .seek,
+            category: .transientTransport,
+            caseCode: "seekTimedOut",
+            underlyingDomain: "AetherEngine.HybridSeek",
+            underlyingCode: Int(seconds.rounded(.up)),
+            recoveryStep: recoveryStep
         )
     }
 

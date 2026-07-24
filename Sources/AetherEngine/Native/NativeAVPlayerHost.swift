@@ -21,8 +21,6 @@ final class NativeAVPlayerHost {
     @Published private(set) var duration: Double = 0
     @Published private(set) var rate: Float = 0
     @Published private(set) var failureMessage: String?
-    /// #50: monotonic token; bumped on each deferred .failed so a superseding failure or item swap cancels the in-flight confirmation.
-    private var failureConfirmToken: Int = 0
     /// #50: latched on first .playing; discriminates startup failures (never played) from mid-playback transients. .failed and timeControlStatus KVOs are unsynchronized, so instantaneous status is unreliable. Reset with the item on a reused host.
     private var hasEverPlayed = false
     @Published private(set) var didReachEnd: Bool = false
@@ -31,25 +29,30 @@ final class NativeAVPlayerHost {
     /// Monotonic count of AVPlayerItem playbackStalled notifications (#93 residual): the engine
     /// opens its spurious-pause recovery window on each stall.
     @Published private(set) var stallCount: Int = 0
-    /// Monotonic count of loopback-path `failedToPlayToEndTime` deaths after playback was
-    /// established (#93 round 3). Accumulated -12889 media timeouts fail the item with tcs parked
-    /// at .paused, which every pause-guarded recovery layer misreads as user intent; the engine
-    /// subscribes and escalates into the stage-2 item reload with the pause guard bypassed.
+    /// Monotonic same-item recovery signal. Generic `item.status == .failed`
+    /// and `failedToPlayToEndTime` evidence are transport-inconclusive: the
+    /// engine subscribes and reloads this exact asset on this exact host with
+    /// progress-aware unbounded backoff. Positive display rejection is the
+    /// only AVPlayer-owned failure that bypasses this signal.
     @Published private(set) var endFailureCount: Int = 0
 
     /// Published when a startup `.failed` is a display-rejection of the served master (#98). The
-    /// engine's fallback subscriber reads it, decides, and either reloads the media playlist or
-    /// surfaces the failure. Reset on each load.
+    /// engine subscriber converts it to a typed capability terminal without
+    /// changing playlist or player. Reset on each load.
     @Published private(set) var pendingDisplayRejection: DisplayRejection?
 
-    /// #35 (Sodalite) cold-DV-master startup-readiness gate. While the engine drives the bounded
-    /// retry loop this is true, so a startup failure (`.failed` with any code, including a
-    /// display-rejection) is NOT published: the gate polls `awaitStartupReadiness` and decides to
-    /// reload the master, fall back to the media playlist, or give up. `lastSuppressedStartupFailure`
-    /// stashes the message so the engine can surface a real terminal error if the gate exhausts
-    /// every option (a timed-out silent 0-track park leaves it nil; the gate supplies a fallback).
+    /// #35 (Sodalite) cold-DV-master startup-readiness gate. While the engine
+    /// owns the observation checkpoint this is true, so a startup failure is
+    /// stashed as privacy-safe typed evidence and published once by the gate.
+    /// Elapsed readiness never reloads or changes the playlist.
     var startupReadinessGateActive: Bool = false
     private(set) var lastSuppressedStartupFailure: String?
+    private(set) var lastSuppressedStartupFailureDomain:
+        String?
+    private(set) var lastSuppressedStartupFailureCode:
+        Int?
+    private(set) var lastEndFailureDomain: String?
+    private(set) var lastEndFailureCode: Int?
 
     // MARK: - Seek landing state
 
@@ -86,13 +89,37 @@ final class NativeAVPlayerHost {
     private var notificationObservers: [NSObjectProtocol] = []
     private var accessLogCount = 0
 
-    /// When true, AVPlayer's `failedToPlayToEndTime` (it gave up: rate 0, no more data) routes into the
-    /// deferred-failure confirmation instead of being log-only. Set only on the lean remote-HLS live path,
-    /// which has no loopback live-reopen / readiness watchdog to recover or surface a dead upstream. Reported
-    /// live-IPTV death: segments started 404ing after the initial buffer, AVPlayer fired failedToPlayToEnd and
-    /// parked at rate 0, but `item.status` stayed `readyToPlay`, so the `.failed` KVO never fired and the host
-    /// never learned playback died. The loopback/VOD path keeps log-only (it owns its own reopen machinery).
-    private var surfaceEndFailures = false
+    /// Exact asset construction contract retained across every internal
+    /// recovery reload. It deliberately includes headers and all AVPlayerItem
+    /// tuning knobs so a reload cannot silently become a different request.
+    struct LoadContract: Equatable {
+        let url: URL
+        let startPosition: Double?
+        let perFrameHDR: Bool
+        let skipInitialSeek: Bool
+        let forwardBufferDuration: Double
+        let surfaceEndFailures: Bool
+        let httpHeaders: [String: String]
+
+        func replacingStartPosition(
+            _ position: Double?
+        ) -> LoadContract {
+            LoadContract(
+                url: url,
+                startPosition: position,
+                perFrameHDR: perFrameHDR,
+                skipInitialSeek: skipInitialSeek,
+                forwardBufferDuration:
+                    forwardBufferDuration,
+                surfaceEndFailures:
+                    surfaceEndFailures,
+                httpHeaders: httpHeaders
+            )
+        }
+    }
+
+    private(set) var activeLoadContract:
+        LoadContract?
 
     /// Monotonic counter tags every load() invocation so multi-attempt sessions produce distinguishable log lines.
     private static var nextSessionID: Int = 0
@@ -123,6 +150,56 @@ final class NativeAVPlayerHost {
         httpHeaders.isEmpty ? nil : ["AVURLAssetHTTPHeaderFieldsKey": httpHeaders]
     }
 
+    nonisolated static func privacySafeSourceLabel(
+        _ url: URL
+    ) -> String {
+        "source=\(url.isFileURL ? "file" : "remote") "
+            + "host=\(url.host ?? "none")"
+    }
+
+    nonisolated static func privacySafeResourceLabel(
+        uri: String?,
+        serverAddress: String?
+    ) -> String {
+        let uriURL = uri.flatMap(URL.init(string:))
+        let uriClass: String
+        if uri == nil {
+            uriClass = "none"
+        } else if uriURL?.isFileURL == true {
+            uriClass = "file"
+        } else if uriURL?.host != nil {
+            uriClass = "remote"
+        } else if uri?.hasPrefix("/") == true {
+            uriClass = "relative"
+        } else {
+            uriClass = "opaque"
+        }
+        let serverHost =
+            serverAddress
+                .flatMap {
+                    URL(string: $0)?.host
+                        ?? URL(
+                            string:
+                                "https://\($0)"
+                        )?.host
+                }
+                ?? "none"
+        return "uriClass=\(uriClass) "
+            + "uriHost=\(uriURL?.host ?? "none") "
+            + "serverHost=\(serverHost)"
+    }
+
+    nonisolated static func privacySafeErrorLabel(
+        _ error: Error?
+    ) -> String {
+        guard let error =
+                error as NSError? else {
+            return "domain=none code=0"
+        }
+        return "domain=\(error.domain) "
+            + "code=\(error.code)"
+    }
+
     /// Load the loopback HLS-fMP4 URL into AVPlayer. DisplayCriteriaController.apply must run first so the HDR pipeline is configured before the first segment fetch.
     /// `inPlaceSwap`: atomic same-content item swap for the #93 recovery reload. The default
     /// teardown pauses and drops the current item to nil before the new one exists; during PiP
@@ -133,14 +210,33 @@ final class NativeAVPlayerHost {
     func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false, forwardBufferDuration: Double = 4.0, surfaceEndFailures: Bool = false, inPlaceSwap: Bool = false, httpHeaders: [String: String] = [:]) {
         unloadCurrentItem(inPlaceSwap: inPlaceSwap)
 
-        self.surfaceEndFailures = surfaceEndFailures
+        activeLoadContract =
+            LoadContract(
+                url: url,
+                startPosition: startPosition,
+                perFrameHDR: perFrameHDR,
+                skipInitialSeek: skipInitialSeek,
+                forwardBufferDuration:
+                    forwardBufferDuration,
+                surfaceEndFailures:
+                    surfaceEndFailures,
+                httpHeaders: httpHeaders
+            )
         Self.nextSessionID += 1
         sessionID = Self.nextSessionID
         let sid = sessionID
         let loadStart = DispatchTime.now()
         loadStartTime = loadStart
 
-        EngineLog.emit("[NativeAVPlayerHost] #\(sid) load url=\(url.absoluteString) startPos=\(startPosition.map { String(format: "%.2fs", $0) } ?? "nil") headers=\(httpHeaders.isEmpty ? "none" : "\(httpHeaders.count)")", category: .engine)
+        let sourceLabel = Self.privacySafeSourceLabel(url)
+        EngineLog.emit(
+            "[NativeAVPlayerHost] #\(sid) load \(sourceLabel) "
+                + "startPos="
+                + "\(startPosition.map { String(format: "%.2fs", $0) } ?? "nil") "
+                + "headers="
+                + "\(httpHeaders.isEmpty ? "none" : "\(httpHeaders.count)")",
+            category: .engine
+        )
 
         // First-frame-visible diagnostic (see `layerReadyObservation`).
         layerReadyObservation = playerLayer.observe(
@@ -160,7 +256,9 @@ final class NativeAVPlayerHost {
         item.preferredForwardBufferDuration = forwardBufferDuration
 
         // Enables per-frame HDR10+ / DV RPU metadata; without it DV sources show in HDR10 mode (DrHurt: Philips TV stayed in HDR mode for P8 MKVs).
-        // Set false on SDR-fallback paths -- the per-frame metadata pipeline is suspected of ~3 MB/sec RSS growth on long DV 8.1 sessions.
+        // Set false only when the selected capability contract is SDR -- the
+        // per-frame metadata pipeline is suspected of ~3 MB/sec RSS growth on
+        // long DV 8.1 sessions.
         item.appliesPerFrameHDRDisplayMetadata = perFrameHDR
         // Apply before replaceCurrentItem (documented safe order; setting after races AVPlayer's track-load). externalMetadata is unavailable on macOS.
         #if !os(macOS)
@@ -173,6 +271,10 @@ final class NativeAVPlayerHost {
         failureMessage = nil
         pendingDisplayRejection = nil
         lastSuppressedStartupFailure = nil
+        lastSuppressedStartupFailureDomain = nil
+        lastSuppressedStartupFailureCode = nil
+        lastEndFailureDomain = nil
+        lastEndFailureCode = nil
         isReady = false
 
         // KVO fires on AVPlayerItem's queue; Task round-trips to MainActor.
@@ -185,24 +287,44 @@ final class NativeAVPlayerHost {
             @unknown default:  statusStr = "@unknown"
             }
             let nsErr = item.error as NSError?
-            let errSuffix = nsErr.map { " err=\($0.domain)/\($0.code) '\($0.localizedDescription)'" } ?? ""
+            let errSuffix =
+                nsErr.map {
+                    " errDomain=\($0.domain) "
+                        + "errCode=\($0.code)"
+                } ?? ""
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.status=\(statusStr)\(errSuffix)", category: .engine)
 
-            // On .failed: dump track FourCCs (hev1 vs hvc1 rejection, dvhe vs dvh1) and full NSError chain.
+            // On .failed: dump track FourCCs (hev1 vs hvc1 rejection, dvhe vs
+            // dvh1) and privacy-safe typed NSError evidence.
             // On .readyToPlay: dump audio CMAudioFormatDescription (channel layout tag diagnoses FLAC-bridge downmix vs route downmix).
             if item.status == .failed {
                 if let nsErr = nsErr,
                    let underlying = nsErr.userInfo[NSUnderlyingErrorKey] as? NSError {
-                    EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.error.underlying=\(underlying.domain)/\(underlying.code) '\(underlying.localizedDescription)'", category: .engine)
+                    EngineLog.emit(
+                        "[NativeAVPlayerHost] #\(sid) "
+                            + "item.error.underlyingDomain="
+                            + "\(underlying.domain) "
+                            + "underlyingCode="
+                            + "\(underlying.code)",
+                        category: .engine
+                    )
                 }
                 // Poll full errorLog on .failed (notification observer misses synchronous entries during replaceCurrentItem).
                 if let log = item.errorLog() {
                     EngineLog.emit("[NativeAVPlayerHost] #\(sid) errorLog dump: \(log.events.count) events", category: .engine)
                     for (idx, event) in log.events.enumerated() {
-                        let comment = event.errorComment ?? "no comment"
-                        let uri = event.uri ?? "-"
-                        let server = event.serverAddress ?? "-"
-                        EngineLog.emit("[NativeAVPlayerHost] #\(sid)   errorLog[\(idx)] code=\(event.errorStatusCode) domain=\(event.errorDomain) uri=\(uri) server=\(server) '\(comment)'", category: .engine)
+                        EngineLog.emit(
+                            "[NativeAVPlayerHost] #\(sid) "
+                                + "errorLog[\(idx)] "
+                                + "code=\(event.errorStatusCode) "
+                                + "domain=\(event.errorDomain) "
+                                + Self.privacySafeResourceLabel(
+                                    uri: event.uri,
+                                    serverAddress:
+                                        event.serverAddress
+                                ),
+                            category: .engine
+                        )
                     }
                 } else {
                     EngineLog.emit("[NativeAVPlayerHost] #\(sid) errorLog dump: <nil>", category: .engine)
@@ -210,8 +332,24 @@ final class NativeAVPlayerHost {
                 if let log = item.accessLog() {
                     EngineLog.emit("[NativeAVPlayerHost] #\(sid) accessLog dump: \(log.events.count) events", category: .engine)
                     for (idx, event) in log.events.enumerated() {
-                        let uri = event.uri ?? "-"
-                        EngineLog.emit("[NativeAVPlayerHost] #\(sid)   accessLog[\(idx)] uri=\(uri) bytes=\(event.numberOfBytesTransferred) reqs=\(event.numberOfMediaRequests) downloadOverdue=\(event.numberOfStalls) dlSegments=\(event.numberOfDroppedVideoFrames)", category: .engine)
+                        EngineLog.emit(
+                            "[NativeAVPlayerHost] #\(sid) "
+                                + "accessLog[\(idx)] "
+                                + Self.privacySafeResourceLabel(
+                                    uri: event.uri,
+                                    serverAddress:
+                                        event.serverAddress
+                                )
+                                + " bytes="
+                                + "\(event.numberOfBytesTransferred) "
+                                + "reqs="
+                                + "\(event.numberOfMediaRequests) "
+                                + "stalls="
+                                + "\(event.numberOfStalls) "
+                                + "droppedFrames="
+                                + "\(event.numberOfDroppedVideoFrames)",
+                            category: .engine
+                        )
                     }
                 } else {
                     EngineLog.emit("[NativeAVPlayerHost] #\(sid) accessLog dump: <nil>", category: .engine)
@@ -253,8 +391,12 @@ final class NativeAVPlayerHost {
                         self.avPlayer.play()
                     }
                 case .failed:
-                    let desc = item.error?.localizedDescription ?? "AVPlayerItem failed (no description)"
-                    self.handleItemFailed(desc, item: item)
+                    self.handleItemFailed(
+                        Self.privacySafeErrorLabel(
+                            item.error
+                        ),
+                        item: item
+                    )
                 default:
                     break
                 }
@@ -309,8 +451,17 @@ final class NativeAVPlayerHost {
             // Delivered on .main (queue: .main above), so assert MainActor to reach @MainActor state.
             MainActor.assumeIsolated {
                 guard let self = self, let event = self.playerItem?.errorLog()?.events.last else { return }
-                let comment = event.errorComment ?? "no comment"
-                EngineLog.emit("[NativeAVPlayerHost] #\(sid) errorLog code=\(event.errorStatusCode) domain=\(event.errorDomain) uri=\(event.uri ?? "-") '\(comment)'", category: .engine)
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(sid) errorLog "
+                        + "code=\(event.errorStatusCode) "
+                        + "domain=\(event.errorDomain) "
+                        + Self.privacySafeResourceLabel(
+                            uri: event.uri,
+                            serverAddress:
+                                event.serverAddress
+                        ),
+                    category: .engine
+                )
                 // #93 startup: -15628 is the loader-poison signature. Before the first frame no
                 // playbackStalled will ever fire (playback never started), so the stall-driven
                 // dead-consumer watchdog would never arm; surface the poison as a stall signal.
@@ -336,7 +487,19 @@ final class NativeAVPlayerHost {
                       self.accessLogCount < 5,
                       let event = self.playerItem?.accessLog()?.events.last else { return }
                 self.accessLogCount += 1
-                EngineLog.emit("[NativeAVPlayerHost] #\(sid) accessLog uri=\(event.uri ?? "-") server=\(event.serverAddress ?? "-") bytes=\(event.numberOfBytesTransferred) reqs=\(event.numberOfMediaRequests)", category: .engine)
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(sid) accessLog "
+                        + Self.privacySafeResourceLabel(
+                            uri: event.uri,
+                            serverAddress:
+                                event.serverAddress
+                        )
+                        + " bytes="
+                        + "\(event.numberOfBytesTransferred) "
+                        + "reqs="
+                        + "\(event.numberOfMediaRequests)",
+                    category: .engine
+                )
             }
         }
         notificationObservers.append(accessLogObs)
@@ -347,29 +510,34 @@ final class NativeAVPlayerHost {
             queue: .main
         ) { [weak self] notification in
             let err = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
-            let suffix = err.map { " \($0.domain)/\($0.code) '\($0.localizedDescription)'" } ?? ""
+            let suffix =
+                err.map {
+                    " domain=\($0.domain) "
+                        + "code=\($0.code)"
+                } ?? " domain=none code=0"
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) failedToPlayToEndTime\(suffix)", category: .engine)
             // Capture only Sendable values (sid: Int, desc: String) across the actor hop; reach the item via
             // self.playerItem on the main actor (the notification/item are non-Sendable). The sid==sessionID
             // guard rejects a stale notification from a since-replaced session.
-            let desc = err?.localizedDescription
-                ?? "The live stream stopped (the source could not continue)."
+            let failureSummary =
+                Self.privacySafeErrorLabel(
+                    err
+                )
+            let errorDomain = err?.domain
+            let errorCode = err?.code
             // Delivered on .main (queue: .main above), so assert MainActor to reach @MainActor state.
             MainActor.assumeIsolated {
                 guard let self = self, self.sessionID == sid,
                       let current = self.playerItem else { return }
-                if self.surfaceEndFailures {
-                    // AVPlayer gave up on this item (rate 0, no more segments) and `.failed` may never fire
-                    // (item.status can stay readyToPlay). Route into the same deferred confirmation as a .failed
-                    // KVO: a transient that resumes within the window self-clears; a dead upstream (live IPTV
-                    // token expiry, persistent segment 404) surfaces .error so the host can retune / show it.
-                    self.handleItemFailed(desc, item: current)
-                } else if Self.shouldCountEndFailureForRevive(
-                    surfaceEndFailures: false, hasEverPlayed: self.hasEverPlayed) {
-                    // #93 round 3: loopback path. Count the death for the engine's revive
-                    // escalation; a startup death (never played) stays with the startup watchdogs.
-                    self.endFailureCount += 1
-                }
+                // `failedToPlayToEndTime` is not structural evidence. It may
+                // leave item.status at readyToPlay, so route it through the
+                // same same-asset recovery signal as a generic `.failed`.
+                self.handleItemFailed(
+                    failureSummary,
+                    item: current,
+                    errorDomain: errorDomain,
+                    errorCode: errorCode
+                )
             }
         }
         notificationObservers.append(failedToEndObs)
@@ -419,7 +587,6 @@ final class NativeAVPlayerHost {
         avPlayer.replaceCurrentItem(with: item)
 
         // Explicitly load each key separately: AVPlayerItem(asset:)+KVO was observed stuck in .unknown (build-123), and separate awaits let DrHurt's "1 success, 3 failures" pattern identify which key -1008 hits.
-        let urlStr = url.absoluteString
         Task { @MainActor in
             for key in ["isPlayable", "tracks", "duration"] {
                 do {
@@ -432,12 +599,31 @@ final class NativeAVPlayerHost {
                     case "duration":   detail = "seconds=\(try await asset.load(.duration).seconds)"
                     default: continue
                     }
-                    EngineLog.emit("[NativeAVPlayerHost] #\(sid) asset.load(\(key)) ok url=\(urlStr) \(detail)", category: .engine)
+                    EngineLog.emit(
+                        "[NativeAVPlayerHost] #\(sid) "
+                            + "asset.load(\(key)) ok "
+                            + "\(sourceLabel) \(detail)",
+                        category: .engine
+                    )
                 } catch {
                     let nsErr = error as NSError
-                    EngineLog.emit("[NativeAVPlayerHost] #\(sid) asset.load(\(key)) failed: \(nsErr.domain)/\(nsErr.code) '\(nsErr.localizedDescription)' url=\(urlStr)", category: .engine)
+                    EngineLog.emit(
+                        "[NativeAVPlayerHost] #\(sid) "
+                            + "asset.load(\(key)) failed "
+                            + "domain=\(nsErr.domain) "
+                            + "code=\(nsErr.code) \(sourceLabel)",
+                        category: .engine
+                    )
                     if let underlying = nsErr.userInfo[NSUnderlyingErrorKey] as? NSError {
-                        EngineLog.emit("[NativeAVPlayerHost] #\(sid) asset.load(\(key)) underlying=\(underlying.domain)/\(underlying.code) '\(underlying.localizedDescription)'", category: .engine)
+                        EngineLog.emit(
+                            "[NativeAVPlayerHost] #\(sid) "
+                                + "asset.load(\(key)) "
+                                + "underlyingDomain="
+                                + "\(underlying.domain) "
+                                + "underlyingCode="
+                                + "\(underlying.code)",
+                            category: .engine
+                        )
                     }
                     // Dump partial track info even on failure: DrHurt's -1008 stall still surfaces the FourCC (hev1 vs hvc1, dvhe vs dvh1).
                     await Self.dumpAssetTracks(asset, sid: sid, reason: "asset.load(\(key)).failed")
@@ -456,14 +642,20 @@ final class NativeAVPlayerHost {
 
     func tearDown() {
         unloadCurrentItem()
+        activeLoadContract = nil
+        pendingDisplayRejection = nil
+        lastSuppressedStartupFailure = nil
+        lastSuppressedStartupFailureDomain = nil
+        lastSuppressedStartupFailureCode = nil
+        lastEndFailureDomain = nil
+        lastEndFailureCode = nil
     }
 
     // MARK: - Failure handling
 
-    /// Shared deferred-failure resolution: after the confirm window, surface a terminal failure only if the
-    /// player neither resumed playing nor advanced the clock past `threshold`. Pure so the `.failed` KVO and
-    /// the live `failedToPlayToEndTime` routing share one recovery contract (a self-healing transient that
-    /// resumes within the window must never surface, a frozen player must).
+    /// After the confirmation window, request recovery only if the player
+    /// neither resumed nor advanced past `threshold`. This is a liveness
+    /// decision, never a terminal classification.
     nonisolated static func shouldSurfaceDeferredFailure(
         isPlaying: Bool, clockAtFailure: Double, clockNow: Double, threshold: Double = 0.5
     ) -> Bool {
@@ -472,96 +664,118 @@ final class NativeAVPlayerHost {
         return true
     }
 
-    /// #93 round 3, pure decision: does a `failedToPlayToEndTime` count toward the loopback
-    /// revive escalation? The lean remote-live path (`surfaceEndFailures`) keeps its own
-    /// deferred-failure contract; a startup death before the first frame stays with the
-    /// startup watchdogs.
-    nonisolated static func shouldCountEndFailureForRevive(
-        surfaceEndFailures: Bool, hasEverPlayed: Bool
-    ) -> Bool {
-        !surfaceEndFailures && hasEverPlayed
+    enum ItemFailureDisposition:
+        Sendable,
+        Equatable
+    {
+        case retrySameItem
+        case failDisplayCapability
     }
 
-    /// #50: AVPlayer fires .failed for self-healing transients (loopback 404, AVIOReader reconnect) while playback advances uninterrupted (rrgomes: tcs=playing at .failed).
-    /// Discriminates on hasEverPlayed, not instantaneous timeControlStatus: .failed and timeControlStatus KVOs are unsynchronized (426b45c: still published terminal failure at 27.3s while AVPlayer played smoothly).
-    /// Before first .playing: surface promptly (genuine startup failure). After: defer 5s and confirm -- clear if .playing or clock advanced, surface if both stopped.
+    /// Generic AVPlayer item death is transport-inconclusive, both before and
+    /// after the first frame. Only a positive display-rejection code is
+    /// structural capability evidence.
+    nonisolated static func itemFailureDisposition(
+        errorCode: Int?
+    ) -> ItemFailureDisposition {
+        guard let errorCode,
+              MasterFallbackDecision
+                .isDisplayRejectionCode(
+                    errorCode
+                ) else {
+            return .retrySameItem
+        }
+        return .failDisplayCapability
+    }
+
+    /// AVPlayer fires `.failed` and `failedToPlayToEndTime` for weak-network
+    /// deaths that are recoverable by rebuilding the item. Publish one
+    /// monotonic signal; the engine owns the progress confirmation, backoff,
+    /// cancellation and exact-contract reload. No elapsed window here can
+    /// convert generic transport evidence into a terminal.
     @MainActor
-    private func handleItemFailed(_ desc: String, item: AVPlayerItem) {
+    private func handleItemFailed(
+        _ failureSummary: String,
+        item: AVPlayerItem,
+        errorDomain: String? = nil,
+        errorCode: Int? = nil
+    ) {
         // Ignore a late `.failed` KVO from an item we have already replaced.
         guard playerItem === item else { return }
 
-        failureConfirmToken &+= 1
-        let token = failureConfirmToken
-
-        // Startup failure: never reached .playing, so nothing to recover here. A display-rejection
-        // of the served master (#98) is instead handed to the engine, which reloads the media
-        // playlist; only a non-rejection startup failure surfaces immediately.
-        if !hasEverPlayed {
-            let code = (item.error as NSError?)?.code
-            // #35: while the cold-DV-master readiness gate drives the retry loop it owns ALL startup
-            // failures (a display rejection AND the -11819 "Cannot Complete Action" cold handshake).
-            // Stash the message and stay silent; the gate polls item state and reloads the master /
-            // falls back to media / surfaces a terminal error itself. Publishing here would race it.
-            if startupReadinessGateActive {
-                lastSuppressedStartupFailure = desc
-                EngineLog.emit(
-                    "[NativeAVPlayerHost] #\(sessionID) startup .failed (code=\(code.map(String.init) ?? "?")) "
-                    + "held by the readiness gate: \(desc)",
-                    category: .engine)
-                return
-            }
-            if let code, MasterFallbackDecision.isDisplayRejectionCode(code) {
-                EngineLog.emit(
-                    "[NativeAVPlayerHost] #\(sessionID) startup .failed is a display rejection "
-                    + "(code=\(code)); signalling engine for media fallback instead of surfacing",
-                    category: .engine)
-                pendingDisplayRejection = DisplayRejection(code: code, message: desc)
-                return
-            }
-            failureMessage = desc
+        let nsError = item.error as NSError?
+        let resolvedDomain =
+            errorDomain ?? nsError?.domain
+        let resolvedCode =
+            errorCode ?? nsError?.code
+        if Self.itemFailureDisposition(
+            errorCode: resolvedCode
+        ) == .failDisplayCapability,
+           let resolvedCode {
+            pendingDisplayRejection =
+                DisplayRejection(
+                    code: resolvedCode,
+                    message: failureSummary
+                )
             return
         }
 
-        let clockAtFailure = renderedTime
-        EngineLog.emit(
-            "[NativeAVPlayerHost] #\(sessionID) item.status=.failed after playback established "
-            + "(tcs=\(avPlayer.timeControlStatus.rawValue) clock=\(String(format: "%.2f", clockAtFailure))); "
-            + "deferring possibly-spurious failure: \(desc)",
-            category: .engine
-        )
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
-            guard let self = self,
-                  self.failureConfirmToken == token,
-                  self.playerItem === item else { return }
-            let advanced = self.renderedTime > clockAtFailure + 0.5
-            if Self.shouldSurfaceDeferredFailure(
-                isPlaying: self.avPlayer.timeControlStatus == .playing,
-                clockAtFailure: clockAtFailure,
-                clockNow: self.renderedTime
-            ) {
-                EngineLog.emit(
-                    "[NativeAVPlayerHost] #\(self.sessionID) deferred failure confirmed: player stopped "
-                    + "(tcs=\(self.avPlayer.timeControlStatus.rawValue) "
-                    + "clock=\(String(format: "%.2f", self.renderedTime)))",
-                    category: .engine
-                )
-                self.failureMessage = desc
-            } else {
-                EngineLog.emit(
-                    "[NativeAVPlayerHost] #\(self.sessionID) deferred failure cleared: player recovered "
-                    + "(tcs=\(self.avPlayer.timeControlStatus.rawValue) "
-                    + "clock=\(String(format: "%.2f", self.renderedTime)) advanced=\(advanced))",
-                    category: .engine
-                )
-            }
+        if startupReadinessGateActive {
+            lastSuppressedStartupFailure =
+                failureSummary
+            lastSuppressedStartupFailureDomain =
+                resolvedDomain
+            lastSuppressedStartupFailureCode =
+                resolvedCode
+        }
+        lastEndFailureDomain =
+            resolvedDomain
+        lastEndFailureCode =
+            resolvedCode
+        if endFailureCount < Int.max {
+            endFailureCount += 1
         }
     }
 
-    /// #35: poll the current item after `play()` until it becomes playable, dies, or the settle
-    /// window elapses. `.ready` as soon as the item reports a non-zero presentation size or actually
-    /// starts playing (`hasEverPlayed`); `.dead` on `item.status == .failed`; `.timedOut` if neither
-    /// happens within `timeoutSeconds` (the silent 0-track park, `AVPlayerWaitingWithNoItemToPlay`).
+    /// Rebuild the current item from the retained exact contract. The URL,
+    /// headers, capability flags and AVPlayer buffering policy are immutable;
+    /// only the recovery anchor may change.
+    @discardableResult
+    func reloadCurrentItemInPlace(
+        at position: Double?
+    ) -> Bool {
+        guard let contract =
+                activeLoadContract else {
+            return false
+        }
+        let replacement =
+            contract.replacingStartPosition(
+                position
+            )
+        load(
+            url: replacement.url,
+            startPosition:
+                replacement.startPosition,
+            perFrameHDR:
+                replacement.perFrameHDR,
+            skipInitialSeek:
+                replacement.skipInitialSeek,
+            forwardBufferDuration:
+                replacement
+                    .forwardBufferDuration,
+            surfaceEndFailures:
+                replacement.surfaceEndFailures,
+            inPlaceSwap: true,
+            httpHeaders:
+                replacement.httpHeaders
+        )
+        return true
+    }
+
+    /// #35: poll the current item after `play()` until it becomes playable,
+    /// reports failure evidence, or the settle window elapses. Generic
+    /// `.failed` maps to recoverable `.dead`; a positive display code maps to
+    /// `.displayRejected`.
     /// Bounded by construction, so the engine's gate loop can never spin forever. `item.status` only
     /// advances once AVPlayer is told to play, so the caller must `play()` before awaiting.
     func awaitStartupReadiness(timeoutSeconds: Double) async -> StartupReadiness {
@@ -570,11 +784,47 @@ final class NativeAVPlayerHost {
         for _ in 0..<ticks {
             guard let item = playerItem else { return .dead }
             if hasEverPlayed || item.presentationSize != .zero { return .ready }
-            if item.status == .failed { return .dead }
+            if item.status == .failed {
+                return startupFailureReadiness(
+                    item
+                )
+            }
             try? await Task.sleep(nanoseconds: tickMs * 1_000_000)
         }
-        if let item = playerItem, hasEverPlayed || item.presentationSize != .zero { return .ready }
+        if let item = playerItem {
+            if hasEverPlayed
+                || item.presentationSize
+                    != .zero {
+                return .ready
+            }
+            if item.status == .failed {
+                return startupFailureReadiness(
+                    item
+                )
+            }
+        }
         return .timedOut
+    }
+
+    private func startupFailureReadiness(
+        _ item: AVPlayerItem
+    ) -> StartupReadiness {
+        let error = item.error as NSError?
+        guard Self.itemFailureDisposition(
+            errorCode: error?.code
+        ) == .failDisplayCapability,
+              let code = error?.code else {
+            return .dead
+        }
+        return .displayRejected(
+            DisplayRejection(
+                code: code,
+                message:
+                    Self.privacySafeErrorLabel(
+                        error
+                    )
+            )
+        )
     }
 
     // MARK: - Playback control
@@ -622,6 +872,19 @@ final class NativeAVPlayerHost {
     func play() {
         // Set intent before play() so readyToPlay observer can re-assert if the replaceCurrentItem swap swallowed it.
         playIntent = true
+        // A paused mount can observe a generic item death without authorizing
+        // recovery. When the user later asks to play, re-publish that evidence
+        // so the same-item recovery loop resumes instead of leaving the dead
+        // item parked forever.
+        if let playerItem,
+           playerItem.status == .failed {
+            handleItemFailed(
+                Self.privacySafeErrorLabel(
+                    playerItem.error
+                ),
+                item: playerItem
+            )
+        }
         // Call play() immediately (no defer-until-ready): item.status never advances past .unknown until AVPlayer is told to play.
         avPlayer.play()
     }
@@ -769,7 +1032,12 @@ final class NativeAVPlayerHost {
     // type) so the AVAsset/AVAssetTrack reads stay on the main actor.
     private static func dumpAssetTracks(_ asset: AVAsset, sid: Int, reason: String) async {
         if let urlAsset = asset as? AVURLAsset {
-            EngineLog.emit("[NativeAVPlayerHost] #\(sid) asset.url=\(urlAsset.url.absoluteString) (\(reason))", category: .engine)
+            EngineLog.emit(
+                "[NativeAVPlayerHost] #\(sid) asset "
+                    + "\(Self.privacySafeSourceLabel(urlAsset.url)) "
+                    + "(\(reason))",
+                category: .engine
+            )
         }
         let tracks = (try? await asset.load(.tracks)) ?? []
         if tracks.isEmpty {

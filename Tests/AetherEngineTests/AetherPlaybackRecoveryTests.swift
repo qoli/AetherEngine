@@ -3,7 +3,7 @@ import Foundation
 import Testing
 @testable import AetherEngine
 
-@Suite("Aether bounded playback recovery")
+@Suite("Aether playback recovery")
 struct AetherPlaybackRecoveryTests {
     private let transient = AetherPlaybackFailure(
         stage: .preflight,
@@ -29,7 +29,7 @@ struct AetherPlaybackRecoveryTests {
         reason: "Hybrid decoder failed"
     )
 
-    @Test("Transient transport uses exactly three attempts with bounded backoff")
+    @Test("Transient transport retry is unbounded with capped backoff")
     func transportBudget() {
         let first = PlaybackRecoveryDecision.resolve(
             context: context(failure: transient, transportAttempt: 1)
@@ -37,13 +37,54 @@ struct AetherPlaybackRecoveryTests {
         let second = PlaybackRecoveryDecision.resolve(
             context: context(failure: transient, transportAttempt: 2)
         )
-        let exhausted = PlaybackRecoveryDecision.resolve(
+        let third = PlaybackRecoveryDecision.resolve(
             context: context(failure: transient, transportAttempt: 3)
+        )
+        let hundredth = PlaybackRecoveryDecision.resolve(
+            context: context(failure: transient, transportAttempt: 100)
         )
 
         #expect(first == .retrySameOperation(afterSeconds: 1))
         #expect(second == .retrySameOperation(afterSeconds: 2))
-        #expect(exhausted == .terminate)
+        #expect(third == .retrySameOperation(afterSeconds: 4))
+        #expect(hundredth == .retrySameOperation(afterSeconds: 30))
+    }
+
+    @Test(
+        "Escaped classification transport evidence retries without admitting a player"
+    )
+    func classificationTransportNeverChoosesProvisionalNative() {
+        for kind in [
+            AetherPlaybackFailureKind.transientTransport,
+            .inconclusiveEvidence,
+        ] {
+            let failure = AetherPlaybackFailure(
+                stage: .classification,
+                kind: kind,
+                domain: "AetherEngine.SourceClassification",
+                code: 0,
+                caseCode: "classificationPending",
+                reason: "classification evidence remains unavailable"
+            )
+            let action = PlaybackRecoveryDecision.resolve(
+                context: AetherPlaybackRecoveryContext(
+                    failure: failure,
+                    activeRoute: nil,
+                    positivelyAdmittedAlternateRoute: nil,
+                    transportAttempt: 100,
+                    sameRouteRebuildCount: 0,
+                    routeTransitionCount: 0,
+                    elapsedSeconds: 10_000
+                )
+            )
+
+            #expect(
+                action
+                    == .retrySameOperation(
+                        afterSeconds: 30
+                    )
+            )
+        }
     }
 
     @Test("Classification preflight and origin share one failure budget")
@@ -62,7 +103,36 @@ struct AetherPlaybackRecoveryTests {
         #expect(!budget.isExhausted)
     }
 
-    @Test("Retry-After is honored but capped at five seconds")
+    @Test("Production liveness windows and backoff remain unbounded")
+    func productionLivenessPolicy() {
+        let policy = AetherPlaybackLivenessPolicy.production
+        #expect(
+            (1...8).map {
+                policy.noProgressWindowSeconds(forAttempt: $0)
+            } == [35, 60, 120, 300, 300, 300, 300, 300]
+        )
+        #expect(
+            (1...9).map {
+                policy.retryBackoffSeconds(forAttempt: $0)
+            } == [1, 2, 4, 8, 15, 30, 30, 30, 30]
+        )
+        #expect(
+            policy.diagnosticCheckpointsSeconds
+                == [15, 45, 90, 300]
+        )
+
+        let attempts = PlaybackTransportRetryBudget(
+            maximumFailureAttempts: nil
+        )
+        for expected in 1...500 {
+            #expect(
+                attempts.recordRetryableFailure() == expected
+            )
+            #expect(!attempts.isExhausted)
+        }
+    }
+
+    @Test("Retry-After is honored but capped at thirty seconds")
     func retryAfterCap() {
         let action = PlaybackRecoveryDecision.resolve(
             context: AetherPlaybackRecoveryContext(
@@ -76,10 +146,10 @@ struct AetherPlaybackRecoveryTests {
                 elapsedSeconds: 0
             )
         )
-        #expect(action == .retrySameOperation(afterSeconds: 5))
+        #expect(action == .retrySameOperation(afterSeconds: 30))
     }
 
-    @Test("Runtime recovery rebuilds once then performs one admitted transition")
+    @Test("Runtime recovery rebuilds once then terminates without player switch")
     func routeBudget() {
         let rebuild = PlaybackRecoveryDecision.resolve(
             context: context(
@@ -107,7 +177,7 @@ struct AetherPlaybackRecoveryTests {
         )
 
         #expect(rebuild == .rebuildSameRoute)
-        #expect(transition == .transition(to: .hybridCarrier))
+        #expect(transition == .terminate)
         #expect(exhausted == .terminate)
     }
 
@@ -167,7 +237,7 @@ struct AetherPlaybackRecoveryTests {
                         alternate: routeCase.alternate
                     )
                 )
-                let exhausted = PlaybackRecoveryDecision.resolve(
+                let laterAttempt = PlaybackRecoveryDecision.resolve(
                     context: context(
                         failure: failure,
                         activeRoute: routeCase.active,
@@ -177,7 +247,7 @@ struct AetherPlaybackRecoveryTests {
                 )
 
                 #expect(rebuild == .rebuildSameRoute)
-                #expect(exhausted == .terminate)
+                #expect(laterAttempt == .rebuildSameRoute)
                 #expect(
                     !PlaybackRecoveryDecision.permitsRouteTransition(
                         afterInitialFailure: failure
@@ -187,7 +257,7 @@ struct AetherPlaybackRecoveryTests {
         }
     }
 
-    @Test("Positive runtime HEVC never rebuilds Native")
+    @Test("Positive runtime HEVC terminates Native without switching players")
     func runtimeHEVCExitsNativeImmediately() {
         let observedHEVC = AetherPlaybackFailure(
             stage: .playback,
@@ -221,12 +291,32 @@ struct AetherPlaybackRecoveryTests {
                 activeRoute: .nativeAVPlayer
             )
         )
-        #expect(transition == .transition(to: .hybridCarrier))
+        #expect(transition == .terminate)
         #expect(noAdmittedHybrid == .terminate)
     }
 
-    @Test("Fresh HEVC facts reclassify provisional Native into an admitted Hybrid transition")
-    func provisionalNativeReclassificationTransition() throws {
+    @Test("HLS reopen failure cannot transition players")
+    func hlsReopenFailureCannotTransitionPlayers() {
+        let failure = AetherPlaybackFailure(
+            stage: .playback,
+            kind: .routeRuntimeFailure,
+            domain: "AetherEngine.HLSReopen",
+            code: 0,
+            caseCode: "vod.read",
+            reason: "hls.reopen.vod.read"
+        )
+
+        #expect(
+            !PlaybackRecoveryDecision.permitsRouteTransition(
+                afterInitialFailure: failure
+            )
+        )
+    }
+
+    @Test(
+        "Unknown URL facts cannot admit Native or later switch to Hybrid"
+    )
+    func unknownURLFactsCannotReclassifyToHybrid() throws {
         let provisional = PlaybackPreflight.resolve(
             sourceProfile: AetherSourceProfile(
                 sourceKind: .unclassifiedURL,
@@ -258,7 +348,12 @@ struct AetherPlaybackRecoveryTests {
                 freshResult: verifiedHEVC
             )
         let reclassified = try #require(candidate)
-        #expect(reclassified.kind == .routeRuntimeFailure)
+        #expect(provisional.route == .unsupported)
+        #expect(
+            provisional.reason
+                == .unsupportedSourceClassificationInconclusive
+        )
+        #expect(reclassified.kind == .invariantViolation)
         #expect(reclassified.stage == .preflight)
         #expect(
             PlaybackRecoveryDecision.resolve(
@@ -268,7 +363,7 @@ struct AetherPlaybackRecoveryTests {
                     alternate: .hybridCarrier,
                     sameRouteRebuildCount: 1
                 )
-            ) == .transition(to: .hybridCarrier)
+            ) == .terminate
         )
         #expect(
             AetherPlaybackSession
@@ -280,8 +375,10 @@ struct AetherPlaybackRecoveryTests {
         )
     }
 
-    @Test("Fresh interlaced H264 facts reclassify provisional Native into Hybrid")
-    func provisionalNativeInterlacedH264Transition() throws {
+    @Test(
+        "Unknown URL facts cannot later switch to interlaced H264 Hybrid"
+    )
+    func unknownURLCannotSwitchToInterlacedH264() throws {
         let provisional = PlaybackPreflight.resolve(
             sourceProfile: AetherSourceProfile(
                 sourceKind: .unclassifiedURL,
@@ -312,9 +409,10 @@ struct AetherPlaybackRecoveryTests {
                 previousResult: provisional,
                 from: .nativeAVPlayer,
                 freshResult: verifiedInterlacedH264
-            )
+        )
         let reclassified = try #require(candidate)
-        #expect(reclassified.kind == .routeRuntimeFailure)
+        #expect(provisional.route == .unsupported)
+        #expect(reclassified.kind == .invariantViolation)
         #expect(
             PlaybackRecoveryDecision.resolve(
                 context: context(
@@ -323,7 +421,7 @@ struct AetherPlaybackRecoveryTests {
                     alternate: .hybridCarrier,
                     sameRouteRebuildCount: 1
                 )
-            ) == .transition(to: .hybridCarrier)
+            ) == .terminate
         )
     }
 
@@ -506,8 +604,8 @@ struct AetherPlaybackRecoveryTests {
         #expect(try #require(drift).kind == .invariantViolation)
     }
 
-    @Test("Provisional Native only admits verified HEVC, not another Hybrid codec")
-    func provisionalNativeRejectsGenericCodecDrift() throws {
+    @Test("Unknown URL facts reject every later codec-route reinterpretation")
+    func unknownURLRejectsGenericCodecDrift() throws {
         let provisional = PlaybackPreflight.resolve(
             sourceProfile: AetherSourceProfile(
                 sourceKind: .unclassifiedURL,
@@ -541,8 +639,8 @@ struct AetherPlaybackRecoveryTests {
         #expect(try #require(candidate).kind == .invariantViolation)
     }
 
-    @Test("Provisional Native admits positively verified audio-only Vorbis Hybrid")
-    func provisionalNativeAdmitsVorbisHybrid() throws {
+    @Test("Unknown URL facts cannot later switch to audio-only Vorbis Hybrid")
+    func unknownURLCannotSwitchToVorbisHybrid() throws {
         let provisional = PlaybackPreflight.resolve(
             sourceProfile: AetherSourceProfile(
                 sourceKind: .unclassifiedURL,
@@ -574,11 +672,12 @@ struct AetherPlaybackRecoveryTests {
                 previousResult: provisional,
                 from: .nativeAVPlayer,
                 freshResult: verifiedVorbis
-            )
+        )
 
+        #expect(provisional.route == .unsupported)
         #expect(verifiedVorbis.route == .hybridCarrier)
         #expect(verifiedVorbis.reason == .hybridAudioBridge)
-        #expect(try #require(candidate).kind == .routeRuntimeFailure)
+        #expect(try #require(candidate).kind == .invariantViolation)
     }
 
     @Test("Initial recovery has no capability baseline; committed runtime recovery does")
@@ -923,8 +1022,8 @@ struct AetherPlaybackRecoveryTests {
         )
     }
 
-    @Test("A recovery episode expires at thirty seconds")
-    func episodeTimeBudget() {
+    @Test("Elapsed time does not terminate structural recovery")
+    func elapsedTimeDoesNotOwnTerminal() {
         let action = PlaybackRecoveryDecision.resolve(
             context: AetherPlaybackRecoveryContext(
                 failure: runtime,
@@ -937,7 +1036,7 @@ struct AetherPlaybackRecoveryTests {
                 elapsedSeconds: 30
             )
         )
-        #expect(action == .terminate)
+        #expect(action == .rebuildSameRoute)
     }
 
     @Test("Recovery deadline distinguishes the final live instant from expiry")
@@ -999,11 +1098,8 @@ struct AetherPlaybackRecoveryTests {
         #expect(!transactions.isActive(transaction))
     }
 
-    @Test("Preparation settle and operation timeout preserve typed ownership")
+    @Test("Operation timeout preserves typed ownership")
     func operationDeadlineContract() {
-        let budget = AetherPlaybackRecoveryBudget.production
-        #expect(budget.initialPreparationSettleSeconds == 15)
-        #expect(budget.maximumEpisodeDurationSeconds == 30)
         #expect(
             AetherPlaybackSession
                 .recoveryTerminalPublicationHeadroomSeconds == 0.25
@@ -1011,7 +1107,7 @@ struct AetherPlaybackRecoveryTests {
 
         let preflight = AetherPlaybackSession.operationDeadlineFailure(
             stage: .preflight,
-            seconds: budget.initialPreparationSettleSeconds
+            seconds: 15
         )
         #expect(preflight.kind == .transientTransport)
         #expect(preflight.domain == "AetherPlaybackOperationDeadline")
@@ -1019,76 +1115,63 @@ struct AetherPlaybackRecoveryTests {
 
         let preparation = AetherPlaybackSession.operationDeadlineFailure(
             stage: .preparation,
-            seconds: budget.maximumEpisodeDurationSeconds
+            seconds: 30
         )
         #expect(preparation.kind == .routeRuntimeFailure)
         #expect(preparation.code == 30)
     }
 
-    @Test("Context restore consumes the remaining episode, not the preparation cap")
-    func recoveryContextRestoreDeadlineUsesEpisodeRemainder() throws {
-        let budget = AetherPlaybackRecoveryBudget.production
-
-        let belowPreparationCap = try AetherPlaybackSession
-            .recoveryContextRestoreDeadline(
+    @Test("Structural context uses liveness windows and seek timeout stays retryable")
+    func recoveryContextUsesLivenessWindow() {
+        let policy = AetherPlaybackLivenessPolicy(
+            noProgressWindowsSeconds: [7, 11],
+            retryBackoffSeconds: [1],
+            diagnosticCheckpointsSeconds: [1],
+            repeatingDiagnosticIntervalSeconds: 30
+        )
+        let seek = AetherPlaybackSession
+            .recoveryLivenessOperationDeadline(
                 stage: .playback,
                 firstStep: .contextSeek,
-                budget: budget,
-                episodeRemainingSeconds: 10,
+                policy: policy,
+                attempt: 1,
                 now: 100
             )
+        #expect(seek.deadline.durationSeconds == 7)
+        #expect(seek.failure.kind == .transientTransport)
+        #expect(seek.failure.caseCode == "seekTimedOut")
+        #expect(seek.failure.recoveryStep == .contextSeek)
         #expect(
-            abs(belowPreparationCap.deadline.durationSeconds - 9.75)
-                < 0.000_001
-        )
-
-        let abovePreparationCap = try AetherPlaybackSession
-            .recoveryContextRestoreDeadline(
-                stage: .playback,
-                firstStep: .contextSeek,
-                budget: budget,
-                episodeRemainingSeconds: 24,
-                now: 200
-            )
-        #expect(
-            abs(abovePreparationCap.deadline.durationSeconds - 23.75)
-                < 0.000_001
-        )
-        #expect(abovePreparationCap.deadline.durationSeconds > 15)
-        let innerSeekTimeout = abovePreparationCap.deadline
-            .remainingSeconds(now: 205)
-        #expect(innerSeekTimeout > 0)
-        #expect(
-            innerSeekTimeout
-                <= abovePreparationCap.deadline.durationSeconds
-        )
-        #expect(abovePreparationCap.failure.code == 30)
-        #expect(
-            abovePreparationCap.failure.recoveryStep == .contextSeek
-        )
-    }
-
-    @Test("Context restore fails typed before consuming publication headroom")
-    func recoveryContextRestoreRejectsHeadroomTheft() {
-        let budget = AetherPlaybackRecoveryBudget.production
-        do {
-            _ = try AetherPlaybackSession
-                .recoveryContextRestoreDeadline(
-                    stage: .playback,
-                    firstStep: .contextApply,
-                    budget: budget,
-                    episodeRemainingSeconds: 0.25,
-                    now: 100
+            AetherPlaybackSession
+                .requiresPersistentSameSourceRecovery(
+                    seek.failure
                 )
-            Issue.record("Context restore started without publication headroom")
-        } catch let failure as AetherPlaybackFailure {
-            #expect(failure.kind == .routeRuntimeFailure)
-            #expect(failure.caseCode == "operation.deadlineExceeded")
-            #expect(failure.code == 30)
-            #expect(failure.recoveryStep == .contextApply)
-        } catch {
-            Issue.record("Unexpected context restore error: \(error)")
-        }
+        )
+
+        let apply = AetherPlaybackSession
+            .recoveryLivenessOperationDeadline(
+                stage: .playback,
+                firstStep: .contextApply,
+                policy: policy,
+                attempt: 2,
+                now: 200
+        )
+        #expect(apply.deadline.durationSeconds == 11)
+        #expect(apply.failure.kind == .transientTransport)
+        #expect(apply.failure.caseCode == "startupNoProgress")
+        #expect(apply.failure.recoveryStep == .contextApply)
+        #expect(
+            AetherPlaybackSession
+                .requiresPersistentSameSourceRecovery(
+                    apply.failure
+                )
+        )
+        #expect(
+            AetherPlaybackSession.classify(
+                AetherNativePlaybackSessionError
+                    .seekTimedOut(seconds: 7)
+            ) == .transientTransport
+        )
     }
 
     @Test("Recovery diagnostics retain only closed trigger and step values")
@@ -1216,7 +1299,7 @@ struct AetherPlaybackRecoveryTests {
 
     @MainActor
     @Test("Factory returns one stable player before route preparation")
-    func stableFactoryBoundary() throws {
+    func stableFactoryBoundary() async throws {
         let session = try AetherPlaybackSessionFactory
             .makeSeekableURLVOD(
                 url: URL(fileURLWithPath: "/not-opened.mp4")
@@ -1230,6 +1313,7 @@ struct AetherPlaybackRecoveryTests {
                 .pictureInPictureVideo != .available
         )
         session.stop()
+        await session.waitForStopIOQuiescence()
         #expect(session.state == .stopped)
     }
 

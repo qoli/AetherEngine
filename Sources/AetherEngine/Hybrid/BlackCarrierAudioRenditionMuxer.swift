@@ -10,6 +10,7 @@ enum BlackCarrierAudioRenditionMuxerError: Error, LocalizedError, Sendable, Equa
     case unsupportedCodec(rawCodecID: UInt32)
     case codecParametersCopyFailed
     case atmosStreamCopyUnavailable(code: Int32)
+    case bridgeCapabilityUnavailable(reason: String)
     case bridgeCreationFailed(reason: String)
     case bridgeHeaderRejected(code: Int32)
     case muxerSetupFailed(reason: String)
@@ -38,6 +39,8 @@ enum BlackCarrierAudioRenditionMuxerError: Error, LocalizedError, Sendable, Equa
         case .unsupportedCodec: "unsupportedCodec"
         case .codecParametersCopyFailed: "codecParametersCopyFailed"
         case .atmosStreamCopyUnavailable: "atmosStreamCopyUnavailable"
+        case .bridgeCapabilityUnavailable:
+            "bridgeCapabilityUnavailable"
         case .bridgeCreationFailed: "bridgeCreationFailed"
         case .bridgeHeaderRejected: "bridgeHeaderRejected"
         case .muxerSetupFailed: "muxerSetupFailed"
@@ -81,6 +84,7 @@ enum BlackCarrierAudioRenditionMuxerError: Error, LocalizedError, Sendable, Equa
         case .alreadyFinished: 17
         case .terminalPacketAllocationFailed: 18
         case .terminalPacketReferenceFailed: 19
+        case .bridgeCapabilityUnavailable: 20
         }
     }
 
@@ -96,6 +100,8 @@ enum BlackCarrierAudioRenditionMuxerError: Error, LocalizedError, Sendable, Equa
             return "Black carrier audio codec parameters could not be copied"
         case .atmosStreamCopyUnavailable(let code):
             return "EAC3 JOC Atmos cannot be preserved in the audio rendition (\(code))"
+        case .bridgeCapabilityUnavailable(let reason):
+            return "Black carrier audio bridge capability is unavailable: \(reason)"
         case .bridgeCreationFailed(let reason):
             return "Black carrier audio bridge could not be created: \(reason)"
         case .bridgeHeaderRejected(let code):
@@ -351,6 +357,12 @@ enum BlackCarrierAudioRenditionMuxer {
                 let outputs: [UnsafeMutablePointer<AVPacket>]
                 do {
                     outputs = try bridge.feed(packet: sourcePacket)
+                } catch let error as AudioBridge.AudioBridgeError
+                    where error.isCapabilityFailure {
+                    throw BlackCarrierAudioRenditionMuxerError
+                        .bridgeCapabilityUnavailable(
+                            reason: error.description
+                        )
                 } catch {
                     throw BlackCarrierAudioRenditionMuxerError.bridgeFeedFailed(
                         reason: String(describing: error)
@@ -1011,6 +1023,12 @@ enum BlackCarrierAudioRenditionMuxer {
                 srcTimeBase: sourceTimeBase,
                 mode: bridgeMode
             )
+        } catch let error as AudioBridge.AudioBridgeError
+            where error.isCapabilityFailure {
+            throw BlackCarrierAudioRenditionMuxerError
+                .bridgeCapabilityUnavailable(
+                    reason: error.description
+                )
         } catch {
             throw BlackCarrierAudioRenditionMuxerError.bridgeCreationFailed(
                 reason: String(describing: error)

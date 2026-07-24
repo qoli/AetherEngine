@@ -6,54 +6,104 @@ import Foundation
 /// (failedToPlayToEndTime, rate 0, tcs .paused). Every recovery layer then
 /// misreads the dead item as a user pause and disarms, making the session
 /// terminal. These tests cover the pure decisions of the escalation path:
-/// counting the death on the loopback path, bypassing the pause guard for
-/// this one trigger, and bounding the reload storm.
+/// classifying generic death as recoverable across native routes, bypassing
+/// the failure-induced pause guard, and progress-aware unbounded retry.
 struct Issue93ItemDeathReviveTests {
 
     // MARK: - ItemDeathReviveGate
 
-    @Test("admits reloads up to the cap at a frozen position")
-    func admitsWithinCap() {
-        var gate = ItemDeathReviveGate(maxAttempts: 3)
-        let admitted = (0..<3).map { _ in gate.admit(position: 354.8) }
-        #expect(admitted == [true, true, true])
+    @Test("hundreds of frozen item deaths remain retryable")
+    func frozenPositionNeverExhausts() {
+        var gate = ItemDeathReviveGate()
+        var last:
+            ItemDeathReviveDecision? =
+                nil
+        for index in 1...500 {
+            last = gate.recordFailure(
+                position: 354.8,
+                nowUptime: Double(index)
+            )
+        }
+        #expect(last?.attempt == 500)
+        #expect(last?.backoffSeconds == 30)
+        #expect(gate.attempts == 500)
     }
 
-    @Test("exhausts after the cap when the position never advances")
-    func exhaustsAtCap() {
-        var gate = ItemDeathReviveGate(maxAttempts: 3)
-        _ = gate.admit(position: 354.8)
-        _ = gate.admit(position: 354.8)
-        _ = gate.admit(position: 354.8)
-        let fourth = gate.admit(position: 354.8)
-        let wiggle = gate.admit(position: 354.9)   // sub-epsilon wiggle is not progress
-        #expect(!fourth)
-        #expect(!wiggle)
-    }
-
-    @Test("playback progress since the last death resets the budget")
+    @Test("playback progress resets attempt and backoff")
     func progressResets() {
-        var gate = ItemDeathReviveGate(maxAttempts: 2)
-        _ = gate.admit(position: 100.0)
-        _ = gate.admit(position: 100.0)
-        let exhausted = gate.admit(position: 100.0)
-        // The reload finally lands and plays for a while before dying again:
-        // a fresh episode, full budget.
-        let freshEpisode = gate.admit(position: 130.0)
-        #expect(!exhausted)
-        #expect(freshEpisode)
+        var gate = ItemDeathReviveGate()
+        _ = gate.recordFailure(
+            position: 100,
+            nowUptime: 1
+        )
+        _ = gate.recordFailure(
+            position: 100,
+            nowUptime: 2
+        )
+        let freshEpisode =
+            gate.recordFailure(
+                position: 130,
+                nowUptime: 3
+            )
+        #expect(freshEpisode.progressReset)
+        #expect(freshEpisode.attempt == 1)
+        #expect(freshEpisode.backoffSeconds == 1)
+        #expect(
+            freshEpisode.diagnostic?
+                .checkpointSeconds == nil
+        )
     }
 
     @Test("a user seek to a different position is a fresh episode too")
     func seekAwayResets() {
-        var gate = ItemDeathReviveGate(maxAttempts: 2)
-        _ = gate.admit(position: 500.0)
-        _ = gate.admit(position: 500.0)
-        let exhausted = gate.admit(position: 500.0)
+        var gate = ItemDeathReviveGate()
+        _ = gate.recordFailure(
+            position: 500,
+            nowUptime: 1
+        )
+        _ = gate.recordFailure(
+            position: 500,
+            nowUptime: 2
+        )
         // Backward jump (user scrubbed away from the dead window).
-        let scrubbedAway = gate.admit(position: 320.0)
-        #expect(!exhausted)
-        #expect(scrubbedAway)
+        let scrubbedAway =
+            gate.recordFailure(
+                position: 320,
+                nowUptime: 3
+            )
+        #expect(scrubbedAway.progressReset)
+        #expect(scrubbedAway.attempt == 1)
+    }
+
+    @Test("retry logs are bounded by liveness checkpoints")
+    func retryLogsUseManualClock() {
+        var gate = ItemDeathReviveGate()
+        #expect(
+            gate.recordFailure(
+                position: 10,
+                nowUptime: 1_000
+            ).diagnostic != nil
+        )
+        #expect(
+            gate.recordFailure(
+                position: 10,
+                nowUptime: 1_001
+            ).diagnostic == nil
+        )
+        #expect(
+            gate.recordFailure(
+                position: 10,
+                nowUptime: 1_015
+            ).diagnostic?
+                .checkpointSeconds == 15
+        )
+        #expect(
+            gate.recordFailure(
+                position: 10,
+                nowUptime: 1_600
+            ).diagnostic?
+                .checkpointSeconds == 600
+        )
     }
 
     // MARK: - Pause-guard bypass
@@ -78,23 +128,38 @@ struct Issue93ItemDeathReviveTests {
             consumerIsPaused: false, allowPausedConsumer: false))
     }
 
-    // MARK: - Host-side counting decision
+    // MARK: - Host-side failure classification
 
-    @Test("loopback path counts an end failure after playback was established")
-    func countsLoopbackDeath() {
-        #expect(NativeAVPlayerHost.shouldCountEndFailureForRevive(
-            surfaceEndFailures: false, hasEverPlayed: true))
+    @Test("generic loopback item death remains same-item retryable")
+    func loopbackDeathRetries() {
+        #expect(
+            NativeAVPlayerHost
+                .itemFailureDisposition(
+                    errorCode: -12889
+                )
+                == .retrySameItem
+        )
     }
 
-    @Test("lean remote-live path keeps its own deferred-failure contract")
-    func leanLivePathDoesNotDoubleHandle() {
-        #expect(!NativeAVPlayerHost.shouldCountEndFailureForRevive(
-            surfaceEndFailures: true, hasEverPlayed: true))
+    @Test("generic remote-live item death remains same-item retryable")
+    func leanLiveDeathRetries() {
+        #expect(
+            NativeAVPlayerHost
+                .itemFailureDisposition(
+                    errorCode: -1001
+                )
+                == .retrySameItem
+        )
     }
 
-    @Test("startup death before the first frame stays with the startup watchdogs")
-    func startupDeathNotCounted() {
-        #expect(!NativeAVPlayerHost.shouldCountEndFailureForRevive(
-            surfaceEndFailures: false, hasEverPlayed: false))
+    @Test("display rejection alone is a typed capability terminal")
+    func displayRejectionFailsClosed() {
+        #expect(
+            NativeAVPlayerHost
+                .itemFailureDisposition(
+                    errorCode: -11868
+                )
+                == .failDisplayCapability
+        )
     }
 }

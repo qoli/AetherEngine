@@ -20,6 +20,7 @@ private final class ControllableOuterTransportRoute:
     var transportIdentity: ObjectIdentifier {
         ObjectIdentifier(self)
     }
+    var transportApplicationIsTemporarilyUnavailable = false
 
     private(set) var events: [Event] = []
     private var isPlaying = false
@@ -27,6 +28,7 @@ private final class ControllableOuterTransportRoute:
         (capturedPlaying: Bool, continuation: CheckedContinuation<Void, Never>)?
 
     var hasPendingSeek: Bool { pendingSeek != nil }
+    private(set) var lastSeekTimeout: TimeInterval?
 
     func play() throws {
         events.append(.play)
@@ -44,9 +46,10 @@ private final class ControllableOuterTransportRoute:
 
     func seek(
         to target: CMTime,
-        timeout _: TimeInterval
+        timeout: TimeInterval
     ) async throws -> AetherPlaybackSeekResult {
         precondition(pendingSeek == nil)
+        lastSeekTimeout = timeout
         let capturedPlaying = isPlaying
         events.append(
             .seekStarted(
@@ -92,6 +95,40 @@ struct AetherPlaybackTransportTests {
             await Task.yield()
         }
         throw HarnessError.seekDidNotStart
+    }
+
+    @MainActor
+    @Test("Public seek uses the liveness no-progress window")
+    func publicSeekUsesLivenessWindow() async throws {
+        let route = ControllableOuterTransportRoute()
+        let policy = AetherPlaybackLivenessPolicy(
+            noProgressWindowsSeconds: [7, 11],
+            retryBackoffSeconds: [0.01],
+            diagnosticCheckpointsSeconds: [0.01],
+            repeatingDiagnosticIntervalSeconds: 1
+        )
+        let session = AetherPlaybackSession(
+            url: URL(
+                fileURLWithPath: "/tmp/aether-seek-liveness"
+            ),
+            options: LoadOptions(),
+            variantSelection: .highestBandwidth,
+            recoveryBudget: AetherPlaybackRecoveryBudget(
+                maximumEpisodeDurationSeconds: 0.01,
+                livenessPolicy: policy
+            )
+        )
+        defer { session.stop() }
+        session.installTransportRaceTestHarness(route)
+
+        let seek = Task { @MainActor in
+            try await session.seek(to: .zero)
+        }
+        try await waitForPendingSeek(route)
+        #expect(route.lastSeekTimeout == 7)
+        #expect(route.lastSeekTimeout != 0.01)
+        route.completePendingSeek()
+        #expect(try await seek.value == .applied)
     }
 
     @MainActor
@@ -318,6 +355,19 @@ struct AetherPlaybackTransportTests {
                 itemIsReady: true,
                 actualRate: 0,
                 timeControlStatus: .unknown,
+                reassertCount: 0
+            ),
+            AetherPlaybackTransportDecision.shouldReassert(
+                requestedSequence: 7,
+                currentSequence: 7,
+                requestedGeneration: 3,
+                currentGeneration: 3,
+                desiredPlaying: true,
+                desiredRate: 1,
+                itemIsReady: true,
+                actualRate: 0,
+                timeControlStatus: .paused,
+                routeApplicationIsTemporarilyUnavailable: true,
                 reassertCount: 0
             ),
         ] {
@@ -627,7 +677,7 @@ struct AetherPlaybackTransportTests {
     }
 
     @MainActor
-    @Test("All execution paths use the outer watchdog and same-route terminal boundary")
+    @Test("All execution paths keep no-progress recovery alive on the same route")
     func routeSpecificOuterWatchdogBoundary() async throws {
         for target in [
             AetherPlaybackStartupWatchdogTarget.directNative,
@@ -648,35 +698,56 @@ struct AetherPlaybackTransportTests {
                     initialPreparationSettleSeconds: 0.1,
                     maximumEpisodeDurationSeconds: 0.05,
                     startupProgressObservationSeconds: 0.01,
-                    startupTerminalPublicationHeadroomSeconds: 0
+                    startupTerminalPublicationHeadroomSeconds: 0,
+                    livenessPolicy:
+                        AetherPlaybackLivenessPolicy(
+                            noProgressWindowsSeconds: [0.01],
+                            // Keep the harness inside the scheduled same-source
+                            // retry. Its intentionally missing local fixture is
+                            // not transport evidence and must not be allowed to
+                            // turn this watchdog-policy test into an identity
+                            // failure.
+                            retryBackoffSeconds: [60],
+                            diagnosticCheckpointsSeconds: [0.01],
+                            repeatingDiagnosticIntervalSeconds: 1
+                        )
                 )
             )
             session.installStartupWatchdogTestHarness(
                 target: target
             )
 
-            for _ in 0..<100 where session.terminalFailure == nil {
+            for _ in 0..<30 {
                 try await Task.sleep(nanoseconds: 10_000_000)
             }
 
-            let terminal = try #require(session.terminalFailure)
+            #expect(session.terminalFailure == nil)
             #expect(
-                terminal.firstFailure.caseCode
+                session.firstFailure?.caseCode
                     == "startupNoProgress"
             )
-            let terminalEvent = try #require(
-                session.recoveryHistory.last
+            #expect(
+                session.recoveryHistory.contains {
+                    $0.fromRoute == target.route
+                        && $0.toRoute == target.route
+                        && $0.outcome == .scheduled
+                }
             )
-            #expect(terminalEvent.fromRoute == target.route)
-            #expect(terminalEvent.toRoute == nil)
-            #expect(terminalEvent.action == .terminate)
-            #expect(terminalEvent.outcome == .exhausted)
+            #expect(
+                !session.recoveryHistory.contains {
+                    $0.action == .terminate
+                        || $0.outcome == .exhausted
+                }
+            )
             session.stop()
+            try await Task.sleep(nanoseconds: 20_000_000)
+            #expect(session.state == .stopped)
+            #expect(session.livenessSnapshot.phase == .cancelled)
         }
     }
 
     @MainActor
-    @Test("Recovery handoff starts zero-remaining watchdog after releasing its owner")
+    @Test("Recovery handoff preserves pending no-progress without terminal")
     func recoveryHandoffDoesNotLoseImmediateStartupFailure() async throws {
         let session = AetherPlaybackSession(
             url: URL(
@@ -692,7 +763,14 @@ struct AetherPlaybackTransportTests {
                 initialPreparationSettleSeconds: 0.1,
                 maximumEpisodeDurationSeconds: 0.03,
                 startupProgressObservationSeconds: 0.02,
-                startupTerminalPublicationHeadroomSeconds: 0.005
+                startupTerminalPublicationHeadroomSeconds: 0.005,
+                livenessPolicy:
+                    AetherPlaybackLivenessPolicy(
+                        noProgressWindowsSeconds: [0.01],
+                        retryBackoffSeconds: [60],
+                        diagnosticCheckpointsSeconds: [0.01],
+                        repeatingDiagnosticIntervalSeconds: 1
+                    )
             )
         )
         defer { session.stop() }
@@ -703,21 +781,20 @@ struct AetherPlaybackTransportTests {
         )
         try await Task.sleep(nanoseconds: 40_000_000)
 
-        let releasedAt = ProcessInfo.processInfo.systemUptime
         session.releaseStartupWatchdogTestRecoveryOwner()
-        for _ in 0..<100 where session.terminalFailure == nil {
-            try await Task.sleep(nanoseconds: 5_000_000)
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 10_000_000)
         }
-        let publicationElapsed = ProcessInfo.processInfo.systemUptime
-            - releasedAt
 
-        let terminal = try #require(session.terminalFailure)
+        #expect(session.terminalFailure == nil)
         #expect(
-            terminal.firstFailure.caseCode == "startupNoProgress"
+            session.firstFailure?.caseCode == "startupNoProgress"
         )
-        #expect(publicationElapsed < 0.2)
         #expect(
-            session.recoveryHistory.last?.outcome == .exhausted
+            !session.recoveryHistory.contains {
+                $0.action == .terminate
+                    || $0.outcome == .exhausted
+            }
         )
     }
 

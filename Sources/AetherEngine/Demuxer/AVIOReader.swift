@@ -9,7 +9,8 @@ import Libavutil
 ///   Fix for AetherEngine#25 (CDN stutter collapsing playback). See `readPersistent`.
 /// - **Seekable chunked** (known size + prefetch=false, still/frame-extraction):
 ///   discrete Range chunks for random access. See `readSeekable`.
-/// - **Streaming** (size=-1): single sequential GET, no reconnect. See `readStreaming`.
+/// - **Streaming** (size=-1): forward-only sequential reads with generation-fenced
+///   same-source reconnect and clean-response EOF confirmation. See `readStreaming`.
 ///
 /// AVIO callbacks run on the demux queue; prefetch/delivery on background queues.
 /// Shared state protected by locks.
@@ -25,11 +26,416 @@ struct NetworkPhaseGate {
     }
 }
 
+struct AVIOPersistentRetryDecision: Sendable, Equatable {
+    let attempt: Int
+    let delaySeconds: TimeInterval
+    fileprivate let progressGeneration: UInt64
+    let retryLogEmission:
+        AetherBoundedRetryLogEmission?
+    let firstRetryLogCause: String?
+}
+
+enum AVIOPersistentRetryWaitOutcome:
+    Sendable,
+    Equatable
+{
+    case retry
+    case progressed
+    case cancelled
+}
+
+struct AVIOStreamingResumePlan:
+    Sendable,
+    Equatable
+{
+    let discardPrefixBytes: Int64
+    let validator: SourceByteStoreValidator?
+}
+
+/// One cancellation-aware retry ledger for the production persistent reader.
+///
+/// Transport failures are intentionally unbounded. Only unique source-byte
+/// progress resets the attempt sequence; cancellation permanently closes
+/// admission so a late callback cannot start another connection.
+final class AVIOPersistentRetryController:
+    @unchecked Sendable
+{
+    private static let maximumRetryAfterSeconds:
+        TimeInterval = 30
+
+    private let condition = NSCondition()
+    private let policy: AetherPlaybackLivenessPolicy
+    private let retryLogClock: any AetherBoundedRetryLogClock
+    private let onWaitStarted:
+        (@Sendable () -> Void)?
+    private var attempt = 0
+    private var progressGeneration: UInt64 = 0
+    private var isCancelled = false
+    private var retryLogCadence:
+        AetherBoundedRetryLogCadence
+    private var firstRetryLogCause: String?
+
+    init(
+        policy: AetherPlaybackLivenessPolicy =
+            .production,
+        retryLogClock: any AetherBoundedRetryLogClock =
+            AetherSystemBoundedRetryLogClock(),
+        onWaitStarted: (@Sendable () -> Void)? =
+            nil
+    ) {
+        self.policy = policy
+        self.retryLogClock = retryLogClock
+        self.onWaitStarted = onWaitStarted
+        retryLogCadence = AetherBoundedRetryLogCadence(
+            policy: policy
+        )
+    }
+
+    var progressToken: UInt64 {
+        condition.lock()
+        defer { condition.unlock() }
+        return progressGeneration
+    }
+
+    func noProgressWindowSeconds(
+        forAttempt attempt: Int
+    ) -> TimeInterval {
+        policy.noProgressWindowSeconds(
+            forAttempt: attempt
+        )
+    }
+
+    /// Returns nil if progress raced the observed failure or cancellation has
+    /// already fenced retry admission.
+    func recordTransientFailure(
+        observedProgressToken: UInt64,
+        retryAfterSeconds: TimeInterval = 0,
+        retryLogCause: String? = nil
+    ) -> AVIOPersistentRetryDecision? {
+        condition.lock()
+        defer { condition.unlock() }
+        guard !isCancelled,
+              observedProgressToken
+                == progressGeneration else {
+            return nil
+        }
+        if attempt < Int.max {
+            attempt += 1
+        }
+        let retryAfter = Self.clampRetryAfter(
+            retryAfterSeconds
+        )
+        let retryLogEmission: AetherBoundedRetryLogEmission?
+        let firstRetryLogCause: String?
+        if let retryLogCause {
+            self.firstRetryLogCause = self.firstRetryLogCause
+                ?? retryLogCause
+            retryLogEmission = retryLogCadence.recordFailure(
+                now: retryLogClock.now()
+            )
+            firstRetryLogCause = self.firstRetryLogCause
+        } else {
+            retryLogEmission = nil
+            firstRetryLogCause = nil
+        }
+        return AVIOPersistentRetryDecision(
+            attempt: attempt,
+            delaySeconds: max(
+                policy.retryBackoffSeconds(
+                    forAttempt: attempt
+                ),
+                retryAfter
+            ),
+            progressGeneration: progressGeneration,
+            retryLogEmission: retryLogEmission,
+            firstRetryLogCause: firstRetryLogCause
+        )
+    }
+
+    func recordProgress() {
+        condition.lock()
+        guard !isCancelled else {
+            condition.unlock()
+            return
+        }
+        attempt = 0
+        progressGeneration &+= 1
+        retryLogCadence.resetAfterProgress()
+        firstRetryLogCause = nil
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func waitUntilRetry(
+        _ decision: AVIOPersistentRetryDecision,
+        shouldAbort: @Sendable () -> Bool = {
+            false
+        }
+    ) -> AVIOPersistentRetryWaitOutcome {
+        condition.lock()
+        defer { condition.unlock() }
+        guard !isCancelled,
+              !shouldAbort() else {
+            return .cancelled
+        }
+        guard decision.progressGeneration
+                == progressGeneration else {
+            return .progressed
+        }
+        guard decision.delaySeconds > 0 else {
+            return .retry
+        }
+
+        let deadline = Date(
+            timeIntervalSinceNow:
+                decision.delaySeconds
+        )
+        onWaitStarted?()
+        while true {
+            if isCancelled || shouldAbort() {
+                return .cancelled
+            }
+            if decision.progressGeneration
+                != progressGeneration {
+                return .progressed
+            }
+            let now = Date()
+            if now >= deadline {
+                return .retry
+            }
+            // The short ceiling observes a bounded read deadline even when it
+            // is armed from outside this controller. markClosed()/progress
+            // still broadcast and wake immediately.
+            _ = condition.wait(
+                until: min(
+                    deadline,
+                    now.addingTimeInterval(0.1)
+                )
+            )
+        }
+    }
+
+    func cancel() {
+        condition.lock()
+        isCancelled = true
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    private static func clampRetryAfter(
+        _ seconds: TimeInterval
+    ) -> TimeInterval {
+        guard !seconds.isNaN else { return 0 }
+        return min(
+            max(seconds, 0),
+            maximumRetryAfterSeconds
+        )
+    }
+}
+
+/// Privacy-safe monotonic unique-byte counters emitted by AVIO readers that
+/// share one launch ledger.
+///
+/// Absolute byte intervals never leave the ledger. The callback contains no
+/// URL, offset, response header or credential material. A byte is attributed
+/// to whichever path first made that exact interval available, so reconnects,
+/// repeated ranges and later store reads cannot manufacture liveness.
+struct AetherFetchedByteProgress: Sendable, Equatable {
+    let originBytesFetched: Int64
+    let sourceStoreBytesReused: Int64
+
+    var totalAdvancedBytes: Int64 {
+        originBytesFetched &+ sourceStoreBytesReused
+    }
+}
+
+enum AetherFetchedByteProgressKind: Sendable {
+    case origin
+    case sourceStore
+}
+
+/// Session-scoped interval union used across progressive preflight attempts
+/// and by the retained first playback Demuxer.
+///
+/// The merged intervals are deliberately private. Only aggregate unique-byte
+/// counts cross the AVIO boundary.
+final class AetherFetchedByteProgressLedger: @unchecked Sendable {
+    private let lock = NSLock()
+    private var intervals: [Range<Int64>] = []
+    private var originBytesFetched: Int64 = 0
+    private var sourceStoreBytesReused: Int64 = 0
+
+    @discardableResult
+    func record(
+        offset: Int64,
+        count: Int,
+        kind: AetherFetchedByteProgressKind
+    ) -> AetherFetchedByteProgress? {
+        guard offset >= 0, count > 0 else { return nil }
+        let (upperBound, overflow) = offset.addingReportingOverflow(
+            Int64(count)
+        )
+        guard !overflow, upperBound > offset else { return nil }
+
+        lock.lock()
+        let delta = insertUniqueRange(
+            offset..<upperBound
+        )
+        guard delta > 0 else {
+            lock.unlock()
+            return nil
+        }
+        switch kind {
+        case .origin:
+            originBytesFetched &+= delta
+        case .sourceStore:
+            sourceStoreBytesReused &+= delta
+        }
+        let snapshot = AetherFetchedByteProgress(
+            originBytesFetched: originBytesFetched,
+            sourceStoreBytesReused: sourceStoreBytesReused
+        )
+        lock.unlock()
+        return snapshot
+    }
+
+    var snapshot: AetherFetchedByteProgress {
+        lock.lock()
+        defer { lock.unlock() }
+        return AetherFetchedByteProgress(
+            originBytesFetched: originBytesFetched,
+            sourceStoreBytesReused: sourceStoreBytesReused
+        )
+    }
+
+    /// Inserts into a sorted, disjoint interval union and returns only the
+    /// newly covered byte count. Adjacent ranges are coalesced as well.
+    private func insertUniqueRange(_ proposed: Range<Int64>) -> Int64 {
+        var uniqueDelta =
+            proposed.upperBound - proposed.lowerBound
+        var mergedLower = proposed.lowerBound
+        var mergedUpper = proposed.upperBound
+        var replacement: [Range<Int64>] = []
+        replacement.reserveCapacity(intervals.count + 1)
+        var didInsert = false
+
+        for existing in intervals {
+            if existing.upperBound < mergedLower {
+                replacement.append(existing)
+                continue
+            }
+            if existing.lowerBound > mergedUpper {
+                if !didInsert {
+                    replacement.append(
+                        mergedLower..<mergedUpper
+                    )
+                    didInsert = true
+                }
+                replacement.append(existing)
+                continue
+            }
+
+            let overlapLower = max(
+                proposed.lowerBound,
+                existing.lowerBound
+            )
+            let overlapUpper = min(
+                proposed.upperBound,
+                existing.upperBound
+            )
+            if overlapUpper > overlapLower {
+                uniqueDelta -= overlapUpper - overlapLower
+            }
+            mergedLower = min(
+                mergedLower,
+                existing.lowerBound
+            )
+            mergedUpper = max(
+                mergedUpper,
+                existing.upperBound
+            )
+        }
+        if !didInsert {
+            replacement.append(mergedLower..<mergedUpper)
+        }
+        intervals = replacement
+        return uniqueDelta
+    }
+}
+
+/// Counts attempt-owned URLSession tasks through their terminal delegate
+/// callbacks. Cancellation only closes admission; quiescence is reached when
+/// every token completes.
+final class AetherIOQuiescenceTracker: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var acceptsNewActivity = true
+    private var activeActivityCount = 0
+
+    func beginActivity() -> AetherIOActivityToken? {
+        condition.lock()
+        defer { condition.unlock() }
+        guard acceptsNewActivity else { return nil }
+        activeActivityCount += 1
+        return AetherIOActivityToken(tracker: self)
+    }
+
+    func beginShutdown() {
+        condition.lock()
+        acceptsNewActivity = false
+        if activeActivityCount == 0 {
+            condition.broadcast()
+        }
+        condition.unlock()
+    }
+
+    func waitForShutdown() {
+        condition.lock()
+        acceptsNewActivity = false
+        while activeActivityCount > 0 {
+            condition.wait()
+        }
+        condition.unlock()
+    }
+
+    fileprivate func completeActivity() {
+        condition.lock()
+        precondition(activeActivityCount > 0)
+        activeActivityCount -= 1
+        if !acceptsNewActivity,
+           activeActivityCount == 0 {
+            condition.broadcast()
+        }
+        condition.unlock()
+    }
+}
+
+final class AetherIOActivityToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var tracker:
+        AetherIOQuiescenceTracker?
+
+    fileprivate init(
+        tracker: AetherIOQuiescenceTracker
+    ) {
+        self.tracker = tracker
+    }
+
+    func complete() {
+        lock.lock()
+        let tracker = tracker
+        self.tracker = nil
+        lock.unlock()
+        tracker?.completeActivity()
+    }
+}
+
 final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     private let url: URL
     private let extraHeaders: [String: String]
     private let sourceByteStore: SourceByteStore?
+    private let ioQuiescence =
+        AetherIOQuiescenceTracker()
     /// Session config factory. Short-lived probes/chunks get a 60s resource timeout;
     /// long-lived persistent/streaming connections omit it (fires mid-stream, NSURLError
     /// -1001; stall detection is handled by `connStallTimeout`). `urlCache = nil` avoids
@@ -51,6 +457,31 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var sourceStoreReadEnabled = false
     private var usesValidatedCompleteSourceStore = false
 
+    private let terminalErrorLock = NSLock()
+    private var _terminalHTTPError: AVIOReaderError?
+    var terminalError: AVIOReaderError? {
+        terminalErrorLock.lock()
+        let httpError = _terminalHTTPError
+        terminalErrorLock.unlock()
+        if let httpError {
+            return httpError
+        }
+        return sourceStoreFailure.map(
+            AVIOReaderError.sourceByteStore
+        )
+    }
+
+    private func recordTerminalReaderError(
+        _ error: AVIOReaderError
+    ) {
+        terminalErrorLock.lock()
+        if _terminalHTTPError == nil {
+            _terminalHTTPError = error
+        }
+        terminalErrorLock.unlock()
+        persistentRetryController.cancel()
+    }
+
     private let sourceStoreFailureLock = NSLock()
     private var _sourceStoreFailure: SourceByteStoreError?
     private var sourceStoreFailure: SourceByteStoreError? {
@@ -64,7 +495,19 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             _sourceStoreFailure = error
         }
         sourceStoreFailureLock.unlock()
+        persistentRetryController.cancel()
     }
+
+    /// Session-scoped unique-range ledger. Progressive preflight installs the
+    /// same instance on every quiesced attempt and transfers it with the exact
+    /// successful Demuxer.
+    var fetchedByteProgressLedger =
+        AetherFetchedByteProgressLedger()
+
+    /// Monotonic, privacy-safe unique-byte progress. Set before `open()` by
+    /// the owning demuxer.
+    var onFetchedByteProgress:
+        (@Sendable (AetherFetchedByteProgress) -> Void)?
 
     private let sourceStoreCounterLock = NSLock()
     private var _sourceStoreBytesServed: Int64 = 0
@@ -73,10 +516,23 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         defer { sourceStoreCounterLock.unlock() }
         return _sourceStoreBytesServed
     }
-    private func addSourceStoreBytesServed(_ count: Int) {
+
+    private func addSourceStoreBytesServed(
+        _ count: Int,
+        at offset: Int64
+    ) {
+        guard count > 0 else { return }
         sourceStoreCounterLock.lock()
         _sourceStoreBytesServed &+= Int64(count)
         sourceStoreCounterLock.unlock()
+        if let snapshot = fetchedByteProgressLedger.record(
+            offset: offset,
+            count: count,
+            kind: .sourceStore
+        ) {
+            persistentRetryController.recordProgress()
+            onFetchedByteProgress?(snapshot)
+        }
     }
 
     /// Typed source-fetch network phase, pushed on every stall/reconnect/recovery transition (#85).
@@ -139,7 +595,46 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return status == 401 || status == 403 || status == 404 || status == 410
     }
 
-    // Cumulative bytes fetched since open; memory probe compares against RSS growth.
+    static func terminalHTTPError(
+        statusCode: Int,
+        responseWasResolvedUpstream: Bool
+    ) -> AVIOReaderError? {
+        guard isResolvedExpiryStatus(statusCode),
+              !responseWasResolvedUpstream else {
+            return nil
+        }
+        return .httpStatus(statusCode: statusCode)
+    }
+
+    /// Returns true when the hard status came from a resolved-upstream hop and
+    /// the same canonical source should be resolved again. A request that
+    /// started at the canonical URL can still reach an expiring signed
+    /// upstream through redirects, so the response route — not only the
+    /// initial request URL — owns this decision.
+    @discardableResult
+    private func handleHardHTTPStatus(
+        _ statusCode: Int,
+        responseWasResolvedUpstream: Bool
+    ) -> Bool {
+        guard Self.isResolvedExpiryStatus(statusCode) else {
+            return false
+        }
+        if responseWasResolvedUpstream {
+            invalidateResolvedURL()
+            return true
+        }
+        if let error = Self.terminalHTTPError(
+            statusCode: statusCode,
+            responseWasResolvedUpstream: false
+        ) {
+            recordTerminalReaderError(error)
+        }
+        return false
+    }
+
+    // Cumulative delivered origin bytes since open. This intentionally keeps
+    // its historical raw-byte semantics for reconnect and memory diagnostics;
+    // progressive liveness uses the separate unique-range ledger above.
     private let counterLock = NSLock()
     private var _cumulativeBytesFetched: Int64 = 0
     var cumulativeBytesFetched: Int64 {
@@ -147,16 +642,30 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         defer { counterLock.unlock() }
         return _cumulativeBytesFetched
     }
-    private func addBytesFetched(_ n: Int) {
+
+    private func addBytesFetched(
+        _ count: Int,
+        at offset: Int64
+    ) {
+        guard count > 0 else { return }
         counterLock.lock()
-        _cumulativeBytesFetched &+= Int64(n)
+        _cumulativeBytesFetched &+= Int64(count)
         counterLock.unlock()
+        if let snapshot = fetchedByteProgressLedger.record(
+            offset: offset,
+            count: count,
+            kind: .origin
+        ) {
+            persistentRetryController.recordProgress()
+            onFetchedByteProgress?(snapshot)
+        }
     }
 
     private var isStreaming: Bool { fileSize <= 0 }
 
     /// #126: a VOD source that resolved no size runs the forward-only streaming reader
-    /// (1 MB back-window, no reconnect); it must not be routed onto seek-dependent paths.
+    /// (1 MB back-window plus same-source reconnect); it must not be routed onto
+    /// seek-dependent paths.
     /// Live keeps true: the persistent reader owns reconnection and live routing never
     /// seeks backward. Meaningful only after `open()` has resolved the mode.
     var isSeekable: Bool { isLive || !isStreaming }
@@ -200,9 +709,26 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     private var streamBuffer = Data()
     private var streamBytesRead: Int64 = 0
-    private var streamEnded = false
-    private let streamLock = NSLock()
+    private var streamBytesReceived: Int64 = 0
+    private var streamConfirmedEOF = false
+    private var streamGeneration = 0
+    private var streamAttemptAcceptedResponse = false
+    private var streamAttemptRetryAfter:
+        TimeInterval = 0
+    private var streamAttemptDiscardPrefixBytes:
+        Int64 = 0
+    private var streamAttemptStartBytes: Int64 = 0
+    private var streamNoProgressAttempt = 1
+    private var streamProgressDeadline =
+        Date.distantFuture
+    private var streamSourceValidator:
+        SourceByteStoreValidator?
+    private let streamLock = NSCondition()
     private let streamDataReady = DispatchSemaphore(value: 0)
+    #if DEBUG
+    private var streamActiveReaderCount = 0
+    private var streamMaximumConcurrentReaderCount = 0
+    #endif
 
     // MARK: - Persistent Mode (single forward-streaming connection, playback path)
 
@@ -216,10 +742,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private static let seekKeepForwardLimit = 8 * 1024 * 1024
     // CDN stall threshold: no bytes for this long triggers reconnect.
     private static let connStallTimeout: TimeInterval = 20
-    // A reconnect that delivers at least this much counts as progress; resets streak.
-    private static let minReconnectProgress: Int64 = 512 * 1024
-    // Cap on CONSECUTIVE unproductive reconnects; resets on real progress.
-    private static let reconnectMaxUnproductive = 12
 
     // MARK: - Detour Block Cache (random-access parse reads; AetherEngine#69)
 
@@ -244,8 +766,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // (rrgomes' #93/#96 traces: the whole 15-35s sat here, invisibly, in the detour fetch). A 4 MB block
     // over a healthy remote 4K source lands in ~1s, so a tight budget aborts a starved fetch fast and
     // lets the reconnect serve, without tripping healthy parse-time detour fetches (#69 stays intact:
-    // its fetches complete well under this, and a genuinely slow parse fetch reconnecting is bounded by
-    // the #71 rate-limit streak, far gentler than the pre-cache per-read storm).
+    // its fetches complete well under this, and a genuinely slow parse fetch reconnects with the
+    // production liveness backoff, far gentler than the pre-cache per-read storm).
     private static let detourFetchBudgetSeconds: TimeInterval = 4
 
     /// Effective per-fetch budget for a detour block: the tight interactive cap, never exceeding the
@@ -255,14 +777,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         min(detourFetchBudgetSeconds, chunkRequestTimeout)
     }
 
-    // Cap on CONSECUTIVE rate-limited (429/503) network attempts before giving up cleanly.
-    // Distinct axis from unproductiveReconnects: NOT reset by seekReconnect, so parse-driven
-    // seeks cannot mask a throttled origin into an infinite reconnect loop (AetherEngine#71).
-    private static let rateLimitMaxStreak = 6
-
     /// NSCondition guards all persistent-mode fields and serves as the
     /// edge-triggered condition variable for read waits and backpressure.
     private let winCond = NSCondition()
+    private let persistentRetryController:
+        AVIOPersistentRetryController
     /// Sliding window of bytes from the live connection, starting at `winStart`.
     /// `position - winStart` is the read offset within `window`.
     private var window = Data()
@@ -274,6 +793,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var connRetryAfter: TimeInterval = 0
     // Bumped on every (re)connect; stale delegate callbacks are ignored.
     private var connGeneration = 0
+    // A body callback is admitted only after the matching generation's response
+    // passed status, range, and immutable-source identity validation.
+    private var connResponseAccepted = false
+    // A persistent VOD connection may initially establish a generation without
+    // a validator. Once any body byte from that generation is accepted, however,
+    // a reconnect must prove the exact non-nil validator-bound generation before
+    // another body can be combined with the existing window/store bytes.
+    private var persistentSourceGeneration:
+        SourceByteStoreGeneration?
+    private var persistentAcceptedBodyBytes: Int64 = 0
     private var activeSession: URLSession?
     private var activeTask: URLSessionDataTask?
     // #93 restart latency diagnostics (winCond-guarded): bytes dropped by the stale-generation
@@ -281,11 +810,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var staleGenDroppedBytes: Int64 = 0
     private var connStartedAt = DispatchTime.now()
     private var connFirstDataSeen = false
-    // Consecutive unproductive reconnects (demux-thread-only).
-    private var unproductiveReconnects = 0
-    private var bytesAtLastReconnect: Int64 = 0
-    // Consecutive 429/503 attempts; survives seekReconnect, resets on real read progress (#71).
-    private var rateLimitStreak = 0
 
     /// Detour LRU block cache (its own leaf lock, never held across `fetchChunk`/network or
     /// `winCond`). Stores only full-size blocks; short bodies are served once but never cached
@@ -299,14 +823,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var detourRunBytes: Int64 = 0
 
     /// Playback path (known size + prefetch) or live feeds. Live always uses the
-    /// persistent reader; the streaming reader has no reconnect machinery.
+    /// persistent reader; unknown-length VOD uses the forward-only reconnecting reader.
     private var usePersistentReader: Bool {
         if isLive { return prefetchEnabled }
         return !isStreaming && prefetchEnabled
     }
 
     /// True for endless live feeds. Suppresses `position >= fileSize` EOF synthesis;
-    /// reports EIO (-5) instead of EOF when the reconnect cap is hit.
+    /// transport recovery continues until explicit cancellation or a typed terminal.
     let isLive: Bool
 
     /// Detour cache is VOD-only: live feeds have no meaningful random access and a
@@ -339,7 +863,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         chunkRequestTimeout: TimeInterval = 35,
         chunkMaxRetries: Int = 3,
         boundedInitialFetch: Int64? = nil,
-        sourceByteStore: SourceByteStore? = nil
+        sourceByteStore: SourceByteStore? = nil,
+        livenessPolicy:
+            AetherPlaybackLivenessPolicy =
+                .production
     ) {
         self.url = url
         self.extraHeaders = extraHeaders
@@ -351,6 +878,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.chunkMaxRetries = max(1, chunkMaxRetries)
         self.boundedInitialFetch = boundedInitialFetch.map { max(1, $0) }
         self.throttleKbps = AetherEngine.sourceThrottleKbpsForTesting
+        self.persistentRetryController =
+            AVIOPersistentRetryController(
+                policy: livenessPolicy
+            )
     }
 
     /// Slow-CDN simulation: hold delivered bytes to `throttleKbps` by sleeping the demux thread before the
@@ -425,17 +956,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         category: .demux
                     )
                 case .changed:
-                    do {
-                        try sourceByteStore.reset()
-                    } catch let error as SourceByteStoreError {
-                        close()
-                        throw AVIOReaderError.sourceByteStore(error)
-                    }
+                    close()
+                    throw AVIOReaderError.sourceByteStore(
+                        .generationMismatch
+                    )
                 case .failed(let reason):
                     close()
                     throw AVIOReaderError.sourceByteStoreValidationFailed(
                         reason: reason
                     )
+                case .terminal(let error):
+                    close()
+                    throw error
                 }
             } else {
                 do {
@@ -465,6 +997,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // probeFileSize() round-trip (and its HEAD fallback, the request some origins 429).
             startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
             let gotData = awaitFirstPersistentData()
+            if let terminalError {
+                throw terminalError
+            }
             var tookFallback = false
             if !isLive {
                 // Atomically decide, under winCond, whether the optimistic connection resolved
@@ -483,6 +1018,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     tookFallback = true
                     EngineLog.emit("[AVIOReader] Data connection resolved no size, falling back to probe", category: .demux, level: .verbose)
                     fileSize = resolveInitialFileSize()
+                    if let terminalError {
+                        throw terminalError
+                    }
                     if isStreaming {
                         startStreamingDownload()
                         _ = streamDataReady.wait(timeout: .now() + .seconds(15))
@@ -502,6 +1040,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // Non-prefetch (still extraction / one-shot seekable): the size is needed up
             // front for SEEK_END and container index seeks, so keep the dedicated probe.
             fileSize = resolveInitialFileSize()
+            if let terminalError {
+                throw terminalError
+            }
             if isStreaming {
                 startStreamingDownload()
                 _ = streamDataReady.wait(timeout: .now() + .seconds(15))
@@ -510,7 +1051,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     currentBuffer = data
                     currentOffset = 0
                 }
+                if let terminalError {
+                    throw terminalError
+                }
             }
+        }
+
+        if let terminalError {
+            throw terminalError
         }
 
         // #126: a VOD source that finishes open() without a resolved size runs the forward-only
@@ -606,6 +1154,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.lock()
         winCond.broadcast()
         winCond.unlock()
+        streamLock.lock()
+        streamLock.broadcast()
+        streamLock.unlock()
     }
 
     func endReadDeadline() {
@@ -625,16 +1176,24 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// Must be called BEFORE acquiring the demuxer's access lock.
     func markClosed() {
         isClosed = true
+        ioQuiescence.beginShutdown()
+        persistentRetryController.cancel()
         // Wake any semaphore waits so the read callbacks can exit
         prefetchReady.signal()
         streamDataReady.signal()
         streamLock.lock()
+        streamGeneration &+= 1
         let sTask = streamingTask
+        let sSession = streamingSession
         let wasSuspended = streamingTaskSuspended
         streamingTaskSuspended = false
+        streamingTask = nil
+        streamingSession = nil
+        streamLock.broadcast()
         streamLock.unlock()
         if wasSuspended { sTask?.resume() }
         sTask?.cancel()
+        sSession?.invalidateAndCancel()
         winCond.lock()
         connGeneration &+= 1
         // #93/#96 residual: cancel the persistent Range GET here, not only in close(). markClosed is
@@ -663,6 +1222,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         guard !isFullyClosed else { return }
         isFullyClosed = true
         isClosed = true
+        ioQuiescence.beginShutdown()
+        persistentRetryController.cancel()
         if let ctx = context {
             // avio_context_free does NOT free ctx->buffer (verified, aviobuf.c).
             // Free ctx.pointee.buffer, not original av_malloc ptr: FFmpeg can
@@ -681,7 +1242,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         detourCache.clear()
 
         streamLock.lock()
-        streamEnded = true
+        streamGeneration &+= 1
         streamBuffer = Data()
         let sTask = streamingTask
         let sSession = streamingSession
@@ -689,6 +1250,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         streamingTaskSuspended = false
         streamingTask = nil
         streamingSession = nil
+        streamLock.broadcast()
         streamLock.unlock()
         if wasSuspended { sTask?.resume() }
         streamDataReady.signal()
@@ -708,14 +1270,21 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         session?.invalidateAndCancel()
     }
 
+    func waitForIOQuiescence() {
+        ioQuiescence.waitForShutdown()
+    }
+
     // MARK: - Read (called by FFmpeg on demux thread)
 
     fileprivate func read(into buf: UnsafeMutablePointer<UInt8>, size: Int32) -> Int32 {
         guard !isClosed else { return -1 }
         if readDeadlinePassedOrAborted { readDeadlineFired = true; return -1 }
+        if terminalError != nil { return -1 }
         if sourceStoreFailure != nil { return -1 }
+        let sourceStoreOffset = sourceStoreReadPosition()
         if sourceStoreReadEnabled,
            let cached = readFromSourceStore(
+               at: sourceStoreOffset,
                maximumLength: Int(size)
            ) {
             cached.withUnsafeBytes { raw in
@@ -727,7 +1296,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 }
             }
             advancePositionAfterSourceStoreRead(cached.count)
-            addSourceStoreBytesServed(cached.count)
+            addSourceStoreBytesServed(
+                cached.count,
+                at: sourceStoreOffset
+            )
             applyThrottle(deliveredBytes: cached.count)
             return Int32(cached.count)
         }
@@ -757,12 +1329,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     }
 
     private func readFromSourceStore(
+        at offset: Int64,
         maximumLength: Int
     ) -> Data? {
         guard let sourceByteStore, maximumLength > 0 else { return nil }
         do {
             return try sourceByteStore.read(
-                at: sourceStoreReadPosition(),
+                at: offset,
                 maximumLength: maximumLength
             )
         } catch let error as SourceByteStoreError {
@@ -885,64 +1458,181 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     // MARK: - Streaming Read (sequential GET)
 
-    private func readStreaming(into buf: UnsafeMutablePointer<UInt8>, size: Int32) -> Int32 {
+    private func readStreaming(
+        into buf: UnsafeMutablePointer<UInt8>,
+        size: Int32
+    ) -> Int32 {
         let requestSize = Int(size)
         var totalRead = 0
 
         while totalRead < requestSize {
+            if isClosed {
+                return totalRead > 0
+                    ? Int32(totalRead)
+                    : -1
+            }
+            if readDeadlinePassedOrAborted {
+                readDeadlineFired = true
+                return totalRead > 0
+                    ? Int32(totalRead)
+                    : -1
+            }
+            if terminalError != nil {
+                return totalRead > 0
+                    ? Int32(totalRead)
+                    : -1
+            }
+
             streamLock.lock()
-            let posInBuffer = Int(position - streamBytesRead)
-            let available = streamBuffer.count - posInBuffer
-            let ended = streamEnded
-            streamLock.unlock()
+            let posInBuffer = Int(
+                position - streamBytesRead
+            )
+            let available =
+                streamBuffer.count - posInBuffer
 
             if available > 0 && posInBuffer >= 0 {
-                let toCopy = min(available, requestSize - totalRead)
-
-                streamLock.lock()
+                let toCopy = min(
+                    available,
+                    requestSize - totalRead
+                )
                 streamBuffer.withUnsafeBytes { raw in
-                    let src = raw.baseAddress!.advanced(by: posInBuffer)
-                        .assumingMemoryBound(to: UInt8.self)
-                    buf.advanced(by: totalRead).update(from: src, count: toCopy)
+                    let src = raw.baseAddress!
+                        .advanced(by: posInBuffer)
+                        .assumingMemoryBound(
+                            to: UInt8.self
+                        )
+                    buf.advanced(by: totalRead)
+                        .update(
+                            from: src,
+                            count: toCopy
+                        )
                 }
-                streamLock.unlock()
-
                 position += Int64(toCopy)
                 totalRead += toCopy
 
-                // subdata (not removeFirst): removeFirst leaks backing storage (see trimWindowLocked).
-                streamLock.lock()
-                let consumed = Int(position - streamBytesRead)
-                if consumed > Self.streamTrimThreshold {
-                    let trimAmount = consumed - Self.streamTrimThreshold
-                    streamBuffer = streamBuffer.subdata(in: trimAmount..<streamBuffer.count)
-                    streamBytesRead += Int64(trimAmount)
+                // subdata (not removeFirst): removeFirst leaks backing
+                // storage (see trimWindowLocked).
+                let consumed = Int(
+                    position - streamBytesRead
+                )
+                if consumed
+                    > Self.streamTrimThreshold {
+                    let trimAmount =
+                        consumed
+                        - Self.streamTrimThreshold
+                    streamBuffer = streamBuffer
+                        .subdata(
+                            in: trimAmount..<streamBuffer.count
+                        )
+                    streamBytesRead +=
+                        Int64(trimAmount)
                 }
-                var toResume: URLSessionDataTask?
-                if streamingTaskSuspended, streamBuffer.count < Self.streamLowWater {
+                var toResume:
+                    URLSessionDataTask?
+                if streamingTaskSuspended,
+                   streamBuffer.count
+                    < Self.streamLowWater {
                     streamingTaskSuspended = false
                     toResume = streamingTask
                 }
                 streamLock.unlock()
                 toResume?.resume()
-            } else if ended {
+                emitNetworkPhase(.flowing)
+                continue
+            }
+
+            if streamConfirmedEOF {
+                streamLock.unlock()
                 break
-            } else {
-                // Resume before waiting: a suspended task would never deliver.
-                streamLock.lock()
-                var toResume: URLSessionDataTask?
-                if streamingTaskSuspended {
-                    streamingTaskSuspended = false
-                    toResume = streamingTask
-                }
-                streamLock.unlock()
-                toResume?.resume()
-                let timeout = streamDataReady.wait(timeout: .now() + .seconds(15))
-                if timeout == .timedOut { break }
+            }
+
+            // Resume before waiting: a suspended task would never deliver.
+            var toResume: URLSessionDataTask?
+            if streamingTaskSuspended {
+                streamingTaskSuspended = false
+                toResume = streamingTask
+            }
+            let observedGeneration =
+                streamGeneration
+            let observedBytes =
+                streamBytesReceived
+            let progressDeadline =
+                streamProgressDeadline
+            streamLock.unlock()
+            toResume?.resume()
+
+            streamLock.lock()
+            let waitDeadline = min(
+                progressDeadline,
+                readDeadline
+            )
+            if !isClosed,
+               terminalError == nil,
+               !streamConfirmedEOF,
+               streamGeneration
+                    == observedGeneration,
+               streamBytesReceived
+                    == observedBytes,
+               Date() < waitDeadline {
+                _ = streamLock.wait(
+                    until: waitDeadline
+                )
+            }
+            let shouldRestartStalledTask =
+                !isClosed
+                && terminalError == nil
+                && !streamConfirmedEOF
+                && streamGeneration
+                    == observedGeneration
+                && streamBytesReceived
+                    == observedBytes
+                && Date() >= progressDeadline
+            let stalledTask =
+                shouldRestartStalledTask
+                    ? streamingTask
+                    : nil
+            if stalledTask != nil {
+                streamProgressDeadline =
+                    .distantFuture
+            }
+            streamLock.unlock()
+
+            if let stalledTask {
+                lastUnplannedReconnectAt = Date()
+                emitNetworkPhase(.reconnecting)
+                stalledTask.cancel()
             }
         }
 
-        return totalRead > 0 ? Int32(totalRead) : FFmpegErr.eof
+        return totalRead > 0
+            ? Int32(totalRead)
+            : FFmpegErr.eof
+    }
+
+    /// Keeps persistent/unknown-length retry output bounded while leaving the
+    /// retry decision and backoff untouched. Cause strings are closed local
+    /// codes, never request URLs, headers, credentials, or response bodies.
+    private func emitBoundedRetryDiagnostic(
+        currentCause: String,
+        decision: AVIOPersistentRetryDecision
+    ) {
+        guard let emission = decision.retryLogEmission,
+              let firstCause = decision.firstRetryLogCause else {
+            return
+        }
+        let checkpoint = emission.checkpointSeconds.map {
+            String(Int($0))
+        } ?? "first"
+        EngineLog.emit(
+            "[AVIOReader] retry checkpoint=\(checkpoint) "
+                + "elapsed=\(Int(emission.elapsedSeconds)) "
+                + "firstFailure=\(firstCause) "
+                + "cumulative=\(emission.cumulativeFailureCount) "
+                + "currentFailure=\(currentCause) "
+                + "attempt=\(decision.attempt) "
+                + "delay=\(Int(decision.delaySeconds))",
+            category: .demux
+        )
     }
 
     // MARK: - Persistent Read (single forward-streaming connection)
@@ -972,6 +1662,35 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             if seek { seekReconnect(at: offset) } else { startPersistentConnection(at: offset) }
             diag.recordConnect(ms: msSince(connectStart))
         }
+        func awaitPersistentRetry(
+            _ decision: AVIOPersistentRetryDecision
+        ) -> AVIOPersistentRetryWaitOutcome {
+            let backoffStart = DispatchTime.now()
+            let outcome =
+                persistentRetryController
+                    .waitUntilRetry(decision) {
+                        [weak self] in
+                        guard let self else {
+                            return true
+                        }
+                        return self.isClosed
+                            || self
+                                .readDeadlinePassedOrAborted
+                            || self.terminalError != nil
+                    }
+            diag.recordBackoff(
+                ms: msSince(backoffStart)
+            )
+            return outcome
+        }
+        func cancelledReadResult() -> Int32 {
+            if readDeadlinePassedOrAborted {
+                readDeadlineFired = true
+            }
+            return totalRead > 0
+                ? Int32(totalRead)
+                : -1
+        }
         winCond.lock()
         let diagEntryPosition = position
         let diagGenAtStart = connGeneration
@@ -996,6 +1715,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             diag.recordIteration()
             if isClosed { return totalRead > 0 ? Int32(totalRead) : -1 }
             if readDeadlinePassedOrAborted { readDeadlineFired = true; return totalRead > 0 ? Int32(totalRead) : -1 }
+            if terminalError != nil {
+                return totalRead > 0 ? Int32(totalRead) : -1
+            }
 
             // #93/#96 residual: time the loop-head lock acquisition. A delegate thread holding winCond
             // across its copy + backpressure window blocks the read HERE with nothing to show for it, so
@@ -1014,6 +1736,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             let curPosition = position
 
             if curPosition < winStart {
+                let observedProgressToken =
+                    persistentRetryController
+                        .progressToken
                 winCond.unlock()
                 // Backward random-access read (MP4 parse ping-pong, or a large backward scrub).
                 // Serve via the pooled detour cache so the anchored streaming connection is NOT
@@ -1037,8 +1762,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         diag.recordDetourServe(ms: detourMs, fetched: detourMs > 2)
                         winCond.lock(); position = curPosition + Int64(n); winCond.broadcast(); winCond.unlock()
                         totalRead += n
-                        unproductiveReconnects = 0
-                        rateLimitStreak = 0
                         emitNetworkPhase(.flowing)   // detour cache served: not stalled (#85)
                         detourTrackSequential(at: curPosition, length: n)
                         continue
@@ -1046,15 +1769,28 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         // #93/#96: account the (throttled) fetch attempt's time so it leaves `unaccounted`.
                         diag.recordDetourFetchAttempt(ms: msSince(detourStart))
                         // Origin is throttling the detour fetch too (#71). Back off in place and
-                        // RETRY the detour fetch; do NOT open a fresh connection (that re-enters
-                        // the 429 churn the cache exists to remove). Give up cleanly at the cap.
-                        if recordRateLimitAndShouldGiveUp() {
-                            EngineLog.emit("[AVIOReader] Detour rate-limit gave up at offset \(curPosition) (\(rateLimitStreak) consecutive 429/503)", category: .demux)
-                            return totalRead > 0 ? Int32(totalRead) : -1
+                        // retry the same source. Production playback has no transport-attempt cap.
+                        guard let decision =
+                                persistentRetryController
+                                    .recordTransientFailure(
+                                        observedProgressToken:
+                                            observedProgressToken,
+                                        retryAfterSeconds:
+                                            retryAfter,
+                                        retryLogCause:
+                                            "detourRateLimited"
+                                    ) else {
+                            continue
                         }
-                        let backoffStart = DispatchTime.now()
-                        backoffBeforeReconnect(streak: rateLimitStreak, retryAfter: retryAfter)
-                        diag.recordBackoff(ms: msSince(backoffStart))
+                        emitBoundedRetryDiagnostic(
+                            currentCause:
+                                "detourRateLimited",
+                            decision: decision
+                        )
+                        if awaitPersistentRetry(decision)
+                            == .cancelled {
+                            return cancelledReadResult()
+                        }
                         continue
                     case .miss:
                         // #93/#96: this is where the residual cold read actually lived. A starved fetch
@@ -1063,8 +1799,39 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         diag.recordDetourFetchAttempt(ms: msSince(detourStart))
                         if isClosed { return totalRead > 0 ? Int32(totalRead) : -1 }
                         if readDeadlinePassedOrAborted { readDeadlineFired = true; return totalRead > 0 ? Int32(totalRead) : -1 }
-                        // Hard transport failure: degrade to the OLD single-reconnect behavior.
-                        timedReconnect(seek: true, at: curPosition)
+                        if terminalError != nil {
+                            return totalRead > 0
+                                ? Int32(totalRead)
+                                : -1
+                        }
+                        guard let decision =
+                                persistentRetryController
+                                    .recordTransientFailure(
+                                        observedProgressToken:
+                                            observedProgressToken,
+                                        retryLogCause:
+                                            "detourTransportMiss"
+                                    ) else {
+                            continue
+                        }
+                        emitBoundedRetryDiagnostic(
+                            currentCause:
+                                "detourTransportMiss",
+                            decision: decision
+                        )
+                        switch awaitPersistentRetry(
+                            decision
+                        ) {
+                        case .retry:
+                            timedReconnect(
+                                seek: true,
+                                at: curPosition
+                            )
+                        case .progressed:
+                            break
+                        case .cancelled:
+                            return cancelledReadResult()
+                        }
                         continue
                     }
                 }
@@ -1084,8 +1851,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 position = curPosition + Int64(copyNow)
                 totalRead += copyNow
                 trimWindowLocked()
-                unproductiveReconnects = 0      // real progress
-                rateLimitStreak = 0             // real progress clears the 429 give-up streak (#71)
                 emitNetworkPhase(.flowing)      // recovered: source delivering again (#85)
                 winCond.broadcast()              // window may have shrunk: wake backpressure
                 winCond.unlock()
@@ -1094,7 +1859,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
             let frontier = winStart + Int64(window.count)
             let ended = connEnded
-            let status = connStatus
             let retryAfter = connRetryAfter
 
             // Genuine EOF: only path that returns AVERROR_EOF. Skip for live
@@ -1117,8 +1881,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         diag.recordDetourServe(ms: 0, fetched: false)   // resident-only path
                         winCond.lock(); position = curPosition + Int64(n); winCond.broadcast(); winCond.unlock()
                         totalRead += n
-                        unproductiveReconnects = 0
-                        rateLimitStreak = 0
                         emitNetworkPhase(.flowing)   // detour cache served: not stalled (#85)
                         detourTrackSequential(at: curPosition, length: n)
                         continue
@@ -1135,56 +1897,82 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 // means connStallTimeout elapsed with no data (socket stall).
                 let waitStart = DispatchTime.now()
                 let signaled = winCond.wait(until: min(Date(timeIntervalSinceNow: Self.connStallTimeout), readDeadline))
+                let observedProgressToken =
+                    persistentRetryController
+                        .progressToken
                 winCond.unlock()
                 diag.recordStallWait(ms: msSince(waitStart), signaled: signaled)
                 // Check deadline before stall handling to avoid misrouting a
                 // deadline wake as a socket stall (which would reconnect).
                 if isPastReadDeadline { continue }
                 if !signaled {
-                    if recordReconnectAndShouldGiveUp() {
-                        EngineLog.emit("[AVIOReader] Persistent stall gave up at offset \(frontier) (\(unproductiveReconnects) unproductive)\(isLive ? " [live source lost]" : "")", category: .demux)
-                        emitNetworkPhase(.flowing)   // reader is exiting; let state carry the terminal outcome (#85)
-                        if isLive {
-                            return totalRead > 0 ? Int32(totalRead) : AVERROR_EIO_VALUE
-                        }
-                        return totalRead > 0 ? Int32(totalRead) : -1
+                    guard let decision =
+                            persistentRetryController
+                                .recordTransientFailure(
+                                    observedProgressToken:
+                                        observedProgressToken,
+                                    retryLogCause:
+                                        "persistentStall"
+                                ) else {
+                        continue
                     }
-                    EngineLog.emit("[AVIOReader] Persistent stall at offset \(frontier), reconnecting", category: .demux)
+                    emitBoundedRetryDiagnostic(
+                        currentCause: "persistentStall",
+                        decision: decision
+                    )
                     lastUnplannedReconnectAt = Date()
                     emitNetworkPhase(.reconnecting)   // unplanned reconnect now in flight (#85)
-                    let backoffStart = DispatchTime.now()
-                    backoffBeforeReconnect(streak: unproductiveReconnects, retryAfter: 0)
-                    diag.recordBackoff(ms: msSince(backoffStart))
-                    timedReconnect(seek: false, at: frontier)
+                    switch awaitPersistentRetry(
+                        decision
+                    ) {
+                    case .retry:
+                        timedReconnect(
+                            seek: false,
+                            at: frontier
+                        )
+                    case .progressed:
+                        break
+                    case .cancelled:
+                        return cancelledReadResult()
+                    }
                 }
                 continue
             }
 
             // Connection ended before EOF; reconnect at frontier. Honour Retry-After for 429/503.
+            let observedProgressToken =
+                persistentRetryController
+                    .progressToken
             winCond.unlock()
-            // A 429/503 is rate limiting, not a dead source: drive give-up + backoff off the
-            // rate-limit streak, which (unlike unproductiveReconnects) survives the seekReconnect
-            // that parse seeks fire, so a throttled origin fails cleanly instead of looping (#71).
-            let isRateLimited = (status == 429 || status == 503)
-            let giveUp = isRateLimited ? recordRateLimitAndShouldGiveUp()
-                                       : recordReconnectAndShouldGiveUp(status: status)
-            if giveUp {
-                let streakDesc = isRateLimited ? "\(rateLimitStreak) consecutive 429/503" : "\(unproductiveReconnects) unproductive"
-                EngineLog.emit("[AVIOReader] Persistent reconnect exhausted at offset \(frontier) status=\(status) (\(streakDesc))\(isLive ? " [live source lost]" : "")", category: .demux)
-                emitNetworkPhase(.flowing)   // reader is exiting; let state carry the terminal outcome (#85)
-                if isLive {
-                    return totalRead > 0 ? Int32(totalRead) : AVERROR_EIO_VALUE
-                }
-                return totalRead > 0 ? Int32(totalRead) : -1
+            guard let decision =
+                    persistentRetryController
+                        .recordTransientFailure(
+                                observedProgressToken:
+                                    observedProgressToken,
+                            retryAfterSeconds:
+                                retryAfter,
+                            retryLogCause:
+                                "persistentConnectionEnded"
+                        ) else {
+                continue
             }
-            let backoffStreak = isRateLimited ? rateLimitStreak : unproductiveReconnects
-            EngineLog.emit("[AVIOReader] Persistent conn ended at offset \(frontier) status=\(status), reconnecting (streak=\(backoffStreak) retryAfter=\(retryAfter)s)", category: .demux)
+            emitBoundedRetryDiagnostic(
+                currentCause: "persistentConnectionEnded",
+                decision: decision
+            )
             lastUnplannedReconnectAt = Date()
             emitNetworkPhase(.reconnecting)   // unplanned reconnect now in flight (#85)
-            let backoffStart = DispatchTime.now()
-            backoffBeforeReconnect(streak: backoffStreak, retryAfter: retryAfter)
-            diag.recordBackoff(ms: msSince(backoffStart))
-            timedReconnect(seek: false, at: frontier)
+            switch awaitPersistentRetry(decision) {
+            case .retry:
+                timedReconnect(
+                    seek: false,
+                    at: frontier
+                )
+            case .progressed:
+                break
+            case .cancelled:
+                return cancelledReadResult()
+            }
         }
 
         return Int32(totalRead)
@@ -1205,63 +1993,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
     }
 
-    /// Intentional reconnect for a seek; clears the unproductive streak.
+    /// Intentional seek reconnect does not count as progress and therefore
+    /// cannot hide an existing transport-failure sequence.
     private func seekReconnect(at offset: Int64) {
-        unproductiveReconnects = 0
-        bytesAtLastReconnect = cumulativeBytesFetched
         startPersistentConnection(at: offset)
-    }
-
-    /// Increments the unproductive-reconnect streak (resets if progress exceeded
-    /// `minReconnectProgress`). Returns true when the cap is hit. Demux-thread-only.
-    private func recordReconnectAndShouldGiveUp(status: Int = 0) -> Bool {
-        let now = cumulativeBytesFetched
-        if now - bytesAtLastReconnect >= Self.minReconnectProgress {
-            unproductiveReconnects = 0
-        } else {
-            unproductiveReconnects += 1
-        }
-        bytesAtLastReconnect = now
-        // Hard 4xx/5xx (not 429/503 which carry Retry-After) on a source that has
-        // never delivered a byte = server-side failure (e.g. Jellyfin 500 after
-        // transcode-failure latency ~15-20s/attempt). One retry, then out.
-        let isHardError = status >= 400 && status != 429 && status != 503
-        if now == 0 && isHardError {
-            return unproductiveReconnects > 1
-        }
-        // Dead-on-arrival sources (never produced data) get a reduced budget;
-        // sources that ever produced data keep the full budget for mid-stream resilience.
-        let cap = now == 0
-            ? Self.reconnectMaxUnproductiveNeverProductive
-            : Self.reconnectMaxUnproductive
-        return unproductiveReconnects > cap
-    }
-
-    // 4 attempts ride out a transient transcode spin-up (~10-15s with backoff)
-    // without grinding a dead tuner for minutes.
-    private static let reconnectMaxUnproductiveNeverProductive = 4
-
-    /// Exponential backoff (0.5s..8s) growing with streak; immediate on streak=0.
-    /// Sleeps in 0.1s slices so a close is honoured promptly.
-    private func backoffBeforeReconnect(streak: Int, retryAfter: TimeInterval) {
-        let expo = streak <= 0 ? 0.0 : min(Double(1 << min(streak, 4)) * 0.5, 8.0)
-        let total = min(max(expo, retryAfter), 15.0)
-        if total <= 0 { return }
-        var slept = 0.0
-        while slept < total {
-            if isClosed { return }
-            Thread.sleep(forTimeInterval: 0.1)
-            slept += 0.1
-        }
-    }
-
-    /// Increments the consecutive 429/503 streak; returns true once the bounded cap is hit.
-    /// Demux-thread-only. Deliberately NOT reset by `seekReconnect` (parse seeks must not mask a
-    /// throttled origin into an endless reconnect loop, #71); only real read progress clears it.
-    /// Internal (not private) so the bounded give-up is unit-tested without a live origin.
-    func recordRateLimitAndShouldGiveUp() -> Bool {
-        rateLimitStreak += 1
-        return rateLimitStreak > Self.rateLimitMaxStreak
     }
 
     // MARK: - Detour Block Cache (AetherEngine#69)
@@ -1392,10 +2127,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     private func detourOriginRange(
         from offset: Int64,
-        size: Int
+        size: Int,
+        forceSource: Bool = false
     ) throws -> OriginChunk {
         let rangeEnd = offset + Int64(size) - 1
-        var request = URLRequest(url: requestURL())
+        let targetURL = forceSource ? url : requestURL()
+        let usedCachedResolvedURL =
+            !forceSource
+                && cachedResolvedURL() == targetURL
+                && targetURL != url
+        var request = URLRequest(url: targetURL)
         request.setValue("bytes=\(offset)-\(rangeEnd)", forHTTPHeaderField: "Range")
         // #93/#96: a starved backward-scrub detour fetch must abort fast (the rescue reconnect serves
         // instantly), so this path uses the tight interactive budget, not the full chunk timeout.
@@ -1404,7 +2145,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         applyExtraHeaders(&request)
         applySourceByteStoreHeaders(&request)
         do {
-            let (data, response) = try syncRequest(request, budget: budget)
+            let result = try syncRequest(
+                request,
+                budget: budget
+            )
+            let data = result.data
+            let response = result.response
             var sourceGeneration:
                 SourceByteStoreGeneration?
             if let http = response as? HTTPURLResponse {
@@ -1416,7 +2162,20 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         )
                 }
                 if status != 200 && status != 206 {
-                    if Self.isResolvedExpiryStatus(status) { invalidateResolvedURL() }
+                    let shouldRetryCanonical =
+                        handleHardHTTPStatus(
+                        status,
+                        responseWasResolvedUpstream:
+                            usedCachedResolvedURL
+                                || result.didFollowRedirect
+                    )
+                    if shouldRetryCanonical && !forceSource {
+                        return try detourOriginRange(
+                            from: offset,
+                            size: size,
+                            forceSource: true
+                        )
+                    }
                     throw SourceByteStoreError
                         .rangeFetchFailed
                 }
@@ -1439,7 +2198,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     sourceGeneration = generation
                 }
             }
-            addBytesFetched(data.count)
+            addBytesFetched(
+                data.count,
+                at: offset
+            )
             if sourceByteStore != nil {
                 guard let sourceGeneration else {
                     throw SourceByteStoreError
@@ -1487,14 +2249,28 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// Open a fresh Range: bytes=<offset>- connection. Bumps generation so
     /// late callbacks from the old connection are ignored.
     private func startPersistentConnection(at offset: Int64, boundedTo: Int64? = nil) {
+        let sourceStoreValidator =
+            sourceByteStore?
+                .snapshot?
+                .generation
+                .validator
         winCond.lock()
         connGeneration &+= 1
         let generation = connGeneration
+        let admittedValidator =
+            isLive
+                ? nil
+                : (
+                    persistentSourceGeneration?
+                        .validator
+                        ?? sourceStoreValidator
+                )
         winStart = offset
         window = Data()
         connEnded = false
         connStatus = 0
         connRetryAfter = 0
+        connResponseAccepted = false
         connStartedAt = DispatchTime.now()   // #93: time-to-first-data per generation
         connFirstDataSeen = false
         let oldSession = activeSession
@@ -1507,8 +2283,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         oldSession?.invalidateAndCancel()
 
         if isClosed { return }
+        guard let ioActivity =
+                ioQuiescence.beginActivity() else {
+            return
+        }
 
-        var request = URLRequest(url: requestURL())
+        let targetURL = requestURL()
+        let usedCachedResolvedURL =
+            cachedResolvedURL() == targetURL
+                && targetURL != url
+        var request = URLRequest(url: targetURL)
         // #93 residual: a bounded open connection asks for a finite range so an origin that dribbles
         // the open-ended `bytes=0-` stream serves it as a fast finite GET. The 206 Content-Range still
         // carries the total size, so fileSize resolution (issue #70) is unaffected.
@@ -1520,11 +2304,22 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         request.timeoutInterval = 0  // long-lived; stalls handled by the reader
         applyExtraHeaders(&request)
         applySourceByteStoreHeaders(&request)
+        if let admittedValidator {
+            request.setValue(
+                Self.ifRangeValue(
+                    for: admittedValidator
+                ),
+                forHTTPHeaderField: "If-Range"
+            )
+        }
 
         let delegate = PersistentReadDelegate(
             reader: self,
             generation: generation,
-            extraHeaders: extraHeaders
+            extraHeaders: extraHeaders,
+            usedCachedResolvedURL:
+                usedCachedResolvedURL,
+            ioActivity: ioActivity
         )
         let session = URLSession(
             configuration: Self.makeSessionConfig(longLived: true),
@@ -1555,9 +2350,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// source dispatch_data per delivery (same leak control as the chunk path).
     fileprivate func appendPersistentData(_ data: Data, generation: Int) {
         winCond.lock()
-        guard generation == connGeneration, !isFullyClosed else {
+        guard generation == connGeneration,
+              connResponseAccepted,
+              !isFullyClosed else {
             // #93: a slow read's summary line reports how much data the stale-generation
-            // guard discarded while the read waited.
+            // or unadmitted-response guard discarded while the read waited.
             staleGenDroppedBytes += Int64(data.count)
             winCond.unlock()
             return
@@ -1569,6 +2366,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             firstDataMs = Double(DispatchTime.now().uptimeNanoseconds - connStartedAt.uptimeNanoseconds) / 1_000_000
         }
         let count = data.count
+        persistentAcceptedBodyBytes &+= Int64(count)
         let base = window.count
         window.count = base + count
         window.withUnsafeMutableBytes { dst in
@@ -1578,7 +2376,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 }
             }
         }
-        addBytesFetched(count)
+        addBytesFetched(
+            count,
+            at: sourceOffset
+        )
         winCond.broadcast()
         // Backpressure: 0.2s timeout is belt-and-suspenders; correctness from broadcasts.
         while generation == connGeneration && !isClosed {
@@ -1608,7 +2409,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     fileprivate func persistentReceivedResponse(
         _ http: HTTPURLResponse,
         resolvedURL: URL?,
-        generation: Int
+        generation: Int,
+        responseWasResolvedUpstream: Bool
     ) -> Bool {
         let status = http.statusCode
         var isOK = status == 200 || status == 206
@@ -1622,6 +2424,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if isCurrentGeneration {
             connStatus = status
             connRetryAfter = retryAfter
+            connResponseAccepted = false
             // #93/#96 residual: time-to-first-response-header for this generation. A large value here
             // with a small subsequent first-data gap points at server-side connection queuing (the
             // origin accepted the socket but withheld the response while it served another connection
@@ -1632,6 +2435,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // from byte 0 (silent corruption). Reject it. Live is exempt: transcode
         // reconnect legitimately answers 200 with "from now".
         let requestedOffset = isCurrentGeneration ? winStart : 0
+        let exactResponseGeneration =
+            !isLive
+                ? Self.sourceStoreGeneration(
+                    response: http,
+                    requestedOffset:
+                        requestedOffset
+                )
+                : nil
         // Issue #70: the first from-0 data connection doubles as the size probe, so the
         // playback open skips probeFileSize() entirely. Derive the total from this
         // response (206 Content-Range, or Content-Length on a from-0 2xx). Write-once
@@ -1649,6 +2460,29 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             #endif
         }
         winCond.unlock()
+        if isOK, isCurrentGeneration, !isLive {
+            winCond.lock()
+            if generation != connGeneration {
+                isOK = false
+            } else if persistentAcceptedBodyBytes > 0 {
+                guard let admitted =
+                        persistentSourceGeneration,
+                      admitted.validator != nil,
+                      let exactResponseGeneration,
+                      exactResponseGeneration
+                        == admitted else {
+                    winCond.unlock()
+                    recordSourceStoreFailure(
+                        .generationMismatch
+                    )
+                    return false
+                }
+            } else {
+                persistentSourceGeneration =
+                    exactResponseGeneration
+            }
+            winCond.unlock()
+        }
         if isOK, isCurrentGeneration,
            !admitSourceStoreResponse(
                http,
@@ -1671,12 +2505,23 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
 
         if isOK {
+            winCond.lock()
+            guard generation == connGeneration,
+                  !isClosed,
+                  terminalError == nil else {
+                winCond.unlock()
+                return false
+            }
+            connResponseAccepted = true
+            winCond.unlock()
             if let resolvedURL { recordResolvedURL(resolvedURL) }
             return true
         }
-        if Self.isResolvedExpiryStatus(status) {
-            invalidateResolvedURL()
-        }
+        handleHardHTTPStatus(
+            status,
+            responseWasResolvedUpstream:
+                responseWasResolvedUpstream
+        )
         return false
     }
 
@@ -1689,21 +2534,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let windowAhead = isCurrentGen ? (window.count - max(0, Int(position - winStart))) : 0
         winCond.broadcast()
         winCond.unlock()
-        if let error {
-            EngineLog.emit("[AVIOReader] Persistent conn gen=\(generation) ended with error: \(error.localizedDescription)", category: .demux)
-        }
-        if isCurrentGen && isLive {
-            EngineLog.emit("[AVIOReader] Live source: connection ended gen=\(generation) buffered=\(windowAhead / 1024)KB; reconnect will fire when buffer drains", category: .demux)
-        }
+        _ = error
+        _ = windowAhead
     }
 
-    /// Parses delta-seconds Retry-After; HTTP-date form falls back to expo backoff. Cap 15s.
+    /// Parses delta-seconds Retry-After; HTTP-date form falls back to policy
+    /// backoff. A server hint can extend the policy delay, capped at 30s.
     private static func parseRetryAfter(_ http: HTTPURLResponse) -> TimeInterval {
         guard let raw = http.value(forHTTPHeaderField: "Retry-After"),
               let seconds = TimeInterval(raw.trimmingCharacters(in: .whitespaces)) else {
             return 0
         }
-        return min(max(seconds, 0), 15)
+        return min(max(seconds, 0), 30)
     }
 
     private func admitSourceStoreResponse(
@@ -1804,6 +2646,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         )
     }
 
+    static func sourceStoreGenerationMatches(
+        _ expected: SourceByteStoreGeneration,
+        response: HTTPURLResponse,
+        requestedOffset: Int64
+    ) -> Bool {
+        sourceStoreGeneration(
+            response: response,
+            requestedOffset: requestedOffset
+        ) == expected
+    }
+
     // MARK: - Streaming Download (background)
 
     private func startStreamingDownload() {
@@ -1813,69 +2666,603 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     }
 
     private func streamDownloadSync() {
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 0  // No timeout for live streams
-        applyExtraHeaders(&request)
-        applySourceByteStoreHeaders(&request)
-
-        let semaphore = DispatchSemaphore(value: 0)
-
-        let delegate = StreamingDelegate { [weak self] data in
-            guard let self, !self.isClosed else { return }
-            self.streamLock.lock()
-            self.streamBuffer.append(data)
-            // Backpressure: park the transfer once the retained buffer
-            // exceeds the high water mark; readStreaming resumes it when
-            // the consumer drains below the low water mark (and before
-            // any wait, so a far-forward seek can't deadlock against a
-            // suspended producer).
-            var toSuspend: URLSessionDataTask?
-            if !self.streamingTaskSuspended, self.streamBuffer.count > Self.streamHighWater {
-                self.streamingTaskSuspended = true
-                toSuspend = self.streamingTask
+        while !isClosed && terminalError == nil {
+            streamLock.lock()
+            if streamConfirmedEOF {
+                streamLock.unlock()
+                return
             }
-            self.streamLock.unlock()
-            toSuspend?.suspend()
-            self.addBytesFetched(data.count)
-            self.streamDataReady.signal()
-        } onComplete: { [weak self] in
-            self?.streamLock.lock()
-            self?.streamEnded = true
-            self?.streamLock.unlock()
-            self?.streamDataReady.signal()
-            semaphore.signal()
+            streamGeneration &+= 1
+            let generation = streamGeneration
+            let requestedOffset =
+                streamBytesReceived
+            let validator =
+                streamSourceValidator
+            streamAttemptAcceptedResponse = false
+            streamAttemptRetryAfter = 0
+            streamAttemptDiscardPrefixBytes = 0
+            streamAttemptStartBytes =
+                streamBytesReceived
+            streamProgressDeadline = Date(
+                timeIntervalSinceNow:
+                    persistentRetryController
+                        .noProgressWindowSeconds(
+                            forAttempt:
+                                streamNoProgressAttempt
+                        )
+            )
+            streamLock.broadcast()
+            streamLock.unlock()
+
+            guard let ioActivity =
+                    ioQuiescence
+                        .beginActivity() else {
+                return
+            }
+
+            let targetURL = requestURL()
+            let usedCachedResolvedURL =
+                cachedResolvedURL() == targetURL
+                    && targetURL != url
+            var request = URLRequest(
+                url: targetURL
+            )
+            request.timeoutInterval = 0
+            if requestedOffset > 0 {
+                request.setValue(
+                    "bytes=\(requestedOffset)-",
+                    forHTTPHeaderField: "Range"
+                )
+                if let validator {
+                    request.setValue(
+                        Self.ifRangeValue(
+                            for: validator
+                        ),
+                        forHTTPHeaderField:
+                            "If-Range"
+                    )
+                }
+            }
+            request.setValue(
+                "identity",
+                forHTTPHeaderField:
+                    "Accept-Encoding"
+            )
+            applyExtraHeaders(&request)
+
+            let semaphore =
+                DispatchSemaphore(value: 0)
+            let delegate = StreamingDelegate(
+                extraHeaders: extraHeaders,
+                onResponse: {
+                    [weak self] response,
+                    resolvedURL,
+                    didFollowRedirect in
+                    guard let self else {
+                        return false
+                    }
+                    return self
+                        .streamingReceivedResponse(
+                            response,
+                            resolvedURL:
+                                resolvedURL,
+                            requestedOffset:
+                                requestedOffset,
+                            generation:
+                                generation,
+                            responseWasResolvedUpstream:
+                                usedCachedResolvedURL
+                                || didFollowRedirect
+                        )
+                },
+                onData: {
+                    [weak self] data in
+                    self?.appendStreamingData(
+                        data,
+                        generation: generation
+                    )
+                },
+                onComplete: {
+                    [weak self] completedWithoutError in
+                    self?
+                        .streamingConnectionEnded(
+                            completedWithoutError:
+                                completedWithoutError,
+                            generation:
+                                generation
+                        )
+                },
+                onStopped: {
+                    semaphore.signal()
+                },
+                ioActivity: ioActivity
+            )
+            let streamSession = URLSession(
+                configuration:
+                    Self.makeSessionConfig(
+                        longLived: true
+                    ),
+                delegate: delegate,
+                delegateQueue: nil
+            )
+            let task =
+                streamSession.dataTask(
+                    with: request
+                )
+
+            // Register before resume so markClosed()/close() can cancel.
+            streamLock.lock()
+            guard generation == streamGeneration,
+                  !isClosed else {
+                streamLock.unlock()
+                streamSession
+                    .invalidateAndCancel()
+                return
+            }
+            streamingSession = streamSession
+            streamingTask = task
+            #if DEBUG
+            streamActiveReaderCount += 1
+            streamMaximumConcurrentReaderCount =
+                max(
+                    streamMaximumConcurrentReaderCount,
+                    streamActiveReaderCount
+                )
+            #endif
+            streamLock.broadcast()
+            streamLock.unlock()
+
+            task.resume()
+
+            #if DEBUG
+            EngineLog.emit(
+                "[AVIOReader] Unknown-length stream started generation=\(generation) offset=\(requestedOffset)",
+                category: .demux
+            )
+            #endif
+
+            semaphore.wait()
+            streamSession.invalidateAndCancel()
+
+            streamLock.lock()
+            #if DEBUG
+            streamActiveReaderCount -= 1
+            #endif
+            let isCurrentGeneration =
+                generation == streamGeneration
+            if isCurrentGeneration {
+                streamingSession = nil
+                streamingTask = nil
+                streamProgressDeadline =
+                    .distantFuture
+                streamLock.broadcast()
+            }
+            let retryAfter =
+                isCurrentGeneration
+                    ? streamAttemptRetryAfter
+                    : 0
+            let reachedEOF =
+                isCurrentGeneration
+                    && streamConfirmedEOF
+            streamLock.unlock()
+
+            if isClosed
+                || terminalError != nil
+                || reachedEOF {
+                return
+            }
+
+            let observedProgressToken =
+                persistentRetryController
+                    .progressToken
+            guard let decision =
+                    persistentRetryController
+                        .recordTransientFailure(
+                                observedProgressToken:
+                                    observedProgressToken,
+                            retryAfterSeconds:
+                                retryAfter,
+                            retryLogCause:
+                                "unknownLengthReconnect"
+                        ) else {
+                continue
+            }
+            emitBoundedRetryDiagnostic(
+                currentCause: "unknownLengthReconnect",
+                decision: decision
+            )
+            streamLock.lock()
+            streamLock.broadcast()
+            streamLock.unlock()
+            let outcome =
+                persistentRetryController
+                    .waitUntilRetry(decision) {
+                        [weak self] in
+                        guard let self else {
+                            return true
+                        }
+                        return self.isClosed
+                            || self.terminalError
+                                != nil
+                    }
+            guard outcome == .retry else {
+                if outcome == .cancelled {
+                    return
+                }
+                continue
+            }
+        }
+    }
+
+    private func streamingReceivedResponse(
+        _ response: HTTPURLResponse,
+        resolvedURL: URL?,
+        requestedOffset: Int64,
+        generation: Int,
+        responseWasResolvedUpstream: Bool
+    ) -> Bool {
+        let statusCode = response.statusCode
+        guard statusCode == 200
+                || statusCode == 206 else {
+            let retryAfter =
+                statusCode == 429
+                    || statusCode == 503
+                    ? Self.parseRetryAfter(
+                        response
+                    )
+                    : 0
+            streamLock.lock()
+            if generation == streamGeneration {
+                streamAttemptRetryAfter =
+                    retryAfter
+                streamLock.broadcast()
+            }
+            streamLock.unlock()
+            handleHardHTTPStatus(
+                statusCode,
+                responseWasResolvedUpstream:
+                    responseWasResolvedUpstream
+            )
+            return false
         }
 
-        let streamSession = URLSession(
-            configuration: Self.makeSessionConfig(longLived: true),
-            delegate: delegate,
-            delegateQueue: nil
+        let plan: AVIOStreamingResumePlan
+        do {
+            plan = try Self.streamingResumePlan(
+                statusCode: statusCode,
+                requestedOffset:
+                    requestedOffset,
+                contentRange: response
+                    .value(
+                        forHTTPHeaderField:
+                            "Content-Range"
+                    ),
+                admittedValidator:
+                    streamValidatorSnapshot(),
+                responseValidator:
+                    Self.responseValidator(
+                        response
+                    ),
+                contentEncoding: response
+                    .value(
+                        forHTTPHeaderField:
+                            "Content-Encoding"
+                    )
+            )
+        } catch let error as AVIOReaderError {
+            recordTerminalReaderError(error)
+            streamLock.lock()
+            streamLock.broadcast()
+            streamLock.unlock()
+            return false
+        } catch {
+            recordTerminalReaderError(
+                .sourceByteStore(
+                    .generationMismatch
+                )
+            )
+            streamLock.lock()
+            streamLock.broadcast()
+            streamLock.unlock()
+            return false
+        }
+
+        streamLock.lock()
+        guard generation == streamGeneration,
+              !isClosed else {
+            streamLock.unlock()
+            return false
+        }
+        streamAttemptAcceptedResponse = true
+        streamAttemptDiscardPrefixBytes =
+            plan.discardPrefixBytes
+        if requestedOffset == 0 {
+            streamSourceValidator =
+                plan.validator
+        }
+        streamLock.broadcast()
+        streamLock.unlock()
+        if let resolvedURL {
+            recordResolvedURL(resolvedURL)
+        }
+        return true
+    }
+
+    private func streamValidatorSnapshot()
+        -> SourceByteStoreValidator? {
+        streamLock.lock()
+        defer { streamLock.unlock() }
+        return streamSourceValidator
+    }
+
+    private func appendStreamingData(
+        _ data: Data,
+        generation: Int
+    ) {
+        guard !data.isEmpty else { return }
+        streamLock.lock()
+        guard generation == streamGeneration,
+              streamAttemptAcceptedResponse,
+              !isClosed else {
+            streamLock.unlock()
+            return
+        }
+
+        var startIndex = 0
+        if streamAttemptDiscardPrefixBytes > 0 {
+            let discarded = min(
+                Int64(data.count),
+                streamAttemptDiscardPrefixBytes
+            )
+            streamAttemptDiscardPrefixBytes -=
+                discarded
+            startIndex = Int(discarded)
+            // This does not advance the unique-byte ledger, but it keeps one
+            // validated replay alive long enough to reach the resume offset.
+            streamProgressDeadline = Date(
+                timeIntervalSinceNow:
+                    persistentRetryController
+                        .noProgressWindowSeconds(
+                            forAttempt:
+                                streamNoProgressAttempt
+                        )
+            )
+        }
+
+        let appendedCount =
+            data.count - startIndex
+        guard appendedCount > 0 else {
+            streamLock.broadcast()
+            streamLock.unlock()
+            return
+        }
+        let sourceOffset =
+            streamBytesReceived
+        streamBytesReceived &+=
+            Int64(appendedCount)
+        if startIndex == 0 {
+            streamBuffer.append(data)
+        } else {
+            streamBuffer.append(
+                data.subdata(
+                    in: startIndex..<data.count
+                )
+            )
+        }
+        streamNoProgressAttempt = 1
+        streamProgressDeadline = Date(
+            timeIntervalSinceNow:
+                persistentRetryController
+                    .noProgressWindowSeconds(
+                        forAttempt: 1
+                    )
         )
-        let task = streamSession.dataTask(with: request)
 
-        // Register before resume so markClosed()/close() can cancel; re-check after.
+        // Backpressure: park the transfer once the retained buffer exceeds
+        // the high-water mark; readStreaming resumes below the low-water mark.
+        var toSuspend:
+            URLSessionDataTask?
+        if !streamingTaskSuspended,
+           streamBuffer.count
+            > Self.streamHighWater {
+            streamingTaskSuspended = true
+            toSuspend = streamingTask
+        }
+        streamLock.broadcast()
+        streamLock.unlock()
+        toSuspend?.suspend()
+
+        addBytesFetched(
+            appendedCount,
+            at: sourceOffset
+        )
+        streamDataReady.signal()
+    }
+
+    private func streamingConnectionEnded(
+        completedWithoutError: Bool,
+        generation: Int
+    ) {
+        var truncatedReplayBytes: Int64 = 0
         streamLock.lock()
-        streamingSession = streamSession
-        streamingTask = task
+        guard generation == streamGeneration else {
+            streamLock.unlock()
+            return
+        }
+        let madeUniqueProgress =
+            streamBytesReceived
+                > streamAttemptStartBytes
+        if completedWithoutError,
+           streamAttemptAcceptedResponse {
+            if streamAttemptDiscardPrefixBytes
+                > 0 {
+                truncatedReplayBytes =
+                    streamAttemptDiscardPrefixBytes
+            } else {
+                streamConfirmedEOF = true
+            }
+        } else if !madeUniqueProgress,
+                  streamNoProgressAttempt
+                    < Int.max {
+            streamNoProgressAttempt += 1
+        }
+        streamProgressDeadline =
+            .distantFuture
+        streamLock.broadcast()
         streamLock.unlock()
 
-        task.resume()
-        if isClosed { task.cancel() }
+        if truncatedReplayBytes > 0 {
+            recordTerminalReaderError(
+                .sourceByteStore(
+                    .generationMismatch
+                )
+            )
+        }
+        streamDataReady.signal()
+    }
 
-        #if DEBUG
-        EngineLog.emit("[AVIOReader] Streaming started: \(url.lastPathComponent)", category: .demux)
-        #endif
+    static func streamingResumePlan(
+        statusCode: Int,
+        requestedOffset: Int64,
+        contentRange: String?,
+        admittedValidator:
+            SourceByteStoreValidator?,
+        responseValidator:
+            SourceByteStoreValidator?,
+        contentEncoding: String?
+    ) throws -> AVIOStreamingResumePlan {
+        precondition(
+            statusCode == 200
+                || statusCode == 206
+        )
+        if let contentEncoding =
+                contentEncoding?
+                    .trimmingCharacters(
+                        in: .whitespacesAndNewlines
+                    ),
+           !contentEncoding.isEmpty,
+           contentEncoding.lowercased()
+            != "identity" {
+            throw AVIOReaderError
+                .sourceByteStore(
+                    .unsupportedContentEncoding(
+                        contentEncoding
+                    )
+                )
+        }
 
-        semaphore.wait()
+        if requestedOffset == 0 {
+            if statusCode == 206,
+               Self.contentRangeStart(
+                    contentRange
+               ) != 0 {
+                throw AVIOReaderError
+                    .sourceByteStore(
+                        .invalidRange
+                    )
+            }
+            return AVIOStreamingResumePlan(
+                discardPrefixBytes: 0,
+                validator: responseValidator
+            )
+        }
 
-        #if DEBUG
-        EngineLog.emit("[AVIOReader] Streaming ended", category: .demux)
-        #endif
-        streamLock.lock()
-        streamingSession = nil
-        streamingTask = nil
-        streamLock.unlock()
-        streamSession.invalidateAndCancel()
+        guard let admittedValidator else {
+            throw AVIOReaderError
+                .sourceByteStore(
+                    .invalidGeneration
+                )
+        }
+        guard responseValidator
+                == admittedValidator else {
+            throw AVIOReaderError
+                .sourceByteStore(
+                    .generationMismatch
+                )
+        }
+        if statusCode == 206 {
+            guard Self.contentRangeStart(
+                contentRange
+            ) == requestedOffset else {
+                throw AVIOReaderError
+                    .sourceByteStore(
+                        .invalidRange
+                    )
+            }
+            return AVIOStreamingResumePlan(
+                discardPrefixBytes: 0,
+                validator:
+                    admittedValidator
+            )
+        }
+        return AVIOStreamingResumePlan(
+            discardPrefixBytes:
+                requestedOffset,
+            validator: admittedValidator
+        )
+    }
+
+    private static func contentRangeStart(
+        _ value: String?
+    ) -> Int64? {
+        guard let value else { return nil }
+        let trimmed = value
+            .trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+        guard trimmed.lowercased()
+                .hasPrefix("bytes ") else {
+            return nil
+        }
+        let rangeAndTotal =
+            trimmed.dropFirst(6)
+        guard let dash =
+                rangeAndTotal.firstIndex(
+                    of: "-"
+                ) else {
+            return nil
+        }
+        return Int64(
+            rangeAndTotal[..<dash]
+        )
+    }
+
+    private static func responseValidator(
+        _ response: HTTPURLResponse
+    ) -> SourceByteStoreValidator? {
+        if let rawETag = response.value(
+            forHTTPHeaderField: "ETag"
+        )?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ),
+           !rawETag.isEmpty,
+           !rawETag.lowercased()
+            .hasPrefix("w/") {
+            return .strongETag(rawETag)
+        }
+        if let lastModified = response.value(
+            forHTTPHeaderField:
+                "Last-Modified"
+        )?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ),
+           !lastModified.isEmpty {
+            return .lastModified(
+                lastModified
+            )
+        }
+        return nil
+    }
+
+    private static func ifRangeValue(
+        for validator:
+            SourceByteStoreValidator
+    ) -> String {
+        switch validator {
+        case .strongETag(let value),
+             .lastModified(let value):
+            return value
+        }
     }
 
     // MARK: - Prefetch (background, seekable mode only)
@@ -1967,7 +3354,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             bufferLock.unlock()
         } else {
             // Streaming: forward-only; backward seeks below the retained
-            // window return failure so the demuxer doesn't silently wait 15s.
+            // window fail explicitly because this reader cannot reconstruct
+            // bytes it has already discarded.
             streamLock.lock()
             let oldestRetained = streamBytesRead
             streamLock.unlock()
@@ -1994,10 +3382,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         case valid
         case changed
         case failed(reason: String)
+        case terminal(AVIOReaderError)
     }
 
     private func validateSourceStore(
-        _ candidate: SourceByteStoreGeneration
+        _ candidate: SourceByteStoreGeneration,
+        allowResolvedExpiryRetry: Bool = true
     ) -> SourceStoreValidationResult {
         guard let validator = candidate.validator else {
             return .failed(reason: "complete store has no response validator")
@@ -2012,8 +3402,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         applyExtraHeaders(&request)
         applySourceByteStoreHeaders(&request)
 
+        guard let ioActivity =
+                ioQuiescence.beginActivity() else {
+            return .failed(
+                reason: "conditional range validation cancelled"
+            )
+        }
         let delegate = SourceByteStoreValidationDelegate(
-            extraHeaders: extraHeaders
+            extraHeaders: extraHeaders,
+            ioActivity: ioActivity
         )
         let task = Self.probeSession.dataTask(with: request)
         task.delegate = delegate
@@ -2034,6 +3431,25 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         guard let response = delegate.response else {
             return .failed(reason: "conditional range validation returned no response")
         }
+        let shouldRetryCanonical = handleHardHTTPStatus(
+            response.statusCode,
+            responseWasResolvedUpstream:
+                delegate.didFollowRedirect
+        )
+        if shouldRetryCanonical,
+           allowResolvedExpiryRetry {
+            return validateSourceStore(
+                candidate,
+                allowResolvedExpiryRetry: false
+            )
+        }
+        if let error = Self.terminalHTTPError(
+            statusCode: response.statusCode,
+            responseWasResolvedUpstream:
+                delegate.didFollowRedirect
+        ) {
+            return .terminal(error)
+        }
         switch response.statusCode {
         case 206:
             if let contentEncoding = response.value(
@@ -2046,10 +3462,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         + "Content-Encoding \(contentEncoding)"
                 )
             }
-            guard Self.sizeFromResponse(
-                response,
+            guard Self.sourceStoreGenerationMatches(
+                candidate,
+                response: response,
                 requestedOffset: 0
-            ) == candidate.contentLength else {
+            ) else {
                 return .changed
             }
             return .valid
@@ -2113,8 +3530,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             #endif
             return size
         }
+        if terminalError != nil {
+            return -1
+        }
         let headSize = headProbeFileSize()
         if headSize > 0 { return headSize }
+        if terminalError != nil {
+            return -1
+        }
         // #126: origins that answer bytes=0- with 200/chunked (no length) and reject HEAD can
         // still honor real ranges (Emby behind a buffering proxy). A bounded two-byte range is
         // the last probe before degrading to forward-only streaming mode; a 206 carries the
@@ -2134,14 +3557,24 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// bytes=0- answers with a proper Content-Range in one shot. The bounded bytes=0-1 form is
     /// the #126 last-resort probe for origins that answer bytes=0- without a length but honor
     /// real ranges.
-    private func rangeProbeFileSize(range: String) -> Int64? {
+    private func rangeProbeFileSize(
+        range: String,
+        allowResolvedExpiryRetry: Bool = true
+    ) -> Int64? {
         var request = URLRequest(url: url)
         request.setValue(range, forHTTPHeaderField: "Range")
         request.timeoutInterval = 20
         applyExtraHeaders(&request)
         applySourceByteStoreHeaders(&request)
 
-        let delegate = ProbeDelegate(extraHeaders: extraHeaders)
+        guard let ioActivity =
+                ioQuiescence.beginActivity() else {
+            return nil
+        }
+        let delegate = ProbeDelegate(
+            extraHeaders: extraHeaders,
+            ioActivity: ioActivity
+        )
         let task = Self.probeSession.dataTask(with: request)
         task.delegate = delegate
 
@@ -2168,11 +3601,28 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if delegate.totalSize == nil {
             EngineLog.emit("[AVIOReader] Range probe (\(range)) didn't yield a size", category: .demux, level: .verbose)
         }
+        if let statusCode = delegate.statusCode {
+            let shouldRetryCanonical =
+                handleHardHTTPStatus(
+                statusCode,
+                responseWasResolvedUpstream:
+                    delegate.didFollowRedirect
+            )
+            if shouldRetryCanonical,
+               allowResolvedExpiryRetry {
+                return rangeProbeFileSize(
+                    range: range,
+                    allowResolvedExpiryRetry: false
+                )
+            }
+        }
         return delegate.totalSize
     }
 
     /// HEAD probe fallback for live-transcode endpoints that reject Range.
-    private func headProbeFileSize() -> Int64 {
+    private func headProbeFileSize(
+        allowResolvedExpiryRetry: Bool = true
+    ) -> Int64 {
         var request = URLRequest(url: url)
         request.httpMethod = "HEAD"
         request.timeoutInterval = 5
@@ -2182,10 +3632,29 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         do {
             // Honour the still budget here too so the open-time HEAD fallback can't
             // ride the default 35s on a stalled origin during a cold/reopen scrub (#27).
-            let (_, response) = try syncRequest(request, budget: chunkRequestTimeout)
-            guard let http = response as? HTTPURLResponse,
-                  (200...299).contains(http.statusCode) else {
+            let result = try syncRequest(
+                request,
+                budget: chunkRequestTimeout
+            )
+            let response = result.response
+            guard let http = response as? HTTPURLResponse else {
                 EngineLog.emit("[AVIOReader] HEAD failed (HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1))", category: .demux, level: .verbose)
+                return -1
+            }
+            guard (200...299).contains(http.statusCode) else {
+                let shouldRetryCanonical =
+                    handleHardHTTPStatus(
+                    http.statusCode,
+                    responseWasResolvedUpstream:
+                        result.didFollowRedirect
+                )
+                if shouldRetryCanonical,
+                   allowResolvedExpiryRetry {
+                    return headProbeFileSize(
+                        allowResolvedExpiryRetry: false
+                    )
+                }
+                EngineLog.emit("[AVIOReader] HEAD failed (HTTP \(http.statusCode))", category: .demux, level: .verbose)
                 return -1
             }
             let length = http.expectedContentLength
@@ -2194,7 +3663,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             #endif
             return length
         } catch {
-            EngineLog.emit("[AVIOReader] HEAD probe failed: \(error.localizedDescription)", category: .demux, level: .verbose)
             return -1
         }
     }
@@ -2273,28 +3741,120 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     ) -> Data? {
         fetchChunk(from: offset, size: size)
     }
+
+    func startUnknownLengthStreamForTesting() {
+        startStreamingDownload()
+    }
+
+    func readUnknownLengthStreamForTesting(
+        maximumLength: Int
+    ) -> (result: Int32, data: Data) {
+        var data = Data(
+            count: max(1, maximumLength)
+        )
+        let result = data
+            .withUnsafeMutableBytes { raw in
+                readStreaming(
+                    into: raw.baseAddress!
+                        .assumingMemoryBound(
+                            to: UInt8.self
+                        ),
+                    size: Int32(
+                        max(1, maximumLength)
+                    )
+                )
+            }
+        if result > 0 {
+            data.count = Int(result)
+        } else {
+            data.removeAll()
+        }
+        return (result, data)
+    }
+
+    func readPersistentStreamForTesting(
+        maximumLength: Int
+    ) -> (result: Int32, data: Data) {
+        var data = Data(
+            count: max(1, maximumLength)
+        )
+        let result = data
+            .withUnsafeMutableBytes { raw in
+                readPersistent(
+                    into: raw.baseAddress!
+                        .assumingMemoryBound(
+                            to: UInt8.self
+                        ),
+                    size: Int32(
+                        max(1, maximumLength)
+                    )
+                )
+            }
+        if result > 0 {
+            data.count = Int(result)
+        } else {
+            data.removeAll()
+        }
+        return (result, data)
+    }
+
+    var unknownLengthStreamGenerationForTesting:
+        Int {
+        streamLock.lock()
+        defer { streamLock.unlock() }
+        return streamGeneration
+    }
+
+    var unknownLengthMaximumConcurrentReadersForTesting:
+        Int {
+        streamLock.lock()
+        defer { streamLock.unlock() }
+        return streamMaximumConcurrentReaderCount
+    }
+
+    var unknownLengthBytesReceivedForTesting:
+        Int64 {
+        streamLock.lock()
+        defer { streamLock.unlock() }
+        return streamBytesReceived
+    }
+
+    func appendUnknownLengthDataForTesting(
+        _ data: Data,
+        generation: Int
+    ) {
+        appendStreamingData(
+            data,
+            generation: generation
+        )
+    }
     #endif
 
     private func fetchOriginChunk(
         from offset: Int64,
         size: Int
     ) -> OriginChunk? {
-        if let chunk = fetchChunkAttempt(
+        let hadCachedResolvedURL =
+            cachedResolvedURL() != nil
+        let firstAttempt = fetchChunkAttempt(
             from: offset,
             size: size,
             forceSource: false
-        ) {
+        )
+        if let chunk = firstAttempt.chunk {
             return chunk
         }
         // Retry against source URL only if a cached resolved URL was used
-        // (so the proxy can re-issue a fresh signed redirect).
-        if cachedResolvedURL() != nil,
+        // or this canonical request followed a redirect to an expired
+        // resolved upstream (so the proxy can re-issue a fresh signature).
+        if (hadCachedResolvedURL
+                || firstAttempt.shouldRetryCanonical),
            sourceStoreFailure == nil {
             return fetchChunkAttempt(
                 from: offset,
                 size: size,
                 forceSource: true
-            )
+            ).chunk
         }
         return nil
     }
@@ -2303,7 +3863,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         from offset: Int64,
         size: Int,
         forceSource: Bool
-    ) -> OriginChunk? {
+    ) -> (
+        chunk: OriginChunk?,
+        shouldRetryCanonical: Bool
+    ) {
         let usingCachedURL = !forceSource && cachedResolvedURL() != nil
         let target = forceSource ? url : requestURL()
         let rangeEnd = offset + Int64(size) - 1
@@ -2316,17 +3879,29 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var lastError: Error?
         for attempt in 0..<chunkMaxRetries {
             do {
-                let (data, response) = try syncRequest(request, budget: chunkRequestTimeout)
+                let result = try syncRequest(
+                    request,
+                    budget: chunkRequestTimeout
+                )
+                let data = result.data
+                let response = result.response
                 var sourceGeneration:
                     SourceByteStoreGeneration?
                 if let http = response as? HTTPURLResponse {
                     let status = http.statusCode
                     if status != 200 && status != 206 {
-                        if usingCachedURL && Self.isResolvedExpiryStatus(status) {
-                            invalidateResolvedURL()
-                        }
+                        let shouldRetryCanonical =
+                            handleHardHTTPStatus(
+                            status,
+                            responseWasResolvedUpstream:
+                                usingCachedURL
+                                    || result.didFollowRedirect
+                        )
                         EngineLog.emit("[AVIOReader] chunk fetch got HTTP \(status) at offset \(offset)\(usingCachedURL ? " (cached URL, will retry source)" : "")", category: .demux, level: .verbose)
-                        return nil
+                        return (
+                            nil,
+                            shouldRetryCanonical
+                        )
                     }
                     // VOD: 200 at offset > 0 = server ignored Range; silent corruption. Reject.
                     if status == 200 && offset > 0 && !isLive {
@@ -2334,7 +3909,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                             "[AVIOReader] server ignored Range (200 for offset \(offset)); rejecting chunk",
                             category: .demux
                         )
-                        return nil
+                        return (nil, false)
                     }
                     if sourceByteStore != nil {
                         guard let generation =
@@ -2342,20 +3917,28 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                                     response: http,
                                     requestedOffset: offset
                                 ) else {
-                            return nil
+                            return (nil, false)
                         }
                         sourceGeneration = generation
                     }
                 }
-                addBytesFetched(data.count)
-                return OriginChunk(
-                    data: data,
-                    generation: sourceGeneration
+                addBytesFetched(
+                    data.count,
+                    at: offset
+                )
+                return (
+                    OriginChunk(
+                        data: data,
+                        generation: sourceGeneration
+                    ),
+                    false
                 )
             } catch {
                 // Superseded / closed / past the read deadline: this read is disposable,
                 // bail at once instead of retrying into the abort (issue #27).
-                if isClosed || isPastReadDeadline { return nil }
+                if isClosed || isPastReadDeadline {
+                    return (nil, false)
+                }
                 lastError = error
                 if attempt < chunkMaxRetries - 1 {
                     Thread.sleep(forTimeInterval: Double(1 << attempt) * 0.5)
@@ -2363,8 +3946,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             }
         }
 
-        EngineLog.emit("[AVIOReader] Fetch failed after \(chunkMaxRetries) retries at offset \(offset): \(lastError?.localizedDescription ?? "?")", category: .demux, level: .verbose)
-        return nil
+        _ = lastError
+        return (nil, false)
     }
 
     /// Long-lived session for seekable-path chunk fetches paired with per-task
@@ -2403,8 +3986,22 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
     }
 
-    private func syncRequest(_ request: URLRequest, budget: TimeInterval = 35) throws -> (Data, URLResponse) {
-        let delegate = ChunkFetchDelegate(extraHeaders: extraHeaders)
+    private func syncRequest(
+        _ request: URLRequest,
+        budget: TimeInterval = 35
+    ) throws -> (
+        data: Data,
+        response: URLResponse,
+        didFollowRedirect: Bool
+    ) {
+        guard let ioActivity =
+                ioQuiescence.beginActivity() else {
+            throw CancellationError()
+        }
+        let delegate = ChunkFetchDelegate(
+            extraHeaders: extraHeaders,
+            ioActivity: ioActivity
+        )
         let task = Self.chunkSession.dataTask(with: request)
         task.delegate = delegate
 
@@ -2428,7 +4025,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
         if let err = delegate.error { throw err }
         guard let response = delegate.response else { throw AVIOReaderError.noResponse }
-        return (delegate.body, response)
+        return (
+            delegate.body,
+            response,
+            delegate.didFollowRedirect
+        )
     }
 }
 
@@ -2545,11 +4146,23 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
     weak var reader: AVIOReader?
     let generation: Int
     let extraHeaders: [String: String]
+    let usedCachedResolvedURL: Bool
+    let ioActivity: AetherIOActivityToken
+    private var didFollowRedirect = false
 
-    init(reader: AVIOReader, generation: Int, extraHeaders: [String: String]) {
+    init(
+        reader: AVIOReader,
+        generation: Int,
+        extraHeaders: [String: String],
+        usedCachedResolvedURL: Bool,
+        ioActivity: AetherIOActivityToken
+    ) {
         self.reader = reader
         self.generation = generation
         self.extraHeaders = extraHeaders
+        self.usedCachedResolvedURL =
+            usedCachedResolvedURL
+        self.ioActivity = ioActivity
     }
 
     func urlSession(
@@ -2559,6 +4172,7 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
+        didFollowRedirect = true
         completionHandler(redirectPreservingHeaders(
             task: task, newRequest: request, extraHeaders: extraHeaders))
     }
@@ -2577,7 +4191,11 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
             ? dataTask.currentRequest?.url
             : nil
         let allow = reader.persistentReceivedResponse(
-            http, resolvedURL: resolved, generation: generation
+            http,
+            resolvedURL: resolved,
+            generation: generation,
+            responseWasResolvedUpstream:
+                usedCachedResolvedURL || didFollowRedirect
         )
         completionHandler(allow ? .allow : .cancel)
     }
@@ -2596,6 +4214,7 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         didCompleteWithError error: Error?
     ) {
         reader?.persistentConnectionEnded(error: error, generation: generation)
+        ioActivity.complete()
     }
 }
 
@@ -2611,9 +4230,15 @@ private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unche
     var error: Error?
     var onCompletion: (() -> Void)?
     var onResolved: ((URL) -> Void)?
+    private(set) var didFollowRedirect = false
+    let ioActivity: AetherIOActivityToken
 
-    init(extraHeaders: [String: String]) {
+    init(
+        extraHeaders: [String: String],
+        ioActivity: AetherIOActivityToken
+    ) {
         self.extraHeaders = extraHeaders
+        self.ioActivity = ioActivity
     }
 
     func urlSession(
@@ -2623,6 +4248,7 @@ private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unche
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
+        didFollowRedirect = true
         completionHandler(redirectPreservingHeaders(
             task: task, newRequest: request, extraHeaders: extraHeaders))
     }
@@ -2672,18 +4298,98 @@ private final class ChunkFetchDelegate: NSObject, URLSessionDataDelegate, @unche
     ) {
         self.error = error
         onCompletion?()
+        ioActivity.complete()
     }
 }
 
 // MARK: - Streaming Delegate
 
-private final class StreamingDelegate: NSObject, URLSessionDataDelegate {
+private final class StreamingDelegate:
+    NSObject,
+    URLSessionDataDelegate,
+    @unchecked Sendable
+{
+    let extraHeaders: [String: String]
+    let onResponse:
+        @Sendable (
+            HTTPURLResponse,
+            URL?,
+            Bool
+        ) -> Bool
     let onData: @Sendable (Data) -> Void
-    let onComplete: @Sendable () -> Void
+    let onComplete: @Sendable (Bool) -> Void
+    let onStopped: @Sendable () -> Void
+    let ioActivity: AetherIOActivityToken
+    private var didFollowRedirect = false
 
-    init(onData: @escaping @Sendable (Data) -> Void, onComplete: @escaping @Sendable () -> Void) {
+    init(
+        extraHeaders: [String: String],
+        onResponse:
+            @escaping @Sendable (
+                HTTPURLResponse,
+                URL?,
+                Bool
+            ) -> Bool,
+        onData: @escaping @Sendable (Data) -> Void,
+        onComplete:
+            @escaping @Sendable (Bool) -> Void,
+        onStopped:
+            @escaping @Sendable () -> Void,
+        ioActivity: AetherIOActivityToken
+    ) {
+        self.extraHeaders = extraHeaders
+        self.onResponse = onResponse
         self.onData = onData
         self.onComplete = onComplete
+        self.onStopped = onStopped
+        self.ioActivity = ioActivity
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        didFollowRedirect = true
+        completionHandler(
+            redirectPreservingHeaders(
+                task: task,
+                newRequest: request,
+                extraHeaders: extraHeaders
+            )
+        )
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler:
+            @escaping (
+                URLSession.ResponseDisposition
+            ) -> Void
+    ) {
+        guard let http =
+                response as? HTTPURLResponse else {
+            completionHandler(.cancel)
+            return
+        }
+        let resolvedURL =
+            (http.statusCode == 200
+                || http.statusCode == 206)
+                ? dataTask.currentRequest?.url
+                : nil
+        completionHandler(
+            onResponse(
+                http,
+                resolvedURL,
+                didFollowRedirect
+            )
+                ? .allow
+                : .cancel
+        )
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
@@ -2691,12 +4397,9 @@ private final class StreamingDelegate: NSObject, URLSessionDataDelegate {
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        #if DEBUG
-        if let error {
-            EngineLog.emit("[AVIOReader] Stream error: \(error.localizedDescription)", category: .demux)
-        }
-        #endif
-        onComplete()
+        onComplete(error == nil)
+        ioActivity.complete()
+        onStopped()
     }
 }
 
@@ -2713,9 +4416,15 @@ private final class SourceByteStoreValidationDelegate:
     let extraHeaders: [String: String]
     var response: HTTPURLResponse?
     var onCompletion: (() -> Void)?
+    let ioActivity: AetherIOActivityToken
+    private(set) var didFollowRedirect = false
 
-    init(extraHeaders: [String: String]) {
+    init(
+        extraHeaders: [String: String],
+        ioActivity: AetherIOActivityToken
+    ) {
         self.extraHeaders = extraHeaders
+        self.ioActivity = ioActivity
     }
 
     func urlSession(
@@ -2725,6 +4434,7 @@ private final class SourceByteStoreValidationDelegate:
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
+        didFollowRedirect = true
         completionHandler(redirectPreservingHeaders(
             task: task,
             newRequest: request,
@@ -2748,6 +4458,7 @@ private final class SourceByteStoreValidationDelegate:
         didCompleteWithError error: Error?
     ) {
         onCompletion?()
+        ioActivity.complete()
     }
 }
 
@@ -2759,11 +4470,18 @@ private final class SourceByteStoreValidationDelegate:
 private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     let extraHeaders: [String: String]
     var totalSize: Int64?
+    var statusCode: Int?
     var onCompletion: (() -> Void)?
     var onResolved: ((URL) -> Void)?
+    private(set) var didFollowRedirect = false
+    let ioActivity: AetherIOActivityToken
 
-    init(extraHeaders: [String: String]) {
+    init(
+        extraHeaders: [String: String],
+        ioActivity: AetherIOActivityToken
+    ) {
         self.extraHeaders = extraHeaders
+        self.ioActivity = ioActivity
     }
 
     func urlSession(
@@ -2773,6 +4491,7 @@ private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked 
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
+        didFollowRedirect = true
         completionHandler(redirectPreservingHeaders(
             task: task, newRequest: request, extraHeaders: extraHeaders))
     }
@@ -2786,6 +4505,7 @@ private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked 
         defer { completionHandler(.cancel) }
         guard let http = response as? HTTPURLResponse else { return }
         let status = http.statusCode
+        statusCode = status
         if (200...299).contains(status), let resolved = dataTask.currentRequest?.url {
             onResolved?(resolved)
         }
@@ -2797,6 +4517,7 @@ private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked 
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         onCompletion?()
+        ioActivity.complete()
     }
 }
 
@@ -2804,8 +4525,6 @@ private final class ProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked 
 
 
 // AVERROR(EIO) = -5: live source lost (distinct from AVERROR_EOF).
-private let AVERROR_EIO_VALUE: Int32 = -5
-
 private func readCallback(
     opaque: UnsafeMutableRawPointer?,
     buf: UnsafeMutablePointer<UInt8>?,
@@ -2828,10 +4547,16 @@ private func seekCallback(
 
 // MARK: - Errors
 
-enum AVIOReaderError: Error, CustomStringConvertible {
+enum AVIOReaderError:
+    Error,
+    CustomStringConvertible,
+    Sendable,
+    Equatable
+{
     case allocationFailed
     case noResponse
     case requestTimeout
+    case httpStatus(statusCode: Int)
     case sourceByteStore(SourceByteStoreError)
     case sourceByteStoreValidationFailed(reason: String)
 
@@ -2840,6 +4565,8 @@ enum AVIOReaderError: Error, CustomStringConvertible {
         case .allocationFailed: return "Failed to allocate AVIO buffer"
         case .noResponse: return "No response from server"
         case .requestTimeout: return "Request timed out"
+        case .httpStatus(let statusCode):
+            return "HTTP source rejected request with status \(statusCode)"
         case .sourceByteStore(let error):
             return error.localizedDescription
         case .sourceByteStoreValidationFailed(let reason):

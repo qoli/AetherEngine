@@ -302,8 +302,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// Pre-gate drop counters; surface the "lädt unendlich" failure mode when the gate never opens.
     private var pregateVideoDropCount: Int = 0
-    private var pregateWaitStart: Date?
-    private static let liveKeyframeGateTimeoutSeconds: TimeInterval = 15
 
     private var audioGateWaitStart: Date?
     /// 5 s is generous; a backward source-clock reset between video gate-open and first audio packet strands the target.
@@ -323,17 +321,21 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// Wall-clock of last finalized live segment; drives no-cut stall watchdog.
     private var lastLiveSegmentFinalizeAt: Date?
-    /// Cutter-wedge timeout: pump reads at full rate but finalizes no segment (hostile SSAI ad pod).
-    private static let liveSegmentStallTimeoutSeconds: TimeInterval = 10
-    /// Source-starvation timeout: feed trickles (slow/flaky CDN). Ingest retries ~31 s then terminates;
-    /// escalating at the tight wedge timeout turns one slow segment into a full host retune (device repro: hung on -1001).
-    private static let liveSourceStarvationTimeoutSeconds: TimeInterval = 35
-    /// Read rate (pkt/s) threshold classifying a no-cut stall as cutter-wedge vs. source-starvation.
-    /// Healthy 1080p25: ~60 pkt/s. Rate-based to avoid misreading a trickle that accumulated a high count (Alex Berlin: 137 pkts/13 s = 10.5 pkt/s).
-    private static let liveWedgeProgressRateThreshold: Double = 40
     private var lastPregateVideoLog: Int = 0
     private var lastPregateAudioLog: Int = 0
     private static let pregateLogInterval = 200
+
+    /// Latest observation-only liveness checkpoint reached by one continuous
+    /// no-cut interval. Crossing a checkpoint never changes pump state.
+    static func latestLivenessDiagnosticCheckpoint(
+        elapsed: TimeInterval,
+        policy: AetherPlaybackLivenessPolicy =
+            .production
+    ) -> TimeInterval? {
+        policy.latestDiagnosticCheckpoint(
+            elapsed: elapsed
+        )
+    }
 
     /// Desired tfdt for each stream: 0 for baseIndex==0; plan[baseIndex].startSeconds for restarts.
     private let desiredFirstVideoTfdtPts: Int64
@@ -373,6 +375,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private let stateLock = NSLock()
     private var pumpStarted = false
     private var shouldStop = false
+    private var _terminalReadError: AVIOReaderError?
+    var terminalReadError: AVIOReaderError? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _terminalReadError
+    }
     /// #65: set when awaitBackpressureRelease breaks a frozen VOD park. runPumpLoop maps the resulting
     /// muxer-nil exit to .backpressureWedge so the host re-anchors rather than treating it as a failure.
     private var _backpressureWedgeBroken = false
@@ -1104,8 +1112,21 @@ final class HLSSegmentProducer: @unchecked Sendable {
     func stop() {
         stateLock.lock()
         shouldStop = true
+        // A startup failure can install the producer before `start()`.
+        // Claim that never-started state here so no later start can enqueue a
+        // worker after the teardown fence has observed quiescence.
+        let finishedWithoutStarting = !pumpStarted
+        if finishedWithoutStarting {
+            pumpStarted = true
+        }
         stateLock.unlock()
         cache.wakeWaiters()
+        if finishedWithoutStarting {
+            finishCondition.lock()
+            didFinishFlag = true
+            finishCondition.broadcast()
+            finishCondition.unlock()
+        }
     }
 
     fileprivate func checkShouldStop() -> Bool {
@@ -1246,6 +1267,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
         var exitReason: PumpExitReason = .eof
         var packetsReadAtLastFinalize = 0
         var lastFinalizeSeen: Date? = lastLiveSegmentFinalizeAt
+        var lastNoCutDiagnosticCheckpoint:
+            TimeInterval = 0
         var videoPktsSinceFinalize = 0
         var audioPktsSinceFinalize = 0
         var videoKeyframesSinceFinalize = 0
@@ -1275,16 +1298,22 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     lastForeignStreamIndexSinceFinalize = -1
                     firstVideoPtsSinceFinalize = Int64.min
                     lastVideoPtsSinceFinalize = Int64.min
+                    lastNoCutDiagnosticCheckpoint = 0
                 }
                 if isLive, let lastFinalize = lastLiveSegmentFinalizeAt {
                     let stalledFor = Date().timeIntervalSince(lastFinalize)
                     let progress = packetsRead - packetsReadAtLastFinalize
                     let readRate = stalledFor > 0 ? Double(progress) / stalledFor : 0
-                    let isWedge = readRate >= Self.liveWedgeProgressRateThreshold
-                    let timeout = isWedge
-                        ? Self.liveSegmentStallTimeoutSeconds
-                        : Self.liveSourceStarvationTimeoutSeconds
-                    if stalledFor > timeout {
+                    if let checkpoint =
+                            Self
+                                .latestLivenessDiagnosticCheckpoint(
+                                    elapsed:
+                                        stalledFor
+                                ),
+                       checkpoint
+                        > lastNoCutDiagnosticCheckpoint {
+                        lastNoCutDiagnosticCheckpoint =
+                            checkpoint
                         let ptsAdvance = (lastVideoPtsSinceFinalize != Int64.min
                             && firstVideoPtsSinceFinalize != Int64.min && sourceVideoTbSeconds > 0)
                             ? Double(lastVideoPtsSinceFinalize - firstVideoPtsSinceFinalize) * sourceVideoTbSeconds
@@ -1294,18 +1323,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             + "\(Int(stalledFor))s (packetsRead=\(packetsRead), "
                             + "sinceFinalize=\(progress), "
                             + "rate=\(String(format: "%.1f", readRate))pkt/s, "
-                            + "\(isWedge ? "cutter wedge" : "source starvation")); "
+                            + "checkpoint=\(Int(checkpoint))s); "
                             + "window video=\(videoPktsSinceFinalize) key=\(videoKeyframesSinceFinalize) "
                             + "audio=\(audioPktsSinceFinalize) foreign=\(foreignPktsSinceFinalize)"
                             + (lastForeignStreamIndexSinceFinalize >= 0
                                 ? " lastForeignIdx=\(lastForeignStreamIndexSinceFinalize)" : "")
                             + (ptsAdvance >= 0
                                 ? " videoPtsAdvance=\(String(format: "%.1f", ptsAdvance))s" : "")
-                            + "; exiting for host retune",
+                            + "; same playback task remains active",
                             category: .session
                         )
-                        exitReason = .segmentStall
-                        break readLoop
                     }
                 }
 
@@ -1780,9 +1807,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             || (packet.pointee.dts != Int64.min && packet.pointee.dts >= restartTargetVideoDts)
                         guard isKey, targetSatisfied else {
                             pregateVideoDropCount += 1
-                            if pregateVideoDropCount == 1 {
-                                pregateWaitStart = Date()
-                            }
                             if pregateVideoDropCount - lastPregateVideoLog >= Self.pregateLogInterval {
                                 lastPregateVideoLog = pregateVideoDropCount
                                 EngineLog.emit(
@@ -1793,18 +1817,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                     + "baseIndex=\(baseIndex)",
                                     category: .session
                                 )
-                            }
-                            // Live bounded wait: mis-flagged TS would starve forever. VOD keeps unbounded wait.
-                            if isLive, let started = pregateWaitStart,
-                               Date().timeIntervalSince(started) > Self.liveKeyframeGateTimeoutSeconds {
-                                EngineLog.emit(
-                                    "[HLSSegmentProducer] live keyframe gate timed out after "
-                                    + "\(Int(Self.liveKeyframeGateTimeoutSeconds))s "
-                                    + "(dropped=\(pregateVideoDropCount)); exiting pump for reopen",
-                                    category: .session
-                                )
-                                exitReason = .keyframeStarvation
-                                break readLoop
                             }
                             continue
                         }
@@ -2176,7 +2188,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 }
             }
         } catch {
-            if case DemuxerError.readFailed(let code) = error {
+            if let terminalReadError =
+                    error as? AVIOReaderError {
+                stateLock.lock()
+                _terminalReadError = terminalReadError
+                stateLock.unlock()
+                lastError = -5
+                exitReason = .readError(code: -5)
+            } else if case DemuxerError.readFailed(let code) = error {
                 lastError = code
                 exitReason = .readError(code: code)
             } else {

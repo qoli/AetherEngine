@@ -175,6 +175,23 @@ struct BlackCarrierFreshDemuxRestartTests {
         }
     }
 
+    private final class BoolBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+
+        func store(_ value: Bool) {
+            lock.lock()
+            self.value = value
+            lock.unlock()
+        }
+
+        func load() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
     @Test("Explicit seek cancels a blocked old demux before opening the new generation")
     func preemptsBlockedRead() throws {
         let sourceData = makeWAV(seconds: 12.25)
@@ -185,10 +202,15 @@ struct BlackCarrierFreshDemuxRestartTests {
         let timeline = try BlackCarrierTimeline.fileVOD(
             duration: CMTime(seconds: 12.25, preferredTimescale: 90_000)
         )
+        let factoryObservedClosedRetiringDemuxer =
+            BoolBox()
         let pump = try BlackCarrierMediaFanoutPump(
             demuxer: initialDemuxer,
             timeline: timeline,
             freshDemuxerFactory: {
+                factoryObservedClosedRetiringDemuxer.store(
+                    initialDemuxer.sourceContainer == .unknown
+                )
                 let fresh = Demuxer()
                 try fresh.open(reader: DataIOReader(data: sourceData))
                 return fresh
@@ -208,6 +230,7 @@ struct BlackCarrierFreshDemuxRestartTests {
             produceFinished.signal()
         }
         #expect(initialReader.waitUntilBlocked(timeout: 2))
+        #expect(pump.isCarrierSegmentProductionActive)
 
         var classifier = HybridSeekIntentClassifier(timeline: timeline)
         let intent = try classifier.registerExplicitHostSeek(
@@ -218,8 +241,10 @@ struct BlackCarrierFreshDemuxRestartTests {
             generation: 1,
             segmentIndex: 2
         ))
+        #expect(factoryObservedClosedRetiringDemuxer.load())
         #expect(Date().timeIntervalSince(startedAt) < 1)
         #expect(produceFinished.wait(timeout: .now() + 1) == .success)
+        #expect(!pump.isCarrierSegmentProductionActive)
 
         let oldResult = try #require(produceResult.load())
         switch oldResult {
@@ -248,20 +273,31 @@ struct BlackCarrierFreshDemuxRestartTests {
         let timeline = try BlackCarrierTimeline.fileVOD(
             duration: CMTime(seconds: 12.25, preferredTimescale: 90_000)
         )
-        let gate = FreshFactoryGate()
+        let factoryGate = FreshFactoryGate()
+        let rejectedReleaseGate = FreshFactoryGate()
         let freshDemuxerBox = DemuxerBox()
-        defer { gate.release() }
+        defer {
+            factoryGate.release()
+            rejectedReleaseGate.release()
+        }
         let pump = try BlackCarrierMediaFanoutPump(
             demuxer: initialDemuxer,
             timeline: timeline,
             freshDemuxerFactory: {
-                gate.wait()
+                factoryGate.wait()
                 let fresh = Demuxer()
                 try fresh.open(reader: DataIOReader(data: sourceData))
                 freshDemuxerBox.store(fresh)
                 return fresh
             },
-            ownsInitialDemuxer: true
+            ownsInitialDemuxer: true,
+            demuxerReleaseFence: { demuxer in
+                demuxer.close()
+                if demuxer !== initialDemuxer {
+                    rejectedReleaseGate.wait()
+                }
+                demuxer.waitForIOQuiescence()
+            }
         )
         _ = try #require(try pump.initSegment(ordinal: 0))
 
@@ -277,7 +313,7 @@ struct BlackCarrierFreshDemuxRestartTests {
             })
             restartFinished.signal()
         }
-        #expect(gate.waitUntilBlocked(timeout: 2))
+        #expect(factoryGate.waitUntilBlocked(timeout: 2))
 
         let closeStartedAt = ProcessInfo.processInfo.systemUptime
         pump.close()
@@ -286,8 +322,41 @@ struct BlackCarrierFreshDemuxRestartTests {
         #expect(closeElapsed < 0.25)
         #expect(pump.generation == 0)
 
-        gate.release()
-        #expect(restartFinished.wait(timeout: .now() + 1) == .success)
+        let closeAndWaitFinished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            pump.closeAndWaitForIOQuiescence()
+            closeAndWaitFinished.signal()
+        }
+        #expect(
+            closeAndWaitFinished.wait(
+                timeout: .now() + 0.05
+            ) == .timedOut
+        )
+
+        factoryGate.release()
+        #expect(
+            rejectedReleaseGate.waitUntilBlocked(timeout: 1)
+        )
+        #expect(
+            restartFinished.wait(timeout: .now() + 0.05)
+                == .timedOut
+        )
+        #expect(
+            closeAndWaitFinished.wait(
+                timeout: .now() + 0.05
+            ) == .timedOut
+        )
+
+        rejectedReleaseGate.release()
+        #expect(
+            restartFinished.wait(timeout: .now() + 1)
+                == .success
+        )
+        #expect(
+            closeAndWaitFinished.wait(
+                timeout: .now() + 1
+            ) == .success
+        )
         let result = try #require(restartResult.load())
         switch result {
         case .success:
@@ -336,6 +405,53 @@ struct BlackCarrierFreshDemuxRestartTests {
         #expect(throws: BlackCarrierMediaFanoutPumpError.closed) {
             try pump.produce(throughSegment: 1)
         }
+    }
+
+    @Test("Fresh-demux transport failure preserves typed retry evidence")
+    func freshTransportOpenFailure() throws {
+        let sourceData = makeWAV(seconds: 5.25)
+        let initialDemuxer = Demuxer()
+        try initialDemuxer.open(
+            reader: DataIOReader(data: sourceData)
+        )
+        defer { initialDemuxer.close() }
+        let timeline = try BlackCarrierTimeline.fileVOD(
+            duration: CMTime(
+                seconds: 5.25,
+                preferredTimescale: 90_000
+            )
+        )
+        let pump = try BlackCarrierMediaFanoutPump(
+            demuxer: initialDemuxer,
+            timeline: timeline,
+            freshDemuxerFactory: {
+                throw AVIOReaderError.requestTimeout
+            }
+        )
+        _ = try #require(try pump.initSegment(ordinal: 0))
+
+        var classifier = HybridSeekIntentClassifier(
+            timeline: timeline
+        )
+        let intent = try classifier.registerExplicitHostSeek(
+            to: CMTime(
+                seconds: 4.5,
+                preferredTimescale: 90_000
+            )
+        )
+        let expected = BlackCarrierMediaFanoutPumpError
+            .demuxFailure(
+                evidence: BlackCarrierDemuxFailureEvidence(
+                    category: .transientTransport,
+                    caseCode: "avio.requestTimeout",
+                    domain: "AetherEngine.AVIOReader",
+                    code: 3
+                )
+            )
+        #expect(throws: expected) {
+            _ = try pump.restart(for: intent)
+        }
+        #expect(expected.failureCategory == .transientTransport)
     }
 
     @Test("Explicit provider close does not record its interrupted demux read as terminal")

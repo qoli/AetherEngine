@@ -37,6 +37,7 @@ enum AetherNativePlaybackFailureCategory:
     case transientTransport
     case authentication
     case security
+    case unsupportedCapability
     case decoder
     case malformed
     case routeRuntime
@@ -52,6 +53,24 @@ struct AetherNativePlaybackFailureEvidence:
     let caseCode: String
     let domain: String
     let code: Int
+    /// HLS reader/reopen failures are already classified at their owning
+    /// boundary. Carry them intact so the Native wrapper cannot rewrite the
+    /// public case code or reclassify the terminal.
+    let pretypedFailure: AetherPlaybackFailure?
+
+    init(
+        category: AetherNativePlaybackFailureCategory,
+        caseCode: String,
+        domain: String,
+        code: Int,
+        pretypedFailure: AetherPlaybackFailure? = nil
+    ) {
+        self.category = category
+        self.caseCode = caseCode
+        self.domain = domain
+        self.code = code
+        self.pretypedFailure = pretypedFailure
+    }
 }
 
 enum AetherNativePlaybackSessionError:
@@ -79,7 +98,7 @@ enum AetherNativePlaybackSessionError:
     case invalidSeekTarget
     case seekDidNotApply
     case seekTimedOut(seconds: Double)
-    case startupTimedOut
+    case itemFailed
 
     public var errorDescription: String? {
         switch self {
@@ -115,8 +134,8 @@ enum AetherNativePlaybackSessionError:
             "The native playback seek did not apply to the active generation"
         case .seekTimedOut(let seconds):
             "The native playback seek exceeded its \(seconds)-second recovery deadline"
-        case .startupTimedOut:
-            "The native playback item did not become ready within its bounded startup window"
+        case .itemFailed:
+            "The native playback item reported an explicit failure"
         }
     }
 }
@@ -124,8 +143,17 @@ enum AetherNativePlaybackSessionError:
 enum AetherNativeItemReadinessDecision: Sendable, Equatable {
     case wait
     case ready
+    /// Failure evidence is available. The caller must classify it; this value
+    /// is not itself terminal ownership.
     case failed
-    case timedOut
+}
+
+enum AetherNativeItemFailureDisposition:
+    Sendable,
+    Equatable
+{
+    case retryExactItem
+    case failTyped
 }
 
 enum AetherNativeAssetPlayabilityOwnership: Sendable, Equatable {
@@ -332,25 +360,18 @@ private extension AetherNativeVideoTrackInspectionResult {
 }
 
 struct AetherNativeItemReadinessGate: Sendable, Equatable {
-    static let defaultTimeout: TimeInterval = 15
-
-    let timeout: TimeInterval
-
-    init(timeout: TimeInterval = Self.defaultTimeout) {
-        self.timeout = timeout
-    }
-
     func decide(
         status: AVPlayerItem.Status,
         elapsed: TimeInterval
     ) -> AetherNativeItemReadinessDecision {
+        _ = elapsed
         switch status {
         case .readyToPlay:
             return .ready
         case .failed:
             return .failed
         case .unknown:
-            return elapsed < timeout ? .wait : .timedOut
+            return .wait
         @unknown default:
             return .failed
         }
@@ -378,57 +399,6 @@ public struct AetherNativePlaybackDiagnostics:
     public let audioAnalysisTrackIDs: [Int]
     public let selectedAudioAnalysisTrackID: Int?
     public let activeAudioAnalysisRequestCount: Int
-}
-
-/// Unstructured MainActor race used only by the unified adapter to put the
-/// recovery episode's deadline around the existing engine seek. Cancelling the
-/// losing task does not invent a second landing policy: engine generation/load
-/// guards still own any late AVPlayer completion after route teardown.
-@MainActor
-private final class AetherNativeEngineSeekDeadlineRace {
-    private var continuation:
-        CheckedContinuation<AetherNativeBoundedSeekOutcome, Never>?
-    private var operationTask: Task<Void, Never>?
-    private var timeoutTask: Task<Void, Never>?
-
-    func start(
-        continuation: CheckedContinuation<
-            AetherNativeBoundedSeekOutcome,
-            Never
-        >,
-        engine: AetherEngine,
-        targetSeconds: Double,
-        timeout: TimeInterval
-    ) {
-        self.continuation = continuation
-        operationTask = Task { @MainActor [weak self] in
-            await engine.seek(to: targetSeconds)
-            self?.resolve(.applied)
-        }
-        timeoutTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(
-                nanoseconds: UInt64(timeout * 1_000_000_000)
-            )
-            guard !Task.isCancelled else { return }
-            self?.resolve(.timedOut)
-        }
-    }
-
-    func cancel() {
-        resolve(.timedOut)
-    }
-
-    private func resolve(
-        _ outcome: AetherNativeBoundedSeekOutcome
-    ) {
-        guard let continuation else { return }
-        self.continuation = nil
-        operationTask?.cancel()
-        timeoutTask?.cancel()
-        operationTask = nil
-        timeoutTask = nil
-        continuation.resume(returning: outcome)
-    }
 }
 
 /// Pure admission gate for the Direct-Native runtime stall nudge. Startup
@@ -605,9 +575,8 @@ final class AetherNativePlaybackSession: ObservableObject {
     private var directStallRecoveryTask: Task<Void, Never>?
     private var directItemDeathConfirmationTask: Task<Void, Never>?
     private var directFailedToEndConfirmationTask: Task<Void, Never>?
-    private var directItemReviveGate = ItemDeathReviveGate(
-        maxAttempts: 3
-    )
+    private var directItemReviveGate =
+        ItemDeathReviveGate()
     private var lastObservedPlayerTime: CMTime = .zero
     private var directSubtitleTracks: [TrackInfo] = []
     private var directSelectedSubtitleTrackID: Int?
@@ -619,8 +588,6 @@ final class AetherNativePlaybackSession: ObservableObject {
         AetherNativeDirectProgressEpoch()
     private var directExplicitAudioTrackID: Int?
     private var seekRequestSequence: UInt64 = 0
-    private var activeEngineSeekDeadlineRace:
-        AetherNativeEngineSeekDeadlineRace?
     private var audioAnalysisSelectionResolutionTask:
         Task<Void, Never>?
     private var audioAnalysisSessions: [
@@ -706,6 +673,17 @@ final class AetherNativePlaybackSession: ObservableObject {
                 .preflightRequiresNative(
                     route: preflightResult.route,
                     reason: preflightResult.reason
+                )
+        }
+        guard preflightResult.sourceProfile.sourceKind
+                != .unclassifiedURL,
+              preflightResult.reason
+                != .nativeProvisionalURL else {
+            throw AetherNativePlaybackSessionError
+                .preflightRequiresNative(
+                    route: .unsupported,
+                    reason:
+                        .unsupportedSourceClassificationInconclusive
                 )
         }
         guard audioAnalysisBinding.sourceURL == url,
@@ -893,6 +871,7 @@ final class AetherNativePlaybackSession: ObservableObject {
             }
             if let engine {
                 if case .error = engine.state {
+                    recordNativeRemuxEngineFailureEvidence(engine)
                     throw AetherNativePlaybackSessionError
                         .engineRouteContractDiverged
                 }
@@ -904,14 +883,32 @@ final class AetherNativePlaybackSession: ObservableObject {
                 await refreshDirectSubtitleSelectionFromPlayer()
             }
             if avPlayerItem.status == .failed {
-                recordReadinessFailure(
-                    item: avPlayerItem,
-                    elapsed: 0,
-                    phase: "prepare"
+                let evidence = Self.failureEvidence(
+                    error: avPlayerItem.error,
+                    caseCode: "itemStatusFailed"
                 )
-                state = .failed(.playerItemFailed)
-                throw AetherNativePlaybackSessionError
-                    .startupTimedOut
+                lastFailureEvidence = evidence
+                switch Self.itemFailureDisposition(
+                    evidence
+                ) {
+                case .retryExactItem:
+                    // Generic/no-error AVPlayer item death is
+                    // transport-inconclusive. The direct item observer owns
+                    // the serialized same-asset retry and remains installed
+                    // after prepare returns.
+                    handleDirectItemDeath()
+                case .failTyped:
+                    recordReadinessFailure(
+                        item: avPlayerItem,
+                        elapsed: 0,
+                        phase: "prepare"
+                    )
+                    state = .failed(
+                        .playerItemFailed
+                    )
+                    throw AetherNativePlaybackSessionError
+                        .itemFailed
+                }
             }
             if avPlayerItem.status == .unknown {
                 EngineLog.emit(
@@ -1048,47 +1045,34 @@ final class AetherNativePlaybackSession: ObservableObject {
         let requestSequence = seekRequestSequence
         videoOutputMonitor.beginSeekGeneration()
         publishVideoOutputSnapshot()
-        activeEngineSeekDeadlineRace?.cancel()
-        activeEngineSeekDeadlineRace = nil
         let engineShouldResume = engine != nil && state == .playing
         state = .seeking
         if let engine {
-            let deadline = ProcessInfo.processInfo.systemUptime
-                + timeout
-            let seekRace = AetherNativeEngineSeekDeadlineRace()
-            activeEngineSeekDeadlineRace = seekRace
-            let engineSeekOutcome = await withCheckedContinuation {
-                continuation in
-                seekRace.start(
-                    continuation: continuation,
-                    engine: engine,
-                    targetSeconds: target.seconds,
-                    timeout: timeout
-                )
-            }
-            if activeEngineSeekDeadlineRace === seekRace {
-                activeEngineSeekDeadlineRace = nil
-            }
+            // The engine owns source seek/reopen and may make valid byte
+            // progress for arbitrarily long on a weak network. Do not put the
+            // adapter's local-carrier landing timeout around that work.
+            await engine.seek(
+                to: target.seconds
+            )
             try requireActive()
             guard requestSequence == seekRequestSequence else {
                 return .superseded
             }
-            switch engineSeekOutcome {
-            case .applied:
-                break
-            case .timedOut:
-                throw AetherNativePlaybackSessionError
-                    .seekTimedOut(seconds: timeout)
-            case .rejected:
-                throw AetherNativePlaybackSessionError.seekDidNotApply
-            }
+            let landingDeadline =
+                ProcessInfo.processInfo
+                    .systemUptime
+                    + timeout
             while true {
                 try requireActive()
                 guard requestSequence == seekRequestSequence else {
                     return .superseded
                 }
                 switch engine.state {
-                case .error, .idle, .ended:
+                case .error:
+                    recordNativeRemuxEngineFailureEvidence(engine)
+                    throw AetherNativePlaybackSessionError
+                        .seekDidNotApply
+                case .idle, .ended:
                     throw AetherNativePlaybackSessionError
                         .seekDidNotApply
                 case .loading, .playing, .paused, .seeking:
@@ -1103,32 +1087,86 @@ final class AetherNativePlaybackSession: ObservableObject {
                     return .applied
                 }
                 guard ProcessInfo.processInfo.systemUptime
-                        < deadline else {
+                        < landingDeadline else {
                     throw AetherNativePlaybackSessionError
                         .seekTimedOut(seconds: timeout)
                 }
                 try await Task.sleep(nanoseconds: 25_000_000)
             }
         } else {
-            avPlayer.currentItem?.cancelPendingSeeks()
-            let outcome = await boundedDirectSeek(
-                to: target,
-                timeout: timeout
-            )
-            try requireActive()
-            guard requestSequence == seekRequestSequence else {
-                return .superseded
-            }
-            switch outcome {
-            case .applied:
-                resetDirectProgressAfterDiscontinuity(
-                    fallbackTime: target
-                )
-            case .rejected:
-                throw AetherNativePlaybackSessionError.seekDidNotApply
-            case .timedOut:
-                throw AetherNativePlaybackSessionError
-                    .seekTimedOut(seconds: timeout)
+            var attempt = 1
+            var retryLogCadence =
+                AetherBoundedRetryLogCadence()
+            while true {
+                try requireActive()
+                guard requestSequence
+                        == seekRequestSequence else {
+                    return .superseded
+                }
+                avPlayer.currentItem?
+                    .cancelPendingSeeks()
+                let outcome =
+                    await boundedDirectSeek(
+                        to: target,
+                        timeout: timeout
+                    )
+                try requireActive()
+                guard requestSequence
+                        == seekRequestSequence else {
+                    return .superseded
+                }
+                if outcome == .applied {
+                    resetDirectProgressAfterDiscontinuity(
+                        fallbackTime: target
+                    )
+                    break
+                }
+                let backoff =
+                    AetherPlaybackLivenessPolicy
+                        .production
+                        .retryBackoffSeconds(
+                            forAttempt: attempt
+                        )
+                if let diagnostic =
+                        retryLogCadence
+                            .recordFailure(
+                                now:
+                                    ProcessInfo
+                                        .processInfo
+                                        .systemUptime
+                            ) {
+                    EngineLog.emit(
+                        "[AetherNativePlaybackSession] "
+                            + "direct seek local landing "
+                            + "remains pending outcome="
+                            + "\(outcome) attempt="
+                            + "\(attempt) failures="
+                            + "\(diagnostic.cumulativeFailureCount) "
+                            + "elapsed="
+                            + "\(Int(diagnostic.elapsedSeconds))s "
+                            + "backoff=\(Int(backoff))s"
+                            + (diagnostic
+                                .checkpointSeconds
+                                .map {
+                                    " checkpoint=\(Int($0))s"
+                                } ?? " firstFailure"),
+                        category: .session
+                    )
+                }
+                if attempt < Int.max {
+                    attempt += 1
+                }
+                do {
+                    try await Task.sleep(
+                        nanoseconds:
+                            UInt64(
+                                backoff
+                                    * 1_000_000_000
+                            )
+                    )
+                } catch {
+                    throw CancellationError()
+                }
             }
             if directPlayIntent {
                 avPlayer.rate = directRateIntent
@@ -1194,6 +1232,7 @@ final class AetherNativePlaybackSession: ObservableObject {
                     return
                 }
                 if case .error = engine.state {
+                    recordNativeRemuxEngineFailureEvidence(engine)
                     throw AetherNativePlaybackSessionError.engineRouteContractDiverged
                 }
                 try await Task.sleep(nanoseconds: 50_000_000)
@@ -1378,8 +1417,6 @@ final class AetherNativePlaybackSession: ObservableObject {
         directTransportGeneration &+= 1
         cancelDirectStallRecovery()
         seekRequestSequence &+= 1
-        activeEngineSeekDeadlineRace?.cancel()
-        activeEngineSeekDeadlineRace = nil
         itemStatusObservation?.invalidate()
         itemStatusObservation = nil
         currentItemObservation?.invalidate()
@@ -1391,6 +1428,12 @@ final class AetherNativePlaybackSession: ObservableObject {
         if let endObserver {
             NotificationCenter.default.removeObserver(endObserver)
             self.endObserver = nil
+        }
+        if let failedToEndObserver {
+            NotificationCenter.default.removeObserver(
+                failedToEndObserver
+            )
+            self.failedToEndObserver = nil
         }
         if let mediaSelectionObserver {
             NotificationCenter.default.removeObserver(
@@ -1413,6 +1456,8 @@ final class AetherNativePlaybackSession: ObservableObject {
         videoOutputMonitor.unbind()
         directItemDeathConfirmationTask?.cancel()
         directItemDeathConfirmationTask = nil
+        directFailedToEndConfirmationTask?.cancel()
+        directFailedToEndConfirmationTask = nil
         cancelAudioAnalysisStreams()
         audioAnalysisTelemetryHub.finish()
         engineCancellables.removeAll()
@@ -1425,10 +1470,15 @@ final class AetherNativePlaybackSession: ObservableObject {
         state = .stopped
     }
 
+    func stopAndWaitForIOQuiescence() async {
+        stop()
+        await engine?.waitForIOQuiescence()
+    }
+
     /// Polls the exact output attached to the current AVPlayerItem. Production
-    /// calls this only from the outer session's caller-bounded evidence wait;
-    /// ordinary playback has no periodic pixel-copy observer or background
-    /// frame sampling cost.
+    /// calls this from caller-bounded evidence waits and the outer session's
+    /// bounded transport checkpoints; ordinary playback has no high-frequency
+    /// pixel-copy observer or background frame sampling cost.
     func pollVideoOutput() {
         guard !isStopped,
               avPlayer.currentItem === avPlayerItem else { return }
@@ -1682,11 +1732,21 @@ final class AetherNativePlaybackSession: ObservableObject {
                     }
                     self.handleMediaSelectionChange()
                 case .failed:
-                    self.lastFailureEvidence = Self.failureEvidence(
+                    let evidence = Self.failureEvidence(
                         error: item.error,
                         caseCode: "itemStatusFailed"
                     )
-                    self.handleDirectItemDeath()
+                    self.lastFailureEvidence =
+                        evidence
+                    if Self.itemFailureDisposition(
+                        evidence
+                    ) == .failTyped {
+                        self.state = .failed(
+                            .playerItemFailed
+                        )
+                    } else {
+                        self.handleDirectItemDeath()
+                    }
                 case .unknown:
                     break
                 @unknown default:
@@ -1775,6 +1835,23 @@ final class AetherNativePlaybackSession: ObservableObject {
         guard engine == nil,
               directItemDeathConfirmationTask == nil,
               !isStopped else { return }
+        let evidence = Self.failureEvidence(
+            error: avPlayerItem.error,
+            caseCode: "itemStatusFailed"
+        )
+        lastFailureEvidence = evidence
+        guard Self.itemFailureDisposition(
+            evidence
+        ) == .retryExactItem else {
+            state = .failed(
+                .playerItemFailed
+            )
+            return
+        }
+        directFailedToEndConfirmationTask?
+            .cancel()
+        directFailedToEndConfirmationTask =
+            nil
         let failedItem = avPlayerItem
         directItemDeathConfirmationTask = Task {
             @MainActor [weak self, weak failedItem] in
@@ -1793,21 +1870,51 @@ final class AetherNativePlaybackSession: ObservableObject {
             }
             let observed = self.lastObservedPlayerTime.seconds
             let frozenPosition = observed.isFinite ? observed : 0
-            guard self.directItemReviveGate.admit(
-                position: frozenPosition
-            ) else {
+            let decision =
+                self.directItemReviveGate
+                    .recordFailure(
+                        position:
+                            frozenPosition
+                    )
+            if let diagnostic =
+                    decision.diagnostic {
+                EngineLog.emit(
+                    "[AetherNativePlaybackSession] "
+                        + "direct item same-route retry "
+                        + "attempt=\(decision.attempt) "
+                        + "failures="
+                        + "\(diagnostic.cumulativeFailureCount) "
+                        + "elapsed="
+                        + "\(Int(diagnostic.elapsedSeconds))s "
+                        + "backoff="
+                        + "\(Int(decision.backoffSeconds))s"
+                        + (diagnostic
+                            .checkpointSeconds
+                            .map {
+                                " checkpoint=\(Int($0))s"
+                            } ?? " firstFailure"),
+                    category: .session
+                )
+            }
+            do {
+                try await Task.sleep(
+                    nanoseconds:
+                        UInt64(
+                            decision.backoffSeconds
+                                * 1_000_000_000
+                        )
+                )
+            } catch {
                 self.directItemDeathConfirmationTask = nil
-                self.state = .failed(.playerItemFailed)
                 return
             }
-            let attempt = self.directItemReviveGate.attempts
+            guard !self.isStopped,
+                  self.avPlayerItem === failedItem,
+                  failedItem.status == .failed else {
+                self.directItemDeathConfirmationTask = nil
+                return
+            }
             self.directItemDeathConfirmationTask = nil
-            EngineLog.emit(
-                "[AetherNativePlaybackSession] direct item revive "
-                    + "attempt=\(attempt) position="
-                    + String(format: "%.3f", frozenPosition),
-                category: .session
-            )
             await self.reviveDirectItem(
                 failedItem,
                 at: CMTime(
@@ -1826,18 +1933,22 @@ final class AetherNativePlaybackSession: ObservableObject {
               avPlayerItem === item,
               !isStopped else { return }
         directFailedToEndConfirmationTask?.cancel()
+        directItemDeathConfirmationTask?.cancel()
+        directItemDeathConfirmationTask = nil
         let frozenTime = lastObservedPlayerTime
-        let nsError = error as NSError?
         lastFailureEvidence = Self.failureEvidence(
             error: error,
             caseCode: "failedToPlayToEnd"
         )
-        EngineLog.emit(
-            "[AetherNativePlaybackSession] failed-to-end evidence "
-                + "domain=\(nsError?.domain ?? "AVFoundation") "
-                + "code=\(nsError?.code ?? -1)",
-            category: .session
-        )
+        guard let lastFailureEvidence,
+              Self.itemFailureDisposition(
+                lastFailureEvidence
+              ) == .retryExactItem else {
+            state = .failed(
+                .playerItemFailed
+            )
+            return
+        }
         directFailedToEndConfirmationTask = Task {
             @MainActor [weak self, weak item] in
             guard let self, let item else { return }
@@ -1855,8 +1966,67 @@ final class AetherNativePlaybackSession: ObservableObject {
                 self.directFailedToEndConfirmationTask = nil
                 return
             }
+            let observed =
+                self.lastObservedPlayerTime
+                    .seconds
+            let frozenPosition =
+                observed.isFinite ? observed : 0
+            let decision =
+                self.directItemReviveGate
+                    .recordFailure(
+                        position:
+                            frozenPosition
+                    )
+            if let diagnostic =
+                    decision.diagnostic {
+                EngineLog.emit(
+                    "[AetherNativePlaybackSession] "
+                        + "failed-to-end remains "
+                        + "inconclusive; same-route retry "
+                        + "attempt=\(decision.attempt) "
+                        + "failures="
+                        + "\(diagnostic.cumulativeFailureCount) "
+                        + "elapsed="
+                        + "\(Int(diagnostic.elapsedSeconds))s "
+                        + "backoff="
+                        + "\(Int(decision.backoffSeconds))s"
+                        + (diagnostic
+                            .checkpointSeconds
+                            .map {
+                                " checkpoint=\(Int($0))s"
+                            } ?? " firstFailure"),
+                    category: .session
+                )
+            }
+            do {
+                try await Task.sleep(
+                    nanoseconds:
+                        UInt64(
+                            decision.backoffSeconds
+                                * 1_000_000_000
+                        )
+                )
+            } catch {
+                self.directFailedToEndConfirmationTask = nil
+                return
+            }
+            guard !self.isStopped,
+                  self.avPlayerItem === item,
+                  !Self.madeProgress(
+                    from: frozenTime,
+                    to: self.lastObservedPlayerTime
+                  ) else {
+                self.directFailedToEndConfirmationTask = nil
+                return
+            }
             self.directFailedToEndConfirmationTask = nil
-            self.state = .failed(.playerItemFailed)
+            await self.reviveDirectItem(
+                item,
+                at: CMTime(
+                    seconds: frozenPosition,
+                    preferredTimescale: 600
+                )
+            )
         }
     }
 
@@ -1914,6 +2084,12 @@ final class AetherNativePlaybackSession: ObservableObject {
         error: Error?,
         caseCode: String
     ) -> AetherNativePlaybackFailureEvidence {
+        if let avioError = error as? AVIOReaderError {
+            return avioFailureEvidence(
+                avioError,
+                caseCode: caseCode
+            )
+        }
         var current = error as NSError?
         var selected = current
         var category = AetherNativePlaybackFailureCategory
@@ -1921,6 +2097,14 @@ final class AetherNativePlaybackSession: ObservableObject {
         for _ in 0..<6 {
             guard let evidenceError = current else { break }
             selected = evidenceError
+            if MasterFallbackDecision
+                .isDisplayRejectionCode(
+                    evidenceError.code
+                ) {
+                category =
+                    .unsupportedCapability
+                break
+            }
             if let response = evidenceError.userInfo.values
                 .compactMap({ $0 as? HTTPURLResponse })
                 .first {
@@ -1965,6 +2149,227 @@ final class AetherNativePlaybackSession: ObservableObject {
         )
     }
 
+    /// Only positive permanent evidence closes direct Native admission.
+    /// Generic/no-error AVPlayer item failure stays on the same asset and
+    /// player with progress-aware unbounded recovery.
+    nonisolated static func itemFailureDisposition(
+        _ evidence:
+            AetherNativePlaybackFailureEvidence
+    ) -> AetherNativeItemFailureDisposition {
+        switch evidence.category {
+        case .transientTransport,
+             .routeRuntime:
+            .retryExactItem
+        case .authentication,
+             .security,
+             .unsupportedCapability,
+             .decoder,
+             .malformed,
+             .cancelled,
+             .invariant:
+            .failTyped
+        }
+    }
+
+    /// A recovery generation may replace the failed AVPlayerItem, but it
+    /// cannot rebuild or reinterpret the source. Reusing the exact AVAsset
+    /// instance preserves the canonical URL, scoped headers and AVFoundation
+    /// resource-loader identity. Item-level playback tuning is copied
+    /// explicitly.
+    static func makeExactRecoveryItem(
+        from failedItem: AVPlayerItem
+    ) -> AVPlayerItem {
+        let replacement =
+            AVPlayerItem(
+                asset: failedItem.asset
+            )
+        replacement
+            .preferredForwardBufferDuration =
+            failedItem
+                .preferredForwardBufferDuration
+        replacement
+            .appliesPerFrameHDRDisplayMetadata =
+            failedItem
+                .appliesPerFrameHDRDisplayMetadata
+        replacement
+            .preferredPeakBitRate =
+            failedItem.preferredPeakBitRate
+        replacement
+            .canUseNetworkResourcesForLiveStreamingWhilePaused =
+            failedItem
+                .canUseNetworkResourcesForLiveStreamingWhilePaused
+        return replacement
+    }
+
+    nonisolated static func failureEvidence(
+        _ failure: AetherPlaybackFailure
+    ) -> AetherNativePlaybackFailureEvidence {
+        let category:
+            AetherNativePlaybackFailureCategory =
+            switch failure.kind {
+            case .transientTransport,
+                 .inconclusiveEvidence:
+                .transientTransport
+            case .authenticationRejected:
+                .authentication
+            case .securityBoundary:
+                .security
+            case .unsupportedCapability:
+                .unsupportedCapability
+            case .decoderRuntimeFailure:
+                .decoder
+            case .malformedMedia:
+                .malformed
+            case .routeRuntimeFailure:
+                .routeRuntime
+            case .cancelled:
+                .cancelled
+            case .hostContractViolation,
+                 .invariantViolation:
+                .invariant
+            }
+        return AetherNativePlaybackFailureEvidence(
+            category: category,
+            caseCode: failure.caseCode
+                ?? "hls.reopen.terminal",
+            domain: failure.domain,
+            code: failure.code,
+            pretypedFailure: failure
+        )
+    }
+
+    nonisolated static func avioFailureEvidence(
+        _ error: AVIOReaderError,
+        caseCode: String
+    ) -> AetherNativePlaybackFailureEvidence {
+        let category: AetherNativePlaybackFailureCategory
+        let suffix: String
+        let domain: String
+        let code: Int
+        switch error {
+        case .allocationFailed:
+            category = .routeRuntime
+            suffix = "allocationFailed"
+            domain = "AVIOReader"
+            code = 0
+        case .noResponse:
+            category = .transientTransport
+            suffix = "noResponse"
+            domain = NSURLErrorDomain
+            code = URLError.cannotParseResponse.rawValue
+        case .requestTimeout:
+            category = .transientTransport
+            suffix = "requestTimeout"
+            domain = NSURLErrorDomain
+            code = URLError.timedOut.rawValue
+        case .httpStatus(let statusCode):
+            suffix = "httpStatus"
+            domain = "HTTP"
+            code = statusCode
+            if statusCode == 401 || statusCode == 403 {
+                category = .authentication
+            } else if statusCode == 408
+                        || statusCode == 425
+                        || statusCode == 429
+                        || statusCode >= 500 {
+                category = .transientTransport
+            } else {
+                category = .malformed
+            }
+        case .sourceByteStore(let storeError):
+            let mapped = sourceByteStoreFailureEvidence(storeError)
+            category = mapped.category
+            suffix = mapped.suffix
+            domain = mapped.domain
+            code = mapped.code
+        case .sourceByteStoreValidationFailed:
+            category = .transientTransport
+            suffix = "sourceValidationInconclusive"
+            domain = "SourceByteStoreValidation"
+            code = 0
+        }
+        return AetherNativePlaybackFailureEvidence(
+            category: category,
+            caseCode: "\(caseCode).\(suffix)",
+            domain: domain,
+            code: code
+        )
+    }
+
+    nonisolated private static func sourceByteStoreFailureEvidence(
+        _ error: SourceByteStoreError
+    ) -> (
+        category: AetherNativePlaybackFailureCategory,
+        suffix: String,
+        domain: String,
+        code: Int
+    ) {
+        let domain = "SourceByteStore"
+        switch error {
+        case .invalidCapacity:
+            return (.invariant, "store.invalidCapacity", domain, 1)
+        case .invalidGeneration:
+            return (.invariant, "store.invalidGeneration", domain, 2)
+        case .generationMismatch:
+            return (.invariant, "store.generationMismatch", domain, 3)
+        case .unsupportedContentEncoding:
+            return (
+                .unsupportedCapability,
+                "store.unsupportedContentEncoding",
+                domain,
+                4
+            )
+        case .invalidRange:
+            return (.invariant, "store.invalidRange", domain, 5)
+        case .cancelled:
+            return (.cancelled, "store.cancelled", domain, 6)
+        case .rangeFetchFailed:
+            return (
+                .transientTransport,
+                "store.rangeFetchFailed",
+                domain,
+                7
+            )
+        case .rangeFetchRateLimited(let retryAfter):
+            return (
+                .transientTransport,
+                "store.rangeFetchRateLimited",
+                domain,
+                Int(retryAfter.rounded(.up))
+            )
+        case .closed:
+            return (.cancelled, "store.closed", domain, 9)
+        case .directoryCreationFailed:
+            return (
+                .routeRuntime,
+                "store.directoryCreationFailed",
+                domain,
+                10
+            )
+        case .blockOpenFailed(let errno):
+            return (
+                .routeRuntime,
+                "store.blockOpenFailed",
+                domain,
+                Int(errno)
+            )
+        case .blockReadFailed(let errno):
+            return (
+                .routeRuntime,
+                "store.blockReadFailed",
+                domain,
+                Int(errno)
+            )
+        case .blockWriteFailed(let errno):
+            return (
+                .routeRuntime,
+                "store.blockWriteFailed",
+                domain,
+                Int(errno)
+            )
+        }
+    }
+
     private func reviveDirectItem(
         _ failedItem: AVPlayerItem,
         at position: CMTime
@@ -1975,7 +2380,13 @@ final class AetherNativePlaybackSession: ObservableObject {
         let selectedAudio = directExplicitAudioTrackID
         let selectedSubtitle = directSelectedSubtitleTrackID
         removeDirectItemObservers()
-        let freshItem = AVPlayerItem(asset: failedItem.asset)
+        // A single serialized recovery task owns this atomic current-item
+        // replacement. There is never a second Aether reader or a second
+        // source/asset identity in flight.
+        let freshItem =
+            Self.makeExactRecoveryItem(
+                from: failedItem
+            )
         avPlayerItem = freshItem
         avPlayer.replaceCurrentItem(with: freshItem)
         bindVideoOutput(to: freshItem)
@@ -1993,14 +2404,30 @@ final class AetherNativePlaybackSession: ObservableObject {
         }
         guard !isStopped else { return }
         guard freshItem.status == .readyToPlay else {
-            recordReadinessFailure(
-                item: freshItem,
-                elapsed: ProcessInfo.processInfo.systemUptime
-                    - readinessStartedAt,
-                phase: "revive"
-            )
             if freshItem.status == .failed {
-                handleDirectItemDeath()
+                let evidence = Self.failureEvidence(
+                    error: freshItem.error,
+                    caseCode: "itemStatusFailed"
+                )
+                lastFailureEvidence = evidence
+                if Self.itemFailureDisposition(
+                    evidence
+                ) == .retryExactItem {
+                    handleDirectItemDeath()
+                } else {
+                    recordReadinessFailure(
+                        item: freshItem,
+                        elapsed:
+                            ProcessInfo
+                                .processInfo
+                                .systemUptime
+                            - readinessStartedAt,
+                        phase: "revive"
+                    )
+                    state = .failed(
+                        .playerItemFailed
+                    )
+                }
             } else {
                 state = .failed(.playerItemFailed)
             }
@@ -2034,6 +2461,7 @@ final class AetherNativePlaybackSession: ObservableObject {
         resetDirectProgressAfterDiscontinuity(
             fallbackTime: position
         )
+        lastFailureEvidence = nil
         if directPlayIntent {
             avPlayer.rate = directRateIntent
             state = .playing
@@ -2063,80 +2491,20 @@ final class AetherNativePlaybackSession: ObservableObject {
 
     private func handleDirectPlaybackStall() {
         guard engine == nil,
-              directStallRecoveryTask == nil,
               !isStopped,
               directPlayIntent,
               directProgressEpoch.wasDemonstrated,
               avPlayer.currentItem === avPlayerItem else { return }
-        let item = avPlayerItem
-        let transportGeneration = directTransportGeneration
-        directStallTaskGeneration &+= 1
-        let taskGeneration = directStallTaskGeneration
-        let frozenTime = lastObservedPlayerTime
-        directStallRecoveryTask = Task {
-            @MainActor [weak self, weak item] in
-            guard let self, let item else { return }
-            defer {
-                if self.directStallTaskGeneration == taskGeneration {
-                    self.directStallRecoveryTask = nil
-                }
-            }
-            do {
-                try await Task.sleep(nanoseconds: 6_000_000_000)
-            } catch {
-                return
-            }
-            let madeInitialProgress = Self.madeProgress(
-                    from: frozenTime,
-                    to: self.lastObservedPlayerTime
-                )
-            guard self.directStallTaskGeneration == taskGeneration,
-                  AetherNativeDirectStallDecision.shouldAct(
-                    requestedTransportGeneration: transportGeneration,
-                    currentTransportGeneration:
-                        self.directTransportGeneration,
-                    itemMatches: self.avPlayerItem === item
-                        && self.avPlayer.currentItem === item,
-                    directPlayIntent: self.directPlayIntent,
-                    demonstratedProgressInEpoch:
-                        self.directProgressEpoch.wasDemonstrated,
-                    madeProgressSinceCheckpoint: madeInitialProgress,
-                    isStopped: self.isStopped
-                  ) else { return }
-            self.avPlayer.play()
-            if self.directRateIntent != 1 {
-                self.avPlayer.rate = self.directRateIntent
-            }
-            let nudgeTime = self.lastObservedPlayerTime
-            EngineLog.emit(
-                "[AetherNativePlaybackSession] direct runtime stall nudge "
-                    + "transportGeneration=\(transportGeneration)",
-                category: .session
-            )
-            do {
-                try await Task.sleep(nanoseconds: 6_000_000_000)
-            } catch {
-                return
-            }
-            let madePostNudgeProgress = Self.madeProgress(
-                    from: nudgeTime,
-                    to: self.lastObservedPlayerTime
-                )
-            guard self.directStallTaskGeneration == taskGeneration,
-                  AetherNativeDirectStallDecision.shouldAct(
-                    requestedTransportGeneration: transportGeneration,
-                    currentTransportGeneration:
-                        self.directTransportGeneration,
-                    itemMatches: self.avPlayerItem === item
-                        && self.avPlayer.currentItem === item,
-                    directPlayIntent: self.directPlayIntent,
-                    demonstratedProgressInEpoch:
-                        self.directProgressEpoch.wasDemonstrated,
-                    madeProgressSinceCheckpoint: madePostNudgeProgress,
-                    isStopped: self.isStopped
-                  ) else { return }
-            self.state = .failed(.playerItemFailed)
-        }
+        // A stall notification is observation evidence, not terminal
+        // ownership. The outer session continuously evaluates media time,
+        // loaded ranges and Aether byte progress with the shared liveness
+        // policy and owns any same-source reconnect.
+        EngineLog.emit(
+            "[AetherNativePlaybackSession] direct runtime stall observed "
+                + "transportGeneration=\(directTransportGeneration) "
+                + "disposition=outer-liveness",
+            category: .session
+        )
     }
 
     private static func madeProgress(
@@ -2188,6 +2556,9 @@ final class AetherNativePlaybackSession: ObservableObject {
                 case .ended:
                     self.state = .ended
                 case .error:
+                    self.recordNativeRemuxEngineFailureEvidence(
+                        engine
+                    )
                     self.state = .failed(.engineFailed)
                 }
             }
@@ -2198,6 +2569,31 @@ final class AetherNativePlaybackSession: ObservableObject {
                 self?.applySelectedAudioAnalysisTrackID(trackID)
             }
             .store(in: &engineCancellables)
+    }
+
+    private func recordNativeRemuxEngineFailureEvidence(
+        _ engine: AetherEngine
+    ) {
+        guard assetPlayabilityOwnership
+                == .aetherOwnedHLSFMP4Remux else {
+            return
+        }
+        if let terminal = engine.nativeVideoSession?
+            .terminalReopenFailureSnapshot() {
+            lastFailureEvidence = Self.failureEvidence(
+                terminal
+            )
+            return
+        }
+        guard let terminalReadError = engine
+            .nativeVideoSession?
+            .producer?.terminalReadError else {
+            return
+        }
+        lastFailureEvidence = Self.failureEvidence(
+            error: terminalReadError,
+            caseCode: "engineSourceRead"
+        )
     }
 
     private func handleMediaSelectionChange() {

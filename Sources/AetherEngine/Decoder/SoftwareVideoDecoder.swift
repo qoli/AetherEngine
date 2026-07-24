@@ -21,6 +21,28 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         max(1, min(16, activeProcessorCount))
     }
 
+    static func uses10BitOutput(
+        bitsPerRawSample: Int32,
+        colorTransfer: AVColorTransferCharacteristic
+    ) -> Bool {
+        bitsPerRawSample > 8
+            || ColorAttachments.isHDRTransfer(colorTransfer)
+    }
+
+    static func conversionPixelFormat(
+        uses10BitOutput: Bool
+    ) -> AVPixelFormat {
+        uses10BitOutput ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12
+    }
+
+    static func coreVideoPixelFormat(
+        uses10BitOutput: Bool
+    ) -> OSType {
+        uses10BitOutput
+            ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+    }
+
     private let threadingMode: SoftwareVideoDecoderThreadingMode
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
     // FFmpeg 8.x exposes SwsContext as a real struct (7.x was OpaquePointer); pointer type must match or call sites miscompile.
@@ -144,7 +166,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
         let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
-        use10Bit = bitsPerSample > 8 || isHDRTransfer
+        use10Bit = Self.uses10BitOutput(
+            bitsPerRawSample: bitsPerSample,
+            colorTransfer: codecpar.pointee.color_trc
+        )
 
         // Release-visible log (no #if DEBUG): needed for TestFlight users and DrHurt #4 black-screen reports.
         EngineLog.emit(
@@ -380,7 +405,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
         let srcFmt = AVPixelFormat(rawValue: frame.pointee.format)
 
-        let dstFmt = use10Bit ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12
+        let dstFmt = Self.conversionPixelFormat(
+            uses10BitOutput: use10Bit
+        )
 
         swsContext = sws_getCachedContext(
             swsContext,
@@ -392,9 +419,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         )
         guard swsContext != nil else { return nil }
 
-        let cvPixelFormat: OSType = use10Bit
-            ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-            : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        let cvPixelFormat = Self.coreVideoPixelFormat(
+            uses10BitOutput: use10Bit
+        )
 
         if pixelBufferPool == nil || poolWidth != width || poolHeight != height {
             pixelBufferPool = nil

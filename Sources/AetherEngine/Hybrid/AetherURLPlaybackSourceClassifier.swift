@@ -28,6 +28,7 @@ public enum AetherURLPlaybackSourceClassificationError:
     case httpStatus(Int)
     case unsupportedContentEncoding
     case redirectCredentialScopeViolation
+    case sourceIdentityChanged
     case dependencyCapabilityUnavailable(
         AetherPlaybackDependencyCapability
     )
@@ -50,6 +51,8 @@ public enum AetherURLPlaybackSourceClassificationError:
             "Playback source classification requires identity content encoding"
         case .redirectCredentialScopeViolation:
             "Playback source classification rejected a cross-origin credential redirect"
+        case .sourceIdentityChanged:
+            "Playback source classification detected changed source bytes while retrying"
         case .dependencyCapabilityUnavailable(let capability):
             "Playback dependency capability is unavailable: \(capability.rawValue)"
         case .nonMediaPayload(let family):
@@ -154,7 +157,9 @@ public enum AetherURLPlaybackSourceClassifier {
     static func inspect(
         url: URL,
         options: LoadOptions = .init(),
-        maximumPrefixBytes: Int = defaultMaximumPrefixBytes
+        maximumPrefixBytes: Int = defaultMaximumPrefixBytes,
+        onVerifiedPrefixProgress:
+            @escaping AetherURLPlaybackVerifiedPrefixProgress = { _ in }
     ) async throws -> AetherURLPlaybackSourceSignature {
         guard maximumPrefixBytes > 0 else {
             throw AetherURLPlaybackSourceClassificationError.emptyResource
@@ -173,6 +178,10 @@ public enum AetherURLPlaybackSourceClassifier {
             } catch {
                 throw AetherURLPlaybackSourceClassificationError.unreadableFile
             }
+            try Task.checkCancellation()
+            if !data.isEmpty {
+                onVerifiedPrefixProgress(data.count)
+            }
         } else {
             guard let scheme = url.scheme?.lowercased(),
                   scheme == "http" || scheme == "https" else {
@@ -185,7 +194,8 @@ public enum AetherURLPlaybackSourceClassifier {
             request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
             data = try await AetherURLPlaybackPrefixFetcher.fetch(
                 request: request,
-                maximumBytes: maximumPrefixBytes
+                maximumBytes: maximumPrefixBytes,
+                onVerifiedPrefixProgress: onVerifiedPrefixProgress
             )
         }
         return try inspect(prefix: data)
@@ -257,74 +267,707 @@ public enum AetherURLPlaybackSourceClassifier {
         }
         return AetherURLPlaybackSourceSignature.progressive
     }
+
+    /// Returns true only when an incomplete network prefix already contains
+    /// enough bytes to make the normal classifier's result permanent. Unknown
+    /// text such as `<!doc` deliberately remains undecided until more bytes or
+    /// a clean response completion arrives.
+    static func isDecisiveNetworkPrefix(_ prefix: Data) -> Bool {
+        guard !prefix.isEmpty else { return false }
+        if prefix.starts(with: asfHeaderObjectSignature) {
+            return true
+        }
+        if prefix.count >= 8,
+           prefix.dropFirst(4).prefix(4).elementsEqual([
+               0x66, 0x74, 0x79, 0x70,
+           ]) {
+            return true
+        }
+
+        var bytes = prefix
+        if bytes.starts(with: [0xEF, 0xBB, 0xBF]) {
+            bytes.removeFirst(3)
+        }
+        guard let text = String(data: bytes, encoding: .utf8) else {
+            return false
+        }
+        let firstNonWhitespace = text.drop(while: { $0.isWhitespace })
+        if firstNonWhitespace.hasPrefix("#EXTM3U") {
+            return true
+        }
+        let leadingText = firstNonWhitespace.prefix(512).lowercased()
+        if leadingText.hasPrefix("<!doctype html")
+            || leadingText.hasPrefix("<html")
+            || leadingText.hasPrefix("<head")
+            || leadingText.hasPrefix("<body")
+            || leadingText.hasPrefix("<script")
+            || leadingText.hasPrefix("<meta")
+            || (leadingText.hasPrefix("<?xml")
+                && leadingText.contains("<html")) {
+            return true
+        }
+        if (firstNonWhitespace.hasPrefix("{")
+                || firstNonWhitespace.hasPrefix("[")),
+           (try? JSONSerialization.jsonObject(with: bytes)) != nil {
+            return true
+        }
+        return false
+    }
 }
 
-/// One-shot prefix fetch. A server may ignore `Range`; reaching the prefix cap is therefore successful
-/// completion, not a whole-resource size failure. The task is cancelled immediately after the cap and no
-/// retry or alternate URL is attempted.
-private final class AetherURLPlaybackPrefixFetcher:
-    NSObject,
-    URLSessionDataDelegate,
-    URLSessionTaskDelegate,
-    @unchecked Sendable
+/// Privacy-safe evidence that the canonical byte-zero prefix grew.
+///
+/// The callback deliberately exposes only the monotonic verified byte count:
+/// no URL, path, request header, credential, response body or byte content can
+/// cross this boundary.
+typealias AetherURLPlaybackVerifiedPrefixProgress =
+    @Sendable (_ verifiedByteCount: Int) -> Void
+
+/// Testable clock seam for the prefix reader's no-progress window and retry
+/// backoff. This measures inactivity, never total fetch duration.
+protocol AetherURLPlaybackPrefixFetchClock: Sendable {
+    func sleep(for seconds: TimeInterval) async throws
+}
+
+private struct AetherSystemURLPlaybackPrefixFetchClock:
+    AetherURLPlaybackPrefixFetchClock
 {
+    func sleep(for seconds: TimeInterval) async throws {
+        try await Task.sleep(
+            nanoseconds: UInt64(seconds * 1_000_000_000)
+        )
+    }
+}
+
+struct AetherURLPlaybackPrefixResponse: Sendable {
+    let statusCode: Int
+    let contentEncoding: String?
+    let contentRange: String?
+}
+
+/// A single physical reader for a prefix fetch generation. The coordinator
+/// owns retries, so this protocol deliberately exposes neither URLs, headers
+/// nor credentials to diagnostics or liveness state.
+protocol AetherURLPlaybackPrefixReader: AnyObject, Sendable {
+    func start(
+        onResponse: @escaping @Sendable (AetherURLPlaybackPrefixResponse) -> Void,
+        onBytes: @escaping @Sendable (Data) -> Void,
+        onCompletion: @escaping @Sendable (Error?) -> Void
+    )
+    func cancel()
+}
+
+/// Same-canonical-source prefix coordinator. A byte which extends the prefix
+/// resets only the inactivity window. No received bytes are discarded because
+/// an origin took longer than a URLSession resource timeout.
+final class AetherURLPlaybackPrefixFetcher: @unchecked Sendable {
+    static let transportGuardTimeoutSeconds: TimeInterval =
+        7 * 24 * 60 * 60
+
+    typealias ReaderFactory = @Sendable (
+        URLRequest
+    ) -> any AetherURLPlaybackPrefixReader
+
     private let request: URLRequest
     private let maximumBytes: Int
+    private let policy: AetherPlaybackLivenessPolicy
+    private let clock: any AetherURLPlaybackPrefixFetchClock
+    private let makeReader: ReaderFactory
+    private let onVerifiedPrefixProgress:
+        AetherURLPlaybackVerifiedPrefixProgress
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<Data, Error>?
-    private var session: URLSession?
-    private var task: URLSessionDataTask?
-    private var data = Data()
-    private var receivedResponse = false
-    private var isFinished = false
+    private var activeAttempt: Attempt?
+    private var isCancelled = false
+    private var lastReportedVerifiedPrefixCount = 0
 
-    private init(request: URLRequest, maximumBytes: Int) {
+    private init(
+        request: URLRequest,
+        maximumBytes: Int,
+        policy: AetherPlaybackLivenessPolicy,
+        clock: any AetherURLPlaybackPrefixFetchClock,
+        makeReader: @escaping ReaderFactory,
+        onVerifiedPrefixProgress:
+            @escaping AetherURLPlaybackVerifiedPrefixProgress
+    ) {
+        var request = Self.applyingTransportGuard(to: request)
+        request.setValue(
+            "bytes=0-\(maximumBytes - 1)",
+            forHTTPHeaderField: "Range"
+        )
         self.request = request
         self.maximumBytes = maximumBytes
+        self.policy = policy
+        self.clock = clock
+        self.makeReader = makeReader
+        self.onVerifiedPrefixProgress = onVerifiedPrefixProgress
+    }
+
+    static func applyingTransportGuard(
+        to request: URLRequest
+    ) -> URLRequest {
+        var request = request
+        request.timeoutInterval = transportGuardTimeoutSeconds
+        return request
     }
 
     static func fetch(
         request: URLRequest,
-        maximumBytes: Int
+        maximumBytes: Int,
+        onVerifiedPrefixProgress:
+            @escaping AetherURLPlaybackVerifiedPrefixProgress = { _ in }
+    ) async throws -> Data {
+        try await fetch(
+            request: request,
+            maximumBytes: maximumBytes,
+            policy: .production,
+            clock: AetherSystemURLPlaybackPrefixFetchClock(),
+            makeReader: { AetherURLSessionPrefixReader(request: $0) },
+            onVerifiedPrefixProgress: onVerifiedPrefixProgress
+        )
+    }
+
+    /// Internal so controlled readers can prove the progress, retry, and
+    /// cancellation contract without live network time.
+    static func fetch(
+        request: URLRequest,
+        maximumBytes: Int,
+        policy: AetherPlaybackLivenessPolicy,
+        clock: any AetherURLPlaybackPrefixFetchClock,
+        makeReader: @escaping ReaderFactory,
+        onVerifiedPrefixProgress:
+            @escaping AetherURLPlaybackVerifiedPrefixProgress = { _ in }
     ) async throws -> Data {
         let fetcher = AetherURLPlaybackPrefixFetcher(
             request: request,
-            maximumBytes: maximumBytes
+            maximumBytes: maximumBytes,
+            policy: policy,
+            clock: clock,
+            makeReader: makeReader,
+            onVerifiedPrefixProgress: onVerifiedPrefixProgress
         )
         return try await withTaskCancellationHandler {
-            try await fetcher.start()
+            try await fetcher.run()
         } onCancel: {
-            fetcher.finish(.failure(CancellationError()))
+            fetcher.cancel()
         }
     }
 
-    private func start() async throws -> Data {
-        try Task.checkCancellation()
-        return try await withCheckedThrowingContinuation { continuation in
-            lock.lock()
-            guard !isFinished else {
+    private func run() async throws -> Data {
+        var attemptNumber = 1
+        var verifiedPrefix = Data()
+        while true {
+            try Task.checkCancellation()
+            let attempt = Attempt(
+                generation: UInt64(attemptNumber),
+                maximumBytes: maximumBytes,
+                expectedPrefix: verifiedPrefix,
+                noProgressWindow: policy.noProgressWindowSeconds(
+                    forAttempt: attemptNumber
+                ),
+                clock: clock,
+                reader: makeReader(request),
+                onVerifiedPrefixProgress: { [weak self] byteCount in
+                    self?.reportVerifiedPrefixProgress(byteCount)
+                }
+            )
+            let wasCancelled = lock.withLock { () -> Bool in
+                guard !isCancelled else { return true }
+                activeAttempt = attempt
+                return false
+            }
+            if wasCancelled {
+                throw CancellationError()
+            }
+            let result: Attempt.Result
+            do {
+                result = try await attempt.run()
+            } catch {
+                clearActiveAttempt(attempt)
+                throw error
+            }
+            clearActiveAttempt(attempt)
+            switch result {
+            case .maximumPrefix(let candidate):
+                verifiedPrefix = try mergeRestartedPrefix(
+                    candidate,
+                    into: verifiedPrefix,
+                    requireCompleteReplay: false
+                )
+                reportVerifiedPrefixProgress(verifiedPrefix.count)
+                return verifiedPrefix
+            case .cleanCompletion(let candidate):
+                verifiedPrefix = try mergeRestartedPrefix(
+                    candidate,
+                    into: verifiedPrefix,
+                    requireCompleteReplay: true
+                )
+                reportVerifiedPrefixProgress(verifiedPrefix.count)
+                guard !verifiedPrefix.isEmpty else {
+                    throw AetherURLPlaybackSourceClassificationError
+                        .emptyResource
+                }
+                return verifiedPrefix
+            case .incomplete(let candidate):
+                verifiedPrefix = try mergeRestartedPrefix(
+                    candidate,
+                    into: verifiedPrefix,
+                    requireCompleteReplay: false
+                )
+                reportVerifiedPrefixProgress(verifiedPrefix.count)
+                if AetherURLPlaybackSourceClassifier
+                    .isDecisiveNetworkPrefix(verifiedPrefix) {
+                    return verifiedPrefix
+                }
+                try await clock.sleep(
+                    for: policy.retryBackoffSeconds(
+                        forAttempt: attemptNumber
+                    )
+                )
+                attemptNumber += 1
+            }
+        }
+    }
+
+    private func clearActiveAttempt(_ attempt: Attempt) {
+        lock.withLock {
+            if activeAttempt === attempt {
+                activeAttempt = nil
+            }
+        }
+    }
+
+    private func reportVerifiedPrefixProgress(_ byteCount: Int) {
+        let callback = lock.withLock {
+            () -> AetherURLPlaybackVerifiedPrefixProgress? in
+            guard !isCancelled,
+                  byteCount > lastReportedVerifiedPrefixCount else {
+                return nil
+            }
+            lastReportedVerifiedPrefixCount = byteCount
+            return onVerifiedPrefixProgress
+        }
+        callback?(byteCount)
+    }
+
+    /// Every retry restarts at byte zero. Only an exact overlap can extend the
+    /// retained prefix; a shorter clean replay or any changed overlap proves
+    /// source identity drift. Candidate suffixes are never stitched onto a
+    /// different generation.
+    private func mergeRestartedPrefix(
+        _ candidate: Data,
+        into verified: Data,
+        requireCompleteReplay: Bool
+    ) throws -> Data {
+        if requireCompleteReplay, candidate.count < verified.count {
+            throw AetherURLPlaybackSourceClassificationError
+                .sourceIdentityChanged
+        }
+        let overlapCount = min(candidate.count, verified.count)
+        guard candidate.prefix(overlapCount).elementsEqual(
+            verified.prefix(overlapCount)
+        ) else {
+            throw AetherURLPlaybackSourceClassificationError
+                .sourceIdentityChanged
+        }
+        return candidate.count > verified.count ? candidate : verified
+    }
+
+    private func cancel() {
+        let attempt = lock.withLock { () -> Attempt? in
+            isCancelled = true
+            return activeAttempt
+        }
+        attempt?.cancelByCaller()
+    }
+
+    private final class Attempt: @unchecked Sendable {
+        enum Result {
+            case maximumPrefix(Data)
+            case cleanCompletion(Data)
+            case incomplete(Data)
+        }
+
+        private enum State {
+            case idle
+            case reading
+            case awaitingCompletion(Result)
+            case finished
+        }
+
+        private let generation: UInt64
+        private let maximumBytes: Int
+        private let expectedPrefix: Data
+        private let noProgressWindow: TimeInterval
+        private let clock: any AetherURLPlaybackPrefixFetchClock
+        private let reader: any AetherURLPlaybackPrefixReader
+        private let onVerifiedPrefixProgress:
+            AetherURLPlaybackVerifiedPrefixProgress
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Result, Error>?
+        private var state: State = .idle
+        private var data = Data()
+        private var receivedResponse = false
+        private var watchdogGeneration: UInt64 = 0
+
+        init(
+            generation: UInt64,
+            maximumBytes: Int,
+            expectedPrefix: Data,
+            noProgressWindow: TimeInterval,
+            clock: any AetherURLPlaybackPrefixFetchClock,
+            reader: any AetherURLPlaybackPrefixReader,
+            onVerifiedPrefixProgress:
+                @escaping AetherURLPlaybackVerifiedPrefixProgress
+        ) {
+            self.generation = generation
+            self.maximumBytes = maximumBytes
+            self.expectedPrefix = expectedPrefix
+            self.noProgressWindow = noProgressWindow
+            self.clock = clock
+            self.reader = reader
+            self.onVerifiedPrefixProgress = onVerifiedPrefixProgress
+        }
+
+        func run() async throws -> Result {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                guard case .idle = state else {
+                    lock.unlock()
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                self.continuation = continuation
+                state = .reading
                 lock.unlock()
-                continuation.resume(throwing: CancellationError())
+                reader.start(
+                    onResponse: { [weak self] response in
+                        self?.receive(response, generation: self?.generation)
+                    },
+                    onBytes: { [weak self] bytes in
+                        self?.receive(bytes, generation: self?.generation)
+                    },
+                    onCompletion: { [weak self] error in
+                        self?.complete(error, generation: self?.generation)
+                    }
+                )
+                resetWatchdog()
+            }
+        }
+
+        func cancelByCaller() {
+            let continuation = lock.withLock { () -> CheckedContinuation<Result, Error>? in
+                guard case .finished = state else {
+                    state = .finished
+                    let continuation = self.continuation
+                    self.continuation = nil
+                    return continuation
+                }
+                return nil
+            }
+            reader.cancel()
+            continuation?.resume(throwing: CancellationError())
+        }
+
+        private func receive(
+            _ response: AetherURLPlaybackPrefixResponse,
+            generation: UInt64?
+        ) {
+            guard generation == self.generation else { return }
+            let terminal: Error?
+            let retry: Bool
+            lock.lock()
+            guard case .reading = state else {
+                lock.unlock()
                 return
             }
-            self.continuation = continuation
-            let configuration = URLSessionConfiguration.ephemeral
-            configuration.timeoutIntervalForRequest = 10
-            configuration.timeoutIntervalForResource = 30
-            configuration.httpCookieStorage = nil
-            configuration.httpShouldSetCookies = false
-            configuration.urlCredentialStorage = nil
-            let session = URLSession(
-                configuration: configuration,
-                delegate: self,
-                delegateQueue: nil
-            )
-            let task = session.dataTask(with: request)
+            receivedResponse = true
+            if (200..<300).contains(response.statusCode) {
+                if response.statusCode == 206,
+                   !Self.isZeroBasedContentRange(
+                       response.contentRange
+                   ) {
+                    terminal = AetherURLPlaybackSourceClassificationError
+                        .sourceIdentityChanged
+                    retry = false
+                } else if let encoding = response.contentEncoding,
+                   !encoding.isEmpty,
+                   encoding.lowercased() != "identity" {
+                    terminal = AetherURLPlaybackSourceClassificationError
+                        .unsupportedContentEncoding
+                    retry = false
+                } else {
+                    terminal = nil
+                    retry = false
+                }
+            } else if Self.isPermanentHTTPStatus(response.statusCode) {
+                terminal = AetherURLPlaybackSourceClassificationError
+                    .httpStatus(response.statusCode)
+                retry = false
+            } else {
+                terminal = nil
+                retry = true
+            }
+            if retry {
+                state = .awaitingCompletion(.incomplete(data))
+            }
+            lock.unlock()
+            if let terminal {
+                finish(.failure(terminal))
+                reader.cancel()
+            } else if retry {
+                reader.cancel()
+            }
+        }
+
+        private func receive(_ bytes: Data, generation: UInt64?) {
+            guard generation == self.generation, !bytes.isEmpty else { return }
+            var prefix: Data?
+            var progressed = false
+            var identityChanged = false
+            var verifiedPrefixCount: Int?
+            lock.lock()
+            guard case .reading = state else {
+                lock.unlock()
+                return
+            }
+            let remaining = maximumBytes - data.count
+            if remaining > 0 {
+                let previousCount = data.count
+                let appended = bytes.prefix(remaining)
+                data.append(appended)
+                let overlapEnd = min(
+                    data.count,
+                    expectedPrefix.count
+                )
+                if overlapEnd > previousCount,
+                   !data[previousCount..<overlapEnd].elementsEqual(
+                       expectedPrefix[previousCount..<overlapEnd]
+                   ) {
+                    identityChanged = true
+                }
+                progressed = data.count > max(
+                    previousCount,
+                    expectedPrefix.count
+                )
+                if !identityChanged, progressed {
+                    verifiedPrefixCount = data.count
+                }
+            }
+            if data.count == maximumBytes {
+                prefix = data
+            }
+            lock.unlock()
+            if identityChanged {
+                finish(.failure(
+                    AetherURLPlaybackSourceClassificationError
+                        .sourceIdentityChanged
+                ))
+                reader.cancel()
+            } else {
+                if let verifiedPrefixCount {
+                    onVerifiedPrefixProgress(verifiedPrefixCount)
+                }
+                if let prefix {
+                    finish(.success(.maximumPrefix(prefix)))
+                    reader.cancel()
+                } else if progressed {
+                    resetWatchdog()
+                }
+            }
+        }
+
+        private func complete(_ error: Error?, generation: UInt64?) {
+            guard generation == self.generation else { return }
+            let outcome = lock.withLock { () -> Swift.Result<Result, Error>? in
+                switch state {
+                case .awaitingCompletion(let result):
+                    return .success(result)
+                case .reading:
+                    if let permanent = Self.permanentClassificationError(
+                        error
+                    ) {
+                        return .failure(permanent)
+                    }
+                    if error == nil {
+                        guard receivedResponse else {
+                            return .failure(
+                                AetherURLPlaybackSourceClassificationError
+                                    .nonHTTPResponse
+                            )
+                        }
+                        return .success(.cleanCompletion(data))
+                    }
+                    return .success(.incomplete(data))
+                case .idle, .finished:
+                    return nil
+                }
+            }
+            if let outcome {
+                finish(outcome)
+            }
+        }
+
+        private func resetWatchdog() {
+            let watchdogToken = lock.withLock { () -> UInt64? in
+                guard case .reading = state else { return nil }
+                watchdogGeneration += 1
+                return watchdogGeneration
+            }
+            guard let watchdogToken else { return }
+            _ = makeWatchdog(token: watchdogToken)
+        }
+
+        private func makeWatchdog(token: UInt64) -> Task<Void, Never> {
+            let clock = clock
+            let window = noProgressWindow
+            return Task { [weak self] in
+                do {
+                    try await clock.sleep(for: window)
+                } catch {
+                    return
+                }
+                self?.noProgressElapsed(token: token)
+            }
+        }
+
+        private func noProgressElapsed(token: UInt64) {
+            let result = lock.withLock { () -> Result? in
+                guard case .reading = state,
+                      token == watchdogGeneration else {
+                    return nil
+                }
+                // An incomplete generation is never classification evidence
+                // by itself. The coordinator verifies its byte-zero overlap
+                // before retaining it for a same-source retry.
+                let result: Result = .incomplete(data)
+                state = .awaitingCompletion(result)
+                return result
+            }
+            guard result != nil else { return }
+            reader.cancel()
+        }
+
+        private static func permanentClassificationError(
+            _ error: Error?
+        ) -> Error? {
+            guard let error = error as? AetherURLPlaybackSourceClassificationError
+            else {
+                return nil
+            }
+            switch error {
+            case .transport:
+                return nil
+            default:
+                return error
+            }
+        }
+
+        private func finish(_ result: Swift.Result<Result, Error>) {
+            let continuation = lock.withLock { () -> CheckedContinuation<Result, Error>? in
+                guard case .finished = state else {
+                    state = .finished
+                    let continuation = self.continuation
+                    self.continuation = nil
+                    return continuation
+                }
+                return nil
+            }
+            continuation?.resume(with: result)
+        }
+
+        private static func isPermanentHTTPStatus(_ status: Int) -> Bool {
+            switch status {
+            case 401, 403, 404, 410:
+                true
+            default:
+                false
+            }
+        }
+
+        private static func isZeroBasedContentRange(
+            _ value: String?
+        ) -> Bool {
+            guard let value else { return false }
+            let normalized = value
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard normalized.hasPrefix("bytes ") else {
+                return false
+            }
+            let range = normalized.dropFirst("bytes ".count)
+            return range.hasPrefix("0-")
+        }
+    }
+}
+
+/// URLSession adapter for exactly one prefix reader generation. URLSession's
+/// own request/resource timeouts are deliberately long: the coordinator above
+/// owns the shorter, progress-resetting liveness window.
+private final class AetherURLSessionPrefixReader:
+    NSObject,
+    URLSessionDataDelegate,
+    URLSessionTaskDelegate,
+    AetherURLPlaybackPrefixReader,
+    @unchecked Sendable
+{
+    private let request: URLRequest
+    private let lock = NSLock()
+    private var onResponse: (@Sendable (AetherURLPlaybackPrefixResponse) -> Void)?
+    private var onBytes: (@Sendable (Data) -> Void)?
+    private var onCompletion: (@Sendable (Error?) -> Void)?
+    private var session: URLSession?
+    private var task: URLSessionDataTask?
+
+    init(request: URLRequest) {
+        self.request = AetherURLPlaybackPrefixFetcher
+            .applyingTransportGuard(to: request)
+    }
+
+    func start(
+        onResponse: @escaping @Sendable (AetherURLPlaybackPrefixResponse) -> Void,
+        onBytes: @escaping @Sendable (Data) -> Void,
+        onCompletion: @escaping @Sendable (Error?) -> Void
+    ) {
+        let configuration = URLSessionConfiguration.ephemeral
+        // These are guards against an abandoned URLSession task, not the
+        // classification deadline. Byte progress is governed by the policy.
+        configuration.timeoutIntervalForRequest =
+            AetherURLPlaybackPrefixFetcher
+                .transportGuardTimeoutSeconds
+        configuration.timeoutIntervalForResource =
+            AetherURLPlaybackPrefixFetcher
+                .transportGuardTimeoutSeconds
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.urlCredentialStorage = nil
+        let session = URLSession(
+            configuration: configuration,
+            delegate: self,
+            delegateQueue: nil
+        )
+        let request = AetherURLPlaybackPrefixFetcher
+            .applyingTransportGuard(to: request)
+        let task = session.dataTask(with: request)
+        lock.withLock {
+            self.onResponse = onResponse
+            self.onBytes = onBytes
+            self.onCompletion = onCompletion
             self.session = session
             self.task = task
-            lock.unlock()
-            task.resume()
         }
+        task.resume()
+    }
+
+    func cancel() {
+        let session = lock.withLock { () -> URLSession? in
+            task?.cancel()
+            task = nil
+            let session = self.session
+            self.session = nil
+            return session
+        }
+        session?.invalidateAndCancel()
     }
 
     func urlSession(
@@ -339,10 +982,10 @@ private final class AetherURLPlaybackPrefixFetcher:
               let sourceOrigin = HLSVODOriginScope(url: sourceURL),
               let targetOrigin = HLSVODOriginScope(url: targetURL) else {
             completionHandler(nil)
-            finish(.failure(
+            emitCompletion(
                 AetherURLPlaybackSourceClassificationError
                     .redirectCredentialScopeViolation
-            ))
+            )
             return
         }
         let originalHeaders = self.request.allHTTPHeaderFields ?? [:]
@@ -355,10 +998,10 @@ private final class AetherURLPlaybackPrefixFetcher:
         } else {
             guard !Self.hasCredentialScopedHeaders(originalHeaders) else {
                 completionHandler(nil)
-                finish(.failure(
+                emitCompletion(
                     AetherURLPlaybackSourceClassificationError
                         .redirectCredentialScopeViolation
-                ))
+                )
                 return
             }
             for (field, value) in originalHeaders
@@ -367,6 +1010,8 @@ private final class AetherURLPlaybackPrefixFetcher:
             }
         }
         redirected.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        redirected = AetherURLPlaybackPrefixFetcher
+            .applyingTransportGuard(to: redirected)
         completionHandler(redirected)
     }
 
@@ -376,55 +1021,35 @@ private final class AetherURLPlaybackPrefixFetcher:
         didReceive response: URLResponse,
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
-        guard let http = response as? HTTPURLResponse else {
+        guard let response = response as? HTTPURLResponse else {
             completionHandler(.cancel)
-            finish(.failure(
+            emitCompletion(
                 AetherURLPlaybackSourceClassificationError.nonHTTPResponse
-            ))
+            )
             return
         }
-        guard (200..<300).contains(http.statusCode) else {
-            completionHandler(.cancel)
-            finish(.failure(
-                AetherURLPlaybackSourceClassificationError.httpStatus(
-                    http.statusCode
+        let callback = lock.withLock { onResponse }
+        callback?(
+            AetherURLPlaybackPrefixResponse(
+                statusCode: response.statusCode,
+                contentEncoding: response.value(
+                    forHTTPHeaderField: "Content-Encoding"
+                ),
+                contentRange: response.value(
+                    forHTTPHeaderField: "Content-Range"
                 )
-            ))
-            return
-        }
-        if let encoding = http.value(forHTTPHeaderField: "Content-Encoding"),
-           !encoding.isEmpty,
-           encoding.lowercased() != "identity" {
-            completionHandler(.cancel)
-            finish(.failure(
-                AetherURLPlaybackSourceClassificationError
-                    .unsupportedContentEncoding
-            ))
-            return
-        }
-        lock.withLock { receivedResponse = true }
+            )
+        )
         completionHandler(.allow)
     }
 
     func urlSession(
         _ session: URLSession,
         dataTask: URLSessionDataTask,
-        didReceive chunk: Data
+        didReceive data: Data
     ) {
-        var completedPrefix: Data?
-        lock.lock()
-        let remaining = maximumBytes - data.count
-        if remaining > 0 {
-            data.append(chunk.prefix(remaining))
-        }
-        if data.count == maximumBytes {
-            completedPrefix = data
-        }
-        lock.unlock()
-        if let completedPrefix {
-            dataTask.cancel()
-            finish(.success(completedPrefix))
-        }
+        let callback = lock.withLock { onBytes }
+        callback?(data)
     }
 
     func urlSession(
@@ -432,57 +1057,20 @@ private final class AetherURLPlaybackPrefixFetcher:
         task: URLSessionTask,
         didCompleteWithError error: Error?
     ) {
-        if let error {
-            if (error as? URLError)?.code == .cancelled {
-                finish(.failure(CancellationError()))
-            } else if let urlError = error as? URLError {
-                finish(.failure(
-                    AetherURLPlaybackSourceClassificationError.transport(
-                        code: urlError.code.rawValue
-                    )
-                ))
-            } else {
-                finish(.failure(
-                    AetherURLPlaybackSourceClassificationError.transport(
-                        code: nil
-                    )
-                ))
-            }
-            return
-        }
-        let responseAndData = lock.withLock { (receivedResponse, data) }
-        guard responseAndData.0 else {
-            finish(.failure(
-                AetherURLPlaybackSourceClassificationError.nonHTTPResponse
-            ))
-            return
-        }
-        guard !responseAndData.1.isEmpty else {
-            finish(.failure(
-                AetherURLPlaybackSourceClassificationError.emptyResource
-            ))
-            return
-        }
-        finish(.success(responseAndData.1))
+        emitCompletion(error)
     }
 
-    private func finish(_ result: Result<Data, Error>) {
-        let continuation: CheckedContinuation<Data, Error>?
-        let session: URLSession?
-        lock.lock()
-        guard !isFinished else {
-            lock.unlock()
-            return
+    private func emitCompletion(_ error: Error?) {
+        let callback = lock.withLock { () -> (@Sendable (Error?) -> Void)? in
+            let callback = onCompletion
+            onCompletion = nil
+            onResponse = nil
+            onBytes = nil
+            task = nil
+            session = nil
+            return callback
         }
-        isFinished = true
-        continuation = self.continuation
-        self.continuation = nil
-        session = self.session
-        self.session = nil
-        task = nil
-        lock.unlock()
-        session?.invalidateAndCancel()
-        continuation?.resume(with: result)
+        callback?(error)
     }
 
     private static let safeCrossOriginHeaders: Set<String> = [

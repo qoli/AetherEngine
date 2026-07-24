@@ -31,6 +31,25 @@ final class AetherPreparedURLSource: @unchecked Sendable {
     let probesize: Int64?
     let maxAnalyzeDuration: Int64?
     let probe: SourceProbe
+    let options: LoadOptions
+    /// Durable privacy-safe progress retained after the exact Demuxer is
+    /// consumed by Hybrid. Nil for legacy one-shot preparation.
+    let progressiveLiveness:
+        AetherProgressivePreflightLiveness?
+    /// Exact session store used by progressive preflight. Hybrid adopts this
+    /// same instance for later same-source demux generations.
+    let sourceByteStore: SourceByteStore?
+    /// Privacy-safe exact content identity established by the source store.
+    /// Contains only total length plus ETag/Last-Modified validator.
+    let sourceGeneration: SourceByteStoreGeneration?
+    /// Exact unique-range ledger and privacy-safe relay retained across every
+    /// later same-source Hybrid demux generation.
+    let fetchedByteProgressLedger:
+        AetherFetchedByteProgressLedger?
+    let onFetchedByteProgress:
+        (@Sendable (AetherFetchedByteProgress) -> Void)?
+    let onProbeMilestone:
+        (@Sendable () -> Void)?
 
     private let lock = NSLock()
     private var demuxer: Demuxer?
@@ -39,7 +58,16 @@ final class AetherPreparedURLSource: @unchecked Sendable {
         url: URL,
         options: LoadOptions,
         probe: SourceProbe,
-        demuxer: Demuxer
+        demuxer: Demuxer,
+        progressiveLiveness:
+            AetherProgressivePreflightLiveness? = nil,
+        sourceByteStore: SourceByteStore? = nil,
+        fetchedByteProgressLedger:
+            AetherFetchedByteProgressLedger? = nil,
+        onFetchedByteProgress:
+            (@Sendable (AetherFetchedByteProgress) -> Void)? = nil,
+        onProbeMilestone:
+            (@Sendable () -> Void)? = nil
     ) {
         self.url = url
         httpHeaders = options.httpHeaders
@@ -47,6 +75,17 @@ final class AetherPreparedURLSource: @unchecked Sendable {
         probesize = options.probesize
         maxAnalyzeDuration = options.maxAnalyzeDuration
         self.probe = probe
+        self.options = options
+        self.progressiveLiveness = progressiveLiveness
+        self.sourceByteStore = sourceByteStore
+        sourceGeneration =
+            sourceByteStore?.snapshot?.generation
+        self.fetchedByteProgressLedger =
+            fetchedByteProgressLedger
+        self.onFetchedByteProgress =
+            onFetchedByteProgress
+        self.onProbeMilestone =
+            onProbeMilestone
         self.demuxer = demuxer
     }
 
@@ -55,10 +94,7 @@ final class AetherPreparedURLSource: @unchecked Sendable {
         options: LoadOptions
     ) throws -> Demuxer {
         guard self.url == url,
-              httpHeaders == options.httpHeaders,
-              isLive == options.isLive,
-              probesize == options.probesize,
-              maxAnalyzeDuration == options.maxAnalyzeDuration else {
+              self.options == options else {
             throw AetherPreparedURLSourceError.identityMismatch
         }
         lock.lock()
@@ -76,6 +112,20 @@ final class AetherPreparedURLSource: @unchecked Sendable {
         self.demuxer = nil
         lock.unlock()
         demuxer?.close()
+        if let demuxer {
+            Task.detached(priority: .utility) {
+                demuxer.waitForIOQuiescence()
+            }
+        }
+    }
+
+    func discardAndWaitForIOQuiescence() {
+        lock.lock()
+        let demuxer = demuxer
+        self.demuxer = nil
+        lock.unlock()
+        demuxer?.close()
+        demuxer?.waitForIOQuiescence()
     }
 
     deinit {
@@ -127,6 +177,35 @@ extension AetherEngine {
         options: LoadOptions = .init()
     ) throws -> AetherPreparedURLSource {
         let demuxer = Demuxer()
+        return try prepareURLSource(
+            url: url,
+            options: options,
+            demuxer: demuxer,
+            sourceByteStore: nil
+        )
+    }
+
+    /// Owned-demuxer variant used by progressive launch policy. The caller
+    /// installs progress/cancellation hooks before this synchronous open and
+    /// may reuse one exact-source byte store across quiesced attempts.
+    ///
+    /// The request value is passed through unchanged on every attempt. The
+    /// prepared owner therefore retains the same URL, headers, liveness and
+    /// probe-budget identity enforced by `consume(url:options:)`.
+    nonisolated static func prepareURLSource(
+        url: URL,
+        options: LoadOptions,
+        demuxer: Demuxer,
+        sourceByteStore: SourceByteStore?,
+        progressiveLiveness:
+            AetherProgressivePreflightLiveness? = nil,
+        fetchedByteProgressLedger:
+            AetherFetchedByteProgressLedger? = nil,
+        onFetchedByteProgress:
+            (@Sendable (AetherFetchedByteProgress) -> Void)? = nil,
+        onProbeMilestone:
+            (@Sendable () -> Void)? = nil
+    ) throws -> AetherPreparedURLSource {
         do {
             let profile = DemuxerOpenProfile.playback.withProbeBudget(
                 probesize: options.probesize,
@@ -136,7 +215,8 @@ extension AetherEngine {
                 url: url,
                 extraHeaders: options.httpHeaders,
                 profile: profile,
-                isLive: options.isLive
+                isLive: options.isLive,
+                sourceByteStore: sourceByteStore
             )
             let probe = makeSourceProbe(
                 demuxer: demuxer,
@@ -146,7 +226,16 @@ extension AetherEngine {
                 url: url,
                 options: options,
                 probe: probe,
-                demuxer: demuxer
+                demuxer: demuxer,
+                progressiveLiveness:
+                    progressiveLiveness,
+                sourceByteStore: sourceByteStore,
+                fetchedByteProgressLedger:
+                    fetchedByteProgressLedger,
+                onFetchedByteProgress:
+                    onFetchedByteProgress,
+                onProbeMilestone:
+                    onProbeMilestone
             )
         } catch {
             demuxer.close()

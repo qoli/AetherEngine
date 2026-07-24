@@ -77,6 +77,9 @@ final class BlackCarrierLazyCompositeProvider:
         decodedFrameHandler: HybridVideoDecodeSink.FrameHandler? = nil,
         videoFailureHandler: HybridVideoDecodeSink.FailureHandler? = nil,
         decoderPreference: HybridVideoDecoderPreference = .automatic,
+        videoBacklogConfiguration:
+            HybridCompressedVideoBacklogConfiguration = .production,
+        videoBacklogScratchRoot: URL? = nil,
         initialGeneration: UInt64 = 0,
         selectTitleID: Int? = nil
     ) throws -> BlackCarrierLazyCompositeProvider {
@@ -117,6 +120,10 @@ final class BlackCarrierLazyCompositeProvider:
                 decodedFrameHandler: decodedFrameHandler,
                 videoFailureHandler: videoFailureHandler,
                 decoderPreference: decoderPreference,
+                videoBacklogConfiguration:
+                    videoBacklogConfiguration,
+                videoBacklogScratchRoot:
+                    videoBacklogScratchRoot,
                 initialGeneration: initialGeneration
             )
         } catch {
@@ -168,7 +175,8 @@ final class BlackCarrierLazyCompositeProvider:
     }
 
     static func hybridPlaybackSessionError(
-        from error: Error
+        from error: Error,
+        stage: HybridPlaybackFailureStage = .provider
     ) -> HybridPlaybackSessionError? {
         let typed: BlackCarrierLazyCompositeProviderError
         if let existing = error as? BlackCarrierLazyCompositeProviderError {
@@ -195,7 +203,8 @@ final class BlackCarrierLazyCompositeProvider:
         case .pump(let pump):
             return .providerFailed(
                 HybridPlaybackFailureEvidence(
-                    stage: .provider,
+                    stage: stage,
+                    category: pump.failureCategory,
                     caseCode: "progressive.\(pump.failureCaseCode)",
                     underlyingDomain: pump.failureDomain,
                     underlyingCode: pump.failureCode
@@ -220,6 +229,10 @@ final class BlackCarrierLazyCompositeProvider:
 
     var progressiveSourceFacts: AetherProgressiveSourceFacts? {
         pump.progressiveSourceFacts
+    }
+
+    var isCarrierSegmentProductionActive: Bool {
+        pump.isCarrierSegmentProductionActive
     }
 
     var hybridSubtitleContracts:
@@ -268,6 +281,15 @@ final class BlackCarrierLazyCompositeProvider:
         }
     }
 
+    func setRoutePreparationProgressHandler(
+        _ handler:
+            (@Sendable (
+                AetherRoutePreparationProgressKind
+            ) -> Void)?
+    ) {
+        pump.setRoutePreparationProgressHandler(handler)
+    }
+
     func restartMedia(
         for intent: HybridSeekIntent
     ) throws -> BlackCarrierMediaFanoutRestartResult {
@@ -277,9 +299,8 @@ final class BlackCarrierLazyCompositeProvider:
             record(.pump(error))
             throw error
         } catch {
-            let typed = BlackCarrierMediaFanoutPumpError.demuxFailed(
-                reason: String(describing: error)
-            )
+            let typed = BlackCarrierMediaFanoutPumpError
+                .wrappingDemuxFailure(error)
             record(.pump(typed))
             throw typed
         }
@@ -292,9 +313,8 @@ final class BlackCarrierLazyCompositeProvider:
             record(.pump(error))
             throw error
         } catch {
-            let typed = BlackCarrierMediaFanoutPumpError.demuxFailed(
-                reason: String(describing: error)
-            )
+            let typed = BlackCarrierMediaFanoutPumpError
+                .wrappingDemuxFailure(error)
             record(.pump(typed))
             throw typed
         }
@@ -308,9 +328,8 @@ final class BlackCarrierLazyCompositeProvider:
             record(typed)
             throw typed
         } catch {
-            let typed = BlackCarrierMediaFanoutPumpError.demuxFailed(
-                reason: String(describing: error)
-            )
+            let typed = BlackCarrierMediaFanoutPumpError
+                .wrappingDemuxFailure(error)
             record(.pump(typed))
             throw typed
         }
@@ -326,6 +345,14 @@ final class BlackCarrierLazyCompositeProvider:
         closeLock.unlock()
         videoProvider.close()
         pump.close()
+    }
+
+    func closeAndWaitForIOQuiescence() async {
+        close()
+        await Task.detached(priority: .userInitiated) {
+            [pump] in
+            pump.closeAndWaitForIOQuiescence()
+        }.value
     }
 
     func initSegment() -> Data? {
@@ -391,6 +418,12 @@ final class BlackCarrierLazyCompositeProvider:
         pump.realVideoBitrateTelemetry
     }
 
+    var compressedVideoBacklogSnapshot:
+        HybridCompressedVideoBacklogSnapshot?
+    {
+        pump.compressedVideoBacklogSnapshot
+    }
+
     var alternateAudioRenditions: [HLSAudioRenditionInfo] {
         zip(pump.renditionMetadata, pump.renditionDescriptors).map {
             metadata,
@@ -454,9 +487,9 @@ final class BlackCarrierLazyCompositeProvider:
             recordIfTerminal(error)
             return nil
         } catch {
-            record(.pump(.demuxFailed(
-                reason: String(describing: error)
-            )))
+            record(.pump(
+                .wrappingDemuxFailure(error)
+            ))
             return nil
         }
     }
@@ -471,7 +504,7 @@ final class BlackCarrierLazyCompositeProvider:
             recordIfTerminal(error)
             return nil
         } catch {
-            record(.pump(.demuxFailed(reason: String(describing: error))))
+            record(.pump(.wrappingDemuxFailure(error)))
             return nil
         }
     }
@@ -493,7 +526,7 @@ final class BlackCarrierLazyCompositeProvider:
             recordIfTerminal(error)
             return nil
         } catch {
-            record(.pump(.demuxFailed(reason: String(describing: error))))
+            record(.pump(.wrappingDemuxFailure(error)))
             return nil
         }
     }
@@ -515,7 +548,7 @@ final class BlackCarrierLazyCompositeProvider:
             recordIfTerminal(error)
             return nil
         } catch {
-            record(.pump(.demuxFailed(reason: String(describing: error))))
+            record(.pump(.wrappingDemuxFailure(error)))
             return nil
         }
     }
@@ -585,7 +618,7 @@ final class BlackCarrierLazyCompositeProvider:
             recordIfTerminal(error)
             return false
         } catch {
-            record(.pump(.demuxFailed(reason: String(describing: error))))
+            record(.pump(.wrappingDemuxFailure(error)))
             return false
         }
     }
@@ -593,4 +626,8 @@ final class BlackCarrierLazyCompositeProvider:
 
 extension BlackCarrierLazyCompositeProvider:
     HybridPlaybackTerminalErrorSource
+{}
+
+extension BlackCarrierLazyCompositeProvider:
+    HybridCarrierSegmentProductionActivitySource
 {}

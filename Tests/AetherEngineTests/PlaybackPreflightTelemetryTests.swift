@@ -357,6 +357,11 @@ struct PlaybackPreflightTelemetryTests {
     private var capabilities: HybridPlaybackCapabilities {
         HybridPlaybackCapabilities(
             hasDirectVideoDecoder: true,
+            libavcodecDecodableVideoCodecs: [
+                .h264,
+                .hevc,
+                .vp9,
+            ],
             hasSampleBufferRenderer: true,
             supportedVideoFormats: [.sdr],
             supportedSourceKinds: [

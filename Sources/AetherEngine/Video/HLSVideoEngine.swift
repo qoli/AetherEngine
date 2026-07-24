@@ -4,6 +4,725 @@ import Libavformat
 import Libavcodec
 import Libavutil
 
+extension AetherPlaybackLivenessPolicy {
+    func latestDiagnosticCheckpoint(
+        elapsed: TimeInterval
+    ) -> TimeInterval? {
+        guard elapsed.isFinite,
+              elapsed >= 0,
+              let first =
+                diagnosticCheckpointsSeconds.first,
+              elapsed >= first,
+              let last =
+                diagnosticCheckpointsSeconds.last else {
+            return nil
+        }
+        if elapsed >= last {
+            let repeats = floor(
+                (elapsed - last)
+                    / repeatingDiagnosticIntervalSeconds
+            )
+            return last
+                + repeats
+                * repeatingDiagnosticIntervalSeconds
+        }
+        return diagnosticCheckpointsSeconds
+            .last {
+                $0 <= elapsed
+            }
+    }
+}
+
+struct HLSRetryDiagnosticSummary:
+    Sendable,
+    Equatable
+{
+    let cumulativeFailures: Int
+    let elapsedSeconds: TimeInterval
+    /// nil identifies the first failure summary.
+    let checkpointSeconds: TimeInterval?
+}
+
+/// Orders a same-source reader generation replacement. The two-second worker
+/// wait is only a diagnostic checkpoint: successor admission remains closed
+/// until both the producer and its AVIO callbacks report real quiescence.
+enum HLSReopenGenerationGate {
+    static let cancellationDiagnosticSeconds:
+        TimeInterval = 2
+
+    static func retirePredecessor(
+        diagnosticCheckpointPassed: Bool = false,
+        requestCancellation: () -> Void,
+        waitForWorker: (TimeInterval) -> Bool,
+        waitForIOQuiescence: () -> Void,
+        onCancellationUnresponsive: () -> Void
+    ) {
+        requestCancellation()
+        if diagnosticCheckpointPassed {
+            onCancellationUnresponsive()
+            while !waitForWorker(
+                cancellationDiagnosticSeconds
+            ) {
+                // A diagnostic timeout never admits a successor.
+            }
+        } else if !waitForWorker(
+            cancellationDiagnosticSeconds
+        ) {
+            onCancellationUnresponsive()
+            while !waitForWorker(
+                cancellationDiagnosticSeconds
+            ) {
+                // A diagnostic timeout never admits a successor.
+            }
+        }
+        waitForIOQuiescence()
+    }
+}
+
+/// Saturating attempt counter for same-source transport recovery. Backoff
+/// reaches the production 30-second ceiling, but attempt admission never
+/// reaches a terminal count.
+struct HLSReopenAttemptLedger: Sendable {
+    private(set) var attempt = 1
+    private var firstFailureUptime:
+        TimeInterval?
+    private var lastLoggedCheckpoint:
+        TimeInterval = 0
+
+    var backoffSeconds: TimeInterval {
+        AetherPlaybackLivenessPolicy
+            .production
+            .retryBackoffSeconds(
+                forAttempt: attempt
+            )
+    }
+
+    @discardableResult
+    mutating func recordFailure(
+        nowUptime: TimeInterval =
+            ProcessInfo.processInfo.systemUptime
+    ) -> HLSRetryDiagnosticSummary? {
+        let failedAttempt = attempt
+        if attempt < Int.max {
+            attempt += 1
+        }
+        guard let firstFailureUptime else {
+            self.firstFailureUptime =
+                nowUptime
+            return HLSRetryDiagnosticSummary(
+                cumulativeFailures:
+                    failedAttempt,
+                elapsedSeconds: 0,
+                checkpointSeconds: nil
+            )
+        }
+        let elapsed =
+            max(
+                0,
+                nowUptime
+                    - firstFailureUptime
+            )
+        guard let checkpoint =
+                AetherPlaybackLivenessPolicy
+                    .production
+                    .latestDiagnosticCheckpoint(
+                        elapsed: elapsed
+                    ),
+              checkpoint
+                > lastLoggedCheckpoint else {
+            return nil
+        }
+        lastLoggedCheckpoint =
+            checkpoint
+        return HLSRetryDiagnosticSummary(
+            cumulativeFailures:
+                failedAttempt,
+            elapsedSeconds: elapsed,
+            checkpointSeconds:
+                checkpoint
+        )
+    }
+
+    mutating func resetAfterProgress() {
+        attempt = 1
+        firstFailureUptime = nil
+        lastLoggedCheckpoint = 0
+    }
+}
+
+enum HLSReopenFailureDisposition:
+    Sendable,
+    Equatable
+{
+    case retry
+    case cancelled
+    case permanent(AetherPlaybackFailure)
+}
+
+/// Privacy-safe stream contract retained across same-request reader
+/// generations. It contains only decoder-facing media shape; request identity,
+/// headers, tokens and signed URLs never enter this value.
+struct HLSReopenStreamShape: Sendable, Equatable {
+    struct Video: Sendable, Equatable {
+        let streamIndex: Int32
+        let codecID: UInt32
+        let profile: Int32
+        let level: Int32
+        let pixelFormat: Int32
+        let width: Int32
+        let height: Int32
+        let timeBaseNumerator: Int32
+        let timeBaseDenominator: Int32
+    }
+
+    struct Audio: Sendable, Equatable {
+        let streamIndex: Int32
+        let codecID: UInt32
+        let profile: Int32
+        let sampleFormat: Int32
+        let sampleRate: Int32
+        let frameSize: Int32
+        let channelCount: Int32
+        let channelLayoutDescription: String
+        let timeBaseNumerator: Int32
+        let timeBaseDenominator: Int32
+    }
+
+    let video: Video
+    let audio: Audio?
+    let audioStreamCount: Int
+
+    static func capture(
+        demuxer: Demuxer,
+        videoStreamIndex: Int32,
+        audioStreamIndex: Int32
+    ) -> HLSReopenStreamShape? {
+        guard let videoStream =
+                demuxer.stream(at: videoStreamIndex),
+              let videoParameters =
+                videoStream.pointee.codecpar else {
+            return nil
+        }
+        let video = Video(
+            streamIndex: videoStreamIndex,
+            codecID:
+                videoParameters.pointee.codec_id.rawValue,
+            profile: videoParameters.pointee.profile,
+            level: videoParameters.pointee.level,
+            pixelFormat: videoParameters.pointee.format,
+            width: videoParameters.pointee.width,
+            height: videoParameters.pointee.height,
+            timeBaseNumerator:
+                videoStream.pointee.time_base.num,
+            timeBaseDenominator:
+                videoStream.pointee.time_base.den
+        )
+
+        let audio: Audio?
+        if audioStreamIndex >= 0,
+           let audioStream =
+                demuxer.stream(at: audioStreamIndex),
+           let audioParameters =
+                audioStream.pointee.codecpar {
+            var normalizedSampleRate =
+                audioParameters.pointee.sample_rate
+            var normalizedChannelCount =
+                audioParameters.pointee
+                    .ch_layout.nb_channels
+            var normalizedProfile =
+                audioParameters.pointee.profile
+            // Live MPEG-TS commonly leaves AAC codec parameters empty during
+            // its bounded probe. This is the same deterministic repair used
+            // by start(); applying it to the signature prevents "unknown"
+            // probe fields from looking like a source-shape change.
+            if audioParameters.pointee.codec_id
+                    == AV_CODEC_ID_AAC {
+                if normalizedSampleRate <= 0 {
+                    normalizedSampleRate = 48_000
+                }
+                if normalizedChannelCount <= 0 {
+                    normalizedChannelCount = 2
+                }
+                if normalizedProfile < 0 {
+                    normalizedProfile = 1
+                }
+            }
+            var channelLayout =
+                audioParameters.pointee.ch_layout
+            if channelLayout.nb_channels <= 0,
+               normalizedChannelCount > 0 {
+                av_channel_layout_default(
+                    &channelLayout,
+                    normalizedChannelCount
+                )
+            }
+            var channelLayoutBuffer = [CChar](
+                repeating: 0,
+                count: 256
+            )
+            let channelLayoutDescription =
+                channelLayoutBuffer
+                    .withUnsafeMutableBufferPointer {
+                        buffer in
+                        _ = av_channel_layout_describe(
+                            &channelLayout,
+                            buffer.baseAddress,
+                            buffer.count
+                        )
+                        return String(
+                            cString:
+                                buffer.baseAddress!
+                        )
+                    }
+            audio = Audio(
+                streamIndex: audioStreamIndex,
+                codecID:
+                    audioParameters.pointee
+                        .codec_id.rawValue,
+                profile: normalizedProfile,
+                sampleFormat:
+                    audioParameters.pointee.format,
+                sampleRate: normalizedSampleRate,
+                frameSize:
+                    audioParameters.pointee.frame_size,
+                channelCount: normalizedChannelCount,
+                channelLayoutDescription:
+                    channelLayoutDescription,
+                timeBaseNumerator:
+                    audioStream.pointee.time_base.num,
+                timeBaseDenominator:
+                    audioStream.pointee.time_base.den
+            )
+        } else {
+            audio = nil
+        }
+        return HLSReopenStreamShape(
+            video: video,
+            audio: audio,
+            audioStreamCount:
+                demuxer.audioTrackInfos().count
+        )
+    }
+}
+
+enum HLSReopenIdentityValidator {
+    static func vodGenerationFailure(
+        expected: SourceByteStoreGeneration?,
+        fresh: SourceByteStoreGeneration?,
+        requiresValidatorBoundGeneration: Bool
+    ) -> AetherPlaybackFailure? {
+        guard requiresValidatorBoundGeneration else {
+            return nil
+        }
+        guard let expected,
+              expected.validator != nil,
+              let fresh,
+              fresh.validator != nil else {
+            return HLSReopenFailureClassifier
+                .structuralFailure(
+                    kind: .invariantViolation,
+                    caseCode:
+                        "vod.progressiveSourceGenerationUnverifiable"
+                )
+        }
+        guard fresh == expected else {
+            return HLSReopenFailureClassifier
+                .structuralFailure(
+                    kind: .invariantViolation,
+                    caseCode:
+                        "vod.progressiveSourceGenerationChanged"
+                )
+        }
+        return nil
+    }
+
+    static func streamShapeFailure(
+        expected: HLSReopenStreamShape?,
+        fresh: HLSReopenStreamShape?,
+        isLive: Bool
+    ) -> AetherPlaybackFailure? {
+        guard let expected,
+              let fresh,
+              fresh == expected else {
+            return HLSReopenFailureClassifier
+                .structuralFailure(
+                    kind: .invariantViolation,
+                    caseCode: isLive
+                        ? "live.streamShapeDrift"
+                        : "vod.streamShapeDrift"
+                )
+        }
+        return nil
+    }
+}
+
+enum HLSReopenTerminalPublicationPolicy {
+    static func shouldPublish(
+        currentEpoch: UInt64,
+        failureEpoch: UInt64,
+        hasActiveSession: Bool,
+        hasExistingFailure: Bool,
+        expectedProducerIsCurrent: Bool
+    ) -> Bool {
+        currentEpoch == failureEpoch
+            && hasActiveSession
+            && !hasExistingFailure
+            && expectedProducerIsCurrent
+    }
+}
+
+/// Exact-generation admission for structural recovery work queued outside
+/// `restartLock`. A stale producer callback may never consume recovery budget
+/// or restart a successor installed by a scrub/stop.
+enum HLSRecoveryEntryPolicy {
+    static func shouldAdmit(
+        currentEpoch: UInt64,
+        expectedEpoch: UInt64?,
+        expectedProducerIsCurrent: Bool
+    ) -> Bool {
+        expectedProducerIsCurrent
+            && expectedEpoch.map {
+                $0 == currentEpoch
+            } ?? true
+    }
+}
+
+/// Applies the shared progressive-source failure policy to HLS reader
+/// generations and converts permanent evidence into the privacy-safe public
+/// failure vocabulary.
+enum HLSReopenFailureClassifier {
+    static func classify(
+        _ error: Error,
+        caseCode: String,
+        hasCompleteValidatedSourceEvidence:
+            Bool = false
+    ) -> HLSReopenFailureDisposition {
+        switch AetherProgressivePreflightFailureClassifier
+            .classify(
+                error,
+                hasCompleteValidatedSourceEvidence:
+                    hasCompleteValidatedSourceEvidence
+            ) {
+        case .retry:
+            return .retry
+        case .cancelled:
+            return .cancelled
+        case .permanent:
+            return .permanent(
+                makeFailure(
+                    error,
+                    caseCode: caseCode,
+                    sourceIsComplete:
+                        hasCompleteValidatedSourceEvidence
+                )
+            )
+        }
+    }
+
+    static func structuralFailure(
+        kind: AetherPlaybackFailureKind,
+        caseCode: String,
+        code: Int = 0
+    ) -> AetherPlaybackFailure {
+        AetherPlaybackFailure(
+            stage: .playback,
+            kind: kind,
+            domain: "AetherEngine.HLSReopen",
+            code: code,
+            caseCode: caseCode,
+            reason: "hls.reopen.\(caseCode)"
+        )
+    }
+
+    private static func makeFailure(
+        _ error: Error,
+        caseCode: String,
+        sourceIsComplete: Bool
+    ) -> AetherPlaybackFailure {
+        if let evidence =
+                BlackCarrierDemuxFailureEvidence
+                    .capture(
+                        error,
+                        sourceIsComplete:
+                            sourceIsComplete
+                    ) {
+            return AetherPlaybackFailure(
+                stage: .playback,
+                kind: playbackKind(
+                    evidence.category
+                ),
+                domain: evidence.domain,
+                code: evidence.code,
+                caseCode:
+                    "\(caseCode).\(evidence.caseCode)",
+                reason: "hls.reopen.\(caseCode)"
+            )
+        }
+        if let urlError = error as? URLError {
+            return AetherPlaybackFailure(
+                stage: .playback,
+                kind: .securityBoundary,
+                domain: NSURLErrorDomain,
+                code: urlError.errorCode,
+                caseCode: "\(caseCode).urlSecurity",
+                reason: "hls.reopen.\(caseCode)"
+            )
+        }
+        return structuralFailure(
+            kind: .invariantViolation,
+            caseCode: caseCode
+        )
+    }
+
+    private static func playbackKind(
+        _ category: HybridPlaybackFailureCategory
+    ) -> AetherPlaybackFailureKind {
+        switch category {
+        case .routeRuntime:
+            return .routeRuntimeFailure
+        case .transientTransport:
+            return .transientTransport
+        case .authentication:
+            return .authenticationRejected
+        case .security:
+            return .securityBoundary
+        case .unsupportedCapability:
+            return .unsupportedCapability
+        case .malformedMedia:
+            return .malformedMedia
+        case .cancelled:
+            return .cancelled
+        case .invariant:
+            return .invariantViolation
+        }
+    }
+}
+
+/// Owns a producer that has been detached from session fields while a reopen
+/// operation runs. Every exit path must either prove that worker quiescent or
+/// execute the retirement closure before the operation can end.
+final class HLSDetachedPredecessorLease:
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var isQuiescent = false
+    private let retire: @Sendable () -> Void
+
+    init(retire: @escaping @Sendable () -> Void) {
+        self.retire = retire
+    }
+
+    func markQuiescent() {
+        lock.lock()
+        isQuiescent = true
+        lock.unlock()
+    }
+
+    func ensureQuiescence() {
+        lock.lock()
+        guard !isQuiescent else {
+            lock.unlock()
+            return
+        }
+        // Claim the one retirement before executing a potentially blocking
+        // cooperative shutdown outside the lock.
+        isQuiescent = true
+        lock.unlock()
+        retire()
+    }
+}
+
+/// Fail-closed lifecycle fence for every live/VOD reopen operation and every
+/// Demuxer it owns before installation. Stop first rejects new admissions and
+/// marks admitted Demuxers closed, then waits until each operation has either
+/// transferred its Demuxer to the session or closed it and observed real I/O
+/// quiescence.
+final class HLSReopenIOCleanupFence:
+    @unchecked Sendable
+{
+    struct Operation: Sendable, Hashable {
+        fileprivate let id: UInt64
+    }
+
+    struct Snapshot: Sendable, Equatable {
+        let isShuttingDown: Bool
+        let operationCount: Int
+        let demuxerCount: Int
+    }
+
+    private let condition = NSCondition()
+    private var nextOperationID: UInt64 = 0
+    private var isShuttingDown = false
+    private var operations: Set<UInt64> = []
+    private var demuxers:
+        [ObjectIdentifier: Demuxer] = [:]
+
+    func beginOperation() -> Operation? {
+        condition.lock()
+        defer { condition.unlock() }
+        guard !isShuttingDown else { return nil }
+        nextOperationID &+= 1
+        operations.insert(nextOperationID)
+        return Operation(id: nextOperationID)
+    }
+
+    func register(
+        _ demuxer: Demuxer,
+        for operation: Operation
+    ) -> Bool {
+        register(
+            [demuxer],
+            for: operation
+        )
+    }
+
+    /// Atomically admits every reader role owned by one generation. Either all
+    /// Demuxers become stop-visible or none do.
+    func register(
+        _ candidates: [Demuxer],
+        for operation: Operation
+    ) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        guard !isShuttingDown,
+              operations.contains(operation.id) else {
+            return false
+        }
+        let identifiers = candidates.map {
+            ObjectIdentifier($0)
+        }
+        guard Set(identifiers).count
+                == identifiers.count,
+              identifiers.allSatisfy({
+                demuxers[$0] == nil
+              }) else {
+            return false
+        }
+        for candidate in candidates {
+            demuxers[
+                ObjectIdentifier(candidate)
+            ] = candidate
+        }
+        return true
+    }
+
+    /// Transfers a successfully installed Demuxer from reopen ownership to
+    /// the main session. Call while holding `restartLock`, the same lock stop
+    /// uses to snapshot the installed session Demuxer.
+    func transferToSession(_ demuxer: Demuxer) {
+        condition.lock()
+        demuxers.removeValue(
+            forKey: ObjectIdentifier(demuxer)
+        )
+        signalIfQuiescentLocked()
+        condition.unlock()
+    }
+
+    /// Discards a failed, late or superseded result. Removal happens only
+    /// after close and the underlying URLSession callbacks are quiescent.
+    func discardAndWait(_ demuxer: Demuxer) {
+        demuxer.close()
+        demuxer.waitForIOQuiescence()
+        condition.lock()
+        demuxers.removeValue(
+            forKey: ObjectIdentifier(demuxer)
+        )
+        signalIfQuiescentLocked()
+        condition.unlock()
+    }
+
+    func endOperation(_ operation: Operation) {
+        condition.lock()
+        operations.remove(operation.id)
+        signalIfQuiescentLocked()
+        condition.unlock()
+    }
+
+    /// Atomically rejects later reopen admission and returns every Demuxer
+    /// currently inside an admitted operation so stop can abort blocking I/O.
+    func beginShutdown() -> [Demuxer] {
+        condition.lock()
+        isShuttingDown = true
+        let active = Array(demuxers.values)
+        // Wake retry-backoff waiters immediately. They must finish their
+        // operation without admitting another Demuxer after shutdown.
+        condition.broadcast()
+        signalIfQuiescentLocked()
+        condition.unlock()
+        return active
+    }
+
+    /// Cancellation-aware retry delay for a registered reopen operation.
+    /// Returns false when stop won or the operation was superseded.
+    func waitForRetryDelay(
+        _ seconds: TimeInterval,
+        operation: Operation
+    ) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        guard !isShuttingDown,
+              operations.contains(operation.id) else {
+            return false
+        }
+        let deadline = Date(
+            timeIntervalSinceNow: max(0, seconds)
+        )
+        while !isShuttingDown,
+              operations.contains(operation.id) {
+            if !condition.wait(until: deadline) {
+                return !isShuttingDown
+                    && operations.contains(
+                        operation.id
+                    )
+            }
+        }
+        return false
+    }
+
+    func waitForQuiescence(
+        timeout: TimeInterval? = nil
+    ) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        if let timeout {
+            let deadline = Date(
+                timeIntervalSinceNow: max(0, timeout)
+            )
+            while !isQuiescentLocked {
+                guard condition.wait(until: deadline)
+                else {
+                    return isQuiescentLocked
+                }
+            }
+            return true
+        }
+        while !isQuiescentLocked {
+            condition.wait()
+        }
+        return true
+    }
+
+    var snapshot: Snapshot {
+        condition.lock()
+        defer { condition.unlock() }
+        return Snapshot(
+            isShuttingDown: isShuttingDown,
+            operationCount: operations.count,
+            demuxerCount: demuxers.count
+        )
+    }
+
+    private var isQuiescentLocked: Bool {
+        operations.isEmpty && demuxers.isEmpty
+    }
+
+    private func signalIfQuiescentLocked() {
+        if isQuiescentLocked {
+            condition.broadcast()
+        }
+    }
+}
+
 /// HLS-fMP4 loopback session: libavformat `hls` muxer fed by `Demuxer`, fragments
 /// redirected into `SegmentCache` via custom `io_open`/`io_close2`, served to
 /// AVPlayer by a local HTTP server that blocks on a condvar until the requested
@@ -42,6 +761,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     let sourceURL: URL
     let sourceHTTPHeaders: [String: String]
+    /// The exact progressive store transferred from preflight. VOD reader
+    /// replacements validate this same store before any cached byte or saved
+    /// codec configuration can be reused.
+    private var progressiveSourceByteStore:
+        SourceByteStore?
+    private var pinnedProgressiveSourceGeneration:
+        SourceByteStoreGeneration?
+    private var progressiveFetchedByteProgressLedger:
+        AetherFetchedByteProgressLedger?
+    private var progressiveFetchedByteProgress:
+        (@Sendable (AetherFetchedByteProgress) -> Void)?
+    private var progressiveProbeMilestone:
+        (@Sendable () -> Void)?
     private let dvModeAvailable: Bool
 
     /// From `LoadOptions.keepDvh1TagWithoutDV`; default OFF, set only for misreporting DV panels.
@@ -91,6 +823,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var videoStreamIndex: Int32 = -1
     var savedVideoConfig: HLSSegmentProducer.StreamConfig?
     var savedAudioConfig: HLSSegmentProducer.AudioConfig?
+    /// Decoder-facing contract of the first admitted source generation.
+    /// Reopen may reuse saved codec parameters only after a fresh Demuxer
+    /// proves this exact shape.
+    var committedReopenStreamShape:
+        HLSReopenStreamShape?
+    var reopenAudioSourceStreamIndex:
+        Int32 = -1
 
     /// When true, the session exposes the native subtitle WebVTT rendition (separate from the A/V
     /// variant, served by HLSLocalServer) and arms its cue readers on track selection (#15 / Sodalite#32).
@@ -393,9 +1132,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     private var ownedCodecParams: [OwnedCodecParameters] = []
 
-    /// In-flight live reopen demuxer, registered before its blocking open so `stop()` can abort it
-    /// (prevents orphan reconnect loops across channel zaps).
-    var reopenDemuxer: Demuxer?
+    /// Tracks complete reopen operations, not just the most recently opened
+    /// Demuxer. This covers live backoff, VOD restart reopen, and every late
+    /// or superseded result until close + I/O quiescence.
+    let reopenIOCleanupFence =
+        HLSReopenIOCleanupFence()
     /// Fires on live program-boundary rebase: `(newShiftSeconds, seamOutputSeconds)`. AetherEngine
     /// defers applying the shift until playback crosses `seamOutputSeconds` so the clock doesn't jump.
     var onPlaylistShiftRebased: (@Sendable (Double, Double) -> Void)?
@@ -405,6 +1146,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// written, empty cache). The playlist exists but no segment will ever land, so AVPlayer
     /// would sit in waitingToPlay forever; the engine surfaces a fatal error instead.
     var onVODSourceFailed: (@Sendable (Int32) -> Void)?
+    /// One privacy-safe permanent source/capability failure for this exact
+    /// session generation. Transport failures never enter this callback.
+    var onTerminalReopenFailure:
+        (@Sendable (AetherPlaybackFailure) -> Void)?
+    private var terminalReopenFailure:
+        AetherPlaybackFailure?
     /// Session-long FLAC bridge for codecs illegal in fMP4. Engine-owned (not producer-owned) so
     /// encoder state survives producer restarts; `startSegment()` rebases PTS on each restart.
     var audioBridge: AudioBridge?
@@ -413,6 +1160,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Guards subsystem refs + `sessionEpoch`. Never held across waits or network I/O so
     /// `stop()` on the main thread is never blocked behind a restart's 5 s waitForFinish.
     let restartLock = NSLock()
+
+    /// One teardown handle shared by every stop caller. Same-source recovery
+    /// awaits it before opening another reader, while ordinary UI teardown may
+    /// remain non-blocking.
+    private let stopCleanupLock = NSLock()
+    private var stopCleanupTask: Task<Void, Never>?
 
     /// Serializes restart requests among themselves. Held across waits (unlike `restartLock`);
     /// only other restarts contend on it.
@@ -456,9 +1209,49 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return sessionEpoch == epoch
     }
 
+    func terminalReopenFailureSnapshot()
+        -> AetherPlaybackFailure?
+    {
+        restartLock.lock()
+        defer { restartLock.unlock() }
+        return terminalReopenFailure
+    }
+
+    @discardableResult
+    func publishTerminalReopenFailure(
+        _ failure: AetherPlaybackFailure,
+        epoch: UInt64,
+        expectedProducer:
+            HLSSegmentProducer? = nil
+    ) -> Bool {
+        restartLock.lock()
+        let producerMatches =
+            expectedProducer.map {
+                producer === $0
+            } ?? true
+        guard HLSReopenTerminalPublicationPolicy
+                .shouldPublish(
+                    currentEpoch: sessionEpoch,
+                    failureEpoch: epoch,
+                    hasActiveSession: provider != nil,
+                    hasExistingFailure:
+                        terminalReopenFailure != nil,
+                    expectedProducerIsCurrent:
+                        producerMatches
+                ) else {
+            restartLock.unlock()
+            return false
+        }
+        terminalReopenFailure = failure
+        let callback = onTerminalReopenFailure
+        restartLock.unlock()
+        callback?(failure)
+        return true
+    }
+
     /// Bumped by `stop()` under `restartLock`. Restarts re-validate before installing the new
     /// producer; a mid-restart stop() wins and the restart unwinds.
-    private var sessionEpoch: UInt64 = 0
+    var sessionEpoch: UInt64 = 0
 
     /// Fires once per session on first HDR10+ T.35 detection so AetherEngine can upgrade
     /// `videoFormat` from `.hdr10` to `.hdr10Plus`. Debounced across producer restarts.
@@ -518,6 +1311,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     ) {
         self.sourceURL = url
         self.sourceHTTPHeaders = sourceHTTPHeaders
+        self.progressiveSourceByteStore = nil
+        self.pinnedProgressiveSourceGeneration = nil
+        self.progressiveFetchedByteProgressLedger = nil
+        self.progressiveFetchedByteProgress = nil
+        self.progressiveProbeMilestone = nil
         // Caller-bounded find_stream_info budget (#68); nil keeps the .playback default. Applied only to the
         // fallback open / live reopen here; the happy path reuses the already-budgeted preopenedDemuxer.
         self.openProfile = DemuxerOpenProfile.playback.withProbeBudget(
@@ -542,6 +1340,66 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.sourceReopenableByURL = sourceReopenableByURL
         self.companionAudioReader = companionAudioReader
         self.forwardWindowSegments = Self.clampedForwardWindow(forwardBufferSegments)
+    }
+
+    /// Internal handoff from the exact prepared progressive source. Kept out
+    /// of the public initializer so SourceByteStore remains an Aether-owned
+    /// implementation detail.
+    func adoptProgressiveSourceIdentity(
+        byteStore: SourceByteStore?,
+        generation: SourceByteStoreGeneration?,
+        fetchedByteProgressLedger:
+            AetherFetchedByteProgressLedger? = nil,
+        onFetchedByteProgress:
+            (@Sendable (AetherFetchedByteProgress) -> Void)? = nil,
+        onProbeMilestone:
+            (@Sendable () -> Void)? = nil
+    ) {
+        precondition(
+            demuxer == nil && producer == nil,
+            "progressive identity must be adopted before start"
+        )
+        progressiveSourceByteStore = byteStore
+        pinnedProgressiveSourceGeneration =
+            generation
+        progressiveFetchedByteProgressLedger =
+            fetchedByteProgressLedger
+        progressiveFetchedByteProgress =
+            onFetchedByteProgress
+        progressiveProbeMilestone =
+            onProbeMilestone
+    }
+
+    /// Installs the exact preflight liveness ledger and privacy-safe relays
+    /// before any successor AVIO provider opens. Every quiesced generation
+    /// therefore contributes to one monotonic unique-byte history.
+    func configureProgressiveLiveness(
+        on demuxer: Demuxer
+    ) {
+        if let progressiveFetchedByteProgressLedger {
+            demuxer.fetchedByteProgressLedger =
+                progressiveFetchedByteProgressLedger
+        }
+        demuxer.onFetchedByteProgress =
+            progressiveFetchedByteProgress
+        demuxer.onProbeMilestone =
+            progressiveProbeMilestone
+    }
+
+    var hasCompleteValidatedProgressiveSourceEvidence:
+        Bool
+    {
+        guard let pinned =
+                pinnedProgressiveSourceGeneration,
+              pinned.validator != nil,
+              let snapshot =
+                progressiveSourceByteStore?
+                    .snapshot,
+              snapshot.isComplete,
+              snapshot.generation == pinned else {
+            return false
+        }
+        return true
     }
 
     /// Session forward-buffer window in segments. Drives BOTH the producer's race-ahead
@@ -610,12 +1468,30 @@ public final class HLSVideoEngine: @unchecked Sendable {
             preopenedDemuxer = nil
         } else {
             dem = Demuxer()
+            configureProgressiveLiveness(
+                on: dem
+            )
             do {
-                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: openProfile, isLive: isLiveSession)
+                try dem.open(
+                    url: sourceURL,
+                    extraHeaders:
+                        sourceHTTPHeaders,
+                    profile: openProfile,
+                    isLive: isLiveSession,
+                    sourceByteStore:
+                        isLiveSession
+                            ? nil
+                            : progressiveSourceByteStore
+                )
             } catch {
                 throw HLSVideoEngineError.openFailed(reason: "\(error)")
             }
         }
+        // The consumed preflight Demuxer already owns these values; reapply
+        // them here as an invariant and keep runtime callbacks explicit.
+        configureProgressiveLiveness(
+            on: dem
+        )
         demuxer = dem
         dem.onNetworkPhaseChanged = onNetworkPhaseChanged   // surface source stall/reconnect to playbackPhase (#85)
 
@@ -755,6 +1631,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 )
             }
         }
+        self.segmentPlan = plan
 
         // 4. Classify DV variant; per-profile policy in `resolveCodecRoute`.
         let route = try resolveCodecRoute(codecpar: codecpar)
@@ -794,10 +1671,74 @@ public final class HLSVideoEngine: @unchecked Sendable {
             )
         }
 
-        // 6. Reset demuxer cursor to 0 (cue prewarm moved it mid-file). Skipped for live
-        //    (no prewarm, forward-only feed).
+        // 6. Position the one initial reader before allocating a producer,
+        //    loopback server, cache or bridge. Cue prewarm moved the cursor
+        //    mid-file; a resumed session lands directly on its anchor instead
+        //    of first seeking to zero and then seeking again. A failed seek
+        //    is synchronously quiesced before this method can throw, so outer
+        //    same-request recovery cannot overlap this reader generation.
         if !isLiveSession {
-            dem.seek(to: 0)
+            if let startSeconds = initialStartSeconds,
+               startSeconds > 0 {
+                initialProducerBaseIndex =
+                    segmentIndexForPlaylistTime(
+                        startSeconds
+                    )
+                EngineLog.emit(
+                    "[HLSVideoEngine] initial producer anchored at idx="
+                        + "\(initialProducerBaseIndex) "
+                        + "(startPosition="
+                        + "\(String(format: "%.2f", startSeconds))s)",
+                    category: .session
+                )
+            }
+            let initialSeekSeconds:
+                Double
+            if initialProducerBaseIndex > 0,
+               initialProducerBaseIndex < plan.count {
+                initialSeekSeconds =
+                    Double(
+                        plan[
+                            initialProducerBaseIndex
+                        ].startPts
+                    )
+                    * Double(videoTimeBase.num)
+                    / Double(videoTimeBase.den)
+            } else {
+                initialSeekSeconds = 0
+            }
+            guard dem.seek(
+                to: initialSeekSeconds
+            ) else {
+                let terminalError =
+                    dem.terminalIOError
+                dem.markClosed()
+                dem.close()
+                dem.waitForIOQuiescence()
+                demuxer = nil
+                segmentPlan = []
+                if let terminalError {
+                    switch HLSReopenFailureClassifier
+                        .classify(
+                            terminalError,
+                            caseCode:
+                                "vod.initialSeek",
+                            hasCompleteValidatedSourceEvidence:
+                                hasCompleteValidatedProgressiveSourceEvidence
+                        ) {
+                    case .cancelled:
+                        throw CancellationError()
+                    case .permanent(
+                        let failure
+                    ):
+                        throw failure
+                    case .retry:
+                        throw terminalError
+                    }
+                }
+                throw DemuxerError
+                    .readFailed(code: -5)
+            }
         }
 
         // volumeAvailableCapacityForImportantUsage is unavailable on tvOS; the plain capacity key
@@ -860,21 +1801,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         )
         self.videoStreamIndex = videoIndex
         self.savedVideoConfig = videoConfig
-        self.segmentPlan = plan
-
-        // #93 residual: anchor the FIRST producer at the session's start position instead of seg0.
-        // A resume start otherwise produces seg0 (torn down and discarded seconds later when
-        // AVPlayer's initial seek fetches the resume segment), restarts, and the fetch/restart race
-        // can 404 the item into a host reload (device: double spinner). The baseIndex > 0 anchor is
-        // the battle-tested restart path (gate at plan[base].startPts, tfdt continuity per 4.9.1).
-        if !isLiveSession, let startSeconds = initialStartSeconds, startSeconds > 0 {
-            initialProducerBaseIndex = segmentIndexForPlaylistTime(startSeconds)
-            EngineLog.emit(
-                "[HLSVideoEngine] initial producer anchored at idx=\(initialProducerBaseIndex) "
-                + "(startPosition=\(String(format: "%.2f", startSeconds))s)",
-                category: .session
-            )
-        }
 
         // Fallback duration from avg_frame_rate for MKVs that drop TrackEntry DefaultDuration
         // (HandBrake/web-rip pipelines). Without it, trun.last.duration=0 and AVPlayer parks on
@@ -1139,6 +2065,23 @@ public final class HLSVideoEngine: @unchecked Sendable {
         )
         self.producer = prod
         self.activeAudioSourceStreamIndex = savedAudioConfig != nil ? audioStreamIndex : -1
+        self.reopenAudioSourceStreamIndex =
+            sideAudioDemuxer == nil
+                ? audioStreamIndex
+                : -1
+        self.committedReopenStreamShape =
+            HLSReopenStreamShape.capture(
+                demuxer: dem,
+                videoStreamIndex: videoIndex,
+                audioStreamIndex:
+                    reopenAudioSourceStreamIndex
+            )
+        guard committedReopenStreamShape != nil else {
+            throw HLSVideoEngineError.openFailed(
+                reason:
+                    "initial reopen stream shape unavailable"
+            )
+        }
 
         // 7. Wire provider, server, and URL.
         let manifestCodecs = audioHLSCodecs.map { "\(primaryCodecs),\($0)" } ?? primaryCodecs
@@ -1202,16 +2145,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         try srv.start()
         self.server = srv
 
-        // 8. Kick the pump. An anchored first producer (#93 residual) needs the demuxer positioned
-        // at the anchor BEFORE the pump reads, exactly like performRestart's pre-makeProducer seek:
-        // the gate only DROPS pre-target packets, so an unseeked pump would read (and discard) the
-        // whole file up to the resume point. Absolute source-PTS for the same reason as the
-        // restart path (relative playlist time lands a keyframe behind on non-zero startPts0).
-        if initialProducerBaseIndex > 0, initialProducerBaseIndex < plan.count {
-            let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
-            let anchorSeconds = Double(plan[initialProducerBaseIndex].startPts) * Double(tb.num) / Double(tb.den)
-            dem.seek(to: anchorSeconds)
-        }
+        // 8. Kick the pump. The reader was already positioned before any
+        // producer/server allocation, so no failed startup can expose a
+        // loopback playlist or survive into an outer recovery generation.
         prod.start()
 
         // URL routing: master playlist (VIDEO-RANGE=PQ + SUPPLEMENTAL-CODECS=dvh1) only when
@@ -1445,6 +2381,110 @@ public final class HLSVideoEngine: @unchecked Sendable {
     }
 
     public func stop() {
+        _ = stopWithIOQuiescenceHandle()
+    }
+
+    private static func waitForProducerQuiescence(
+        _ producer: HLSSegmentProducer,
+        context: String,
+        diagnosticCheckpointPassed: Bool = false
+    ) {
+        if diagnosticCheckpointPassed {
+            EngineLog.emit(
+                "[HLSVideoEngine] cancellationUnresponsive "
+                    + "\(context) producer still draining after 2s",
+                category: .session
+            )
+            while !producer.waitForFinish(
+                timeout: 2.0
+            ) {
+                // Keep the fail-closed fence without log spam.
+            }
+        } else if !producer.waitForFinish(timeout: 2.0) {
+            EngineLog.emit(
+                "[HLSVideoEngine] cancellationUnresponsive "
+                    + "\(context) producer still draining after 2s",
+                category: .session
+            )
+            while !producer.waitForFinish(
+                timeout: 2.0
+            ) {
+                // Keep the fail-closed fence without log spam.
+            }
+        }
+    }
+
+    /// Retires one source-reader generation before any successor Demuxer may
+    /// be opened. `markClosed()` cooperatively interrupts FFmpeg/AVIO; the
+    /// producer and URLSession callbacks must both acknowledge shutdown.
+    static func retireReaderGeneration(
+        producer: HLSSegmentProducer,
+        demuxer: Demuxer,
+        context: String,
+        diagnosticCheckpointPassed: Bool = false
+    ) {
+        retireReaderGeneration(
+            producer: producer,
+            demuxers: [demuxer],
+            context: context,
+            diagnosticCheckpointPassed:
+                diagnosticCheckpointPassed
+        )
+    }
+
+    static func retireReaderGeneration(
+        producer: HLSSegmentProducer,
+        demuxers: [Demuxer],
+        context: String,
+        diagnosticCheckpointPassed: Bool = false
+    ) {
+        HLSReopenGenerationGate.retirePredecessor(
+            diagnosticCheckpointPassed:
+                diagnosticCheckpointPassed,
+            requestCancellation: {
+                producer.stop()
+                demuxers.forEach {
+                    $0.markClosed()
+                }
+            },
+            waitForWorker: { timeout in
+                producer.waitForFinish(
+                    timeout: timeout
+                )
+            },
+            waitForIOQuiescence: {
+                demuxers.forEach {
+                    $0.waitForIOQuiescence()
+                }
+            },
+            onCancellationUnresponsive: {
+                EngineLog.emit(
+                    "[HLSVideoEngine] "
+                        + "cancellationUnresponsive "
+                        + "\(context) generation still "
+                        + "draining after 2s",
+                    category: .session
+                )
+            }
+        )
+        // FFmpeg context teardown is safe only after the producer has exited.
+        demuxers.forEach {
+            $0.close()
+            $0.waitForIOQuiescence()
+        }
+    }
+
+    /// Begins the same idempotent stop as `stop()` and returns the one task
+    /// that owns producer drain plus demuxer close. A recovery caller must
+    /// await this handle before admitting another same-source reader.
+    @discardableResult
+    func stopWithIOQuiescenceHandle() -> Task<Void, Never> {
+        stopCleanupLock.lock()
+        if let stopCleanupTask {
+            stopCleanupLock.unlock()
+            return stopCleanupTask
+        }
+
         // Sodalite#32: drop the tap routes first so a pump still draining its last packets no-ops
         // instead of decoding into stores being torn down.
         subtitleTapLock.lock()
@@ -1476,11 +2516,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
         savedAudioConfig = nil
         let ownedParams = ownedCodecParams
         ownedCodecParams = []
-        let reopening = reopenDemuxer
-        reopenDemuxer = nil
+        let reopening =
+            reopenIOCleanupFence.beginShutdown()
         segmentPlan = []
         restartLock.unlock()
-        reopening?.markClosed()
+        for demuxer in reopening {
+            demuxer.markClosed()
+        }
 
         p?.stop()
 
@@ -1496,16 +2538,41 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
         // Detached cleanup: producer waitForFinish must precede demuxer/cache/server close
         // (pump accesses them during unwind). ownedParams released last (pump read them).
-        Task.detached {
-            _ = p?.waitForFinish(timeout: 3.0)
+        let reopenFence = reopenIOCleanupFence
+        let cleanupTask = Task.detached {
+            if let p {
+                Self.waitForProducerQuiescence(
+                    p,
+                    context: "stop"
+                )
+            }
+            if !reopenFence
+                .waitForQuiescence(timeout: 2.0) {
+                // Diagnostic only. A late live/VOD reopen can still own a
+                // blocking open or a superseded Demuxer, so teardown remains
+                // fail-closed until every operation performs close + wait.
+                EngineLog.emit(
+                    "[HLSVideoEngine] cancellationUnresponsive "
+                        + "reopen I/O still draining after 2s",
+                    category: .session
+                )
+                _ = reopenFence
+                    .waitForQuiescence()
+            }
             s?.stop()
             c?.close()
             ab?.close()
             d?.close()
             sd?.close()
             preopened?.close()
+            d?.waitForIOQuiescence()
+            sd?.waitForIOQuiescence()
+            preopened?.waitForIOQuiescence()
             _ = ownedParams
         }
+        stopCleanupTask = cleanupTask
+        stopCleanupLock.unlock()
+        return cleanupTask
     }
 
     deinit {
@@ -1623,15 +2690,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     // MARK: - Live source-loss recovery
 
-    /// Max reopen attempts per lost-source event (AVIO absorbs transient drops internally;
-    /// pump exits only on exhausted sources: dead transcode, dropped tuner, blown budget).
-    static let liveReopenMaxAttempts = 6
-
-    /// Barren-cycle backstop: an open-then-starve source would cycle forever without this.
-    /// After `maxBarrenReopenCycles` consecutive cycles producing no new segment, stop reviving.
+    /// Repeated open-then-starve cycles are diagnostic evidence only. They do
+    /// not terminate the same-source playback task.
     var barrenReopenCycles = 0
     var lastReopenSegmentCount = -1
-    static let maxBarrenReopenCycles = 3
+    var barrenReopenDiagnostics =
+        HLSReopenAttemptLedger()
+    var vodSourceRecoveryDiagnostics =
+        HLSReopenAttemptLedger()
 
     private func handleVideoShiftKnown(_ shiftPts: Int64) {
         let seconds = shiftPts == Int64.min ? 0 : Double(shiftPts) * sourceVideoTbSeconds
@@ -1696,8 +2762,29 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return provider?.mediaFetchCount ?? 0
     }
 
-    func requestRestart(at idx: Int, authoritative: Bool = false) {
+    func requestRestart(
+        at idx: Int,
+        authoritative: Bool = false,
+        expectedProducer:
+            HLSSegmentProducer? = nil,
+        expectedEpoch: UInt64? = nil
+    ) {
         restartLock.lock()
+        let producerMatches =
+            expectedProducer.map {
+                producer === $0
+            } ?? true
+        guard HLSRecoveryEntryPolicy
+                .shouldAdmit(
+                    currentEpoch: sessionEpoch,
+                    expectedEpoch:
+                        expectedEpoch,
+                    expectedProducerIsCurrent:
+                        producerMatches
+                ) else {
+            restartLock.unlock()
+            return
+        }
         let shouldRun = restartCoalescer.begin(idx, authoritative: authoritative)
         let seekTime = segmentStartSecondsLocked(idx) // under lock; segmentPlan guarded by restartLock (#38)
         restartLock.unlock()
@@ -1710,8 +2797,23 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
         onSeekStateChanged?(true, seekTime) // publish seek in-flight until coalesced run drains (#38)
         var target = idx
+        var firstExpectedProducer =
+            expectedProducer
+        var firstExpectedEpoch =
+            expectedEpoch
         while true {
-            performRestart(at: target)
+            performRestart(
+                at: target,
+                expectedProducer:
+                    firstExpectedProducer,
+                expectedEpoch:
+                    firstExpectedEpoch
+            )
+            // A queued ordinary scrub belongs to the successor produced by
+            // the first recovery. The failed generation token fences only
+            // that first recovery entry.
+            firstExpectedProducer = nil
+            firstExpectedEpoch = nil
             restartLock.lock()
             let nextTarget = restartCoalescer.next(justRan: target)
             let nextSeekTime = nextTarget.flatMap { segmentStartSecondsLocked($0) }
@@ -1763,22 +2865,75 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return parts.joined(separator: " ")
     }
 
-    // Driven exclusively through requestRestart(at:) so bursts coalesce (#35).
-    private func performRestart(at idx: Int) {
+    // Ordinary scrubs arrive through requestRestart(at:) so bursts coalesce
+    // (#35). A producer read failure may call this directly with
+    // `expectedProducer`: restartGate still serializes it, and the identity
+    // check discards the late recovery if another producer already won.
+    func performRestart(
+        at idx: Int,
+        forceFreshSourceGeneration: Bool = false,
+        expectedProducer:
+            HLSSegmentProducer? = nil,
+        expectedEpoch: UInt64? = nil
+    ) {
         restartGate.lock()
         defer { restartGate.unlock() }
 
         restartLock.lock()
-        guard idx >= 0, idx < segmentPlan.count, let dem = demuxer else {
+        guard idx >= 0,
+              idx < segmentPlan.count,
+              let dem = demuxer,
+              let old = producer,
+              HLSRecoveryEntryPolicy
+                .shouldAdmit(
+                    currentEpoch:
+                        sessionEpoch,
+                    expectedEpoch:
+                        expectedEpoch,
+                    expectedProducerIsCurrent:
+                        expectedProducer.map({
+                            old === $0
+                        }) ?? true
+                ),
+              let reopenOperation =
+                reopenIOCleanupFence.beginOperation() else {
             restartLock.unlock()
             return
         }
         let epoch = sessionEpoch
-        let old = producer
+        let oldSideDemuxer = sideAudioDemuxer
+        let predecessorDemuxers =
+            [dem] + [oldSideDemuxer].compactMap { $0 }
+        let predecessorLease =
+            HLSDetachedPredecessorLease {
+            Self.retireReaderGeneration(
+                producer: old,
+                demuxers:
+                    predecessorDemuxers,
+                context:
+                    "superseded VOD restart"
+            )
+        }
+        defer {
+            // `producer` stopped being session-owned below. A stop/epoch
+            // guard may return anywhere after that point, so the operation
+            // cannot end until its local predecessor worker is quiescent.
+            predecessorLease.ensureQuiescence()
+            reopenIOCleanupFence
+                .endOperation(reopenOperation)
+        }
         producer = nil
         let ab = audioBridge
         let targetStartPts = segmentPlan[idx].startPts
         let videoTb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
+        let absoluteTargetSeconds =
+            Double(targetStartPts)
+                * Double(videoTb.num)
+                / Double(videoTb.den)
+        let expectedStreamShape =
+            committedReopenStreamShape
+        let expectedAudioStreamIndex =
+            reopenAudioSourceStreamIndex
         restartLock.unlock()
 
         let restartStart = DispatchTime.now()
@@ -1789,103 +2944,540 @@ public final class HLSVideoEngine: @unchecked Sendable {
         var reopenMs: Double? = nil
         var seekMs: Double = 0
 
-        // The new producer reuses this demuxer unless we have to replace a wedged one (#79, below).
-        var activeDem = dem
         var freshDemuxer: Demuxer?
-        if let old {
-            old.stop()
-            let ok = old.waitForFinish(timeout: 5.0)
-            stopWaitMs = msSince(restartStart)
-            if !ok {
-                // #79: the old pump is wedged in a blocking network read on the SHARED demuxer; stop() can't
-                // unblock a socket read, so waitForFinish timed out. Reusing this demuxer makes the new
-                // producer's first post-seek read queue behind that stuck read for the full ~20s
-                // connStallTimeout (the reporter's ~25s restart), after which the abandoned reader also steals
-                // the first packet. markClosed() aborts the stuck read immediately (the existing thread-safe
-                // unblock) but dooms the demuxer, so open a FRESH one and hand it to the new producer. Open
-                // FIRST, abort only on success, so a reopen failure falls back to the prior abandon behaviour
-                // (no regression) rather than poisoning the only demuxer. Scoped to the VOD single-demuxer
-                // scrub case; the side-source / live-reopen paths keep their existing behaviour.
-                if !isLiveSession, sideAudioDemuxer == nil {
-                    let reopenStart = DispatchTime.now()
-                    let fresh = Demuxer()
-                    do {
-                        // .restartReopen: bounded find_stream_info budget; the FULL playback budget was
-                        // the bulk of a 44 s wedge-reopen over WAN (#93 residual). The pass itself must
-                        // run so video_delay resolves, else B-frame dts arrive broken (#93 judder).
-                        try fresh.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: .restartReopen, isLive: false)
-                        dem.markClosed() // abort the wedged read now that the replacement is ready
-                        freshDemuxer = fresh
-                        activeDem = fresh
-                        EngineLog.emit(
-                            "[HLSVideoEngine] restart at idx=\(idx): old producer wedged in a read past 5s; "
-                            + "aborted it and reopened a fresh demuxer (avoids the ~20s shared-read stall)",
-                            category: .session
-                        )
-                    } catch {
-                        fresh.close()
-                        EngineLog.emit(
-                            "[HLSVideoEngine] restart at idx=\(idx): old producer wedged; reopen failed (\(error)), "
-                            + "abandoning it and reusing the demuxer",
-                            category: .session
-                        )
-                    }
-                    reopenMs = msSince(reopenStart)
-                } else {
-                    EngineLog.emit(
-                        "[HLSVideoEngine] restart at idx=\(idx): old producer didn't exit within 5s, abandoning it "
-                        + "(its in-flight read shares the demuxer and may consume the first post-seek packet; "
-                        + "if the new session starts a GOP late, this is why)",
-                        category: .session
-                    )
-                }
+        var seekCompleted = false
+        var predecessorSeekTerminalError:
+            AVIOReaderError?
+        old.stop()
+        let predecessorStopped =
+            old.waitForFinish(
+                timeout:
+                    HLSReopenGenerationGate
+                        .cancellationDiagnosticSeconds
+            )
+        stopWaitMs = msSince(restartStart)
+        if predecessorStopped {
+            predecessorLease.markQuiescent()
+        }
+
+        var needsFreshSourceGeneration =
+            forceFreshSourceGeneration
+                || !predecessorStopped
+        if predecessorStopped,
+           !needsFreshSourceGeneration,
+           !isLiveSession {
+            let seekStart = DispatchTime.now()
+            seekCompleted = dem.seek(
+                to: absoluteTargetSeconds
+            )
+            seekMs += msSince(seekStart)
+            if !seekCompleted {
+                predecessorSeekTerminalError =
+                    dem.terminalIOError
+                needsFreshSourceGeneration = true
+                EngineLog.emit(
+                    "[HLSVideoEngine] restart at "
+                        + "idx=\(idx): predecessor seek "
+                        + "made no admissible landing; "
+                        + "retiring that reader generation",
+                    category: .session
+                )
             }
         }
 
-        // Seek to ABSOLUTE source-PTS, not relative playlist time. segmentPlan[N].startSeconds is
-        // relative to startPts0; if startPts0 != 0 (B-frame head or remux), seeking the relative
-        // value lands a-keyframe-or-more behind (AVSEEK_FLAG_BACKWARD rolls back). Subtitle cue
-        // timestamps are absolute source-PTS, so a wrong seek shifts them up to one segment ahead.
-        let absoluteTargetSeconds = Double(targetStartPts) * Double(videoTb.num) / Double(videoTb.den)
-        // Seek outside restartLock (network-bound). Concurrent stop() calls markClosed() so the
-        // seek fails fast instead of racing teardown.
-        let seekStart = DispatchTime.now()
-        activeDem.seek(to: absoluteTargetSeconds)
+        if needsFreshSourceGeneration {
+            // #79 plus transport-read recovery: the predecessor is either
+            // wedged, or it finished but cannot prove the requested cursor.
+            // Retire its worker and every AVIO callback before admitting a
+            // new same-request reader.
+            if let oldSideDemuxer {
+                restartLock.lock()
+                guard sessionEpoch == epoch,
+                      demuxer === dem,
+                      sideAudioDemuxer
+                        === oldSideDemuxer,
+                      reopenIOCleanupFence.register(
+                        [dem, oldSideDemuxer],
+                        for: reopenOperation
+                      ) else {
+                    restartLock.unlock()
+                    return
+                }
+                demuxer = nil
+                sideAudioDemuxer = nil
+                restartLock.unlock()
+
+                Self.retireReaderGeneration(
+                    producer: old,
+                    demuxers:
+                        [dem, oldSideDemuxer],
+                    context:
+                        "dual-source restart",
+                    diagnosticCheckpointPassed:
+                        !predecessorStopped
+                )
+                reopenIOCleanupFence
+                    .discardAndWait(dem)
+                reopenIOCleanupFence
+                    .discardAndWait(
+                        oldSideDemuxer
+                    )
+                predecessorLease.markQuiescent()
+                _ = publishTerminalReopenFailure(
+                    HLSReopenFailureClassifier
+                        .structuralFailure(
+                            kind:
+                                .unsupportedCapability,
+                            caseCode:
+                                "sideSourceReopenUnavailable"
+                        ),
+                    epoch: epoch
+                )
+                return
+            }
+
+            let reopenStart = DispatchTime.now()
+            restartLock.lock()
+            guard sessionEpoch == epoch,
+                  demuxer === dem,
+                  reopenIOCleanupFence.register(
+                    dem,
+                    for: reopenOperation
+                  ) else {
+                restartLock.unlock()
+                return
+            }
+            // The predecessor now belongs to the reopen operation. Stop can
+            // still mark it through the cleanup fence, while no session field
+            // advertises a closed Demuxer as active.
+            demuxer = nil
+            restartLock.unlock()
+
+            Self.retireReaderGeneration(
+                producer: old,
+                demuxer: dem,
+                context: isLiveSession
+                    ? "live restart"
+                    : "VOD restart",
+                diagnosticCheckpointPassed:
+                    !predecessorStopped
+            )
+            reopenIOCleanupFence
+                .discardAndWait(dem)
+            predecessorLease.markQuiescent()
+
+            if let predecessorSeekTerminalError {
+                switch HLSReopenFailureClassifier
+                    .classify(
+                        predecessorSeekTerminalError,
+                        caseCode:
+                            "vod.seek",
+                        hasCompleteValidatedSourceEvidence:
+                            hasCompleteValidatedProgressiveSourceEvidence
+                    ) {
+                case .cancelled:
+                    return
+                case .permanent(let failure):
+                    _ = publishTerminalReopenFailure(
+                        failure,
+                        epoch: epoch
+                    )
+                    return
+                case .retry:
+                    break
+                }
+            }
+
+            let requiresValidatorBoundGeneration =
+                !isLiveSession
+                    && (sourceURL.scheme == "http"
+                        || sourceURL.scheme == "https")
+            if let failure =
+                    HLSReopenIdentityValidator
+                        .vodGenerationFailure(
+                            expected:
+                                pinnedProgressiveSourceGeneration,
+                            fresh:
+                                pinnedProgressiveSourceGeneration,
+                            requiresValidatorBoundGeneration:
+                                requiresValidatorBoundGeneration
+                        ) {
+                _ = publishTerminalReopenFailure(
+                    failure,
+                    epoch: epoch
+                )
+                return
+            }
+
+            var reopenAttempts =
+                HLSReopenAttemptLedger()
+            while freshDemuxer == nil {
+                restartLock.lock()
+                let remainsCurrent =
+                    sessionEpoch == epoch
+                        && demuxer == nil
+                restartLock.unlock()
+                guard remainsCurrent else {
+                    return
+                }
+
+                let fresh = Demuxer()
+                configureProgressiveLiveness(
+                    on: fresh
+                )
+                guard reopenIOCleanupFence.register(
+                    fresh,
+                    for: reopenOperation
+                ) else {
+                    reopenIOCleanupFence
+                        .discardAndWait(fresh)
+                    return
+                }
+                do {
+                    // .restartReopen retains the bounded stream-info probe,
+                    // but transport attempts have no count or elapsed-time
+                    // terminal. VOD reuses the exact preflight byte store so
+                    // conditional validation precedes any resident-byte read.
+                    try fresh.open(
+                        url: sourceURL,
+                        extraHeaders:
+                            sourceHTTPHeaders,
+                        profile: isLiveSession
+                            ? openProfile
+                            : .restartReopen,
+                        isLive: isLiveSession,
+                        sourceByteStore:
+                            isLiveSession
+                                ? nil
+                                : progressiveSourceByteStore
+                    )
+
+                    if let failure =
+                            HLSReopenIdentityValidator
+                                .vodGenerationFailure(
+                                    expected:
+                                        pinnedProgressiveSourceGeneration,
+                                    fresh:
+                                        progressiveSourceByteStore?
+                                            .snapshot?
+                                            .generation,
+                                    requiresValidatorBoundGeneration:
+                                        requiresValidatorBoundGeneration
+                                ) {
+                        reopenIOCleanupFence
+                            .discardAndWait(fresh)
+                        _ = publishTerminalReopenFailure(
+                            failure,
+                            epoch: epoch
+                        )
+                        return
+                    }
+                    let freshShape =
+                        HLSReopenStreamShape.capture(
+                            demuxer: fresh,
+                            videoStreamIndex:
+                                videoStreamIndex,
+                            audioStreamIndex:
+                                expectedAudioStreamIndex
+                        )
+                    if let failure =
+                            HLSReopenIdentityValidator
+                                .streamShapeFailure(
+                                    expected:
+                                        expectedStreamShape,
+                                    fresh: freshShape,
+                                    isLive:
+                                        isLiveSession
+                                ) {
+                        reopenIOCleanupFence
+                            .discardAndWait(fresh)
+                        _ = publishTerminalReopenFailure(
+                            failure,
+                            epoch: epoch
+                        )
+                        return
+                    }
+
+                    if !isLiveSession {
+                        let seekStart =
+                            DispatchTime.now()
+                        let landed = fresh.seek(
+                            to:
+                                absoluteTargetSeconds
+                        )
+                        seekMs += msSince(seekStart)
+                        guard landed else {
+                            let terminalError =
+                                fresh
+                                    .terminalIOError
+                            reopenIOCleanupFence
+                                .discardAndWait(fresh)
+                            if let terminalError {
+                                switch HLSReopenFailureClassifier
+                                    .classify(
+                                        terminalError,
+                                        caseCode:
+                                            "vod.seek",
+                                        hasCompleteValidatedSourceEvidence:
+                                            hasCompleteValidatedProgressiveSourceEvidence
+                                    ) {
+                                case .cancelled:
+                                    return
+                                case .permanent(
+                                    let failure
+                                ):
+                                    _ = publishTerminalReopenFailure(
+                                        failure,
+                                        epoch: epoch
+                                    )
+                                    return
+                                case .retry:
+                                    break
+                                }
+                            }
+                            let backoff =
+                                reopenAttempts
+                                    .backoffSeconds
+                            if let diagnostic =
+                                    reopenAttempts
+                                        .recordFailure() {
+                                EngineLog.emit(
+                                    "[HLSVideoEngine] restart at "
+                                        + "idx=\(idx): fresh "
+                                        + "same-source seek has no "
+                                        + "admissible landing; failures="
+                                        + "\(diagnostic.cumulativeFailures) "
+                                        + "elapsed="
+                                        + "\(Int(diagnostic.elapsedSeconds))s "
+                                        + "nextBackoff="
+                                        + "\(Int(backoff))s"
+                                        + (diagnostic
+                                            .checkpointSeconds
+                                            .map {
+                                                " checkpoint=\(Int($0))s"
+                                            } ?? " firstFailure"),
+                                    category: .session
+                                )
+                            }
+                            guard reopenIOCleanupFence
+                                .waitForRetryDelay(
+                                    backoff,
+                                    operation:
+                                        reopenOperation
+                                ) else {
+                                return
+                            }
+                            continue
+                        }
+                        seekCompleted = true
+                    }
+                    freshDemuxer = fresh
+                    EngineLog.emit(
+                        "[HLSVideoEngine] restart at "
+                            + "idx=\(idx): predecessor "
+                            + "generation quiesced; fresh "
+                            + "same-source Demuxer opened "
+                            + "and identity admitted "
+                            + "(attempt "
+                            + "\(reopenAttempts.attempt))",
+                        category: .session
+                    )
+                } catch {
+                    reopenIOCleanupFence
+                        .discardAndWait(fresh)
+                    switch HLSReopenFailureClassifier
+                        .classify(
+                            error,
+                            caseCode: isLiveSession
+                                ? "live.open"
+                                : "vod.open",
+                            hasCompleteValidatedSourceEvidence:
+                                hasCompleteValidatedProgressiveSourceEvidence
+                        ) {
+                    case .cancelled:
+                        return
+                    case .permanent(let failure):
+                        _ = publishTerminalReopenFailure(
+                            failure,
+                            epoch: epoch
+                        )
+                        return
+                    case .retry:
+                        let backoff =
+                            reopenAttempts
+                                .backoffSeconds
+                        if let diagnostic =
+                                reopenAttempts
+                                    .recordFailure() {
+                            EngineLog.emit(
+                                "[HLSVideoEngine] restart at "
+                                    + "idx=\(idx): transient "
+                                    + "same-source reopen failures="
+                                    + "\(diagnostic.cumulativeFailures) "
+                                    + "elapsed="
+                                    + "\(Int(diagnostic.elapsedSeconds))s "
+                                    + "nextBackoff="
+                                    + "\(Int(backoff))s"
+                                    + (diagnostic
+                                        .checkpointSeconds
+                                        .map {
+                                            " checkpoint=\(Int($0))s"
+                                        } ?? " firstFailure"),
+                                category: .session
+                            )
+                        }
+                        guard reopenIOCleanupFence
+                            .waitForRetryDelay(
+                                backoff,
+                                operation:
+                                    reopenOperation
+                            ) else {
+                            return
+                        }
+                    }
+                }
+            }
+            reopenMs = msSince(reopenStart)
+        }
+
+        if needsFreshSourceGeneration,
+           freshDemuxer == nil,
+           oldSideDemuxer == nil {
+            // A retired single-source generation must never fall through and
+            // reuse the closed predecessor.
+            EngineLog.emit(
+                "[HLSVideoEngine] restart at idx=\(idx): "
+                    + "no admitted successor after predecessor "
+                    + "retirement",
+                category: .session
+            )
+            return
+        }
+
+        var liveRestartContinuation:
+            (
+                nextIndex: Int,
+                outputEndSeconds: Double
+            )?
+        if isLiveSession, freshDemuxer != nil {
+            restartLock.lock()
+            guard sessionEpoch == epoch,
+                  let provider else {
+                restartLock.unlock()
+                if let freshDemuxer {
+                    reopenIOCleanupFence
+                        .discardAndWait(
+                            freshDemuxer
+                        )
+                }
+                return
+            }
+            liveRestartContinuation =
+                provider.liveContinuationPoint()
+            restartLock.unlock()
+        }
+
+        if liveRestartContinuation == nil,
+           !seekCompleted {
+            // Every VOD path either proved a seek above or returned. Reaching
+            // this branch would install an arbitrary-cursor producer.
+            if let freshDemuxer {
+                reopenIOCleanupFence
+                    .discardAndWait(freshDemuxer)
+            }
+            _ = publishTerminalReopenFailure(
+                HLSReopenFailureClassifier
+                    .structuralFailure(
+                        kind: .invariantViolation,
+                        caseCode:
+                            "vod.seekLandingUnproven",
+                        code: idx
+                    ),
+                epoch: epoch
+            )
+            return
+        }
         // Re-arm bridge PTS rebase so the encoder timeline starts from the new demuxer cursor.
         ab?.startSegment()
-        seekMs = msSince(seekStart)
 
-        // Re-validate: a stop() landing during waits bumped sessionEpoch; don't resurrect into a torn-down session.
+        // Re-validate: a stop() landing during waits bumped sessionEpoch;
+        // don't resurrect into a torn-down session.
         restartLock.lock()
-        guard sessionEpoch == epoch else {
+        let expectedDemuxerState =
+            freshDemuxer == nil
+                ? demuxer === dem
+                : demuxer == nil
+        guard sessionEpoch == epoch,
+              expectedDemuxerState else {
             restartLock.unlock()
-            // #79: a reopened demuxer (replacing a wedged one) must not leak when stop() superseded us.
-            freshDemuxer?.close()
+            if let freshDemuxer {
+                reopenIOCleanupFence
+                    .discardAndWait(freshDemuxer)
+            }
             EngineLog.emit(
                 "[HLSVideoEngine] restart at idx=\(idx): superseded by stop(), unwinding",
                 category: .session
             )
             return
         }
-        // #79: install the reopened demuxer only inside the validated section so makeProducer reads it and a
-        // concurrent teardown can't race a resurrected demuxer into a torn-down session.
+        // The successor stays reopen-owned until producer construction and
+        // atomic session installation both succeed. A build failure leaves
+        // demuxer=nil; the retired predecessor is never restored.
         if let freshDemuxer {
             demuxer = freshDemuxer
-            freshDemuxer.onNetworkPhaseChanged = onNetworkPhaseChanged   // re-wire stall signal onto the reopened demuxer (#85)
+            freshDemuxer.onNetworkPhaseChanged =
+                onNetworkPhaseChanged
         }
+        let newProducer: HLSSegmentProducer
         do {
-            let newProd = try makeProducer(baseIndex: idx)
-            producer = newProd
-            restartLock.unlock()
-            newProd.start()
+            newProducer = try makeProducer(
+                baseIndex:
+                    liveRestartContinuation?
+                        .nextIndex ?? idx,
+                liveReopenOutputEndSeconds:
+                    liveRestartContinuation?
+                        .outputEndSeconds
+            )
         } catch {
+            if freshDemuxer != nil {
+                demuxer = nil
+            }
             restartLock.unlock()
-            EngineLog.emit(
-                "[HLSVideoEngine] restart at idx=\(idx) failed: \(error)",
-                category: .session
+            if let freshDemuxer {
+                reopenIOCleanupFence
+                    .discardAndWait(freshDemuxer)
+            }
+            _ = publishTerminalReopenFailure(
+                HLSReopenFailureClassifier
+                    .structuralFailure(
+                        kind: .routeRuntimeFailure,
+                        caseCode: "vod.producerBuild",
+                        code: idx
+                    ),
+                epoch: epoch
             )
             return
         }
+        if let liveRestartContinuation {
+            newProducer.firstSegmentDiscontinuous =
+                true
+            newProducer.onVideoShiftKnown = {
+                [weak self] shiftPts in
+                self?.handleLiveTimelineRebase(
+                    shiftPts,
+                    seamOutputSeconds:
+                        liveRestartContinuation
+                            .outputEndSeconds
+                )
+            }
+        }
+        producer = newProducer
+        if let freshDemuxer {
+            reopenIOCleanupFence
+                .transferToSession(freshDemuxer)
+        }
+        restartLock.unlock()
+        newProducer.start()
 
         let elapsedMs = msSince(restartStart)
         // build = everything after the seek (re-validation, muxer/producer construction, start).

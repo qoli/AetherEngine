@@ -23,7 +23,7 @@ import Libswresample
 ///     only routes (Sonos Arc, Samsung HW-Q, Bose) where FLAC falls down.
 ///   - `.lossless`: FLAC up to 7.1, AVPlayer -> LPCM HDMI route. Needs a multichannel-LPCM sink (Denon/Marantz/NAD);
 ///     a stereo-LPCM route downmixes to stereo.
-public enum AudioBridgeMode: String, Sendable, CaseIterable {
+public enum AudioBridgeMode: String, Sendable, CaseIterable, Hashable {
     case surroundCompat
     case lossless
 }
@@ -36,7 +36,7 @@ final class AudioBridge: @unchecked Sendable {
 
     // MARK: - Errors
 
-    enum AudioBridgeError: Error, CustomStringConvertible {
+    enum AudioBridgeError: Error, CustomStringConvertible, Sendable, Equatable {
         case decoderNotFound(codecID: UInt32)
         case decoderAllocFailed
         case decoderParametersFailed(code: Int32)
@@ -47,8 +47,13 @@ final class AudioBridge: @unchecked Sendable {
         case codecparAllocFailed
         case resamplerAllocFailed(code: Int32)
         case resamplerInitFailed(code: Int32)
+        case resamplerReconfigurationFailed(code: Int32)
         case sendPacketFailed(code: Int32)
         case sendFrameFailed(code: Int32)
+        case sourceChannelLayoutUnavailable(
+            containerChannels: Int32,
+            decoderChannels: Int32
+        )
 
         var description: String {
             switch self {
@@ -62,8 +67,37 @@ final class AudioBridge: @unchecked Sendable {
             case .codecparAllocFailed:           return "AudioBridge: avcodec_parameters_alloc failed"
             case .resamplerAllocFailed(let c):   return "AudioBridge: swr_alloc_set_opts2 returned \(c)"
             case .resamplerInitFailed(let c):    return "AudioBridge: swr_init returned \(c)"
+            case .resamplerReconfigurationFailed(let c):
+                return "AudioBridge: decoded audio layout cannot be represented by the bridge resampler (\(c))"
             case .sendPacketFailed(let c):       return "AudioBridge: avcodec_send_packet (decoder) returned \(c)"
             case .sendFrameFailed(let c):        return "AudioBridge: avcodec_send_frame (encoder) returned \(c)"
+            case .sourceChannelLayoutUnavailable(
+                let containerChannels,
+                let decoderChannels
+            ):
+                return "AudioBridge: source channel layout is unavailable "
+                    + "(container=\(containerChannels), decoder=\(decoderChannels))"
+            }
+        }
+
+        var isCapabilityFailure: Bool {
+            switch self {
+            case .decoderNotFound,
+                 .encoderNotFound,
+                 .sourceChannelLayoutUnavailable,
+                 .resamplerReconfigurationFailed:
+                true
+            case .decoderAllocFailed,
+                 .decoderParametersFailed,
+                 .decoderOpenFailed,
+                 .encoderAllocFailed,
+                 .encoderOpenFailed,
+                 .codecparAllocFailed,
+                 .resamplerAllocFailed,
+                 .resamplerInitFailed,
+                 .sendPacketFailed,
+                 .sendFrameFailed:
+                false
             }
         }
     }
@@ -138,12 +172,37 @@ final class AudioBridge: @unchecked Sendable {
 
     private static let avNoPTS: Int64 = -0x7FFFFFFFFFFFFFFF - 1
 
+    static var supportedModes: Set<Mode> {
+        Set(Mode.allCases.filter(supports))
+    }
+
+    static func supports(_ mode: Mode) -> Bool {
+        let codecID: AVCodecID
+        switch mode {
+        case .surroundCompat:
+            codecID = AV_CODEC_ID_EAC3
+        case .lossless:
+            codecID = AV_CODEC_ID_FLAC
+        }
+        return avcodec_find_encoder(codecID) != nil
+    }
+
+    static func channelLayoutIsUsable(
+        _ layout: inout AVChannelLayout,
+        maximumChannels: Int32 = .max
+    ) -> Bool {
+        layout.nb_channels > 0
+            && layout.nb_channels <= maximumChannels
+            && av_channel_layout_check(&layout) == 1
+    }
+
     // MARK: - Lifecycle
 
     /// Opens source decoder + bridge encoder (eagerly, so encoderCodecpar is ready for muxer init). Encoder by mode:
     /// `.surroundCompat` EAC3 128 kbps/ch, max 6 ch, FLTP; `.lossless` FLAC, max 8 ch, S16 (lossy src) or S32@24
-    /// (lossless src). Incomplete source codecpar (TrueHD sometimes reports sample_rate=0 pre-frame) falls back to
-    /// 48 kHz stereo, which the resampler reconfigures on the first decoded frame if it differs.
+    /// (lossless src). A missing sample rate can safely use 48 kHz because the first decoded frame reconfigures
+    /// the resampler. A missing channel layout cannot be guessed: doing so would silently downmix the source, so
+    /// bridge creation fails with a typed capability error.
     init(
         srcCodecpar: UnsafeMutablePointer<AVCodecParameters>,
         srcTimeBase: AVRational,
@@ -210,7 +269,19 @@ final class AudioBridge: @unchecked Sendable {
         // EINVAL -22), which feed() skips per-packet instead of failing the whole feed (#64).
         let openRet = avcodec_open2(dec, srcCodec, nil)
         guard openRet >= 0 else {
+            let containerChannels =
+                srcCodecpar.pointee.ch_layout.nb_channels
+            let decoderChannels =
+                dec.pointee.ch_layout.nb_channels
             cleanup()
+            if containerChannels <= 0,
+               decoderChannels <= 0 {
+                throw AudioBridgeError
+                    .sourceChannelLayoutUnavailable(
+                        containerChannels: containerChannels,
+                        decoderChannels: decoderChannels
+                    )
+            }
             throw AudioBridgeError.decoderOpenFailed(code: openRet)
         }
 
@@ -242,29 +313,29 @@ final class AudioBridge: @unchecked Sendable {
             : 48000
 
         // Channel count in order: (1) srcCodecpar.ch_layout (demuxer from container header, most sources);
-        // (2) dec.ch_layout after avcodec_open2 (some codecs propagate a default at init); (3) stereo fallback
-        // with a loud log. Matroska doesn't reliably populate Channels for TrueHD/MLP (layout is in the bitstream,
-        // container header optional); when both come back 0 the bridge defaults stereo and downmixes the real
-        // 5.1/7.1, which the WARNING logs as a repro (proper fix: peek the first packet before opening the encoder).
+        // (2) dec.ch_layout after avcodec_open2 (some codecs propagate a default at init). When both are missing,
+        // selecting stereo would silently change the media contract, so fail closed instead.
         let containerChannels = srcCodecpar.pointee.ch_layout.nb_channels
         let decoderChannels = dec.pointee.ch_layout.nb_channels
         let resolvedChannels: Int32
         let resolvedSource: String
-        if containerChannels > 0 && containerChannels <= 8 {
+        if Self.channelLayoutIsUsable(
+            &srcCodecpar.pointee.ch_layout,
+            maximumChannels: 8
+        ) {
             resolvedChannels = containerChannels
             resolvedSource = "container"
-        } else if decoderChannels > 0 && decoderChannels <= 8 {
+        } else if Self.channelLayoutIsUsable(
+            &dec.pointee.ch_layout,
+            maximumChannels: 8
+        ) {
             resolvedChannels = decoderChannels
             resolvedSource = "decoder"
         } else {
-            resolvedChannels = 2
-            resolvedSource = "fallback (stereo)"
-            EngineLog.emit(
-                "[AudioBridge] WARNING: source channel layout unresolved at bridge init "
-                + "(container=\(containerChannels), decoder=\(decoderChannels)); "
-                + "defaulting to stereo. Surround / Atmos sources will be downmixed. "
-                + "Codec: \(srcCodecID.rawValue). Need to peek first packet to fix.",
-                category: .session
+            cleanup()
+            throw AudioBridgeError.sourceChannelLayoutUnavailable(
+                containerChannels: containerChannels,
+                decoderChannels: decoderChannels
             )
         }
         // Cap to encoder max (EAC3 5.1, FLAC 7.1). Above-cap downmix happens automatically inside swr_convert
@@ -711,10 +782,23 @@ final class AudioBridge: @unchecked Sendable {
     private func reconfigureSwrInputIfNeeded(
         forFrame sf: UnsafeMutablePointer<AVFrame>,
         enc: UnsafeMutablePointer<AVCodecContext>
-    ) {
+    ) throws {
         let frameFmtRaw = sf.pointee.format
         let frameRate = sf.pointee.sample_rate
-        guard frameFmtRaw >= 0, frameRate > 0, sf.pointee.ch_layout.nb_channels > 0 else { return }
+        guard frameFmtRaw >= 0, frameRate > 0 else {
+            return
+        }
+        guard Self.channelLayoutIsUsable(
+            &sf.pointee.ch_layout
+        ) else {
+            throw AudioBridgeError
+                .sourceChannelLayoutUnavailable(
+                    containerChannels:
+                        sf.pointee.ch_layout.nb_channels,
+                    decoderChannels:
+                        sf.pointee.ch_layout.nb_channels
+                )
+        }
         let matchesCurrent = frameFmtRaw == swrInFmt.rawValue
             && frameRate == swrInRate
             && av_channel_layout_compare(&swrInLayout, &sf.pointee.ch_layout) == 0
@@ -732,7 +816,15 @@ final class AudioBridge: @unchecked Sendable {
             0,
             nil
         )
-        guard setRet >= 0, swrCtx != nil, swr_init(swrCtx) >= 0 else { return }
+        guard setRet >= 0, let swrCtx else {
+            throw AudioBridgeError
+                .resamplerReconfigurationFailed(code: setRet)
+        }
+        let initRet = swr_init(swrCtx)
+        guard initRet >= 0 else {
+            throw AudioBridgeError
+                .resamplerReconfigurationFailed(code: initRet)
+        }
 
         av_channel_layout_uninit(&swrInLayout)
         av_channel_layout_copy(&swrInLayout, &sf.pointee.ch_layout)
@@ -775,10 +867,13 @@ final class AudioBridge: @unchecked Sendable {
 
         // Align swr's INPUT to the frame the decoder actually produced before converting. No-op once the seed
         // matched (the usual case); only a wrong init seed or a genuine mid-stream format change rebuilds swr.
-        reconfigureSwrInputIfNeeded(forFrame: sf, enc: enc)
+        try reconfigureSwrInputIfNeeded(forFrame: sf, enc: enc)
         // The rebuild reuses the context pointer on success, but swr_alloc_set_opts2 frees it on a set-opts
         // failure (swr_free(ps) -> swrCtx == nil), which would dangle the caller's `swr`. Re-bind to the live one.
-        guard let swr = swrCtx else { return }
+        guard let swr = swrCtx else {
+            throw AudioBridgeError
+                .resamplerReconfigurationFailed(code: -1)
+        }
 
         let outNbSamples = swr_get_out_samples(swr, sf.pointee.nb_samples)
         guard outNbSamples > 0 else { return }
@@ -900,4 +995,3 @@ final class AudioBridge: @unchecked Sendable {
         }
     }
 }
-

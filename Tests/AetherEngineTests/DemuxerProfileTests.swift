@@ -2,6 +2,21 @@ import Testing
 @testable import AetherEngine
 
 struct DemuxerProfileTests {
+    @Test("FFmpeg interrupt follows owner cancellation and close")
+    func interruptCallbackLatch() {
+        let demuxer = Demuxer()
+        #expect(!demuxer.shouldInterruptFFmpeg)
+
+        demuxer.openCancellationRequested = { true }
+        #expect(demuxer.shouldInterruptFFmpeg)
+
+        demuxer.openCancellationRequested = nil
+        #expect(!demuxer.shouldInterruptFFmpeg)
+
+        demuxer.markClosed()
+        #expect(demuxer.shouldInterruptFFmpeg)
+    }
+
     @Test("playback profile keeps the large probe budget + prefetch")
     func playbackDefaults() {
         let p = DemuxerOpenProfile.playback

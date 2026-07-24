@@ -20,6 +20,8 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         ]
         private let delayNanoseconds: UInt64
         private var requests: [URLRequest] = []
+        private var activeRequestCount = 0
+        private var maximumConcurrentRequestCount = 0
 
         init(
             responses: [URL: HLSVODOriginFetchResponse],
@@ -34,6 +36,12 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
             maximumBytes: Int
         ) async throws -> HLSVODOriginFetchResponse {
             requests.append(request)
+            activeRequestCount += 1
+            maximumConcurrentRequestCount = max(
+                maximumConcurrentRequestCount,
+                activeRequestCount
+            )
+            defer { activeRequestCount -= 1 }
             if delayNanoseconds > 0 {
                 try await Task.sleep(
                     nanoseconds: delayNanoseconds
@@ -50,11 +58,57 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
             requests.count
         }
 
+        var maximumConcurrentRequests: Int {
+            maximumConcurrentRequestCount
+        }
+
         func headers(at index: Int) -> [String: String]? {
             guard requests.indices.contains(index) else {
                 return nil
             }
             return requests[index].allHTTPHeaderFields
+        }
+    }
+
+    private actor SequencedFetchRecorder {
+        private var responses:
+            [URL: [HLSVODOriginFetchResponse]]
+        private var requestsByURL:
+            [URL: Int] = [:]
+
+        init(
+            responses:
+                [URL: [HLSVODOriginFetchResponse]]
+        ) {
+            self.responses = responses
+        }
+
+        func fetch(
+            _ request: URLRequest,
+            maximumBytes: Int
+        ) throws
+            -> HLSVODOriginFetchResponse
+        {
+            guard let url = request.url,
+                  var sequence =
+                    responses[url],
+                  let response =
+                    sequence.first else {
+                throw HLSVODOriginResourceError
+                    .httpStatus(404)
+            }
+            requestsByURL[url, default: 0] += 1
+            if sequence.count > 1 {
+                sequence.removeFirst()
+                responses[url] = sequence
+            }
+            return response
+        }
+
+        func requestCount(
+            for url: URL
+        ) -> Int {
+            requestsByURL[url, default: 0]
         }
     }
 
@@ -1746,7 +1800,7 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         try await loader.close()
     }
 
-    func testServerFailureUsesBoundedTransportRetriesWithoutInvalidatingGraph()
+    func testServerFailureRetriesUntilCancellationWithoutOverlappingReaders()
         async throws
     {
         let fixture = try makeFixture()
@@ -1763,7 +1817,8 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
                             fixture.audioFirstSegmentURL,
                         statusCode: 503,
                         contentLength: 0,
-                        contentEncoding: nil
+                        contentEncoding: nil,
+                        retryAfterSeconds: 0.001
                     ),
             ]
         )
@@ -1778,36 +1833,184 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
             }
         )
 
-        do {
-            _ = try await loader.payload(for: key)
-            XCTFail("HTTP 503 unexpectedly produced bytes")
-        } catch let error as HLSVODOriginResourceError {
-            XCTAssertEqual(error, .httpStatus(503))
+        let payload = Task {
+            try await loader.payload(for: key)
         }
-        let firstSnapshot = await loader.snapshot
+        for _ in 0..<500 {
+            if await recorder.requestCount >= 5 {
+                break
+            }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let retryRequestCount = await recorder.requestCount
+        XCTAssertGreaterThanOrEqual(
+            retryRequestCount,
+            5,
+            "the public HLS transport must not terminate at three attempts"
+        )
+        let maximumConcurrentRequests =
+            await recorder.maximumConcurrentRequests
+        XCTAssertEqual(
+            maximumConcurrentRequests,
+            1,
+            "same-source retries must retain one sequential reader"
+        )
+        let retrySnapshot = await loader.snapshot
         XCTAssertNil(
-            firstSnapshot.preflightGenerationInvalidation
-        )
-        let firstRequestCount = await recorder.requestCount
-        XCTAssertEqual(
-            firstRequestCount,
-            3,
-            "one transport operation may make at most three attempts"
-        )
-
-        do {
-            _ = try await loader.payload(for: key)
-            XCTFail("explicit second request unexpectedly produced bytes")
-        } catch let error as HLSVODOriginResourceError {
-            XCTAssertEqual(error, .transportBudgetExhausted)
-        }
-        let secondRequestCount = await recorder.requestCount
-        XCTAssertEqual(
-            secondRequestCount,
-            3,
-            "the recovery episode owns one shared transport budget"
+            retrySnapshot.preflightGenerationInvalidation
         )
         try await loader.close()
+        do {
+            _ = try await payload.value
+            XCTFail("cancelled HLS transport unexpectedly produced bytes")
+        } catch let error as HLSVODOriginResourceError {
+            XCTAssertEqual(error, .closed)
+        }
+        let requestCountAfterClose = await recorder.requestCount
+        try await Task.sleep(nanoseconds: 10_000_000)
+        let finalRequestCount = await recorder.requestCount
+        XCTAssertEqual(
+            finalRequestCount,
+            requestCountAfterClose
+        )
+    }
+
+    func testSuccessfulResourceProgressResetsSharedTransportBackoff()
+        async throws
+    {
+        let fixture = try makeFixture()
+        let firstURL =
+            fixture.audioFirstSegmentURL
+        let secondURL =
+            firstURL
+                .deletingLastPathComponent()
+                .appendingPathComponent(
+                    "a1.aac"
+                )
+        let unavailable: (URL, TimeInterval)
+            -> HLSVODOriginFetchResponse = {
+                url, retryAfter in
+                HLSVODOriginFetchResponse(
+                    data: Data(),
+                    effectiveURL: url,
+                    statusCode: 503,
+                    contentLength: 0,
+                    contentEncoding: nil,
+                    retryAfterSeconds:
+                        retryAfter
+                )
+            }
+        let recovered =
+            HLSVODOriginFetchResponse(
+                data:
+                    fixture
+                        .audioFirstSegmentData,
+                effectiveURL: firstURL,
+                statusCode: 200,
+                contentLength:
+                    Int64(
+                        fixture
+                            .audioFirstSegmentData
+                            .count
+                    ),
+                contentEncoding: nil
+            )
+        let recorder =
+            SequencedFetchRecorder(
+                responses: [
+                    firstURL: [
+                        unavailable(firstURL, 0),
+                        recovered,
+                    ],
+                    secondURL: [
+                        unavailable(secondURL, 30),
+                    ],
+                ]
+            )
+        let budget =
+            PlaybackTransportRetryBudget(
+                maximumFailureAttempts: nil
+            )
+        let loader =
+            try HLSVODOriginResourceLoader(
+                graph: fixture.graph,
+                httpHeaders: [:],
+                transportRetryBudget:
+                    budget,
+                fetchOverride: {
+                    request,
+                    maximumBytes in
+                    try await recorder.fetch(
+                        request,
+                        maximumBytes:
+                            maximumBytes
+                    )
+                }
+            )
+
+        let first =
+            try await loader.payload(
+                for: .audioSegment(
+                    renditionOrdinal: 0,
+                    index: 0
+                )
+            )
+        XCTAssertEqual(
+            first.data,
+            fixture.audioFirstSegmentData
+        )
+        XCTAssertEqual(
+            budget.currentFailureAttempt,
+            0,
+            "delivered bytes must reset the shared retry episode"
+        )
+
+        let second = Task {
+            try await loader.payload(
+                for: .audioSegment(
+                    renditionOrdinal: 0,
+                    index: 1
+                )
+            )
+        }
+        for _ in 0..<400 {
+            if await recorder.requestCount(
+                for: secondURL
+            ) >= 1,
+               budget.currentFailureAttempt
+                == 1 {
+                break
+            }
+            try await Task.sleep(
+                for: .milliseconds(5)
+            )
+        }
+        XCTAssertEqual(
+            budget.currentFailureAttempt,
+            1,
+            "the next resource failure must restart at attempt one"
+        )
+        XCTAssertEqual(
+            AetherPlaybackLivenessPolicy
+                .production
+                .retryBackoffSeconds(
+                    forAttempt:
+                        budget
+                            .currentFailureAttempt
+                ),
+            1
+        )
+
+        try await loader.close()
+        do {
+            _ = try await second.value
+            XCTFail(
+                "closed retry unexpectedly produced bytes"
+            )
+        } catch let error
+                as HLSVODOriginResourceError {
+            XCTAssertEqual(error, .closed)
+        }
     }
 
     func testRuntimeEffectiveOriginMustRemainInsidePreflightScope()
@@ -2147,6 +2350,84 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         XCTAssertTrue(response.data.isEmpty)
     }
 
+    func testBoundedHTTPTransportAllowsLongResourceWithChunkProgress()
+        async throws
+    {
+        let url = URL(
+            string:
+                "https://origin.test/slow-progress.m4s"
+        )!
+        let chunks =
+            (0..<6).map {
+                Data([UInt8($0)])
+            }
+        HLSVODOriginURLProtocol.reset()
+        HLSVODOriginURLProtocol.fixtures[
+            url.absoluteString
+        ] = .init(
+            statusCode: 200,
+            headers: [
+                "Content-Length": "6",
+            ],
+            body: Data(chunks.joined()),
+            chunks: chunks,
+            chunkDelaySeconds: 0.02
+        )
+        let configuration =
+            URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [
+            HLSVODOriginURLProtocol.self,
+        ]
+
+        let started =
+            ProcessInfo.processInfo
+                .systemUptime
+        let response =
+            try await HLSVODBoundedHTTPFetcher
+                .fetch(
+                    request:
+                        URLRequest(url: url),
+                    maximumBytes: 8,
+                    configuration:
+                        configuration,
+                    inactivityTimeoutSeconds:
+                        0.05
+                )
+        let elapsed =
+            ProcessInfo.processInfo
+                .systemUptime
+                - started
+
+        XCTAssertEqual(
+            response.data,
+            Data(chunks.joined())
+        )
+        XCTAssertGreaterThanOrEqual(
+            elapsed,
+            0.1
+        )
+        XCTAssertEqual(
+            configuration
+                .timeoutIntervalForRequest,
+            0.05
+        )
+        XCTAssertGreaterThan(
+            configuration
+                .timeoutIntervalForResource,
+            45
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(
+                HLSVODOriginURLProtocol
+                    .recordedTimeout(
+                        for: url
+                    )
+            ),
+            0.05,
+            accuracy: 0.001
+        )
+    }
+
     func testBoundedHTTPTransportRejectsCredentialedCrossOriginRedirect()
         async throws
     {
@@ -2355,6 +2636,20 @@ final class HLSVODOriginResourceLoaderTests: XCTestCase {
         XCTAssertEqual(
             targetHeaders?["Accept-Encoding"],
             "identity"
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(
+                HLSVODOriginURLProtocol
+                    .recordedTimeout(
+                        for: targetURL
+                    )
+            ),
+            AetherPlaybackLivenessPolicy
+                .production
+                .noProgressWindowSeconds(
+                    forAttempt: 1
+                ),
+            accuracy: 0.001
         )
     }
 
@@ -2573,35 +2868,51 @@ private final class HLSVODOriginURLProtocol:
     URLProtocol,
     @unchecked Sendable
 {
-    struct Fixture {
+    struct Fixture: Sendable {
         let statusCode: Int
         let headers: [String: String]
         let body: Data
         let redirectURL: URL?
+        let chunks: [Data]?
+        let chunkDelaySeconds:
+            TimeInterval
 
         init(
             statusCode: Int,
             headers: [String: String],
             body: Data,
-            redirectURL: URL? = nil
+            redirectURL: URL? = nil,
+            chunks: [Data]? = nil,
+            chunkDelaySeconds:
+                TimeInterval = 0
         ) {
             self.statusCode = statusCode
             self.headers = headers
             self.body = body
             self.redirectURL = redirectURL
+            self.chunks = chunks
+            self.chunkDelaySeconds =
+                chunkDelaySeconds
         }
     }
 
     private static let lock = NSLock()
+    private let stateLock = NSLock()
+    private var isStopped = false
+    private var slowDelivery:
+        HLSVODSlowChunkDelivery?
     nonisolated(unsafe) static var fixtures:
         [String: Fixture] = [:]
     nonisolated(unsafe) private static var headersByURL:
         [String: [String: String]] = [:]
+    nonisolated(unsafe) private static var timeoutByURL:
+        [String: TimeInterval] = [:]
 
     static func reset() {
         lock.withLock {
             fixtures = [:]
             headersByURL = [:]
+            timeoutByURL = [:]
         }
     }
 
@@ -2610,6 +2921,16 @@ private final class HLSVODOriginURLProtocol:
     ) -> [String: String]? {
         lock.withLock {
             headersByURL[url.absoluteString]
+        }
+    }
+
+    static func recordedTimeout(
+        for url: URL
+    ) -> TimeInterval? {
+        lock.withLock {
+            timeoutByURL[
+                url.absoluteString
+            ]
         }
     }
 
@@ -2636,6 +2957,9 @@ private final class HLSVODOriginURLProtocol:
         let fixture: Fixture? = Self.lock.withLock {
             Self.headersByURL[url.absoluteString] =
                 request.allHTTPHeaderFields ?? [:]
+            Self.timeoutByURL[
+                url.absoluteString
+            ] = request.timeoutInterval
             return Self.fixtures[url.absoluteString]
         }
         guard let fixture else {
@@ -2672,9 +2996,94 @@ private final class HLSVODOriginURLProtocol:
             didReceive: response,
             cacheStoragePolicy: .notAllowed
         )
+        if let chunks = fixture.chunks {
+            let delay =
+                fixture.chunkDelaySeconds
+            let delivery =
+                HLSVODSlowChunkDelivery(
+                    owner: self
+                )
+            stateLock.withLock {
+                slowDelivery = delivery
+            }
+            Task.detached {
+                await delivery.deliver(
+                    chunks: chunks,
+                    delaySeconds: delay
+                )
+            }
+            return
+        }
         client?.urlProtocol(self, didLoad: fixture.body)
         client?.urlProtocolDidFinishLoading(self)
     }
 
-    override func stopLoading() {}
+    override func stopLoading() {
+        stateLock.withLock {
+            isStopped = true
+            slowDelivery?.cancel()
+            slowDelivery = nil
+        }
+    }
+}
+
+private final class HLSVODSlowChunkDelivery:
+    @unchecked Sendable
+{
+    private weak var owner:
+        HLSVODOriginURLProtocol?
+    private let lock = NSLock()
+    private var isCancelled = false
+
+    init(owner: HLSVODOriginURLProtocol) {
+        self.owner = owner
+    }
+
+    func cancel() {
+        lock.withLock {
+            isCancelled = true
+        }
+    }
+
+    func deliver(
+        chunks: [Data],
+        delaySeconds: TimeInterval
+    ) async {
+        for chunk in chunks {
+            do {
+                try await Task.sleep(
+                    nanoseconds:
+                        UInt64(
+                            delaySeconds
+                                * 1_000_000_000
+                        )
+                )
+            } catch {
+                return
+            }
+            guard !lock.withLock({
+                isCancelled
+            }),
+                  let owner,
+                  let client =
+                    owner.client else {
+                return
+            }
+            client.urlProtocol(
+                owner,
+                didLoad: chunk
+            )
+        }
+        guard !lock.withLock({
+            isCancelled
+        }),
+              let owner,
+              let client =
+                owner.client else {
+            return
+        }
+        client.urlProtocolDidFinishLoading(
+            owner
+        )
+    }
 }

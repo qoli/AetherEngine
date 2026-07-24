@@ -18,16 +18,17 @@ public enum AetherMediaSourceKind: String, Sendable, Equatable, Hashable {
     case hls
     case progressive
     case custom
-    /// URL evidence remained inconclusive after the bounded retry budget.
-    /// This is an explicit same-URL Native trial contract, not inferred
-    /// progressive provenance and never a Hybrid admission.
+    /// URL evidence is still inconclusive. This state is not playback
+    /// admission for any player; the owning liveness policy keeps resolving
+    /// the same request until cancellation or typed permanent evidence.
     case unclassifiedURL
 }
 
 /// Codec identity used by the route policy. `.unknown` is deliberately not treated as AVPlayer-compatible.
-public enum AetherVideoCodec: String, Sendable, Equatable {
+public enum AetherVideoCodec: String, Sendable, Equatable, Hashable {
     case h264
     case hevc
+    case prores
     case av1
     case vp9
     case vp8
@@ -40,6 +41,7 @@ public enum AetherVideoCodec: String, Sendable, Equatable {
         self = switch codecName?.lowercased() {
         case "h264", "avc": .h264
         case "hevc", "h265": .hevc
+        case "prores": .prores
         case "av1": .av1
         case "vp9": .vp9
         case "vp8": .vp8
@@ -56,11 +58,13 @@ public enum AetherVideoCodec: String, Sendable, Equatable {
 /// the bridge can decode them.
 public enum AetherAudioCodec: String, Sendable, Equatable, Hashable {
     case vorbis
+    case pcmS24LE = "pcm_s24le"
     case unknown
 
     init(codecName: String?) {
         self = switch codecName?.lowercased() {
         case "vorbis": .vorbis
+        case "pcm_s24le": .pcmS24LE
         default: .unknown
         }
     }
@@ -386,8 +390,18 @@ public struct HLSVideoPackaging: Sendable, Equatable {
 /// `.unsupported`, not an implicit SDR tone-map path.
 public struct HybridPlaybackCapabilities: Sendable, Equatable {
     public let hasDirectVideoDecoder: Bool
+    /// Codecs whose software decoder has been positively established in the
+    /// linked libavcodec build. An empty set means no codec-specific software
+    /// decoder capability has been established.
+    public let libavcodecDecodableVideoCodecs: Set<AetherVideoCodec>
+    /// Audio codecs whose source decoder has been positively established in
+    /// the linked libavcodec build.
+    public let libavcodecDecodableAudioCodecs: Set<AetherAudioCodec>
     public let hasSampleBufferRenderer: Bool
     public let hasAudioBridgeCarrier: Bool
+    /// Audio bridge output modes whose encoders are positively present in the
+    /// linked libavcodec build.
+    public let supportedAudioBridgeModes: Set<AudioBridgeMode>
     public let supportedVideoFormats: Set<VideoFormat>
     public let supportedDolbyVisionProfiles:
         Set<AetherDolbyVisionProfile>
@@ -395,8 +409,11 @@ public struct HybridPlaybackCapabilities: Sendable, Equatable {
 
     public init(
         hasDirectVideoDecoder: Bool,
+        libavcodecDecodableVideoCodecs: Set<AetherVideoCodec> = [],
+        libavcodecDecodableAudioCodecs: Set<AetherAudioCodec> = [],
         hasSampleBufferRenderer: Bool,
         hasAudioBridgeCarrier: Bool = false,
+        supportedAudioBridgeModes: Set<AudioBridgeMode>? = nil,
         supportedVideoFormats: Set<VideoFormat>,
         supportedDolbyVisionProfiles:
             Set<AetherDolbyVisionProfile> = [],
@@ -407,12 +424,28 @@ public struct HybridPlaybackCapabilities: Sendable, Equatable {
         ]
     ) {
         self.hasDirectVideoDecoder = hasDirectVideoDecoder
+        self.libavcodecDecodableVideoCodecs =
+            libavcodecDecodableVideoCodecs
+        self.libavcodecDecodableAudioCodecs =
+            libavcodecDecodableAudioCodecs
         self.hasSampleBufferRenderer = hasSampleBufferRenderer
         self.hasAudioBridgeCarrier = hasAudioBridgeCarrier
+        self.supportedAudioBridgeModes =
+            supportedAudioBridgeModes
+            ?? (hasAudioBridgeCarrier
+                ? Set(AudioBridgeMode.allCases)
+                : [])
         self.supportedVideoFormats = supportedVideoFormats
         self.supportedDolbyVisionProfiles =
             supportedDolbyVisionProfiles
         self.supportedSourceKinds = supportedSourceKinds
+    }
+
+    public func supportsAudioBridge(
+        mode: AudioBridgeMode
+    ) -> Bool {
+        hasAudioBridgeCarrier
+            && supportedAudioBridgeModes.contains(mode)
     }
 }
 
@@ -422,11 +455,18 @@ public enum PlaybackRouteReason: String, Sendable, Equatable {
     case nativeHLSContractVerified
     case nativeProtectedHLSContractVerified
     case nativeHLSFMP4Remux
+    @available(
+        *,
+        deprecated,
+        message:
+            "Unknown URL facts are not playback admission; classification remains pending or fails typed"
+    )
     case nativeProvisionalURL
     case hybridRecoveryAfterNativeFailure
     case hybridAudioBridge
     case hybridInterlacedH264
     case hybridHEVC
+    case hybridProRes
     case hybridHEV1SampleEntry
     case hybridHEVCInMPEGTransport
     case hybridHLSManifestMissingCodecs
@@ -444,6 +484,7 @@ public enum PlaybackRouteReason: String, Sendable, Equatable {
     case unsupportedHybridAudioBridgeUnavailable
     case unsupportedHybridVideoFormat
     case unsupportedProgressiveContainerUnverified
+    case unsupportedSourceClassificationInconclusive
     case unsupportedProvisionalURLFactsResolved
     case unsupportedVideoStreamPresenceInconclusive
     case unsupportedDolbyVisionConfigurationMissing
@@ -483,17 +524,32 @@ public struct PlaybackPreflightResult: Sendable, Equatable {
 /// This policy performs no I/O. The HLS inspector is responsible for constructing
 /// `HLSVideoPackaging` from the selected playlist, init segment and first media segment before calling it.
 public enum PlaybackPreflight {
+    private static let softwareDecodedVideoCodecs:
+        Set<AetherVideoCodec> = [
+            .h264,
+            .prores,
+            .av1,
+            .vp9,
+            .vp8,
+            .mpeg2,
+            .mpeg4Part2,
+            .vc1,
+        ]
+
     public static func resolve(
         sourceProfile: AetherSourceProfile,
         hlsPackaging: HLSVideoPackaging?,
-        hybridCapabilities: HybridPlaybackCapabilities
+        hybridCapabilities: HybridPlaybackCapabilities,
+        requiredAudioBridgeMode: AudioBridgeMode? = nil
     ) -> PlaybackPreflightResult {
         switch sourceProfile.sourceKind {
         case .hls:
             return resolveHLS(
                 sourceProfile: sourceProfile,
                 hlsPackaging: hlsPackaging,
-                hybridCapabilities: hybridCapabilities
+                hybridCapabilities: hybridCapabilities,
+                requiredAudioBridgeMode:
+                    requiredAudioBridgeMode
             )
         case .unclassifiedURL:
             guard sourceProfile.videoStreamPresence == .unknown,
@@ -523,8 +579,8 @@ public enum PlaybackPreflight {
             return result(
                 sourceProfile,
                 nil,
-                .nativeAVPlayer,
-                .nativeProvisionalURL
+                .unsupported,
+                .unsupportedSourceClassificationInconclusive
             )
         case .progressive, .custom:
             switch sourceProfile.videoStreamPresence {
@@ -532,7 +588,9 @@ public enum PlaybackPreflight {
                 if sourceProfile.audioCodecs == [.vorbis] {
                     return hybridAudioResult(
                         sourceProfile: sourceProfile,
-                        capabilities: hybridCapabilities
+                        capabilities: hybridCapabilities,
+                        requiredAudioBridgeMode:
+                            requiredAudioBridgeMode
                     )
                 }
                 return result(
@@ -558,7 +616,9 @@ public enum PlaybackPreflight {
                         sourceProfile: sourceProfile,
                         hlsPackaging: nil,
                         reason: .hybridInterlacedH264,
-                        capabilities: hybridCapabilities
+                        capabilities: hybridCapabilities,
+                        requiredAudioBridgeMode:
+                            requiredAudioBridgeMode
                     )
                 }
                 guard sourceProfile.sourceContainer
@@ -581,7 +641,18 @@ public enum PlaybackPreflight {
                     sourceProfile: sourceProfile,
                     hlsPackaging: nil,
                     reason: .hybridHEVC,
-                    capabilities: hybridCapabilities
+                    capabilities: hybridCapabilities,
+                    requiredAudioBridgeMode:
+                        requiredAudioBridgeMode
+                )
+            case .prores:
+                return hybridResult(
+                    sourceProfile: sourceProfile,
+                    hlsPackaging: nil,
+                    reason: .hybridProRes,
+                    capabilities: hybridCapabilities,
+                    requiredAudioBridgeMode:
+                        requiredAudioBridgeMode
                 )
             case .unknown:
                 return result(sourceProfile, nil, .unsupported, .unsupportedVideoCodec)
@@ -590,78 +661,42 @@ public enum PlaybackPreflight {
                     sourceProfile: sourceProfile,
                     hlsPackaging: nil,
                     reason: .hybridNonAVPlayerCodec,
-                    capabilities: hybridCapabilities
+                    capabilities: hybridCapabilities,
+                    requiredAudioBridgeMode:
+                        requiredAudioBridgeMode
                 )
             }
         }
     }
 
-    /// Resolve the only evidence-backed alternate route allowed after the
-    /// active route has exhausted its same-route rebuild. The source profile,
-    /// packaging and capability facts are unchanged.
+    /// Retained for source compatibility. A playback task cannot change
+    /// players after admission, so recovery never exposes an alternate route.
+    @available(
+        *,
+        deprecated,
+        message:
+            "Playback recovery is same-route only and never returns an alternate player"
+    )
     public static func resolveRecoveryAlternate(
         sourceProfile: AetherSourceProfile,
         hlsPackaging: HLSVideoPackaging?,
         excluding activeRoute: PlaybackRenderRoute,
-        hybridCapabilities: HybridPlaybackCapabilities
+        hybridCapabilities: HybridPlaybackCapabilities,
+        requiredAudioBridgeMode: AudioBridgeMode? = nil
     ) -> PlaybackPreflightResult? {
-        switch activeRoute {
-        case .nativeAVPlayer:
-            guard sourceProfile.sourceKind != .unclassifiedURL,
-                  sourceProfile.videoCodec != .unknown,
-                  sourceProfile.videoCodec != .h264,
-                  sourceProfile.videoCodec != .hevc else {
-                return nil
-            }
-            guard resolve(
-                sourceProfile: sourceProfile,
-                hlsPackaging: hlsPackaging,
-                hybridCapabilities: hybridCapabilities
-            ).route == .nativeAVPlayer else {
-                return nil
-            }
-            if sourceProfile.sourceKind == .progressive
-                || sourceProfile.sourceKind == .custom {
-                guard sourceProfile.sourceContainer
-                        .supportsNativeHLSFMP4Remux else {
-                    return nil
-                }
-            }
-            if sourceProfile.sourceKind == .hls {
-                guard let hlsPackaging,
-                      hlsPackaging.contentProtection == .none,
-                      hlsPackaging.codecVerification
-                        != .segmentNotInspected,
-                      hlsPackaging.actualVideoCodec
-                        == sourceProfile.videoCodec else {
-                    return nil
-                }
-            }
-            let result = hybridResult(
-                sourceProfile: sourceProfile,
-                hlsPackaging: hlsPackaging,
-                reason: .hybridRecoveryAfterNativeFailure,
-                capabilities: hybridCapabilities
-            )
-            return result.route == .hybridCarrier ? result : nil
-
-        case .hybridCarrier:
-            let result = resolve(
-                sourceProfile: sourceProfile,
-                hlsPackaging: hlsPackaging,
-                hybridCapabilities: hybridCapabilities
-            )
-            return result.route == .nativeAVPlayer ? result : nil
-
-        case .unsupported:
-            return nil
-        }
+        _ = sourceProfile
+        _ = hlsPackaging
+        _ = activeRoute
+        _ = hybridCapabilities
+        _ = requiredAudioBridgeMode
+        return nil
     }
 
     private static func resolveHLS(
         sourceProfile: AetherSourceProfile,
         hlsPackaging: HLSVideoPackaging?,
-        hybridCapabilities: HybridPlaybackCapabilities
+        hybridCapabilities: HybridPlaybackCapabilities,
+        requiredAudioBridgeMode: AudioBridgeMode?
     ) -> PlaybackPreflightResult {
         guard let hlsPackaging else {
             return result(sourceProfile, nil, .unsupported, .unsupportedHLSPreflightMissing)
@@ -711,7 +746,9 @@ public enum PlaybackPreflight {
                 sourceProfile: sourceProfile,
                 hlsPackaging: hlsPackaging,
                 reason: .hybridHLSMasterContainsHEVCVariant,
-                capabilities: hybridCapabilities
+                capabilities: hybridCapabilities,
+                requiredAudioBridgeMode:
+                    requiredAudioBridgeMode
             )
         }
         if sourceProfile.videoCodec == .hevc,
@@ -737,7 +774,9 @@ public enum PlaybackPreflight {
                 sourceProfile: sourceProfile,
                 hlsPackaging: hlsPackaging,
                 reason: .hybridInterlacedH264,
-                capabilities: hybridCapabilities
+                capabilities: hybridCapabilities,
+                requiredAudioBridgeMode:
+                    requiredAudioBridgeMode
             )
         }
 
@@ -748,8 +787,8 @@ public enum PlaybackPreflight {
                 hlsPackaging.codecVerification == .verified
                 || hlsPackaging.codecVerification
                     == .protectedManifestVerified
-        case .hevc, .av1, .vp9, .vp8, .mpeg2, .mpeg4Part2, .vc1,
-             .unknown:
+        case .hevc, .prores, .av1, .vp9, .vp8, .mpeg2,
+             .mpeg4Part2, .vc1, .unknown:
             nativeContractVerified = false
         }
         if hlsPackaging.contentProtection != .none {
@@ -794,7 +833,20 @@ public enum PlaybackPreflight {
                 sourceProfile: sourceProfile,
                 hlsPackaging: hlsPackaging,
                 reason: reason,
-                capabilities: hybridCapabilities
+                capabilities: hybridCapabilities,
+                requiredAudioBridgeMode:
+                    requiredAudioBridgeMode
+            )
+
+        case .prores:
+            // ProRes capability admission is currently proven only by the
+            // progressive/custom demux contract. Recognizing an HLS codec
+            // token is identity evidence, not an HLS packaging admission.
+            return result(
+                sourceProfile,
+                hlsPackaging,
+                .unsupported,
+                .unsupportedHLSVideoPackaging
             )
 
         case .unknown:
@@ -805,7 +857,9 @@ public enum PlaybackPreflight {
                 sourceProfile: sourceProfile,
                 hlsPackaging: hlsPackaging,
                 reason: .hybridNonAVPlayerCodec,
-                capabilities: hybridCapabilities
+                capabilities: hybridCapabilities,
+                requiredAudioBridgeMode:
+                    requiredAudioBridgeMode
             )
         }
     }
@@ -814,9 +868,24 @@ public enum PlaybackPreflight {
     /// black carrier while `AudioBridge` decodes the exact source audio and
     /// emits a truthful carrier rendition. It has no real-video decoder or
     /// presentation-surface requirement.
+    private static func audioBridgeIsAvailable(
+        capabilities: HybridPlaybackCapabilities,
+        requiredMode: AudioBridgeMode?
+    ) -> Bool {
+        guard let requiredMode else {
+            return capabilities.hasAudioBridgeCarrier
+                && !capabilities
+                    .supportedAudioBridgeModes.isEmpty
+        }
+        return capabilities.supportsAudioBridge(
+            mode: requiredMode
+        )
+    }
+
     private static func hybridAudioResult(
         sourceProfile: AetherSourceProfile,
-        capabilities: HybridPlaybackCapabilities
+        capabilities: HybridPlaybackCapabilities,
+        requiredAudioBridgeMode: AudioBridgeMode?
     ) -> PlaybackPreflightResult {
         guard sourceProfile.videoStreamPresence == .provenAbsent,
               sourceProfile.videoCodec == .unknown,
@@ -846,7 +915,19 @@ public enum PlaybackPreflight {
                 .unsupportedHybridSourceKind
             )
         }
-        guard capabilities.hasAudioBridgeCarrier else {
+        guard audioBridgeIsAvailable(
+            capabilities: capabilities,
+            requiredMode: requiredAudioBridgeMode
+        ) else {
+            return result(
+                sourceProfile,
+                nil,
+                .unsupported,
+                .unsupportedHybridAudioBridgeUnavailable
+            )
+        }
+        guard capabilities.libavcodecDecodableAudioCodecs
+                .contains(.vorbis) else {
             return result(
                 sourceProfile,
                 nil,
@@ -866,7 +947,8 @@ public enum PlaybackPreflight {
         sourceProfile: AetherSourceProfile,
         hlsPackaging: HLSVideoPackaging?,
         reason: PlaybackRouteReason,
-        capabilities: HybridPlaybackCapabilities
+        capabilities: HybridPlaybackCapabilities,
+        requiredAudioBridgeMode: AudioBridgeMode?
     ) -> PlaybackPreflightResult {
         guard sourceProfile.isSeekableVOD else {
             return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHybridRequiresSeekableVOD)
@@ -876,6 +958,33 @@ public enum PlaybackPreflight {
         }
         guard capabilities.hasDirectVideoDecoder else {
             return result(sourceProfile, hlsPackaging, .unsupported, .unsupportedHybridDecoderUnavailable)
+        }
+        if softwareDecodedVideoCodecs.contains(
+            sourceProfile.videoCodec
+        ) {
+            guard capabilities.libavcodecDecodableVideoCodecs
+                    .contains(sourceProfile.videoCodec) else {
+                return result(
+                    sourceProfile,
+                    hlsPackaging,
+                    .unsupported,
+                    .unsupportedHybridDecoderUnavailable
+                )
+            }
+        }
+        if sourceProfile.audioCodecs.contains(.pcmS24LE),
+           (!capabilities.libavcodecDecodableAudioCodecs
+                .contains(.pcmS24LE)
+            || !audioBridgeIsAvailable(
+                capabilities: capabilities,
+                requiredMode: requiredAudioBridgeMode
+            )) {
+                return result(
+                    sourceProfile,
+                    hlsPackaging,
+                    .unsupported,
+                    .unsupportedHybridAudioBridgeUnavailable
+                )
         }
         guard capabilities.hasSampleBufferRenderer else {
             return result(

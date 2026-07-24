@@ -14,6 +14,54 @@ import UIKit
 #endif
 import MediaPlayer
 
+/// Serializes public lifecycle admission behind the exact detached native-I/O
+/// teardown that preceded it. The handle identity prevents an older waiter
+/// from clearing a newer cleanup installed while it was suspended.
+final class AetherEngineIOCleanupFence: @unchecked Sendable {
+    struct Handle: Sendable {
+        fileprivate let id: UInt64
+        fileprivate let task: Task<Void, Never>
+    }
+
+    private let lock = NSLock()
+    private var nextID: UInt64 = 0
+    private var pending: Handle?
+
+    @discardableResult
+    func install(_ task: Task<Void, Never>) -> Handle {
+        lock.lock()
+        nextID &+= 1
+        let handle = Handle(id: nextID, task: task)
+        pending = handle
+        lock.unlock()
+        return handle
+    }
+
+    func snapshot() -> Handle? {
+        lock.lock()
+        defer { lock.unlock() }
+        return pending
+    }
+
+    func wait(for handle: Handle) async {
+        await handle.task.value
+        clearIfCurrent(handle)
+    }
+
+    private func clearIfCurrent(_ handle: Handle) {
+        lock.lock()
+        if pending?.id == handle.id {
+            pending = nil
+        }
+        lock.unlock()
+    }
+
+    func waitForCurrent() async {
+        guard let handle = snapshot() else { return }
+        await wait(for: handle)
+    }
+}
+
 /// AetherEngine, format-agnostic video muxer that feeds AVPlayer.
 ///
 /// Open-source LGPL 3.0 engine that takes any source (HTTP, file://,
@@ -465,6 +513,10 @@ public final class AetherEngine: ObservableObject {
 
     /// Loopback HLS-fMP4 engine. Non-nil between load and stop.
     var nativeVideoSession: HLSVideoEngine?
+    /// Exact detached loopback teardown that gates public stop/load lifecycle
+    /// publication and successor reader admission.
+    private let nativeVideoIOCleanupFence =
+        AetherEngineIOCleanupFence()
     /// Thread-safe starvation inputs for session-coupled FrameExtractor yield closures
     /// (#93 startup); written on load/stop and by the 1 Hz telemetry tick.
     let extractorYieldState = ExtractorYieldState()
@@ -743,18 +795,14 @@ public final class AetherEngine: ObservableObject {
     nonisolated static let stallReengageGraceSeconds: TimeInterval = 6.0
 
     /// #93 round 3: item death (failedToPlayToEndTime after -12889 strikes) escalation.
-    /// Deferred-confirm task (a transient that resumes within the window self-clears) plus the
-    /// bounded reload budget. Cancelled on load reset; superseded by newer deaths.
+    /// Deferred-confirm task (a transient that resumes within the window
+    /// self-clears) plus unbounded, progress-aware same-item recovery. Cancelled
+    /// on load reset; superseded by newer deaths.
     var itemDeathConfirmTask: Task<Void, Never>? = nil
-    var itemDeathReviveGate = ItemDeathReviveGate(maxAttempts: 3)
+    var itemDeathReviveGate = ItemDeathReviveGate()
     nonisolated static let itemDeathConfirmSeconds: TimeInterval = 3.0
 
-    /// Single-shot latch for the reactive master->media fallback (#98): fall back at most once per
-    /// session so a media reload that also fails cannot loop. Reset on each load.
-    var masterFallbackUsed = false
-
-    /// Start position of the current loopback video load, replayed if the master is rejected and we
-    /// reload the media playlist (a startup-failed item has no reliable renderedTime).
+    /// Start position of the current loopback video load.
     var lastNativeVideoStartPosition: Double = 0
 
     /// #93 PiP skips: AVKit-side seeks (PiP +-15s buttons) bypass the engine seek API, so a far
@@ -856,41 +904,85 @@ public final class AetherEngine: ObservableObject {
     /// the AVPlayer instance alive); segments are in retention so the reload serves instantly.
     /// Native subtitle rendition selection is per-item, so the host's last request is replayed
     /// onto the fresh item below (an active PiP rendition otherwise silently disappeared).
-    /// React to a display rejecting the served master (#98): if eligible, reload the media playlist
-    /// in place (single-variant, SDR-tone-mappable); otherwise surface the failure normally.
-    @MainActor
-    func fallBackToMediaPlaylist(_ rejection: DisplayRejection) {
-        guard let host = nativeHost, let session = nativeVideoSession else {
-            state = .error(rejection.message)
-            return
-        }
-        guard MasterFallbackDecision.shouldFallBackToMediaPlaylist(
-            errorCode: rejection.code,
-            servingMasterPlaylist: session.servingMasterPlaylist,
-            alreadyFellBack: masterFallbackUsed),
-              let mediaURL = session.mediaPlaylistURL else {
-            state = .error(rejection.message)
-            return
-        }
-        masterFallbackUsed = true
-        session.markServingMediaAfterFallback()
-        nativeSubtitleRenditionsServed = false
-        let position = lastNativeVideoStartPosition
-        EngineLog.emit(
-            "[AetherEngine] display rejected the master (code=\(rejection.code)); falling back to "
-            + "media playlist (SDR tone-mapping, no CC/subtitle renditions) at "
-            + "\(String(format: "%.2f", position))s",
-            category: .session)
-        host.load(url: mediaURL, startPosition: position, inPlaceSwap: true)
-        host.play()
+    nonisolated static func nativeStartupFailure(
+        domain: String?,
+        code: Int?
+    ) -> AetherPlaybackFailure {
+        let resolvedCode = code ?? 0
+        let displayRejected =
+            MasterFallbackDecision
+                .productionAction(
+                    errorCode:
+                        resolvedCode
+                ) == .failTyped
+        return AetherPlaybackFailure(
+            stage: .presentation,
+            kind: displayRejected
+                ? .unsupportedCapability
+                : .routeRuntimeFailure,
+            domain:
+                domain
+                    ?? "AVFoundationErrorDomain",
+            code: resolvedCode,
+            caseCode: displayRejected
+                ? "native.displayCapabilityRejected"
+                : "native.startupItemFailed",
+            reason: displayRejected
+                ? "native.presentation.displayCapabilityRejected"
+                : "native.presentation.startupItemFailed"
+        )
     }
 
-    /// #35 readiness-gate settle windows. Generous enough that a slow-but-healthy cold start reads as
-    /// ready (early-out on presentationSize / first play), tight enough that two failed master attempts
-    /// plus a media fallback stay within ~8.5s worst case. Tunable from device logs.
-    static let startupGateInitialSeconds: Double = 3.0
-    static let startupGateReloadSeconds: Double = 3.0
-    static let startupGateMediaSeconds: Double = 2.5
+    /// Positive display rejection terminates the exact capability contract.
+    /// It never authorizes a reduced master or media-playlist downgrade.
+    @MainActor
+    func handleDisplayRejection(
+        _ rejection: DisplayRejection
+    ) {
+        guard let session =
+                nativeVideoSession else {
+            state = .error(rejection.message)
+            return
+        }
+        guard MasterFallbackDecision
+                .productionAction(
+                    errorCode:
+                        rejection.code
+                ) == .failTyped else {
+            state = .error(rejection.message)
+            return
+        }
+        let failure =
+            Self.nativeStartupFailure(
+                domain:
+                    "AVFoundationErrorDomain",
+                code: rejection.code
+            )
+        _ = session
+            .publishTerminalReopenFailure(
+                failure,
+                epoch:
+                    session
+                        .sessionEpochSnapshot()
+            )
+        EngineLog.emit(
+            "[AetherEngine] display rejected the exact master "
+                + "(code=\(rejection.code)); publishing typed "
+                + "capability terminal without playlist/player transition",
+            category: .session
+        )
+        state = .error(
+            failure.reason
+        )
+    }
+
+    /// First liveness checkpoint. It is observation-only: crossing it never
+    /// reloads or downgrades the selected master.
+    static let startupReadinessDiagnosticSeconds:
+        Double = AetherPlaybackLivenessPolicy
+            .production
+            .diagnosticCheckpointsSeconds
+            .first ?? 15
 
     /// #124: whether a completed load runs its terminal autostart, the single decision every load
     /// path routes through: the native/software/audio `host.play()` + `state = .playing`, and the
@@ -902,14 +994,36 @@ public final class AetherEngine: ObservableObject {
         options.autoplay
     }
 
-    /// #35 cold-DV-master startup-readiness gate. A DV master (P7->P8.1, or any HDR master)
-    /// instantiated while the HDMI DV/HDCP decode path is still warming right after an SDR->HDR switch
-    /// resolves 0 tracks (silent park) or fails -11819 "Cannot Complete Action"; neither is a
-    /// -11868/-11848 rejection, so the reactive #98 path never fires and startup surfaces "Playback
-    /// stopped". A second launch just works because the failed attempt warmed the link. This gate
-    /// replays that recovery in-session: play, poll readiness, and on a cold failure reload the SAME
-    /// master with a fresh asset (bounded) before falling back to the media playlist (HDR10 base, no
-    /// DV upgrade). Bounded at every stage, so a cold resume can never hang forever on 0 tracks.
+    /// Native state is evidence-driven: intent alone never publishes
+    /// `.playing`. Before the first real `.playing` observation, a slow,
+    /// failed or paused-by-AVFoundation item stays `.loading`; after a frame,
+    /// waiting/failed-item recovery remains truthfully playing+buffering.
+    nonisolated static func nativeObservedPlaybackState(
+        status: AVPlayer.TimeControlStatus,
+        playIntent: Bool,
+        hasPresentedFrame: Bool
+    ) -> PlaybackState {
+        guard playIntent else {
+            return .paused
+        }
+        switch status {
+        case .playing:
+            return .playing
+        case .waitingToPlayAtSpecifiedRate,
+             .paused:
+            return hasPresentedFrame
+                ? .playing
+                : .loading
+        @unknown default:
+            return hasPresentedFrame
+                ? .playing
+                : .loading
+        }
+    }
+
+    /// Observation-only cold-DV/HDR checkpoint. A slow or generically failed
+    /// item remains on its exact recovery contract. Positive display
+    /// rejection alone is typed and fail-closed.
     @MainActor
     private func runStartupReadinessGate(
         session: HLSVideoEngine, position: Double, gen: UInt64
@@ -918,103 +1032,57 @@ public final class AetherEngine: ObservableObject {
         host.startupReadinessGateActive = true
         defer { host.startupReadinessGateActive = false }
 
-        var attempt = 1
-        while true {
-            // Attempt 1 plays the item the load path already created; later attempts replay it fresh.
-            host.play()
-            let timeout = attempt == 1
-                ? Self.startupGateInitialSeconds
-                : Self.startupGateReloadSeconds
-            let outcome = await host.awaitStartupReadiness(timeoutSeconds: timeout)
-            try checkLoadCurrent(gen)
+        host.play()
+        let outcome =
+            await host.awaitStartupReadiness(
+                timeoutSeconds:
+                    Self
+                        .startupReadinessDiagnosticSeconds
+            )
+        try checkLoadCurrent(gen)
 
-            switch StartupReadinessGate.nextAction(
-                outcome: outcome,
-                attempt: attempt,
-                masterAlreadyFellBack: masterFallbackUsed,
-                hasMediaFallbackURL: session.mediaPlaylistURL != nil
-            ) {
-            case .proceed:
-                return
-
-            case .reloadMaster:
-                guard let masterURL = session.masterPlaylistURL else {
-                    // Master URL unavailable (should not happen while serving the master): force the
-                    // fallback path on the next loop rather than reloading a URL we don't have.
-                    attempt = StartupReadinessGate.masterAttempts
-                    continue
-                }
-                EngineLog.emit(
-                    "[AetherEngine] #35 readiness gate: master did not start (\(outcome)) after a "
-                    + "panel switch; reloading the master (attempt \(attempt + 1)/"
-                    + "\(StartupReadinessGate.masterAttempts), link may still be warming) at "
-                    + "\(String(format: "%.2f", position))s",
-                    category: .session)
-                host.load(url: masterURL, startPosition: position, inPlaceSwap: true)
-                attempt += 1
-
-            case .fallBackToMedia:
-                // #98: before the bare (subtitle-less) media playlist, try the HDR-preserving reduced
-                // master. It keeps HDR10 + subtitle renditions and, being plain hvc1 without DV signaling,
-                // may start where the cold DV handshake did not. This case is terminal (returns/throws),
-                // so it runs at most once per gate; no guard needed.
-                if let reducedURL = session.reducedHDRMasterPlaylistURL {
-                    EngineLog.emit(
-                        "[AetherEngine] #35 readiness gate: master never produced tracks; trying the "
-                        + "HDR-preserving reduced master (subtitles preserved, DV dropped) at "
-                        + "\(String(format: "%.2f", position))s",
-                        category: .session)
-                    host.load(url: reducedURL, startPosition: position, inPlaceSwap: true)
-                    host.play()
-                    let reducedOutcome = await host.awaitStartupReadiness(
-                        timeoutSeconds: Self.startupGateReloadSeconds)
-                    try checkLoadCurrent(gen)
-                    if reducedOutcome == .ready {
-                        EngineLog.emit(
-                            "[AetherEngine] #35 readiness gate: reduced master started; HDR10 base and "
-                            + "subtitles preserved (DV upgrade dropped this session)",
-                            category: .session)
-                        return
-                    }
-                }
-                guard let mediaURL = session.mediaPlaylistURL else {
-                    throw StartupGateFailure(message: startupGateFailureMessage(host))
-                }
-                masterFallbackUsed = true
-                session.markServingMediaAfterFallback()
-                nativeSubtitleRenditionsServed = false
-                EngineLog.emit(
-                    "[AetherEngine] #35 readiness gate: master never produced tracks after "
-                    + "\(StartupReadinessGate.masterAttempts) attempts; falling back to the media "
-                    + "playlist at \(String(format: "%.2f", position))s (HDR10 base, DV upgrade "
-                    + "dropped this session)",
-                    category: .session)
-                host.load(url: mediaURL, startPosition: position, inPlaceSwap: true)
-                host.play()
-                // Best-effort readiness confirm; the media playlist is the universal-compatible route.
-                // Clearing the gate (defer) lets a genuine residual media failure surface normally via
-                // the host's startup path -- no false-negative terminal error, still bounded.
-                _ = await host.awaitStartupReadiness(timeoutSeconds: Self.startupGateMediaSeconds)
-                try checkLoadCurrent(gen)
-                return
-
-            case .giveUp:
-                throw StartupGateFailure(message: startupGateFailureMessage(host))
-            }
+        switch StartupReadinessGate
+            .nextAction(outcome: outcome) {
+        case .proceed:
+            return
+        case .observeSameItem:
+            EngineLog.emit(
+                "[AetherEngine] readiness diagnostic checkpoint "
+                    + "\(Int(Self.startupReadinessDiagnosticSeconds))s "
+                    + "reached at "
+                    + "\(String(format: "%.2f", position))s; "
+                    + "same master/item/capabilities remain active",
+                category: .session
+            )
+            return
+        case .failTyped(let rejection):
+            let failure =
+                Self.nativeStartupFailure(
+                    domain:
+                        "AVFoundationErrorDomain",
+                    code:
+                        rejection.code
+                )
+            _ = session
+                .publishTerminalReopenFailure(
+                    failure,
+                    epoch:
+                        session
+                            .sessionEpochSnapshot()
+                )
+            throw failure
         }
     }
 
-    /// The message for a terminal gate failure: prefer the real startup error the gate suppressed
-    /// while it held the item; fall back to a generic line for a silent 0-track park (no `.failed`).
-    @MainActor
-    private func startupGateFailureMessage(_ host: NativeAVPlayerHost) -> String {
-        host.lastSuppressedStartupFailure
-            ?? "The video could not start (no playable tracks after the display handshake)."
-    }
-
-    func reloadStalledConsumerItem(position: Double, allowPausedConsumer: Bool = false) {
-        guard let host = nativeHost, let player = currentAVPlayer,
-              let url = (player.currentItem?.asset as? AVURLAsset)?.url else { return }
+    func reloadStalledConsumerItem(
+        position: Double,
+        allowPausedConsumer: Bool = false,
+        logRecovery: Bool = true
+    ) {
+        guard let host = nativeHost,
+              let player = currentAVPlayer else {
+            return
+        }
         // Item death parks tcs at .paused; only that trigger may bypass the user-pause guard.
         guard Self.stalledConsumerRecoveryAllowed(
             consumerIsPaused: player.timeControlStatus == .paused,
@@ -1023,22 +1091,35 @@ public final class AetherEngine: ObservableObject {
             frozenPosition: position, pendingSeekTarget: pendingRecoverySeekClockTarget,
             currentRendered: player.currentTime().seconds)
         stallRecoveryWindowUntil = Date().addingTimeInterval(Self.stallRecoveryWindowSeconds)
-        EngineLog.emit(
-            "[AetherEngine] #65 nudge did not revive the consumer; reloading item at "
-            + "\(String(format: "%.2f", anchor))s"
-            + Self.recoveryAnchorLogSuffix(
-                anchor: anchor, position: position,
-                pendingSeekTarget: pendingRecoverySeekClockTarget)
-            + " (same URL, same host)",
-            category: .engine
-        )
-        host.load(url: url, startPosition: anchor, inPlaceSwap: true)
-        host.play()
-        if let ordinal = nativeSubtitleReapplyOrdinal {
+        if logRecovery {
             EngineLog.emit(
-                "[AetherEngine] #65 re-applying native subtitle ordinal=\(ordinal) after item reload",
+                "[AetherEngine] #65 nudge did not revive the consumer; reloading item at "
+                + "\(String(format: "%.2f", anchor))s"
+                + Self.recoveryAnchorLogSuffix(
+                    anchor: anchor, position: position,
+                    pendingSeekTarget: pendingRecoverySeekClockTarget)
+                + " (same source contract, same host)",
                 category: .engine
             )
+        }
+        guard host.reloadCurrentItemInPlace(
+            at: anchor
+        ) else {
+            EngineLog.emit(
+                "[AetherEngine] same-item recovery ignored: "
+                    + "no active native load contract",
+                category: .engine
+            )
+            return
+        }
+        host.play()
+        if let ordinal = nativeSubtitleReapplyOrdinal {
+            if logRecovery {
+                EngineLog.emit(
+                    "[AetherEngine] #65 re-applying native subtitle ordinal=\(ordinal) after item reload",
+                    category: .engine
+                )
+            }
             // The select path's own stall-recovery retries (#32) cover the fresh item's
             // not-ready window; the stores are already filled, so the pre-fill returns fast.
             setNativeSubtitleSelected(track: ordinal)
@@ -1395,6 +1476,18 @@ public final class AetherEngine: ObservableObject {
         // the SW dispatch branch releases it if this source routes software.
         let priorBackendWasNative = (playbackBackend == .native)
         stopInternal(keepNativeHost: priorBackendWasNative)
+        // Capture this load's generation before suspension. A newer stop/load
+        // may install another cleanup while this task waits; in that case the
+        // generation check rejects this predecessor before it admits any
+        // source reader or publishes `.loading`.
+        let gen = loadGeneration
+        if let cleanup =
+            nativeVideoIOCleanupFence.snapshot() {
+            await nativeVideoIOCleanupFence.wait(
+                for: cleanup
+            )
+            try checkLoadCurrent(gen)
+        }
         // #35/#93: a genuinely new item has not rendered yet; re-arm the cold-startup wedge suspension.
         // Scrub/seek/producer-restart never route through load(), so mid-stream #93 detection stays armed.
         hasRenderedFirstFrameMirror.set(false)
@@ -1403,8 +1496,6 @@ public final class AetherEngine: ObservableObject {
         // genuinely new load clears it, which also keeps custom sources (shared placeholder URL) from
         // bleeding one disc's structure into the next.
         DiscReader.clearCache()
-        // Capture generation; every suspension point re-checks for supersession.
-        let gen = loadGeneration
         // For custom sources this is a synthetic placeholder; all I/O runs against the preopened probe demuxer.
         let url: URL
         switch source {
@@ -1449,8 +1540,7 @@ public final class AetherEngine: ObservableObject {
         stallReengageTask = nil
         itemDeathConfirmTask?.cancel()
         itemDeathConfirmTask = nil
-        itemDeathReviveGate = ItemDeathReviveGate(maxAttempts: 3)
-        masterFallbackUsed = false
+        itemDeathReviveGate = ItemDeathReviveGate()
         nativeSubtitleReanchorTask?.cancel()
         nativeSubtitleReanchorTask = nil
         setPendingRecoverySeekTarget(nil)
@@ -1648,7 +1738,16 @@ public final class AetherEngine: ObservableObject {
         let resolvedInitialAudio = selectedAudio ?? probedDefaultAudioIndex
         activeAudioTrackIndex = resolvedInitialAudio >= 0 ? Int(resolvedInitialAudio) : nil
         let snappedRate = FrameRateSnap.snap(detectedRate ?? 0)
-        EngineLog.emit("[AetherEngine] load url=\(url.absoluteString) source-format=\(detectedFormat) effective-format=\(effectiveFormat) rate=\(snappedRate.map { String(format: "%.3f", $0) } ?? "n/a")", category: .engine)
+        EngineLog.emit(
+            "[AetherEngine] load source="
+                + "\(url.isFileURL ? "file" : "remote") "
+                + "host=\(url.host ?? "none") "
+                + "source-format=\(detectedFormat) "
+                + "effective-format=\(effectiveFormat) "
+                + "rate="
+                + "\(snappedRate.map { String(format: "%.3f", $0) } ?? "n/a")",
+            category: .engine
+        )
 
         // 1.5 Audio-only fast path: no display-criteria handshake, no video dispatch.
         //     Native sub-branch closes the probe and reopens via AVPlayer; FFmpeg sub-branch reuses the probe
@@ -1897,6 +1996,21 @@ public final class AetherEngine: ObservableObject {
                     // this; fresh joins keep the verified seek-to-0.
                     liveRejoin: options.isLiveRejoin,
                     preopenedDemuxer: probeOpened ? probe : nil,
+                    progressiveSourceByteStore:
+                        preparedURLSource?
+                            .sourceByteStore,
+                    progressiveSourceGeneration:
+                        preparedURLSource?
+                            .sourceGeneration,
+                    progressiveFetchedByteProgressLedger:
+                        preparedURLSource?
+                            .fetchedByteProgressLedger,
+                    progressiveFetchedByteProgress:
+                        preparedURLSource?
+                            .onFetchedByteProgress,
+                    progressiveProbeMilestone:
+                        preparedURLSource?
+                            .onProbeMilestone,
                     generation: gen
                 )
                 playbackBackend = .native
@@ -1917,10 +2031,11 @@ public final class AetherEngine: ObservableObject {
                 await displayCriteria.waitForSwitch()
                 try checkLoadCurrent(gen)
                 // automaticallyWaitsToMinimizeStalling=true (default) handles play-before-ready.
-                // #35: on a real SDR->HDR switch while serving a VOD master, drive the bounded
-                // cold-start readiness gate (play -> poll -> reload master -> media fallback) instead
-                // of an unconditional play(); the gate calls play() itself. Warm/live/media paths keep
-                // the immediate play().
+                // #35: on a real SDR->HDR switch while serving a VOD master,
+                // drive the observation-only cold-start readiness checkpoint
+                // instead of an unconditional play(); the gate calls play()
+                // itself. Generic death remains on the exact-contract recovery
+                // path, and only display rejection fails typed.
                 // #124: a paused mount skips the terminal play() AND the cold-start readiness gate
                 // (an autostart-path recovery: it plays to poll readiness). loadNative wired
                 // host.$isReady, which settles .loading -> .paused; the host resumes later with play().
@@ -1932,7 +2047,25 @@ public final class AetherEngine: ObservableObject {
                     } else {
                         nativeHost?.play()
                     }
-                    state = .playing
+                    if let host = nativeHost {
+                        switch state {
+                        case .error:
+                            break
+                        default:
+                            state =
+                                Self.nativeObservedPlaybackState(
+                                    status:
+                                        host
+                                            .timeControlStatus,
+                                    playIntent:
+                                        host
+                                            .transportIntentIsPlaying,
+                                    hasPresentedFrame:
+                                        hasRenderedFirstFrameMirror
+                                            .get()
+                                )
+                        }
+                    }
                 }
                 startMemoryProbe()
                 startLiveTelemetrySampler()
@@ -2256,7 +2389,9 @@ public final class AetherEngine: ObservableObject {
 
     public func stop() {
         stopInternal()
-        state = .idle
+        let stopGeneration = loadGeneration
+        let cleanup =
+            nativeVideoIOCleanupFence.snapshot()
         clock.currentTime = 0
         clock.bufferedPosition = 0
         clock.progress = 0
@@ -2289,6 +2424,52 @@ public final class AetherEngine: ObservableObject {
         loadedURL = nil
         isCustomSource = false
         customSourceIsSeekable = false
+
+        guard let cleanup else {
+            publishIdleAfterStop(
+                generation: stopGeneration
+            )
+            return
+        }
+        // `stop()` remains source-compatible for existing synchronous hosts,
+        // but `.idle` is not reloadable truth until the detached producer and
+        // every owned Demuxer have reached real I/O quiescence.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.nativeVideoIOCleanupFence.wait(
+                for: cleanup
+            )
+            self.publishIdleAfterStop(
+                generation: stopGeneration
+            )
+        }
+    }
+
+    private func publishIdleAfterStop(
+        generation: UInt64
+    ) {
+        guard loadGeneration == generation else {
+            return
+        }
+        state = .idle
+    }
+
+    /// Waits for the reader and producer detached by the most recent stop.
+    /// Public load and stop finalization use the same exact handle, so a
+    /// timeout can diagnose slow cancellation but can never release the
+    /// successor-admission fence.
+    func waitForIOQuiescence() async {
+        await nativeVideoIOCleanupFence
+            .waitForCurrent()
+    }
+
+    /// Installs the exact cleanup returned by the current native video
+    /// session. Internal so deterministic lifecycle tests exercise the same
+    /// seam without constructing a network-backed HLS session.
+    func installNativeVideoIOCleanup(
+        _ task: Task<Void, Never>
+    ) {
+        nativeVideoIOCleanupFence.install(task)
     }
 
     /// Active AVPlayer on the native path, nil on SW path or when idle. Published so hosts driving an
@@ -2605,13 +2786,20 @@ public final class AetherEngine: ObservableObject {
         liveTelemetrySampler?.stop()
         liveTelemetrySampler = nil
         diagnostics.liveTelemetry = nil
+        itemDeathConfirmTask?.cancel()
+        itemDeathConfirmTask = nil
+        itemDeathReviveGate =
+            ItemDeathReviveGate()
         nativeCancellables.removeAll()
         nativeHost?.tearDown()
         if !keepNativeHost {
             nativeHost = nil
             currentAVPlayer = nil
         }
-        nativeVideoSession?.stop()
+        if let cleanup = nativeVideoSession?
+            .stopWithIOQuiescenceHandle() {
+            installNativeVideoIOCleanup(cleanup)
+        }
         nativeVideoSession = nil
         nativeSubtitleRenditionsServed = false
         extractorYieldState.deactivate()

@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import AVFoundation
 @testable import AetherEngine
 
 /// #124: `LoadOptions.autoplay` lets a host mount media paused (a synchronized-start lobby, a
@@ -25,5 +26,48 @@ struct Issue124LoadPausedAutoplayTests {
     func autostartGate() {
         #expect(AetherEngine.loadPerformsAutostart(LoadOptions(autoplay: true)))
         #expect(!AetherEngine.loadPerformsAutostart(LoadOptions(autoplay: false)))
+    }
+
+    @Test("native autostart remains loading until AVPlayer really plays")
+    func nativeAutostartNeedsObservedPlayback() {
+        #expect(
+            AetherEngine.nativeObservedPlaybackState(
+                status: .paused,
+                playIntent: true,
+                hasPresentedFrame: false
+            ) == .loading
+        )
+        #expect(
+            AetherEngine.nativeObservedPlaybackState(
+                status: .waitingToPlayAtSpecifiedRate,
+                playIntent: true,
+                hasPresentedFrame: false
+            ) == .loading
+        )
+        #expect(
+            AetherEngine.nativeObservedPlaybackState(
+                status: .playing,
+                playIntent: true,
+                hasPresentedFrame: false
+            ) == .playing
+        )
+    }
+
+    @Test("native pause and post-frame buffering remain truthful")
+    func nativePauseAndRebufferState() {
+        #expect(
+            AetherEngine.nativeObservedPlaybackState(
+                status: .paused,
+                playIntent: false,
+                hasPresentedFrame: true
+            ) == .paused
+        )
+        #expect(
+            AetherEngine.nativeObservedPlaybackState(
+                status: .waitingToPlayAtSpecifiedRate,
+                playIntent: true,
+                hasPresentedFrame: true
+            ) == .playing
+        )
     }
 }

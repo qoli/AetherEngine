@@ -2,6 +2,7 @@ import AVFoundation
 import Combine
 import CoreMedia
 import Foundation
+import Libavcodec
 
 #if os(tvOS)
 import AVKit
@@ -209,10 +210,34 @@ final class AetherHybridPlaybackSession: ObservableObject {
     /// SDR, HDR10, HLG, and verified Dolby Vision Profile 8.4; every other
     /// color format is rejected by preflight rather than tone-mapped.
     public nonisolated static var capabilities: HybridPlaybackCapabilities {
-        HybridPlaybackCapabilities(
+        var videoCodecs: Set<AetherVideoCodec> = []
+        for (codec, codecID) in [
+            (AetherVideoCodec.h264, AV_CODEC_ID_H264),
+            (.prores, AV_CODEC_ID_PRORES),
+            (.av1, AV_CODEC_ID_AV1),
+            (.vp9, AV_CODEC_ID_VP9),
+            (.vp8, AV_CODEC_ID_VP8),
+            (.mpeg2, AV_CODEC_ID_MPEG2VIDEO),
+            (.mpeg4Part2, AV_CODEC_ID_MPEG4),
+            (.vc1, AV_CODEC_ID_VC1),
+        ] where avcodec_find_decoder(codecID) != nil {
+            videoCodecs.insert(codec)
+        }
+        var audioCodecs: Set<AetherAudioCodec> = []
+        if avcodec_find_decoder(AV_CODEC_ID_PCM_S24LE) != nil {
+            audioCodecs.insert(.pcmS24LE)
+        }
+        if avcodec_find_decoder(AV_CODEC_ID_VORBIS) != nil {
+            audioCodecs.insert(.vorbis)
+        }
+        let audioBridgeModes = AudioBridge.supportedModes
+        return HybridPlaybackCapabilities(
             hasDirectVideoDecoder: true,
+            libavcodecDecodableVideoCodecs: videoCodecs,
+            libavcodecDecodableAudioCodecs: audioCodecs,
             hasSampleBufferRenderer: true,
-            hasAudioBridgeCarrier: true,
+            hasAudioBridgeCarrier: !audioBridgeModes.isEmpty,
+            supportedAudioBridgeModes: audioBridgeModes,
             supportedVideoFormats: AetherHybridPresentationView
                 .verifiedVideoFormats,
             supportedDolbyVisionProfiles: [.profile84],
@@ -267,6 +292,10 @@ final class AetherHybridPlaybackSession: ObservableObject {
     private let telemetryHub:
         AetherHybridPlaybackTelemetryHub
     private var videoOutputSequence: UInt64 = 0
+    var routePreparationRetryEventDidChange:
+        (@MainActor @Sendable (
+            AetherRoutePreparationRetryEvent
+        ) -> Void)?
     #if os(tvOS)
     private weak var configuredCarrierPlayerViewController:
         AVPlayerViewController?
@@ -344,6 +373,10 @@ final class AetherHybridPlaybackSession: ObservableObject {
             [weak self] trackID in
             self?.selectedAudioAnalysisTrackID = trackID
         }
+        core.routePreparationRetryEventDidChange = {
+            [weak self] event in
+            self?.routePreparationRetryEventDidChange?(event)
+        }
         #if os(tvOS)
         core.runtimePresentationValidation = {
             [weak self] in
@@ -380,15 +413,10 @@ final class AetherHybridPlaybackSession: ObservableObject {
         let currentResult = PlaybackPreflight.resolve(
             sourceProfile: preflightResult.sourceProfile,
             hlsPackaging: preflightResult.hlsPackaging,
-            hybridCapabilities: capabilities
+            hybridCapabilities: capabilities,
+            requiredAudioBridgeMode: options.audioBridgeMode
         )
-        guard currentResult == preflightResult
-                || PlaybackPreflight.resolveRecoveryAlternate(
-                    sourceProfile: preflightResult.sourceProfile,
-                    hlsPackaging: preflightResult.hlsPackaging,
-                    excluding: .nativeAVPlayer,
-                    hybridCapabilities: capabilities
-                ) == preflightResult else {
+        guard currentResult == preflightResult else {
             throw HybridPlaybackSessionError
                 .preflightContractChanged(
                     route: currentResult.route,
@@ -496,6 +524,9 @@ final class AetherHybridPlaybackSession: ObservableObject {
         preflightResult: PlaybackPreflightResult,
         avPlayer: AVPlayer,
         decoderPreference: HybridVideoDecoderPreference = .automatic,
+        videoBacklogConfiguration:
+            HybridCompressedVideoBacklogConfiguration = .production,
+        videoBacklogScratchRoot: URL? = nil,
         initialGeneration: UInt64 = 0,
         selectTitleID: Int? = nil
     ) async throws -> AetherHybridPlaybackSession {
@@ -507,6 +538,10 @@ final class AetherHybridPlaybackSession: ObservableObject {
             preflightResult: preflightResult,
             avPlayer: avPlayer,
             decoderPreference: decoderPreference,
+            videoBacklogConfiguration:
+                videoBacklogConfiguration,
+            videoBacklogScratchRoot:
+                videoBacklogScratchRoot,
             initialGeneration: initialGeneration,
             selectTitleID: selectTitleID
         )
@@ -520,6 +555,9 @@ final class AetherHybridPlaybackSession: ObservableObject {
         preflightResult: PlaybackPreflightResult,
         avPlayer: AVPlayer,
         decoderPreference: HybridVideoDecoderPreference,
+        videoBacklogConfiguration:
+            HybridCompressedVideoBacklogConfiguration,
+        videoBacklogScratchRoot: URL?,
         initialGeneration: UInt64,
         selectTitleID: Int?
     ) async throws -> AetherHybridPlaybackSession {
@@ -532,15 +570,10 @@ final class AetherHybridPlaybackSession: ObservableObject {
         let currentResult = PlaybackPreflight.resolve(
             sourceProfile: preflightResult.sourceProfile,
             hlsPackaging: preflightResult.hlsPackaging,
-            hybridCapabilities: capabilities
+            hybridCapabilities: capabilities,
+            requiredAudioBridgeMode: options.audioBridgeMode
         )
-        guard currentResult == preflightResult
-                || PlaybackPreflight.resolveRecoveryAlternate(
-                    sourceProfile: preflightResult.sourceProfile,
-                    hlsPackaging: preflightResult.hlsPackaging,
-                    excluding: .nativeAVPlayer,
-                    hybridCapabilities: capabilities
-                ) == preflightResult else {
+        guard currentResult == preflightResult else {
             throw HybridPlaybackSessionError.preflightContractChanged(
                 route: currentResult.route,
                 reason: currentResult.reason
@@ -578,6 +611,10 @@ final class AetherHybridPlaybackSession: ObservableObject {
                 timeline: timeline,
                 avPlayer: avPlayer,
                 decoderPreference: decoderPreference,
+                videoBacklogConfiguration:
+                    videoBacklogConfiguration,
+                videoBacklogScratchRoot:
+                    videoBacklogScratchRoot,
                 initialGeneration: initialGeneration,
                 selectTitleID: selectTitleID
             )
@@ -657,15 +694,10 @@ final class AetherHybridPlaybackSession: ObservableObject {
         let currentResult = PlaybackPreflight.resolve(
             sourceProfile: preflight.result.sourceProfile,
             hlsPackaging: preflight.result.hlsPackaging,
-            hybridCapabilities: capabilities
+            hybridCapabilities: capabilities,
+            requiredAudioBridgeMode: bridgeMode
         )
-        guard currentResult == preflight.result
-                || PlaybackPreflight.resolveRecoveryAlternate(
-                    sourceProfile: preflight.result.sourceProfile,
-                    hlsPackaging: preflight.result.hlsPackaging,
-                    excluding: .nativeAVPlayer,
-                    hybridCapabilities: capabilities
-                ) == preflight.result else {
+        guard currentResult == preflight.result else {
             throw HybridPlaybackSessionError
                 .preflightContractChanged(
                     route: currentResult.route,
@@ -696,7 +728,7 @@ final class AetherHybridPlaybackSession: ObservableObject {
                 .makeHLSVOD(
                     preflight: preflight,
                     bridgeMode: bridgeMode,
-            initialGeneration:
+                    initialGeneration:
                         initialGeneration,
                     fetchOverride: fetchOverride
                 )
@@ -754,7 +786,7 @@ final class AetherHybridPlaybackSession: ObservableObject {
         decoderPreference: HybridVideoDecoderPreference = .automatic,
         initialGeneration: UInt64 = 0,
         transportRetryBudget: PlaybackTransportRetryBudget = .init(
-            maximumFailureAttempts: 3
+            maximumFailureAttempts: nil
         )
     ) async throws -> AetherHybridPlaybackSession {
         guard preflight.result.route == .hybridCarrier else {
@@ -766,15 +798,10 @@ final class AetherHybridPlaybackSession: ObservableObject {
         let currentResult = PlaybackPreflight.resolve(
             sourceProfile: preflight.result.sourceProfile,
             hlsPackaging: preflight.result.hlsPackaging,
-            hybridCapabilities: capabilities
+            hybridCapabilities: capabilities,
+            requiredAudioBridgeMode: bridgeMode
         )
-        guard currentResult == preflight.result
-                || PlaybackPreflight.resolveRecoveryAlternate(
-                    sourceProfile: preflight.result.sourceProfile,
-                    hlsPackaging: preflight.result.hlsPackaging,
-                    excluding: .nativeAVPlayer,
-                    hybridCapabilities: capabilities
-                ) == preflight.result else {
+        guard currentResult == preflight.result else {
             throw HybridPlaybackSessionError.preflightContractChanged(
                 route: currentResult.route,
                 reason: currentResult.reason
@@ -939,6 +966,15 @@ final class AetherHybridPlaybackSession: ObservableObject {
         #endif
     }
 
+    func setRoutePreparationProgressHandler(
+        _ handler:
+            (@Sendable (
+                AetherRoutePreparationProgressKind
+            ) -> Void)?
+    ) {
+        core.setRoutePreparationProgressHandler(handler)
+    }
+
     public func play() throws {
         try core.play()
     }
@@ -992,6 +1028,11 @@ final class AetherHybridPlaybackSession: ObservableObject {
 
     public func stop() {
         core.stop()
+        telemetryHub.finish()
+    }
+
+    func stopAndWaitForIOQuiescence() async {
+        await core.stopAndWaitForIOQuiescence()
         telemetryHub.finish()
     }
 

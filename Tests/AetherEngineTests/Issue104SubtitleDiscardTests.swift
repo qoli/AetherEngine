@@ -93,6 +93,60 @@ final class Issue104SubtitleDiscardTests: XCTestCase {
                              "subtitle packets must reach the pump for the packet sink")
     }
 
+    func test_reopenIdentityCapturesRealDemuxerShapeAndRejectsTimebaseDrift() throws {
+        let initial = try makeDemuxer()
+        defer { initial.close() }
+        let fresh = try makeDemuxer()
+        defer { fresh.close() }
+
+        let expected = try XCTUnwrap(
+            HLSReopenStreamShape.capture(
+                demuxer: initial,
+                videoStreamIndex:
+                    initial.videoStreamIndex,
+                audioStreamIndex: -1
+            )
+        )
+        let matching = try XCTUnwrap(
+            HLSReopenStreamShape.capture(
+                demuxer: fresh,
+                videoStreamIndex:
+                    initial.videoStreamIndex,
+                audioStreamIndex: -1
+            )
+        )
+        XCTAssertNil(
+            HLSReopenIdentityValidator
+                .streamShapeFailure(
+                    expected: expected,
+                    fresh: matching,
+                    isLive: false
+                )
+        )
+
+        let stream = try XCTUnwrap(
+            fresh.stream(
+                at: initial.videoStreamIndex
+            )
+        )
+        stream.pointee.time_base.den &+= 1
+        let drifted = HLSReopenStreamShape.capture(
+            demuxer: fresh,
+            videoStreamIndex:
+                initial.videoStreamIndex,
+            audioStreamIndex: -1
+        )
+        XCTAssertEqual(
+            HLSReopenIdentityValidator
+                .streamShapeFailure(
+                    expected: expected,
+                    fresh: drifted,
+                    isLive: false
+                )?.caseCode,
+            "vod.streamShapeDrift"
+        )
+    }
+
     private static let fixtureBase64 = """
         AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAgfbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAOpgAAQAAAQAA
         AAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwAA

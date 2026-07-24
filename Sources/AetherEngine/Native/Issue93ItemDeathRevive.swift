@@ -1,37 +1,84 @@
 import Foundation
 
-/// Bounded revive for an AVPlayerItem that died via `failedToPlayToEndTime` (issue #93, round 3).
+struct ItemDeathReviveDecision:
+    Sendable,
+    Equatable
+{
+    let attempt: Int
+    let backoffSeconds: TimeInterval
+    let progressReset: Bool
+    let diagnostic:
+        AetherBoundedRetryLogEmission?
+}
+
+/// Same-route recovery for an AVPlayerItem that died via
+/// `failedToPlayToEndTime` (issue #93, round 3).
 ///
-/// Accumulated -12889 media timeouts (a requested segment outliving AVPlayer's ~3.5 s
-/// time-to-first-byte window during a wedge-window producer restart) fail the item: rate 0,
-/// `timeControlStatus` parked at `.paused`, `item.status` often still `readyToPlay`. Every
-/// recovery layer read that pause as user intent and disarmed, so the session was terminal.
-/// The gate bounds the stage-2 item reloads the death escalation may attempt: a frozen position
-/// across consecutive deaths means the reloads are not taking (persistently missing segment),
-/// so the budget exhausts instead of reload-storming; any real position change (playback
-/// progressed, or the user scrubbed away) is a fresh episode and restores the full budget.
+/// The notification is not positive structural-failure evidence. In the
+/// observed case it follows accumulated -12889 media-request timeouts and
+/// means only that AVPlayer's local consumer abandoned the item. Recovery
+/// therefore has no count or elapsed-time terminal: it reloads the same asset,
+/// backs off at 1/2/4/8/15/30 seconds, and resets after real media-time
+/// progress (or an explicit seek to a different dead spot). A separately
+/// proven auth, identity, corruption, capability, or cancellation terminal
+/// remains owned by the surrounding playback session.
 struct ItemDeathReviveGate {
-    let maxAttempts: Int
+    private let policy:
+        AetherPlaybackLivenessPolicy
     private(set) var attempts = 0
     private var lastPosition: Double?
+    private var retryLogCadence:
+        AetherBoundedRetryLogCadence
 
-    init(maxAttempts: Int) {
-        self.maxAttempts = maxAttempts
+    init(
+        policy:
+            AetherPlaybackLivenessPolicy =
+                .production
+    ) {
+        self.policy = policy
+        retryLogCadence =
+            AetherBoundedRetryLogCadence(
+                policy: policy
+            )
     }
 
-    /// Position deltas at or below this are the same dead spot (rendered-clock jitter),
-    /// not progress.
+    /// Position deltas at or below this are the same dead spot (rendered-clock
+    /// jitter), not progress.
     private let progressEpsilon: Double = 0.5
 
-    /// Records one item death at `position`. True while the episode's failure count is within
-    /// the cap (caller should reload the item), false once exhausted (caller gives up and logs).
-    mutating func admit(position: Double) -> Bool {
-        if let last = lastPosition, abs(position - last) > progressEpsilon {
+    mutating func recordFailure(
+        position: Double,
+        nowUptime: TimeInterval =
+            ProcessInfo.processInfo.systemUptime
+    ) -> ItemDeathReviveDecision {
+        let progressReset =
+            lastPosition.map {
+                abs(position - $0)
+                    > progressEpsilon
+            } ?? false
+        if progressReset {
             attempts = 0
+            retryLogCadence
+                .resetAfterProgress()
         }
         lastPosition = position
-        attempts += 1
-        return attempts <= maxAttempts
+        if attempts < Int.max {
+            attempts += 1
+        }
+        return ItemDeathReviveDecision(
+            attempt: attempts,
+            backoffSeconds:
+                policy.retryBackoffSeconds(
+                    forAttempt:
+                        max(1, attempts)
+                ),
+            progressReset: progressReset,
+            diagnostic:
+                retryLogCadence
+                    .recordFailure(
+                        now: nowUptime
+                    )
+        )
     }
 }
 

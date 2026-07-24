@@ -102,8 +102,18 @@ struct BlackCarrierLazyCompositeProviderTests {
             videoProvider: videoProvider,
             pump: pump
         )
+        let routeProgress =
+            AetherRoutePreparationProgressLedger()
+        provider.setRoutePreparationProgressHandler {
+            routeProgress.record($0)
+        }
 
         try provider.prepareForTransportStart()
+        #expect(routeProgress.snapshot.ordinal > 0)
+        #expect(
+            routeProgress.snapshot
+                .lastProgressUptimeSeconds != nil
+        )
         let firstAudioURL = try #require(
             pump.peekMediaSegmentURL(ordinal: 0, index: 0)
         )

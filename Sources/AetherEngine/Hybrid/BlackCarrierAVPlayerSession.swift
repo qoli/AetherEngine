@@ -59,6 +59,14 @@ enum BlackCarrierTransportState: Sendable, Equatable {
     case stopped
 }
 
+enum BlackCarrierReadinessObservationResult:
+    Sendable,
+    Equatable
+{
+    case ready
+    case noProgress
+}
+
 /// AVPlayer transport surface for a prebuilt black-video / real-audio carrier.
 ///
 /// This type deliberately does not play, seek, render real video, or own hybrid first-frame
@@ -81,9 +89,28 @@ final class BlackCarrierAVPlayerSession {
     private let server: HLSLocalServer
     private var lifecycle: Lifecycle = .idle
     private var statusObservation: NSKeyValueObservation?
-    private var readinessContinuation: CheckedContinuation<Void, Error>?
-    private var preparationTimedOut = false
+    private var readinessContinuation:
+        CheckedContinuation<
+            BlackCarrierReadinessObservationResult,
+            Error
+        >?
+    private weak var readinessObservedItem:
+        AVPlayerItem?
+    private var readinessRetryGate:
+        ItemDeathReviveGate
+    private let livenessPolicy:
+        AetherPlaybackLivenessPolicy
+    private let readinessAttemptOverride:
+        (@MainActor @Sendable (
+            AVPlayerItem,
+            TimeInterval
+        ) async throws
+            -> BlackCarrierReadinessObservationResult)?
     private var installedItem: AVPlayerItem?
+    private var routePreparationRetryEventHandler:
+        (@MainActor @Sendable (
+            AetherRoutePreparationRetryEvent
+        ) -> Void)?
     private var previousAllowsExternalPlayback: Bool?
     #if os(iOS) || os(tvOS)
     private var previousUsesExternalPlaybackWhileExternalScreenIsActive:
@@ -92,11 +119,28 @@ final class BlackCarrierAVPlayerSession {
 
     init(
         provider: any BlackCarrierTransportProvider,
-        avPlayer: AVPlayer = AVPlayer()
+        avPlayer: AVPlayer = AVPlayer(),
+        livenessPolicy:
+            AetherPlaybackLivenessPolicy =
+                .production,
+        readinessAttemptOverride:
+            (@MainActor @Sendable (
+                AVPlayerItem,
+                TimeInterval
+            ) async throws
+                -> BlackCarrierReadinessObservationResult)?
+                = nil
     ) {
         self.provider = provider
         server = HLSLocalServer(provider: provider)
         self.avPlayer = avPlayer
+        self.livenessPolicy = livenessPolicy
+        readinessRetryGate =
+            ItemDeathReviveGate(
+                policy: livenessPolicy
+            )
+        self.readinessAttemptOverride =
+            readinessAttemptOverride
     }
 
     func start() throws {
@@ -142,17 +186,17 @@ final class BlackCarrierAVPlayerSession {
             throw BlackCarrierAVPlayerSessionError.playlistURLUnavailable
         }
 
-        let asset = AVURLAsset(url: playlistURL)
-        let item = AVPlayerItem(asset: asset)
-        item.preferredForwardBufferDuration = Double(
-            BlackCarrierProfile.approved.nominalFileSegmentDurationTicks
-        ) / Double(BlackCarrierProfile.approved.timescale)
-        item.appliesPerFrameHDRDisplayMetadata = false
-        item.canUseNetworkResourcesForLiveStreamingWhilePaused = false
+        let item = makeCarrierItem(
+            playlistURL: playlistURL
+        )
         installedItem = item
         avPlayer.replaceCurrentItem(with: item)
 
         self.playlistURL = playlistURL
+        readinessRetryGate =
+            ItemDeathReviveGate(
+                policy: livenessPolicy
+            )
         lifecycle = .started
         transportState = .started
     }
@@ -223,34 +267,146 @@ final class BlackCarrierAVPlayerSession {
             transportState = .failed(error)
             throw error
         }
-        guard let item = avPlayer.currentItem else {
+        guard var item = avPlayer.currentItem else {
             let error = BlackCarrierAVPlayerSessionError.notStarted
             transportState = .failed(error)
             throw error
         }
 
         transportState = .preparing
-        preparationTimedOut = false
-        let timeoutError = BlackCarrierAVPlayerSessionError.readinessTimedOut(
-            seconds: timeout
-        )
         let readinessTask = Task { @MainActor [weak self] in
             guard let self else {
                 throw BlackCarrierAVPlayerSessionError.preparationCancelled
             }
-            try await self.loadAndAwaitReady(item: item)
-        }
-        let timeoutTask = Task { [weak self] in
-            try? await Task.sleep(
-                nanoseconds: UInt64(timeout * 1_000_000_000)
-            )
-            guard !Task.isCancelled else { return }
-            self?.markPreparationTimedOutAndCancel(readinessTask)
+            while true {
+                let nextAttempt =
+                    self.readinessRetryGate.attempts
+                        == Int.max
+                    ? Int.max
+                    : self.readinessRetryGate.attempts
+                        + 1
+                self.routePreparationRetryEventHandler?(
+                    .attemptStarted(
+                        attempt: nextAttempt
+                    )
+                )
+                let noProgressWindow =
+                    self.livenessPolicy
+                        .noProgressWindowSeconds(
+                            forAttempt: nextAttempt
+                        )
+                let retryReason: String
+                let decision: ItemDeathReviveDecision
+                do {
+                    let result =
+                        try await self
+                            .loadAndAwaitReady(
+                                item: item,
+                                noProgressWindow:
+                                    noProgressWindow
+                            )
+                    switch result {
+                    case .ready:
+                        self.routePreparationRetryEventHandler?(
+                            .completed
+                        )
+                        return
+                    case .noProgress:
+                        retryReason =
+                            "zeroProgressWindowElapsed"
+                        decision =
+                            self.readinessRetryGate
+                                .recordFailure(
+                                    position: 0
+                                )
+                    }
+                } catch let error
+                        as BlackCarrierAVPlayerSessionError {
+                    guard Self
+                            .isTransientReadinessFailure(
+                                error
+                            ) else {
+                        throw error
+                    }
+                    retryReason =
+                        "transientItemFailure"
+                    decision =
+                        self.readinessRetryGate
+                            .recordFailure(position: 0)
+                }
+                if let diagnostic =
+                        decision.diagnostic {
+                    EngineLog.emit(
+                        "[BlackCarrierAVPlayerSession] "
+                            + "local carrier readiness "
+                            + "remains pending reason="
+                            + retryReason
+                            + " attempt="
+                            + "\(decision.attempt) "
+                            + "failures="
+                            + "\(diagnostic.cumulativeFailureCount) "
+                            + "elapsed="
+                            + "\(Int(diagnostic.elapsedSeconds))s "
+                            + "window="
+                            + "\(Int(noProgressWindow))s "
+                            + "backoff="
+                            + "\(Int(decision.backoffSeconds))s"
+                            + (diagnostic
+                                .checkpointSeconds
+                                .map {
+                                    " checkpoint=\(Int($0))s"
+                                } ?? " firstFailure"),
+                        category: .session
+                    )
+                }
+                let nextRetryUptime =
+                    ProcessInfo.processInfo.systemUptime
+                    + decision.backoffSeconds
+                self.routePreparationRetryEventHandler?(
+                    .retryScheduled(
+                        completedAttempt:
+                            decision.attempt,
+                        nextAttempt:
+                            decision.attempt == Int.max
+                                ? Int.max
+                                : decision.attempt + 1,
+                        nextRetryUptimeSeconds:
+                            nextRetryUptime
+                    )
+                )
+                try await Task.sleep(
+                    nanoseconds:
+                        UInt64(
+                            decision
+                                .backoffSeconds
+                                * 1_000_000_000
+                        )
+                )
+                try Task.checkCancellation()
+                guard self.lifecycle == .started,
+                      let playlistURL =
+                        self.playlistURL,
+                      self.avPlayer.currentItem
+                        === item else {
+                    throw BlackCarrierAVPlayerSessionError
+                        .preparationCancelled
+                }
+                let replacement =
+                    self.makeCarrierItem(
+                        playlistURL:
+                            playlistURL
+                    )
+                self.installedItem =
+                    replacement
+                self.avPlayer
+                    .replaceCurrentItem(
+                        with: replacement
+                    )
+                item = replacement
+            }
         }
         defer {
-            timeoutTask.cancel()
             readinessTask.cancel()
-            preparationTimedOut = false
         }
         do {
             try await withTaskCancellationHandler {
@@ -258,23 +414,18 @@ final class BlackCarrierAVPlayerSession {
             } onCancel: {
                 readinessTask.cancel()
             }
-            if preparationTimedOut {
-                throw timeoutError
-            }
             transportState = .ready
             EngineLog.emit(
                 "[BlackCarrierAVPlayerSession] transport ready",
                 category: .session
             )
         } catch let error as BlackCarrierAVPlayerSessionError {
-            let resolved = preparationTimedOut ? timeoutError : error
-            cancelPendingReadiness(with: resolved)
-            recordPreparationFailure(resolved)
-            throw resolved
+            cancelPendingReadiness(with: error)
+            recordPreparationFailure(error)
+            throw error
         } catch is CancellationError {
-            let error = preparationTimedOut
-                ? timeoutError
-                : BlackCarrierAVPlayerSessionError.preparationCancelled
+            let error =
+                BlackCarrierAVPlayerSessionError.preparationCancelled
             cancelPendingReadiness(with: error)
             recordPreparationFailure(error)
             throw error
@@ -290,6 +441,7 @@ final class BlackCarrierAVPlayerSession {
 
     func stop() {
         guard lifecycle != .stopped else { return }
+        routePreparationRetryEventHandler?(.completed)
         cancelPendingReadiness(with: .preparationCancelled)
         let mayRestorePlayerConfiguration = avPlayer.currentItem == nil
             || avPlayer.currentItem === installedItem
@@ -307,6 +459,15 @@ final class BlackCarrierAVPlayerSession {
         playlistURL = nil
         lifecycle = .stopped
         transportState = .stopped
+    }
+
+    func setRoutePreparationRetryEventHandler(
+        _ handler:
+            (@MainActor @Sendable (
+                AetherRoutePreparationRetryEvent
+            ) -> Void)?
+    ) {
+        routePreparationRetryEventHandler = handler
     }
 
     private func failAndClose() {
@@ -331,6 +492,24 @@ final class BlackCarrierAVPlayerSession {
         #endif
     }
 
+    private func makeCarrierItem(
+        playlistURL: URL
+    ) -> AVPlayerItem {
+        let asset = AVURLAsset(url: playlistURL)
+        let item = AVPlayerItem(asset: asset)
+        item.preferredForwardBufferDuration = Double(
+            BlackCarrierProfile.approved
+                .nominalFileSegmentDurationTicks
+        ) / Double(
+            BlackCarrierProfile.approved.timescale
+        )
+        item.appliesPerFrameHDRDisplayMetadata =
+            false
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused =
+            false
+        return item
+    }
+
     private func restorePlayerConfiguration(ifOwned: Bool) {
         guard ifOwned,
               let previousAllowsExternalPlayback else { return }
@@ -346,7 +525,18 @@ final class BlackCarrierAVPlayerSession {
         #endif
     }
 
-    private func loadAndAwaitReady(item: AVPlayerItem) async throws {
+    private func loadAndAwaitReady(
+        item: AVPlayerItem,
+        noProgressWindow: TimeInterval
+    ) async throws
+        -> BlackCarrierReadinessObservationResult
+    {
+        if let readinessAttemptOverride {
+            return try await readinessAttemptOverride(
+                item,
+                noProgressWindow
+            )
+        }
         let playable: Bool
         do {
             playable = try await item.asset.load(.isPlayable)
@@ -362,13 +552,63 @@ final class BlackCarrierAVPlayerSession {
             "[BlackCarrierAVPlayerSession] asset playable; awaiting item status",
             category: .session
         )
-        try await awaitReadyStatus(item: item)
+        return try await awaitReadyStatus(
+            item: item,
+            noProgressWindow: noProgressWindow
+        )
     }
 
-    private func awaitReadyStatus(item: AVPlayerItem) async throws {
-        try await withTaskCancellationHandler {
+    nonisolated static func
+        isTransientReadinessFailure(
+            _ error:
+                BlackCarrierAVPlayerSessionError
+        ) -> Bool {
+        switch error {
+        case .assetLoadFailed, .itemFailed:
+            return true
+        case .notStarted, .alreadyStarted,
+             .alreadyStopped, .providerPreparationFailed,
+             .serverStartFailed, .playlistURLUnavailable,
+             .assetNotPlayable, .preparationInProgress,
+             .readinessTimedOut, .preparationCancelled:
+            return false
+        }
+    }
+
+    private func awaitReadyStatus(
+        item: AVPlayerItem,
+        noProgressWindow: TimeInterval
+    ) async throws
+        -> BlackCarrierReadinessObservationResult
+    {
+        let noProgressTask = Task {
+            @MainActor [weak self, weak item] in
+            do {
+                try await Task.sleep(
+                    nanoseconds: UInt64(
+                        noProgressWindow
+                            * 1_000_000_000
+                    )
+                )
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  let item else {
+                return
+            }
+            self?
+                .completePendingReadinessWithoutProgress(
+                    for: item
+                )
+        }
+        defer {
+            noProgressTask.cancel()
+        }
+        return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 readinessContinuation = continuation
+                readinessObservedItem = item
                 statusObservation = item.observe(
                     \.status,
                     options: [.initial, .new]
@@ -380,9 +620,12 @@ final class BlackCarrierAVPlayerSession {
                     Task { @MainActor [weak self] in
                         switch status {
                         case .readyToPlay:
-                            self?.completePendingReadiness()
+                            self?.completePendingReadiness(
+                                for: item
+                            )
                         case .failed:
                             self?.cancelPendingReadiness(
+                                for: item,
                                 with: .itemFailed(reason: reason)
                             )
                         case .unknown:
@@ -400,12 +643,32 @@ final class BlackCarrierAVPlayerSession {
         }
     }
 
-    private func completePendingReadiness() {
+    private func completePendingReadiness(
+        for item: AVPlayerItem
+    ) {
+        guard readinessObservedItem === item else {
+            return
+        }
         let continuation = readinessContinuation
         readinessContinuation = nil
+        readinessObservedItem = nil
         statusObservation?.invalidate()
         statusObservation = nil
-        continuation?.resume()
+        continuation?.resume(returning: .ready)
+    }
+
+    private func completePendingReadinessWithoutProgress(
+        for item: AVPlayerItem
+    ) {
+        guard readinessObservedItem === item else {
+            return
+        }
+        let continuation = readinessContinuation
+        readinessContinuation = nil
+        readinessObservedItem = nil
+        statusObservation?.invalidate()
+        statusObservation = nil
+        continuation?.resume(returning: .noProgress)
     }
 
     private func cancelPendingReadiness(
@@ -413,14 +676,26 @@ final class BlackCarrierAVPlayerSession {
     ) {
         let continuation = readinessContinuation
         readinessContinuation = nil
+        readinessObservedItem = nil
         statusObservation?.invalidate()
         statusObservation = nil
         continuation?.resume(throwing: error)
     }
 
+    private func cancelPendingReadiness(
+        for item: AVPlayerItem,
+        with error: BlackCarrierAVPlayerSessionError
+    ) {
+        guard readinessObservedItem === item else {
+            return
+        }
+        cancelPendingReadiness(with: error)
+    }
+
     private func recordPreparationFailure(
         _ error: BlackCarrierAVPlayerSessionError
     ) {
+        routePreparationRetryEventHandler?(.completed)
         guard lifecycle != .stopped else {
             transportState = .stopped
             return
@@ -433,14 +708,4 @@ final class BlackCarrierAVPlayerSession {
         )
     }
 
-    private func markPreparationTimedOutAndCancel(
-        _ readinessTask: Task<Void, Error>
-    ) {
-        guard lifecycle == .started,
-              transportState == .preparing else {
-            return
-        }
-        preparationTimedOut = true
-        readinessTask.cancel()
-    }
 }
