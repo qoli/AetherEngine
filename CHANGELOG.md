@@ -12,6 +12,11 @@ the public-API contract.
 
 ### Added
 
+- **`installAudioTap(lossless: true)` preserves queued PCM for continuous analysis (AE#864).**
+  The opt-in stream does not evict queued buffers or block the producer. Its consumer must keep
+  draining it or cancel/remove the tap when it stops consuming. The default newest-64 policy
+  remains unchanged, and source discontinuities remain explicit.
+
 - **Remote MPEG-DASH on-demand manifests play (AE#859, thanks @qoli).**
   A static, single-Period MPD whose representations are single files addressed by `SegmentBase`
   failed at open with `Invalid data found when processing input`: the FFmpeg build has no DASH
@@ -111,6 +116,11 @@ the public-API contract.
   since #87.
 
 ### Fixed
+
+- **Long audio-tap segments no longer look like backward seeks (AE#864).** Loopback and remote-HLS
+  VOD readers track actual playhead movement. A complete segment running beyond the preferred
+  lead waits for playback instead of repeatedly decoding the same segments; actual backward
+  jumps and forward seeks still re-anchor with a discontinuity.
 
 - **Source failures keep their cause and request ownership.** Initial live probes preserve HTTP,
   URL and TLS failures without changing the live-start `liveSourceUnavailable` kind (HTTP and

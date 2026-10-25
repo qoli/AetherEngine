@@ -41,6 +41,7 @@ final class LoopbackAudioReader: @unchecked Sendable {
     // Worker-thread state (only touched from the loop / runOnce).
     private var nextIndex: Int?
     private var lastDecodedEndPTS: Double?
+    private var previousPlayhead: Double?
     private var pendingDiscontinuity = true
     private var missStreak = 0
 
@@ -79,8 +80,10 @@ final class LoopbackAudioReader: @unchecked Sendable {
     /// One loop iteration. Internal (not private) so tests drive it directly.
     func runOnce() -> StepResult {
         let playhead = deps.playhead() ?? 0
+        defer { previousPlayhead = playhead }
 
         switch AudioTapPacing.decide(lastDecodedEndPTS: lastDecodedEndPTS, playhead: playhead,
+                                     previousPlayhead: previousPlayhead,
                                      leadSeconds: AudioTapDefaults.leadSeconds,
                                      toleranceSeconds: AudioTapDefaults.toleranceSeconds) {
         case .sleep:

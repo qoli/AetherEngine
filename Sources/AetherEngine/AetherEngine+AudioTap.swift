@@ -6,7 +6,9 @@ extension AetherEngine {
 
     /// Install the tap on the currently loaded item and return its buffer stream.
     /// Mono Float32 48 kHz (`AetherEngine.audioTapFormat`), source-PTS timestamps, lossy under
-    /// pressure, never stalls playback. One tap per engine: installing again finishes the
+    /// pressure by default, never stalls playback. `lossless` prevents queue eviction for
+    /// consumers that pace input to the media clock. They must drain or cancel their stream;
+    /// source discontinuities remain explicit. One tap per engine: installing again finishes the
     /// previous stream. `load()` and `stop()` finish it too (opt-in is per load). With no
     /// active playback session (or a video-only source) the returned stream finishes
     /// immediately.
@@ -24,7 +26,7 @@ extension AetherEngine {
     /// rejects outright (`SFSpeechErrorDomain Code=17`, the reason the filter exists). A stream
     /// that ends is a boundary a host can act on; a stitched one is not.
     @MainActor
-    public func installAudioTap() -> AsyncStream<AudioTapBuffer> {
+    public func installAudioTap(lossless: Bool = false) -> AsyncStream<AudioTapBuffer> {
         removeAudioTap()
         let controller = AudioTapController()
         audioTapController = controller
@@ -37,25 +39,25 @@ extension AetherEngine {
             hasLoadedURL: loadedURL != nil)
         switch kind {
         case .loopback:
-            stream = controller.makeStream { onStop in
+            stream = controller.makeStream(lossless: lossless) { onStop in
                 guard let reader = makeNativeTapReader(controller: controller) else { return }
                 reader.start()
                 onStop { reader.stop() }
             }
         case .remoteHLS:
-            stream = controller.makeStream { onStop in
+            stream = controller.makeStream(lossless: lossless) { onStop in
                 guard let reader = makeRemoteHLSTapReader(controller: controller) else { return }
                 reader.start()
                 onStop { reader.stop() }
             }
         case .software:
-            stream = controller.makeStream { onStop in
+            stream = controller.makeStream(lossless: lossless) { onStop in
                 guard softwareHost != nil else { return }
                 installSoftwareTapSink(controller: controller)
                 onStop { [weak self] in self?.softwareHost?.audioTapSink = nil }
             }
         case .none:
-            stream = controller.makeStream { _ in }
+            stream = controller.makeStream(lossless: lossless) { _ in }
         }
         // No session / no audio track / backend .none: nothing will ever yield, finish now.
         if !controller.hasDeliverySource { controller.teardown() }

@@ -42,11 +42,13 @@ enum AudioTapPacing {
         case reanchor     // playhead moved away; jump to the playhead's segment
     }
 
-    static func decide(lastDecodedEndPTS: Double?, playhead: Double,
+    static func decide(lastDecodedEndPTS: Double?, playhead: Double, previousPlayhead: Double?,
                        leadSeconds: Double, toleranceSeconds: Double) -> Decision {
         guard let last = lastDecodedEndPTS else { return .decodeNext }
+        if let previousPlayhead, playhead < previousPlayhead - toleranceSeconds { return .reanchor }
         if last < playhead - toleranceSeconds { return .reanchor }
-        if last - playhead > leadSeconds + toleranceSeconds { return .reanchor }
+        // A complete segment can overshoot the preferred lead. Only movement
+        // of the playhead proves a backward seek; decoded lead alone does not.
         if last - playhead >= leadSeconds { return .sleep }
         return .decodeNext
     }

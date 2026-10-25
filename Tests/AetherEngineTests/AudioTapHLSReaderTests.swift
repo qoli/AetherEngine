@@ -75,4 +75,51 @@ final class AudioTapHLSReaderTests: XCTestCase {
         XCTAssertFalse(seg3.isEmpty)                // seg 3 audio present
         XCTAssertTrue(seg3.first?.discontinuity ?? false) // first buffer after reanchor flagged
     }
+
+    func testLongVODSegmentsWaitWithoutRefetchingAndBackwardSeekStillReanchors() async {
+        let playhead = Box<Double>(1)
+        let fetched = Box<[Int]>([])
+        let emitted = Box<[AudioTapBuffer]>([])
+        let playlist = HLSMediaPlaylist(targetDuration: 15, mediaSequence: 0,
+            segments: (0..<4).map { HLSMediaSegment(uri: "s\($0).ts", duration: 15, discontinuityBefore: false) },
+            hasEndList: true, isEncrypted: false, hasUnsupportedEncryption: false, hasMap: false)
+        let deps = AudioTapHLSReader.Dependencies(
+            playhead: { playhead.value },
+            mediaURL: URL(string: "https://h/media.m3u8")!,
+            fetchPlaylist: { _ in playlist },
+            fetchSegment: { uri, _ in
+                fetched.value.append(Int(uri.dropFirst().prefix(1))!)
+                return Data([1])
+            },
+            decodeSegment: { _ in
+                let buffer = AVAudioPCMBuffer(pcmFormat: AetherEngine.audioTapFormat, frameCapacity: 720_000)!
+                buffer.frameLength = 720_000
+                return [AudioTapChunk(buffer: buffer, ptsSeconds: 0)]
+            },
+            emit: { emitted.value.append($0) })
+        let reader = AudioTapHLSReader(deps: deps)
+        reader.primeForTest(playlist: playlist)
+        let first = await reader.stepVOD()
+        XCTAssertEqual(first, .decoded)
+        for _ in 0..<10 {
+            let step = await reader.stepVOD()
+            XCTAssertEqual(step, .slept)
+        }
+        XCTAssertEqual(fetched.value, [0])
+        playhead.value = 6
+        let next = await reader.stepVOD()
+        XCTAssertEqual(next, .decoded)
+        let wait = await reader.stepVOD()
+        XCTAssertEqual(wait, .slept)
+        XCTAssertEqual(fetched.value, [0, 1])
+        XCTAssertFalse(emitted.value[1].discontinuity)
+        playhead.value = 1
+        let reanchor = await reader.stepVOD()
+        XCTAssertEqual(reanchor, .reanchored)
+        let afterSeek = await reader.stepVOD()
+        XCTAssertEqual(afterSeek, .decoded)
+        XCTAssertEqual(fetched.value, [0, 1, 0])
+        XCTAssertTrue(emitted.value.last!.discontinuity)
+        XCTAssertEqual(emitted.value.last!.sourceTime, 0, accuracy: 0.001)
+    }
 }

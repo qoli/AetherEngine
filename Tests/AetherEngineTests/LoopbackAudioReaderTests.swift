@@ -3,7 +3,7 @@ import AVFAudio
 @testable import AetherEngine
 
 /// #95: loop logic of the loopback reader, driven step-by-step with stubbed dependencies.
-/// No media involved; decode is stubbed to return one 1 s chunk per decode call.
+/// No media involved; decode returns the requested segment's duration and timestamp.
 final class LoopbackAudioReaderTests: XCTestCase {
 
     /// Mutable stub world shared with the closures. Single-threaded in these tests.
@@ -23,15 +23,16 @@ final class LoopbackAudioReaderTests: XCTestCase {
             shiftSeconds: { w.shift },
             anchorIndex: { Int($0 / w.segmentSeconds) },
             initData: { _ in Data([0]) },
-            segmentData: { w.segments.contains($0) ? Data([1]) : nil },
+            segmentData: { w.segments.contains($0) ? Data(String($0).utf8) : nil },
             highestStoredIndex: { w.highestStored },
-            decodeSegment: { _, _ in
-                w.decoded.append(w.decoded.count)
-                let idx = Double(w.decoded.count - 1)
+            decodeSegment: { _, data in
+                let idx = Int(String(decoding: data, as: UTF8.self))!
+                w.decoded.append(idx)
+                let frames = AVAudioFrameCount(w.segmentSeconds * 48_000)
                 let buf = AVAudioPCMBuffer(pcmFormat: AetherEngine.audioTapFormat,
-                                           frameCapacity: 48_000)!
-                buf.frameLength = 48_000
-                return [AudioTapChunk(buffer: buf, ptsSeconds: idx * w.segmentSeconds)]
+                                           frameCapacity: frames)!
+                buf.frameLength = frames
+                return [AudioTapChunk(buffer: buf, ptsSeconds: Double(idx) * w.segmentSeconds)]
             },
             emit: { w.emitted.append($0) }
         )
@@ -88,6 +89,41 @@ final class LoopbackAudioReaderTests: XCTestCase {
         w.playhead = 300.0                             // far forward seek
         XCTAssertEqual(reader.runOnce(), .reanchored)
         XCTAssertEqual(reader.runOnce(), .decoded)
+        XCTAssertTrue(w.emitted.last!.discontinuity)
+    }
+
+    func testLongSegmentsDoNotDecodeAgainWhilePlayheadIsUnchanged() {
+        let w = World()
+        w.segmentSeconds = 15
+        w.playhead = 95.1
+        w.segments = Set(0...30); w.highestStored = 30
+        let reader = makeReader(w)
+        XCTAssertEqual(reader.runOnce(), .decoded) // 90..105
+        XCTAssertEqual(reader.runOnce(), .decoded) // 105..120 overshoots the 10 s lead
+        for _ in 0..<10 { XCTAssertEqual(reader.runOnce(), .slept) }
+        XCTAssertEqual(w.decoded, [6, 7])
+        XCTAssertEqual(w.emitted.count, 2)
+        XCTAssertFalse(w.emitted[1].discontinuity)
+        w.playhead = 110.1
+        XCTAssertEqual(reader.runOnce(), .decoded)
+        XCTAssertEqual(reader.runOnce(), .slept)
+        XCTAssertEqual(w.decoded, [6, 7, 8])
+        XCTAssertFalse(w.emitted[2].discontinuity)
+    }
+
+    func testLongSegmentsStillReanchorOnBackwardSeek() {
+        let w = World()
+        w.segmentSeconds = 15
+        w.playhead = 95.1
+        w.segments = Set(0...30); w.highestStored = 30
+        let reader = makeReader(w)
+        XCTAssertEqual(reader.runOnce(), .decoded)
+        XCTAssertEqual(reader.runOnce(), .decoded)
+        w.playhead = 50.1
+        XCTAssertEqual(reader.runOnce(), .reanchored)
+        XCTAssertEqual(reader.runOnce(), .decoded)
+        XCTAssertEqual(w.decoded, [6, 7, 3])
+        XCTAssertEqual(w.emitted.last!.sourceTime, 45, accuracy: 0.001)
         XCTAssertTrue(w.emitted.last!.discontinuity)
     }
 }

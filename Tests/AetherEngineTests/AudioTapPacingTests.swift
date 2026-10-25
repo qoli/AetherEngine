@@ -6,8 +6,9 @@ import XCTest
 /// to decode the next segment, idle, or re-anchor after the playhead moved away.
 final class AudioTapPacingTests: XCTestCase {
 
-    private func decide(_ last: Double?, _ playhead: Double) -> AudioTapPacing.Decision {
+    private func decide(_ last: Double?, _ playhead: Double, previous: Double? = nil) -> AudioTapPacing.Decision {
         AudioTapPacing.decide(lastDecodedEndPTS: last, playhead: playhead,
+                              previousPlayhead: previous,
                               leadSeconds: 10, toleranceSeconds: 2)
     }
 
@@ -39,7 +40,15 @@ final class AudioTapPacingTests: XCTestCase {
 
     func testPlayheadJumpedBackReanchors() {
         // Backward seek: decoded position is far ahead of the new playhead.
-        XCTAssertEqual(decide(300.0, 100.0), .reanchor)
-        XCTAssertEqual(decide(112.5, 100.0), .reanchor)     // > lead + tolerance
+        XCTAssertEqual(decide(300.0, 100.0, previous: 290.0), .reanchor)
+        XCTAssertEqual(decide(112.5, 100.0, previous: 105.0), .reanchor)
+        XCTAssertEqual(decide(106.0, 100.0, previous: 105.0), .reanchor)
+    }
+
+    func testWholeSegmentOvershootWaitsForPlayback() {
+        XCTAssertEqual(decide(120.0, 95.1, previous: 95.1), .sleep)
+        XCTAssertEqual(decide(120.0, 95.1), .sleep)
+        XCTAssertEqual(decide(120.0, 95.0, previous: 95.1), .sleep)
+        XCTAssertEqual(decide(120.0, 110.1, previous: 95.1), .decodeNext)
     }
 }

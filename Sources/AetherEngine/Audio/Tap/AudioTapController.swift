@@ -17,9 +17,9 @@ final class AudioTapController {
 
     /// Build the stream and let the caller start its delivery source. `startReader` runs
     /// synchronously; it registers a stop closure via its callback.
-    func makeStream(startReader: StartReader) -> AsyncStream<AudioTapBuffer> {
+    func makeStream(lossless: Bool = false, startReader: StartReader) -> AsyncStream<AudioTapBuffer> {
         let (stream, cont) = AsyncStream.makeStream(of: AudioTapBuffer.self,
-                                                    bufferingPolicy: .bufferingNewest(64))
+                                                    bufferingPolicy: lossless ? .unbounded : .bufferingNewest(64))
         continuation = cont
         filter = AudioTapMonotonicFilter(downstream: { buf in _ = cont.yield(buf) })
         startReader { [weak self] stop in self?.stopReader = stop }

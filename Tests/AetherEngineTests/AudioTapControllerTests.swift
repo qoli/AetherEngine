@@ -8,10 +8,10 @@ import AVFAudio
 @MainActor
 final class AudioTapControllerTests: XCTestCase {
 
-    private func makeBuffer() -> AudioTapBuffer {
+    private func makeBuffer(sourceTime: Double = 1.0) -> AudioTapBuffer {
         let b = AVAudioPCMBuffer(pcmFormat: AetherEngine.audioTapFormat, frameCapacity: 480)!
         b.frameLength = 480
-        return AudioTapBuffer(buffer: b, sourceTime: 1.0, discontinuity: false)
+        return AudioTapBuffer(buffer: b, sourceTime: sourceTime, discontinuity: false)
     }
 
     func testYieldReachesConsumerAndTeardownFinishes() async {
@@ -43,5 +43,32 @@ final class AudioTapControllerTests: XCTestCase {
         let controller = AudioTapController()
         _ = controller.makeStream(startReader: { _ in })
         XCTAssertFalse(controller.hasDeliverySource)
+    }
+
+    func testLosslessDeliveryKeepsWholeBurstBeforeConsumerRuns() async {
+        let burstCount = 512
+        let controller = AudioTapController()
+        let stream = controller.makeStream(lossless: true, startReader: { onStop in onStop {} })
+        let yield = controller.makeYield()!
+        for index in 0..<burstCount { yield(makeBuffer(sourceTime: Double(index) / 100)) }
+        controller.teardown()
+        var times: [Double] = []
+        for await buffer in stream { times.append(buffer.sourceTime) }
+        XCTAssertEqual(times.count, burstCount)
+        for (index, time) in times.enumerated() {
+            XCTAssertEqual(time, Double(index) / 100, accuracy: 0.00001)
+        }
+        XCTAssertNil(controller.makeYield())
+    }
+
+    func testDefaultDeliveryRetainsExistingNewest64Policy() async {
+        let controller = AudioTapController()
+        let stream = controller.makeStream(startReader: { onStop in onStop {} })
+        let yield = controller.makeYield()!
+        for index in 0..<200 { yield(makeBuffer(sourceTime: Double(index) / 100)) }
+        controller.teardown()
+        var received = 0
+        for await _ in stream { received += 1 }
+        XCTAssertEqual(received, 64)
     }
 }
