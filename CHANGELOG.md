@@ -112,6 +112,14 @@ the public-API contract.
 
 ### Fixed
 
+- **Retained bitmap subtitles use lossless encoded backing instead of keeping every image
+  expanded to RGBA.** PGS, DVB and DVD subtitle history retains PNG-backed `CGImage` providers
+  and expands pixels when drawn, preserving the authored crop, placement, alpha, forced flag
+  and cue lifetime for subtitle offsets and backward seeks. Encoding runs on the existing
+  subtitle worker. `SubtitleImage.encodedBackingBytes` reports the known compressed backing
+  size separately from process memory; callers draw the image rather than assuming its provider
+  has a particular raw pixel layout.
+
 - **Source failures keep their cause and request ownership.** Initial live probes preserve HTTP,
   URL and TLS failures without changing the live-start `liveSourceUnavailable` kind (HTTP and
   certificate classifications stay specific). A transport failure at open (a reset or a timeout from

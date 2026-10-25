@@ -1450,7 +1450,7 @@ All flags default to safe values; the table is the full set. Depth for the media
 | `SubtitleCue` | `id`, `startTime`, `endTime`, `body` (a `SubtitleCue.Body`: `.text`, `.richText`, `.image`), `placement`, plus `text` and `isForced` conveniences. |
 | `SubtitleTextRun` | `text`, `color`, `isBold`, `isItalic`, `isUnderlined`, `isStruckThrough`, `fontName`, `fontSize`, `isStyled`. |
 | `SubtitleTextPlacement` | `alignment` (numpad), `position` (a [0, 1] anchor). |
-| `SubtitleImage` | `cgImage`, `position`, `canvasSize`, `isForced`. |
+| `SubtitleImage` | `cgImage`, `position`, `canvasSize`, `isForced`, `encodedBackingBytes`. Bitmap images retain lossless PNG backing and expand pixels when drawn. Draw the `CGImage` rather than assuming its provider exposes premultiplied RGBA bytes. `encodedBackingBytes` is the known compressed backing size, or nil for an image without that accounting; it excludes ImageIO/CGImage overhead and temporary drawing pixels, so it is not a process-memory measurement. |
 | `ExternalSubtitleTrack` | `url`, `name`, `language`, `isForced`, `isHearingImpaired`, `isDefault`, `httpHeaders` (nil forwards `LoadOptions.httpHeaders`), `formatHint` for URLs whose path hides the format, and `sourceStreamIndex` for a container holding several subtitle streams. That index addresses the container at `url`, not the played media. |
 | `NativeSubtitleTrack` | `ordinal`, `language`, `displayName`, plus `sameLanguageRank(of:in:)` for disambiguating same-language options (eng Full against eng SDH). |
 | `RecordingState` | `.idle`, `.recording(RecordingProgress)`, `.ended(RecordingEndReason)`, `.failed(RecordingFailure)`. What the session's live recording is doing. |
