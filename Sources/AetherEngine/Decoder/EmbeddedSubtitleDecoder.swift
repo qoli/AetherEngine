@@ -737,10 +737,11 @@ final class EmbeddedSubtitleDecoder {
                              encodedBackingBytes: retained.encodedByteCount)
     }
 
-    /// The subtitle history needs authored images for offsets and backward seeks, but does not
-    /// need every image expanded to RGBA at once. Retain PNG bytes through ImageIO's provider;
-    /// drawing decodes the same pixels without caching them for the whole cue lifetime. This
-    /// runs on the existing subtitle decode worker, not on the presentation actor.
+    /// Retain authored bitmap history as lossless PNG for offsets and backward seeks.
+    /// Encoding runs on the subtitle decode worker; pixel decoding follows the consumer's
+    /// rendering path. Core Animation may decode during a main-thread commit and retain the
+    /// decoded pixels for the CGImage's lifetime. Disabling ImageIO caching does not prevent
+    /// renderer-side caching or bound the process footprint after presentation.
     static func retainedBitmap(_ image: CGImage) -> (image: CGImage, encodedByteCount: Int)? {
         autoreleasepool {
             let data = NSMutableData()

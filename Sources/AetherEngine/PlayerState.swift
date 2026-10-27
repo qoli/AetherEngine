@@ -1635,7 +1635,8 @@ public struct SubtitleImage: @unchecked Sendable {
     /// forced caption (sign / foreign-dialogue overlay shown even with subtitles off).
     public let isForced: Bool
     /// Known compressed provider storage, when the decoder retains a lossless encoded image.
-    /// This excludes ImageIO/CGImage overhead and temporary pixels used while drawing.
+    /// Excludes ImageIO/CGImage overhead, temporary drawing pixels and decoded pixels retained
+    /// by a renderer. This diagnostic count is not a process-footprint measurement or memory bound.
     public let encodedBackingBytes: Int?
 
     public init(cgImage: CGImage, position: CGRect, canvasSize: CGSize = .zero, isForced: Bool = false,

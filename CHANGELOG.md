@@ -12,6 +12,11 @@ the public-API contract.
 
 ### Added
 
+- **`SubtitleImage.encodedBackingBytes` reports known compressed provider storage.**
+  The optional count excludes ImageIO/CGImage overhead, temporary drawing pixels and decoded
+  pixels a renderer retains. It is a diagnostic count, not a process-footprint measurement or
+  a memory budget.
+
 - **Remote MPEG-DASH on-demand manifests play (AE#859, thanks @qoli).**
   A static, single-Period MPD whose representations are single files addressed by `SegmentBase`
   failed at open with `Invalid data found when processing input`: the FFmpeg build has no DASH
@@ -76,6 +81,14 @@ the public-API contract.
 
 ### Changed
 
+- **`SubtitleImage.cgImage` no longer guarantees a premultiplied RGBA data-provider layout.**
+  Bitmap subtitle history retains lossless PNG-backed images. Hosts that inspect provider bytes
+  must draw into an explicitly configured bitmap context instead of interpreting them as raw
+  RGBA. Authored pixels, alpha, crop, placement, forced flags and cue lifetime are preserved.
+  PNG encoding runs on the subtitle worker; pixel decoding follows the consumer's rendering
+  path. Core Animation may decode during a main-thread commit and retain decoded pixels for
+  the image's lifetime, so encoded backing alone does not bound post-presentation memory.
+
 - **A Profile 7 FEL source keeps the native route while the host reports an AirPlay video receiver on the audio route (iOS).**
   The dual-layer route draws into a local layer that no receiver picks up, so a TV the viewer sent the
   title to played sound only. When the host says the receiver shows video
@@ -111,14 +124,6 @@ the public-API contract.
   since #87.
 
 ### Fixed
-
-- **Retained bitmap subtitles use lossless encoded backing instead of keeping every image
-  expanded to RGBA.** PGS, DVB and DVD subtitle history retains PNG-backed `CGImage` providers
-  and expands pixels when drawn, preserving the authored crop, placement, alpha, forced flag
-  and cue lifetime for subtitle offsets and backward seeks. Encoding runs on the existing
-  subtitle worker. `SubtitleImage.encodedBackingBytes` reports the known compressed backing
-  size separately from process memory; callers draw the image rather than assuming its provider
-  has a particular raw pixel layout.
 
 - **Source failures keep their cause and request ownership.** Initial live probes preserve HTTP,
   URL and TLS failures without changing the live-start `liveSourceUnavailable` kind (HTTP and
