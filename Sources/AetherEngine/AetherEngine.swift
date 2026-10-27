@@ -61,6 +61,14 @@ public final class AetherEngine: ObservableObject {
             if case .error = state {} else { errorInfo = nil }
             recomputePlaybackPhase()
             resolveLoadingStashedSeek(from: oldValue)
+            if Self.backgroundPolicyIsOwedOnResume(
+                isBackgrounded: isBackgrounded, retainsPausedPipeline: retainsVideoPipelineWhenBackgrounded,
+                from: oldValue, to: state
+            ) {
+                // AE#870: a retained paused session skipped the background policy, so a resume in the
+                // background (lock screen, Control Center, AVKit) owes the playing-session decision.
+                backgroundActionOwed = true
+            }
             settleOwedBackgroundAction()
             // A renderer path has no player for the Atmos output activator to observe; it follows this.
             atmosOutputActivator?.refresh()
@@ -917,6 +925,17 @@ public final class AetherEngine: ObservableObject {
 
     /// Master enable for background playback (iOS: PiP + background audio; tvOS: PiP keepalive). Default on.
     public var backgroundPlaybackEnabled = true
+
+    /// Whether renderer paths activate the shared audio session during load and interruption recovery.
+    /// Disable before loading when the host owns activation across several inline players.
+    /// The category is still declared once per process; pair with `deactivatesAudioSessionOnStop = false`
+    /// when the host also owns final deactivation. Native AVKit activation is unaffected.
+    public var rendererAudioSessionActivationEnabled = true
+
+    /// Keep a paused video session through background suspension instead of releasing its pipeline.
+    /// Off by default: the system may invalidate decoders while suspended, requiring a reload.
+    /// This does not enable background playback or change the policy for a playing session.
+    public var retainsVideoPipelineWhenBackgrounded = false
     /// Set by the host from its PiP delegate (iOS: AVKit; tvOS: host-built AVPictureInPictureController);
     /// the keepalive policy + pause-safety read it.
     public var pictureInPictureActive = false {
@@ -1286,8 +1305,10 @@ public final class AetherEngine: ObservableObject {
         softwareHostHasAudio: Bool,
         keepVideoAlive: Bool,
         pipActive: Bool,
-        state: PlaybackState
+        state: PlaybackState,
+        retainPausedVideoPipeline: Bool = false
     ) -> BackgroundAction {
+        if retainPausedVideoPipeline && state == .paused { return .doNothing }
         if isAudioBackend { return .doNothing }
         if keepVideoAlive {
             if hasSoftwareHost {
@@ -1306,6 +1327,15 @@ public final class AetherEngine: ObservableObject {
     /// decision is owed until the state settles.
     nonisolated static func backgroundActionIsOwed(state: PlaybackState) -> Bool {
         state == .loading || state == .seeking
+    }
+
+    /// AE#870: `retainsVideoPipelineWhenBackgrounded` answers only for a paused session. One that
+    /// resumes while still backgrounded gets the playing-session policy (teardown with background
+    /// playback off, software audio-only), whichever transport owner started it.
+    nonisolated static func backgroundPolicyIsOwedOnResume(
+        isBackgrounded: Bool, retainsPausedPipeline: Bool, from: PlaybackState, to: PlaybackState
+    ) -> Bool {
+        isBackgrounded && retainsPausedPipeline && from == .paused && to == .playing
     }
 
     /// #127: how to execute a BackgroundAction. A PAUSED teardown on platforms with quick app switches
@@ -1774,6 +1804,20 @@ public final class AetherEngine: ObservableObject {
         EngineLog.emit(
             "[DisplayCriteria] return from the background clears the panel's HDR-master refusal (#588); "
             + "the next HDR load asks the display again",
+            category: .engine)
+    }
+
+    /// AE#887: a panel that reports HDR headroom during playback is presenting HDR, so a refusal latched
+    /// earlier in the process was about the stream it was served, not about the panel. Measured on an
+    /// Apple TV 4K (tvOS 27, output 4K HDR): a live PQ master refused with -11868, the latch set, and the
+    /// playback probe read headroom 1.20 a tenth of a second later. Left standing, the latch routed every
+    /// later HDR title in the process media-direct, without its subtitle renditions.
+    nonisolated static func withdrawPanelRefusalOnHDRReading() {
+        guard panelRefusedHDRMaster else { return }
+        panelRefusedHDRMaster = false
+        EngineLog.emit(
+            "[DisplayCriteria] the panel reports HDR during playback, so the earlier HDR-master refusal was "
+            + "not the panel's; withdrawn, the next HDR load offers the master again (#887)",
             category: .engine)
     }
 
@@ -2943,7 +2987,8 @@ public final class AetherEngine: ObservableObject {
             } else if MasterFallbackDecision.shouldLatchPanelRefusal(
                 code: rejection.code, servedMasterIsHDR: true, displayEligibleForHDRNow: eligibleNow,
                 displaySwitchInProgress: switching,
-                panelEngagesHDROnDemand: HLSVideoEngine.builtInPanelEngagesOnDemand) {
+                panelEngagesHDROnDemand: HLSVideoEngine.builtInPanelEngagesOnDemand,
+                hostAssertsPanelHDR: loadedOptions.panelIsInHDRMode) {
                 Self.panelRefusedHDRMaster = true
                 // A display that refused an HDR master no longer vouches for the HDR proof either. Cleared
                 // here, before the fallback below reloads, so that session cannot read the proof.
@@ -2951,6 +2996,11 @@ public final class AetherEngine: ObservableObject {
                 EngineLog.emit(
                     "[DisplayCriteria] panel refused an HDR master (code=\(rejection.code)); this process "
                     + "routes HDR sources media-direct until it returns from the background (#588)",
+                    category: .engine)
+            } else if loadedOptions.panelIsInHDRMode {
+                EngineLog.emit(
+                    "[DisplayCriteria] HDR master refused (code=\(rejection.code)) while the host asserts the "
+                    + "panel presents HDR; this item falls back, the process does not latch the refusal (#887)",
                     category: .engine)
             } else if HLSVideoEngine.builtInPanelEngagesOnDemand {
                 EngineLog.emit(
@@ -3935,16 +3985,6 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
-    /// Off-main declaration of the AVAudioSession category (#114). `setCategory` /
-    /// `setSupportsMultichannelContent` are XPC round-trips to mediaserverd; running them on the main
-    /// thread while the session is already active (a second playback in the same app session, or a live
-    /// route like AirPods) trips Xcode's hang-risk diagnostic and can block the watchdog. The category
-    /// only has to be declared before the FIRST activation, and nothing reads it synchronously at init,
-    /// so we run the pair on a detached task and every load path awaits it before it can activate. This
-    /// keeps issue #24's "declare early, never activate at init" contract; only the blocking XPC call
-    /// leaves the main thread. The closure captures no engine state, so it holds no reference to `self`.
-    private var audioSessionCategoryTask: Task<Void, Never>?
-
     #if os(iOS) || os(tvOS)
     /// Pending off-main deactivation (#215). See `scheduleAudioSessionDeactivation()`.
     private var audioSessionDeactivationTask: Task<Void, Never>?
@@ -3983,37 +4023,44 @@ public final class AetherEngine: ObservableObject {
         FFmpegRuntimeCheck.logOnce()
         _ = DeinterlaceHardwareWarmup.shared
 
-        // Declare category + multichannel support but do NOT activate the session here.
-        //
-        // Issue #24: activating at launch latches the route against whatever HDMI reports at that instant.
-        // With "Continuous Audio Connection" off, the link idles at stereo (output=2); no later
-        // AVAudioSession call can lift that latch, causing 5.1 EAC3 to downmix. AVPlayerViewController
-        // owns and activates the session for the native path, letting tvOS auto-negotiate the route.
-        // SW/audio renderer paths activate via `activateRendererAudioSession()` since they bypass AVKit.
-        //
-        // Issue #114: the declaration runs off the main thread. See `audioSessionCategoryTask`.
-        #if os(iOS) || os(tvOS)
-        audioSessionCategoryTask = BlockingWork.detached(priority: .userInitiated) {
-            let session = AVAudioSession.sharedInstance()
-            do {
-                try session.setCategory(.playback, mode: .moviePlayback, policy: AetherEngine.audioSessionRouteSharingPolicy)
-                try session.setSupportsMultichannelContent(true)
-                EngineLog.emit("[AetherEngine] AVAudioSession: category set off-main, not activated (AVKit drives activation) policy=\(AetherEngine.audioSessionRouteSharingPolicy.rawValue) maxChannels=\(session.maximumOutputNumberOfChannels) output=\(session.outputNumberOfChannels)", category: .engine)
-            } catch {
-                EngineLog.emit("[AetherEngine] AVAudioSession setup error: \(error)", category: .engine)
-            }
-        }
-        #endif
+        // The category is declared off-main at the first load, once per process (#114), and the session
+        // is never activated here: AVKit owns native playback activation (#24).
 
         setupLifecycleObservers()
     }
 
-    /// Await the off-main category declaration (#114) so it is guaranteed complete before the first
-    /// AVAudioSession activation. Idempotent: once the task has finished, `.value` returns immediately;
-    /// nil on macOS (no session setup) returns immediately too.
+    /// Declare the process-wide category before a load can activate the session (#114, off-main).
+    /// Concurrent loads share one operation, and once it has succeeded no later load touches the
+    /// category again: a host that switches the mode afterwards (music playback setting `.default`)
+    /// keeps it, as it did when the declaration ran once at init. A failed attempt is retried.
     func awaitAudioSessionCategoryConfigured() async {
-        await audioSessionCategoryTask?.value
+        #if os(iOS) || os(tvOS)
+        await SharedOutputCoordinator.shared.configureAudioSessionCategory {
+            Self.configureAudioSessionCategory()
+        }
+        #endif
     }
+
+    #if os(iOS) || os(tvOS)
+    /// A host that already declared `.playback` before the first load owns mode and policy; only a
+    /// session still on the system default gets the engine's declaration.
+    nonisolated private static func configureAudioSessionCategory() -> Bool {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            if session.category != .playback {
+                try session.setCategory(.playback, mode: .moviePlayback, policy: audioSessionRouteSharingPolicy)
+            }
+            if !session.supportsMultichannelContent {
+                try session.setSupportsMultichannelContent(true)
+            }
+            EngineLog.emit("[AetherEngine] AVAudioSession: category set off-main, not activated (AVKit drives activation) category=\(session.category.rawValue) mode=\(session.mode.rawValue) policy=\(session.routeSharingPolicy.rawValue) maxChannels=\(session.maximumOutputNumberOfChannels) output=\(session.outputNumberOfChannels)", category: .engine)
+            return true
+        } catch {
+            EngineLog.emit("[AetherEngine] AVAudioSession setup error: \(error)", category: .engine)
+            return false
+        }
+    }
+    #endif
 
     // MARK: - Public load
 
@@ -4492,9 +4539,9 @@ public final class AetherEngine: ObservableObject {
         sourceVideoHeight = 0
         sourceVideoPixelAspectRatio = 1
 
-        // #114: guarantee the AVAudioSession category is declared (off-main, from init) before any branch
+        // #114: guarantee the AVAudioSession category is declared off-main before any branch
         // below can activate the session: AVKit on the native/remote-HLS paths, activateRendererAudioSession()
-        // on the SW and audio paths. The task is short and typically already complete, so this rarely suspends.
+        // on the SW and audio paths. Only the first load in the process does any work here.
         await awaitAudioSessionCategoryConfigured()
         // Audit CORE-6: the first suspension point. Two loads issued back to back right after init
         // both wait on the same category task, and the older one must not resume as the current one.
@@ -5153,11 +5200,12 @@ public final class AetherEngine: ObservableObject {
             // AE#459: the ROUTE may assume more than the LABEL may claim. `panelHDRAfterHandshake` stays the
             // label's answer, conservative by design; the route additionally offers an unproven but
             // HDR-eligible display the master and lets AVFoundation's acceptance be the readout `UIScreen`
-            // has been measured getting wrong on a panel that was demonstrably presenting HDR. Live is excluded: its fallback is a rejoin at
-            // the edge rather than a restored position, and that cost has not been measured.
+            // has been measured getting wrong on a panel that was demonstrably presenting HDR. Live attempts
+            // too: a refusal lands before the first frame, so the fallback's rejoin at the edge is where the
+            // session was joining anyway (#130), and without the attempt a live session has no proof at all (#887).
             routingPanelHDR = Self.sessionRoutesAsHDRPanel(
                 panelPresentsHDR: panelHDRAfterHandshake,
-                attemptWhenUnproven: options.attemptsHDRMasterOnUnprovenPanel && !options.isLive,
+                attemptWhenUnproven: options.attemptsHDRMasterOnUnprovenPanel,
                 displayEligibleForHDR: observedDisplayCaps.supportsHDR,
                 panelRefusedHDRMaster: Self.panelRefusedHDRMaster)
             // AE#667: that acceptance only answers once the panel has arrived. See `unprovenMasterAwaitsSwitchEnd`.
@@ -5185,7 +5233,7 @@ public final class AetherEngine: ObservableObject {
                     hostAsserts: options.panelIsInHDRMode, criteriaReadout: criteriaPanelReadout)
                 routingPanelHDR = Self.sessionRoutesAsHDRPanel(
                     panelPresentsHDR: panelHDRAfterHandshake,
-                    attemptWhenUnproven: options.attemptsHDRMasterOnUnprovenPanel && !options.isLive,
+                    attemptWhenUnproven: options.attemptsHDRMasterOnUnprovenPanel,
                     displayEligibleForHDR: observedDisplayCaps.supportsHDR,
                     panelRefusedHDRMaster: Self.panelRefusedHDRMaster)
             }
@@ -5465,23 +5513,25 @@ public final class AetherEngine: ObservableObject {
            let vStream = probe.stream(at: probe.videoStreamIndex),
            let codecpar = vStream.pointee.codecpar {
             let dvProfile = Self.dvProfile(stream: vStream)
-            let forcesSoftware = {
-                VideoRoutingPolicy.forcesSoftwareForUndecodableFormat(
-                   codecID: detectedCodecID,
-                   // A Profile 5 record served as its base layer plays as plain HEVC, which is what
-                   // the raw-hvcC probe judges; the exemption is for the dvh1 route it is not on.
-                   // AE#532: a record the RPU corrected is not on that route either, and its base layer
-                   // is standard Main10, so the gate judges it the way it judges any Profile 7 / 8.
-                   dvProfile: presentsDolbyVisionBaseLayer ? nil : (correctedDVProfile ?? dvProfile),
-                   canHardwareDecode: { VTCapabilityProbe.canHardwareDecode(codecpar: codecpar) })
-            }
-            var routesSoftware = forcesSoftware()
+            // A Profile 5 record served as its base layer plays as plain HEVC, which is what
+            // the raw-hvcC probe judges; the exemption is for the dvh1 route it is not on.
+            // AE#532: a record the RPU corrected is not on that route either, and its base layer
+            // is standard Main10, so the gate judges it the way it judges any Profile 7 / 8.
+            let gateDVProfile = presentsDolbyVisionBaseLayer ? nil : (correctedDVProfile ?? dvProfile)
+            // AE#883: called in place rather than through a stored closure. Swift 6.2 infers a stored local
+            // closure main-actor and rejects it capturing `codecpar` ("sending risks causing data races");
+            // a non-escaping argument is not sent.
+            var routesSoftware = VideoRoutingPolicy.forcesSoftwareForUndecodableFormat(
+                codecID: detectedCodecID, dvProfile: gateDVProfile,
+                canHardwareDecode: { VTCapabilityProbe.canHardwareDecode(codecpar: codecpar) })
             // AE#348: with the pre-flight gate beside the load, this probe's throwaway session can open while
             // the panel switches, which the serial order never did. Only a refusal changes the route, so a
             // refusal taken then is asked again once the panel has settled, where the serial order asked it.
             if routesSoftware, !panelRoutingSettled {
                 try await settlePanelRouting(ownsProbe: true)
-                routesSoftware = forcesSoftware()
+                routesSoftware = VideoRoutingPolicy.forcesSoftwareForUndecodableFormat(
+                    codecID: detectedCodecID, dvProfile: gateDVProfile,
+                    canHardwareDecode: { VTCapabilityProbe.canHardwareDecode(codecpar: codecpar) })
             }
             if routesSoftware {
                 useSoftwarePath = true
@@ -5884,6 +5934,11 @@ public final class AetherEngine: ObservableObject {
         if state == .paused || state == .loading {
             state = .playing
         }
+        // #882: the software pumps keep their rebuffer hold across a pause, and pause() cleared the level,
+        // so a play into a hold carries no edge. Re-read it, or the phase reads `.playing` until the hold ends.
+        if let softwareHost {
+            isBuffering = state == .playing && softwareHost.isRebuffering
+        }
         // A resume that leaves `state` at `.playing` (the end of an audio interruption) restarts the
         // renderer without a state change; the Atmos output activator follows the renderer, so tell it.
         atmosOutputActivator?.refresh()
@@ -5905,7 +5960,7 @@ public final class AetherEngine: ObservableObject {
         // (wedge-safe, mirrors the unconditional background teardown). Audio backends are already spared.
         // #127: same grace window as the didEnterBackground path, so pause-after-background quick switches
         // also skip the rebuild.
-        if isBackgrounded && !pictureInPictureActive && !audioAVPlayerActive && audioHost == nil && softwareHost == nil {
+        if isBackgrounded && !retainsVideoPipelineWhenBackgrounded && !pictureInPictureActive && !audioAVPlayerActive && audioHost == nil && softwareHost == nil {
             switch Self.backgroundStep(
                 action: .teardownVideo,
                 state: state,
@@ -7143,6 +7198,7 @@ public final class AetherEngine: ObservableObject {
             }
             let presentsHDR = await self.displayCriteria.probePanelDuringPlayback()
             guard !Task.isCancelled, self.loadGeneration == gen, presentsHDR else { return }
+            Self.withdrawPanelRefusalOnHDRReading()
             self.republishPanelPresentsHDR(
                 effectiveFormat: effectiveFormat,
                 because: "the panel answered HDR during playback and the load-time read could not see it")
@@ -8419,8 +8475,9 @@ public final class AetherEngine: ObservableObject {
         backgroundActionOwed = false
         guard isBackgrounded, state == .playing || state == .paused else { return }
         EngineLog.emit(
-            "[AetherEngine] background: the decision owed while a load or seek was in flight settled "
-            + "(state=\(state)); applying the background policy now (audit CORE-2)",
+            "[AetherEngine] background: an owed decision settled (a load or seek in flight, or a "
+            + "retained paused session resuming, AE#870; state=\(state)); applying the background "
+            + "policy now (audit CORE-2)",
             category: .engine)
         Task { @MainActor [weak self] in await self?.runOwedBackgroundPolicy() }
     }
@@ -8512,7 +8569,8 @@ public final class AetherEngine: ObservableObject {
             softwareHostHasAudio: softwareHost?.deliversAudio == true,
             keepVideoAlive: keepAlive,
             pipActive: pictureInPictureActive,
-            state: state
+            state: state,
+            retainPausedVideoPipeline: retainsVideoPipelineWhenBackgrounded
         )
         switch Self.backgroundStep(
             action: action,
@@ -8644,7 +8702,8 @@ public final class AetherEngine: ObservableObject {
             softwareHostHasAudio: softwareHost?.deliversAudio == true,
             keepVideoAlive: keepAlive,
             pipActive: pictureInPictureActive,
-            state: state
+            state: state,
+            retainPausedVideoPipeline: retainsVideoPipelineWhenBackgrounded
         )
     }
     #endif
